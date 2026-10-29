@@ -1,0 +1,40 @@
+# golangci-lint v2 configuration for the Torch platform.
+# David's rule: every module ships with lint gates that run clean, from
+# birth. This file is part of the skeleton, not an afterthought: the
+# standard set plus security, style, and correctness linters on top.
+version: "2"
+
+run:
+  timeout: 3m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - gocritic
+    - gosec
+    - misspell
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+    - wastedassign
+  settings:
+    revive:
+      confidence: 0.8
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+        - name: package-comments
+        - name: unused-parameter
+          arguments:
+            - allowRegex: "^_"
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

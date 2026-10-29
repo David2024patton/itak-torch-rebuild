@@ -29,7 +29,9 @@ import (
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/server"
 )
 
-func main() {
+func main() { os.Exit(run()) }
+
+func run() int {
 	addr := flag.String("addr", "127.0.0.1:8091", "listen address (default loopback only)")
 	socket := flag.String("engine-socket", "", "path to the Rust engine unix socket; empty = no engine configured")
 	models := flag.String("models", "glimmer", "comma-separated model ids advertised on /v1/models")
@@ -44,7 +46,7 @@ func main() {
 	if apiKey == "" {
 		if os.Getenv("TORCH_ALLOW_NO_AUTH") != "1" {
 			log.Error("TORCH_API_KEY is not set; refusing to start an unauthenticated server (set TORCH_ALLOW_NO_AUTH=1 to override deliberately)")
-			os.Exit(1)
+			return 1
 		}
 		log.Warn("TORCH_ALLOW_NO_AUTH=1: running WITHOUT authentication; every route is open")
 	}
@@ -80,9 +82,10 @@ func main() {
 	log.Info("torchd listening", "addr", *addr, "engine_socket", *socket)
 	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Error("server exited", "err", err)
-		os.Exit(1)
+		return 1
 	}
 	log.Info("torchd stopped")
+	return 0
 }
 
 // dialEngine connects to the Rust engine socket when configured. A

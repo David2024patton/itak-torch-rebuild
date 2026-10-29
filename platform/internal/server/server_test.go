@@ -49,7 +49,7 @@ func (notImplEngine) Generate(context.Context, engine.GenerateRequest) (<-chan e
 	return nil, engine.ErrNotImplemented
 }
 
-func newServer(t *testing.T, eng engine.Client) (*server.Server, *httptest.Server) {
+func newServer(t *testing.T, eng engine.Client) *httptest.Server {
 	t.Helper()
 	srv := server.New(server.Config{
 		Engine:   eng,
@@ -62,7 +62,7 @@ func newServer(t *testing.T, eng engine.Client) (*server.Server, *httptest.Serve
 		ts.Close()
 		srv.Close()
 	})
-	return srv, ts
+	return ts
 }
 
 func do(t *testing.T, ts *httptest.Server, method, path, body, key string) (int, http.Header, []byte) {
@@ -107,7 +107,7 @@ func errorCode(t *testing.T, body []byte) string {
 }
 
 func TestHealthzOpenWithoutKey(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	code, _, body := do(t, ts, http.MethodGet, "/healthz", "", "")
 	if code != http.StatusOK {
 		t.Fatalf("healthz status = %d, want 200 (%s)", code, body)
@@ -118,7 +118,7 @@ func TestHealthzOpenWithoutKey(t *testing.T) {
 }
 
 func TestRoutesRequireKey(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	for _, path := range []string{"/v1/models", "/debug"} {
 		code, _, _ := do(t, ts, http.MethodGet, path, "", "")
 		if code != http.StatusUnauthorized {
@@ -135,7 +135,7 @@ const chatBody = `{"model":"glimmer","messages":[{"role":"user","content":"Say h
 
 func TestChatCompletionAndCache(t *testing.T) {
 	fake := &fakeEngine{}
-	_, ts := newServer(t, fake)
+	ts := newServer(t, fake)
 
 	code, hdr, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
 	if code != http.StatusOK {
@@ -168,7 +168,7 @@ func TestChatCompletionAndCache(t *testing.T) {
 }
 
 func TestChatStreaming(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	streamBody := `{"model":"glimmer","stream":true,"messages":[{"role":"user","content":"hi"}]}`
 	code, hdr, body := do(t, ts, http.MethodPost, "/v1/chat/completions", streamBody, testKey)
 	if code != http.StatusOK {
@@ -184,7 +184,7 @@ func TestChatStreaming(t *testing.T) {
 }
 
 func TestChatValidation(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	cases := map[string]string{
 		"no model":    `{"messages":[{"role":"user","content":"x"}]}`,
 		"no messages": `{"model":"glimmer"}`,
@@ -201,7 +201,7 @@ func TestChatValidation(t *testing.T) {
 }
 
 func TestChatWithoutEngineIsNamedUnavailable(t *testing.T) {
-	_, ts := newServer(t, nil) // no engine configured
+	ts := newServer(t, nil) // no engine configured
 	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
 	if code != http.StatusServiceUnavailable || errorCode(t, body) != "engine_unavailable" {
 		t.Fatalf("status = %d, body = %s; want 503 engine_unavailable", code, body)
@@ -209,7 +209,7 @@ func TestChatWithoutEngineIsNamedUnavailable(t *testing.T) {
 }
 
 func TestChatNotImplementedMapping(t *testing.T) {
-	_, ts := newServer(t, notImplEngine{&fakeEngine{}})
+	ts := newServer(t, notImplEngine{&fakeEngine{}})
 	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
 	if code != http.StatusNotImplemented || errorCode(t, body) != "not_implemented" {
 		t.Fatalf("status = %d, body = %s; want 501 not_implemented", code, body)
@@ -217,7 +217,7 @@ func TestChatNotImplementedMapping(t *testing.T) {
 }
 
 func TestEmbeddings(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	code, _, body := do(t, ts, http.MethodPost, "/v1/embeddings",
 		`{"model":"glimmer","input":["a","b"]}`, testKey)
 	if code != http.StatusOK {
@@ -239,7 +239,7 @@ func TestEmbeddings(t *testing.T) {
 }
 
 func TestDebugReportsModules(t *testing.T) {
-	_, ts := newServer(t, &fakeEngine{})
+	ts := newServer(t, &fakeEngine{})
 	// Generate some activity first.
 	_, _, _ = do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
 

@@ -35,7 +35,8 @@ func holdSlot(t *testing.T, s *scheduler.Scheduler) func() {
 // queueWaiter starts a goroutine that acquires, records its name in the
 // completion order, and releases immediately.
 func queueWaiter(s *scheduler.Scheduler, p scheduler.Priority, name string,
-	mu *sync.Mutex, order *[]string, wg *sync.WaitGroup) {
+	mu *sync.Mutex, order *[]string, wg *sync.WaitGroup,
+) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()

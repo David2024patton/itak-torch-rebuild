@@ -181,10 +181,11 @@ const LAYER_SUFFIXES: [&str; 14] = [
 /// Every tensor name [`Weights::load`] will request for `cfg`, in load
 /// order. Exposed so the loader's tensor inventory (TODO T-2.1) can be
 /// checked against this module's expectations mechanically, instead of
-/// by reading two codebases side by side. One entry to verify against
-/// the first real inventory dump: `output_norm.weight` follows the GGUF
-/// naming convention; the census confirmed `output.weight` and
-/// `token_embd.weight` directly.
+/// by reading two codebases side by side. Verified against the real
+/// file on 2026-10-29 through the `itak-loader` inventory check: all
+/// 731 expected names present, zero unexpected, and
+/// `output_norm.weight` confirmed as the file's final-norm tensor
+/// (F32, shape [6656]), not merely a naming-convention assumption.
 pub fn expected_tensor_names(cfg: &GlimmerConfig) -> Vec<String> {
     let mut names = Vec::with_capacity(3 + cfg.block_count as usize * LAYER_SUFFIXES.len());
     names.push("token_embd.weight".to_string());

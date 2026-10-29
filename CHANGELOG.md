@@ -17,6 +17,11 @@ RULES:
 -->
 # CHANGELOG: iTaK Torch Rebuild
 
+## 2026-10-29: Tokenizer proven token-for-token on Glimmer's real vocabulary (TODO T-2.3)
+- The Rust BPE tokenizer matches the production llama-server token for token on the 16-prompt bench set (16/16 identical, 16/16 decode round-trips exact), using Glimmer's own 202,048-token vocabulary and 439,802 merges extracted from the production GGUF by the new gguf `tokenizer_extract` example.
+- The first run failed one case, contractions: the pre-tokenizer had implemented the llama-3 split (contraction as its own piece), while llama.cpp routes `pre = llama4` to the GPT-4o pattern, where the contraction is a suffix of the word piece. `pretokenize.rs` and the crate docs now implement and document the GPT-4o pattern, with regression tests.
+- Proof: crates/tokenizer/CONFORMANCE.md; harness in crates/tokenizer/examples/conformance.rs; reference in crates/tokenizer/conformance/.
+
 ## 2026-10-27: Project repo created with the full standard file set and the evidence base
 - The rebuild plan (PLAN.md), task list (TODO.md), idea record (IDEA.md), end goal (ENDGOAL.md), decisions, status, runbook, map, and references were written from the project's real state and published together with the research documents and bench scripts under docs/research/ and bench/.
 - Proof: this repository, created public on 2026-10-27 on David's order.

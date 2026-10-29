@@ -69,6 +69,22 @@ fn letter_run(chars: &[(usize, char)], mut i: usize) -> usize {
     i
 }
 
+/// The end of a word piece whose letters end at `end`: absorbs one
+/// trailing contraction when one starts there. In the GPT-4o pattern
+/// the contraction is an optional suffix of the word alternatives
+/// (`(?:'s|'t|'re|'ve|'m|'ll|'d)?`), never a standalone alternative,
+/// so `don't` is one piece; a second contraction in a row
+/// (`you'd've`) is left for the next piece, where the prefix-char
+/// letter branch picks it up as `'ve`.
+fn word_end(chars: &[(usize, char)], end: usize) -> usize {
+    if end < chars.len() && chars[end].1 == '\'' {
+        if let Some(len) = contraction_len(chars, end) {
+            return end + len;
+        }
+    }
+    end
+}
+
 /// Consumes a symbol run starting at `i`, plus any `\r`/`\n` run that
 /// immediately follows it (the pattern's `[\r\n]*` tail); returns the
 /// end index.
@@ -84,33 +100,29 @@ fn symbol_run(chars: &[(usize, char)], mut i: usize) -> usize {
 
 /// Scans one piece starting at char index `i` and returns the index
 /// just past its end. Mirrors the alternation order of the pattern:
-/// contraction, letter branch (with optional one-char prefix), number,
-/// symbol (via the whitespace branch's single-space case), newline and
-/// whitespace branches.
+/// letter branch (bare, then with a one-char prefix), number, symbol
+/// (via the whitespace branch's single-space case), newline and
+/// whitespace branches. There is deliberately no standalone
+/// contraction branch: see [`word_end`].
 fn scan_piece(chars: &[(usize, char)], i: usize) -> usize {
     let n = chars.len();
     let c = chars[i].1;
 
-    // 1. Contraction: 's 't 're 've 'm 'll 'd.
-    if c == '\'' {
-        if let Some(len) = contraction_len(chars, i) {
-            return i + len;
-        }
-    }
-
-    // 2. Letter branch, bare: \p{L}+
+    // 1. Letter branch, bare: \p{L}+ with an optional contraction
+    //    suffix.
     if is_letter(c) {
-        return letter_run(chars, i);
+        return word_end(chars, letter_run(chars, i));
     }
 
-    // 3. Letter branch with one prefix char ([^\r\n\p{L}\p{N}]? before
-    //    letters). Covers " word" and "-word". Newlines are excluded
-    //    from the prefix class by the pattern.
+    // 2. Letter branch with one prefix char ([^\r\n\p{L}\p{N}]? before
+    //    letters). Covers " word", "-word", and a contraction left
+    //    over after a word piece ("'ve" in "you'd've"). Newlines are
+    //    excluded from the prefix class by the pattern.
     if !is_number(c) && !matches!(c, '\r' | '\n') && i + 1 < n && is_letter(chars[i + 1].1) {
-        return letter_run(chars, i + 1);
+        return word_end(chars, letter_run(chars, i + 1));
     }
 
-    // 4. Number branch: \p{N}{1,3}.
+    // 3. Number branch: \p{N}{1,3}.
     if is_number(c) {
         let mut j = i;
         while j < n && j - i < 3 && is_number(chars[j].1) {
@@ -119,12 +131,12 @@ fn scan_piece(chars: &[(usize, char)], i: usize) -> usize {
         return j;
     }
 
-    // 5. Whitespace branches.
+    // 4. Whitespace branches.
     if c.is_whitespace() {
         return scan_whitespace(chars, i);
     }
 
-    // 6. Symbol branch: [^\s\p{L}\p{N}]+ with an optional newline tail.
+    // 5. Symbol branch: [^\s\p{L}\p{N}]+ with an optional newline tail.
     symbol_run(chars, i)
 }
 
@@ -162,7 +174,7 @@ fn scan_whitespace(chars: &[(usize, char)], i: usize) -> usize {
     // digit it stands alone (the number branch has no prefix).
     let next = chars[run_end].1;
     if is_letter(next) {
-        return letter_run(chars, run_end);
+        return word_end(chars, letter_run(chars, run_end));
     }
     if is_symbol(next) {
         return symbol_run(chars, run_end);
@@ -181,6 +193,8 @@ mod tests {
             "Hello world",
             "  leading and trailing  ",
             "don't stop believin'",
+            "you'd've thought we'd have learned",
+            "'tis the season, the 90's are back",
             "abc1234567def",
             "line one\nline two\r\n\r\nend",
             "tabs\tand\ttabs",
@@ -199,15 +213,32 @@ mod tests {
     #[test]
     fn basic_splits_match_the_pattern() {
         assert_eq!(pretokenize("Hello world"), vec!["Hello", " world"]);
-        assert_eq!(
-            pretokenize("I don't know"),
-            vec!["I", " don", "'t", " know"]
-        );
+        assert_eq!(pretokenize("I don't know"), vec!["I", " don't", " know"]);
         assert_eq!(pretokenize("abc1234567"), vec!["abc", "123", "456", "7"]);
         assert_eq!(pretokenize("a  b"), vec!["a", " ", " b"]);
         assert_eq!(pretokenize("hello "), vec!["hello", " "]);
         assert_eq!(pretokenize("one\ntwo"), vec!["one", "\n", "two"]);
         assert_eq!(pretokenize("123"), vec!["123"]);
         assert_eq!(pretokenize(" 123"), vec![" ", "123"]);
+    }
+
+    #[test]
+    fn contractions_are_word_suffixes_not_pieces() {
+        // The GPT-4o pattern attaches one optional contraction to the
+        // word piece. A second contraction in a row splits, via the
+        // prefix-char letter branch. A contraction-shaped fragment
+        // after digits goes through the same prefix branch, and an
+        // apostrophe that starts no contraction is a symbol.
+        assert_eq!(pretokenize("you'd've"), vec!["you'd", "'ve"]);
+        assert_eq!(
+            pretokenize("'tis the season"),
+            vec!["'tis", " the", " season"]
+        );
+        assert_eq!(
+            pretokenize("the 90's vibe"),
+            vec!["the", " ", "90", "'s", " vibe"]
+        );
+        assert_eq!(pretokenize("dogs' bones"), vec!["dogs", "'", " bones"]);
+        assert_eq!(pretokenize("DON'T"), vec!["DON'T"]);
     }
 }

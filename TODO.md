@@ -44,7 +44,7 @@ RULES:
 ## Phase 2: Rust engine core (PLAN S5)
 - [ ] T-2.1 itak-loader: GGUF parser and mmap weight access (proof: loads the Qwen2.5-7B test GGUF and dumps a tensor inventory matching llama.cpp's) (PLAN S5)
 - [ ] T-2.2 itak-kernels: Q4_K dequant and matmul, RMSNorm, RoPE, softmax (proof: unit tests against reference outputs computed by the Go native engine and llama.cpp) (PLAN S5)
-- [ ] T-2.3 Real BPE tokenizer (proof: token-for-token match with the reference tokenizer on the bench prompt set; the char tokenizer from the original native path is not acceptable) (PLAN S5)
+- [x] T-2.3 Real BPE tokenizer (proof: token-for-token match with the reference tokenizer on the bench prompt set; the char tokenizer from the original native path is not acceptable) (PLAN S5)
 - [ ] T-2.4 KV-cached transformer forward for Llama and Qwen2 families with paged KV from itak-kv (proof: generates coherent text; per-token latency measured; no allocation inside the token loop, proven by an allocation counter test) (PLAN S5)
 - [ ] T-2.5 Sampling as config: temperature, top-p, top-k, penalties (proof: seeded determinism test at temp 0; config override test) (PLAN S5)
 - [ ] T-2.6 Minimal serve through the seam (socket control, shared-memory tokens) with an OpenAI-compatible chat endpoint (proof: end-to-end request from the Go platform stub; published speed comparison vs llama.cpp on the same model and prompts) (PLAN S5)

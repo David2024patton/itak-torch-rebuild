@@ -11,5 +11,11 @@ default = []
 # Emit diagnostic lines (loads, refusals, fallbacks) to stderr.
 debug-log = []
 
+# The library stays decoupled from the GGUF parser (see src/lib.rs).
+# Examples and tests may use it: the conformance harness adapts
+# gguf::TokenizerInfo into TokenizerData.
+[dev-dependencies]
+gguf = { path = "../gguf" }
+
 [lints]
 workspace = true

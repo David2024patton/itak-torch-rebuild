@@ -24,19 +24,32 @@
 //!
 //! # Pre-tokenizer
 //!
-//! Before BPE, text is split by a hand-written scanner implementing this
-//! llama4 / GPT-2 family pattern (the llama.cpp `llama4` pre-tokenizer is
-//! the GPT-2 pattern with a 1-to-3 digit number rule):
+//! Before BPE, text is split by a hand-written scanner implementing
+//! the GPT-4o family pattern. That is the pattern llama.cpp assigns
+//! to Glimmer's `tokenizer.ggml.pre = "llama4"` (its
+//! `LLAMA_VOCAB_PRE_TYPE_GPT4O`); its word alternatives carry the
+//! contraction as an optional suffix:
 //!
 //! ```text
-//! (?i:'s|'t|'re|'ve|'m|'ll|'d)
-//! | [^\r\n\p{L}\p{N}]?\p{L}++
+//! [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'s|'t|'re|'ve|'m|'ll|'d)?
+//! | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'s|'t|'re|'ve|'m|'ll|'d)?
 //! | \p{N}{1,3}
-//! |  ?[^\s\p{L}\p{N}]++[\r\n]*
-//! | \s*[\r\n]++
-//! | \s++(?!\S)
-//! | \s++
+//! |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+//! | \s*[\r\n]+
+//! | \s+(?!\S)
+//! | \s+
 //! ```
+//!
+//! The two word alternatives differ only in case structure; both
+//! span the same maximal letter run, so the scanner implements them
+//! as one letter run plus the optional contraction suffix. There is
+//! no standalone contraction alternative: a contraction that does
+//! not follow a word (the `'ve` in `you'd've`, the `'s` in `90's`)
+//! is picked up by the prefix-char word branch instead. An earlier
+//! version of this crate implemented the llama-3 pattern, in which
+//! contractions are a standalone first alternative; that split
+//! `don't` into `don` + `'t` and failed conformance against the
+//! reference (see `CONFORMANCE.md` beside this crate).
 //!
 //! Deviations from a true regex engine, stated plainly:
 //!
@@ -45,8 +58,10 @@
 //!   alphabetic characters such as some combining marks).
 //! - `\p{N}` is [`char::is_numeric`] (Nd, Nl, No), which matches `\p{N}`.
 //! - `\s` is [`char::is_whitespace`] (the Unicode White_Space property).
-//! - Contractions are matched ASCII case-insensitively; the pattern's
-//!   `(?i)` is Unicode-aware in principle.
+//! - Contractions are matched ASCII case-insensitively, as in
+//!   llama.cpp's implemented form of the pattern (explicit
+//!   `[sS]`-style letter classes); the original pattern's `(?i)` is
+//!   Unicode-aware in principle.
 //! - A whitespace run containing newlines is emitted up to the end of
 //!   its last newline, leaving any following spaces to the plain
 //!   whitespace rules; a regex engine's backtracking can split such a
@@ -69,6 +84,13 @@
 //! assert_eq!(ids, vec![0, 2]);
 //! assert_eq!(tok.decode(&ids).unwrap(), "a a");
 //! ```
+//!
+//! # Conformance
+//!
+//! The token-for-token proof against the reference tokenizer on
+//! Glimmer's real vocabulary (TODO T-2.3) lives in `CONFORMANCE.md`
+//! beside this crate; the harness is `examples/conformance.rs` and
+//! the reference data sits in `conformance/`.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

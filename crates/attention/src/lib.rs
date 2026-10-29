@@ -15,9 +15,11 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attention;
 pub mod cache;
 pub mod diag;
 pub mod error;
 
+pub use attention::{gqa_attention, kv_head_for_query_head, AttentionParams};
 pub use cache::{glimmer_layer_pattern, CacheView, KvCache, LayerKind, LayerStats};
 pub use error::AttentionError;

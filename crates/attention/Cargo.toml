@@ -1,0 +1,10 @@
+[package]
+name = "attention"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "KV cache (global and sliding-window ring layers) and grouped-query attention for the Torch token loop, shaped by Glimmer's 39 windowed / 13 global hybrid layer pattern"
+
+[lints]
+workspace = true

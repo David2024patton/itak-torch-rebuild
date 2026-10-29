@@ -1,0 +1,38 @@
+# iTaK Torch rebuild: Rust engine workspace (PLAN S2, S5).
+# One crate per module; the Go platform lives outside this workspace.
+# These crates are the token-loop side of the seam.
+#
+# This root merges the per-crate versions several builders each wrote
+# while scaffolding their crate (gguf, torch-math, tokenizer,
+# muse-glimmer, attention): the member list is the union of crates/,
+# [workspace.package] and the lint tables are restored because most
+# member manifests inherit edition/license/rust-version and lints
+# from here, and the release profile from the tokenizer version is
+# kept.
+[workspace]
+resolver = "2"
+members = [
+    "crates/attention",
+    "crates/gguf",
+    "crates/muse-glimmer",
+    "crates/tokenizer",
+    "crates/torch-math",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+# Lint gates are part of every module, not an afterthought: warnings
+# are denied workspace-wide and clippy must run clean (David's rule,
+# 2026-10-20: every module ships with debugging and lint tests built
+# in from birth).
+[workspace.lints.rust]
+warnings = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+
+[profile.release]
+lto = "thin"

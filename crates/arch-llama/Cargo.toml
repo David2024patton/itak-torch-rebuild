@@ -1,0 +1,15 @@
+[package]
+name = "arch-llama"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Generic dense architecture module for the iTaK Torch Rust engine: the llama and qwen2 families (pre-norm, RoPE, GQA with KV cache, SwiGLU), config and weights read from the file's own GGUF metadata and tensor names, fail-loud on anything absent"
+
+[dependencies]
+attention = { path = "../attention" }
+gguf = { path = "../gguf" }
+torch-math = { path = "../torch-math" }
+
+[lints]
+workspace = true

@@ -11,5 +11,11 @@ attention = { path = "../attention" }
 gguf = { path = "../gguf" }
 torch-math = { path = "../torch-math" }
 
+# The golden-run example drives the model with the rebuild's own
+# tokenizer, the way the conformance harness in the tokenizer crate
+# already does in the other direction.
+[dev-dependencies]
+tokenizer = { path = "../tokenizer" }
+
 [lints]
 workspace = true

@@ -49,7 +49,7 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Nodes marked (
 | itak-kernels (planned) | module | Production quantized matmul and dequant kernels that graduate from torch-math's reference implementations. |
 | itak-ssm (planned) | module | The state space scan: three-term recurrence, rotation on B and C, MIMO rank. |
 | itak-moe (planned) | module | MoE routing, expert cache, expert streaming from disk. |
-| itak-spec (planned) | module | Speculative decoding: n-gram, Medusa, MTP, rejection sampling. |
+| itak-spec (planned) | module | Speculative decoding: n-gram, Medusa, MTP, rejection sampling. Design: docs/specs/SPEC-itak-spec.md (DFlash verify loop, ring rollback semantics, T-P.1 sweep protocol, Medusa verdict). |
 | itak-backend (planned) | module | Backend trait: CPU SIMD, wgpu/Vulkan, others behind the seam. |
 | itak-train (planned) | module | Training compute: autograd, optimizers, trainers, LoRA. |
 | itak-dissect (planned) | tool | Weight statistics, measured heat maps, .itf conversion, quant planning. |

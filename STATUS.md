@@ -21,7 +21,7 @@ RULES:
 -->
 # STATUS: iTaK Torch Rebuild
 
-## As of 2026-10-27
+## As of 2026-10-29
 
 ## Proven state
 - The original engine is fully audited: feature inventory, the three stacked build blockers, and the measured Core usage surface are on record (proof: PLAN.md S2; TODO Phase 0 items T-0.1 and T-0.6, checked with proofs).
@@ -31,6 +31,7 @@ RULES:
 - The architecture is decided: Go platform plus Rust engine core, two processes, socket plus shared-memory seam (proof: DECISIONS.md, 2026-10-27).
 
 ## In flight
+- muse-glimmer crate skeleton landed in the Rust workspace (TODO T-P.3, opened ahead of its Phase 2 gate on David's 2026-10-29 order): config parsed from the real file's GGUF metadata, the measured 39/13 layer pattern with its origin recorded, the full 14-tensor-per-layer weight inventory behind a TensorSource seam, and the structured forward with compute and KV storage trait-bound to the kernel and KV crates (proof: cargo build clean, cargo test 23 passed, cargo clippy clean, all under the workspace deny-warnings lints).
 - This repo: standard file set and research documents being published (this pass).
 - Nothing in code yet. Phase 1 has not started.
 

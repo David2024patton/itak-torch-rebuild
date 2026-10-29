@@ -42,6 +42,7 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Unmarked nodes
 | itak-types (planned) | module | Rust mirror of the shared contracts, with version fields. |
 | itak-diag (planned) | module | Engine-side structured logs, health, events. |
 | itak-loader (planned) | module | GGUF (and later .itf) parsing, mmap weight access. |
+| muse-glimmer | module | The Muse Glimmer architecture: config parsed from GGUF metadata, the measured weight layout (14 tensors per layer), and the structured forward for the 52-layer hybrid (39 sliding-window + 13 global). Skeleton stage: compute and KV storage sit behind traits. |
 | itak-kernels (planned) | module | Quantized matmul and dequant, RoPE, norms, softmax. |
 | itak-kv (planned) | module | KV cache pools: paged, ring, INT8, compressed, offloaded; prefix sharing. |
 | itak-ssm (planned) | module | The state space scan: three-term recurrence, rotation on B and C, MIMO rank. |
@@ -68,6 +69,10 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Unmarked nodes
 | Rust engine | itak-types | reads (contracts) | itak-types is imported by Rust engine |
 | Rust engine | itak-diag | emits (logs, health, events) | itak-diag reports Rust engine state to the platform via The seam |
 | Rust engine | itak-loader | calls (load model) | itak-loader hands weights to Rust engine |
+| Rust engine | muse-glimmer | calls (architecture forward) | muse-glimmer returns logits to Rust engine |
+| muse-glimmer | itak-loader | reads (metadata and tensors via traits) | itak-loader hands metadata and weights to muse-glimmer |
+| muse-glimmer | itak-kernels | calls (compute trait) | itak-kernels returns activations to muse-glimmer |
+| muse-glimmer | itak-kv | reads and writes (cache trait) | itak-kv holds cache state for muse-glimmer |
 | Rust engine | itak-kernels | calls (tensor math) | itak-kernels returns tensors to Rust engine |
 | Rust engine | itak-kv | reads and writes (cache state) | itak-kv holds state for Rust engine |
 | Rust engine | itak-ssm | calls (SSM layers) | itak-ssm returns layer outputs to Rust engine |
@@ -97,6 +102,10 @@ flowchart TD
   ENG --> TYPES[itak-types - planned]
   ENG --> DIAG[itak-diag - planned]
   ENG --> LOAD[itak-loader - planned]
+  ENG --> GLIM[muse-glimmer]
+  GLIM --> LOAD
+  GLIM --> KERN
+  GLIM --> KV
   ENG --> KERN[itak-kernels - planned]
   ENG --> KV[itak-kv - planned]
   ENG --> SSM[itak-ssm - planned]

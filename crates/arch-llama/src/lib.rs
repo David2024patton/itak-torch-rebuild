@@ -19,11 +19,11 @@
 //!
 //! - [`LlamaConfig`] parsed from the file's own GGUF metadata,
 //!   every required key named when absent, no fabricated defaults.
-//! - The full tensor inventory (the weight set) for both families,
+//! - The full tensor inventory ([`Weights`]) for both families,
 //!   including the optional q/k/v biases, loaded through the
-//!   the tensor-source seam seam (the `gguf` crate's file implements it)
+//!   [`TensorSource`] seam (the `gguf` crate's file implements it)
 //!   with every shape checked against the config.
-//! - The forward in the forward: embedding, per-layer
+//! - The forward in [`LlamaModel::forward`]: embedding, per-layer
 //!   pre-norm, RoPE, GQA attention against the `attention` crate's
 //!   KV cache, SwiGLU FFN, final norm, head. Prefill and incremental
 //!   decode are the same code path over the shared cache; the tests
@@ -38,6 +38,8 @@
 pub mod config;
 pub mod diag;
 pub mod error;
+pub mod model;
+pub mod weights;
 
 #[cfg(test)]
 mod testkit;
@@ -45,3 +47,5 @@ mod testkit;
 pub use config::{LlamaConfig, ARCHITECTURES};
 pub use diag::{Diag, NullDiag, StderrDiag};
 pub use error::{LlamaError, Result};
+pub use model::LlamaModel;
+pub use weights::{expected_tensor_names, LayerWeights, TensorData, TensorSource, Weights};

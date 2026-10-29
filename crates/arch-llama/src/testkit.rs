@@ -5,7 +5,13 @@
 //! for synthetic weights. Test code only; nothing here ships in the
 //! library's API surface.
 
+use std::collections::HashMap;
+
 use gguf::MetadataValue;
+
+use crate::config::LlamaConfig;
+use crate::error::{LlamaError, Result};
+use crate::weights::{TensorData, TensorSource};
 
 /// One tensor to write into a synthetic GGUF: name, dimensions in
 /// GGUF stored order, and its F32 values (written as ggml type F32).
@@ -241,6 +247,22 @@ pub fn tiny_metadata(arch: &str) -> Vec<(String, MetadataValue)> {
     entries
 }
 
+/// Deterministic pseudo-values in a stable range, so synthetic
+/// weights are neither zeros (which hide wiring bugs: every path
+/// would output zero) nor random per run (which hides regressions).
+/// Values land in [-0.3, 0.3).
+pub fn deterministic_values(count: usize, seed: u32) -> Vec<f32> {
+    let mut state = seed.wrapping_add(0x9E37_79B9);
+    (0..count)
+        .map(|_| {
+            // LCG, Numerical Recipes constants.
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+            unit * 0.6 - 0.3
+        })
+        .collect()
+}
+
 /// Convert owned metadata fixtures to the borrowed shape
 /// [`build_gguf`] takes.
 pub fn refs(entries: &[(String, MetadataValue)]) -> Vec<(&str, MetadataValue)> {
@@ -248,4 +270,174 @@ pub fn refs(entries: &[(String, MetadataValue)]) -> Vec<(&str, MetadataValue)> {
         .iter()
         .map(|(k, v)| (k.as_str(), v.clone()))
         .collect()
+}
+
+/// A [`LlamaConfig`] for the tiny synthetic shape [`tiny_metadata`]
+/// describes, built directly (config parsing itself is tested
+/// through the GGUF byte path in the config module).
+pub fn tiny_config(arch: &str) -> LlamaConfig {
+    LlamaConfig {
+        architecture: arch.to_string(),
+        name: Some(format!("tiny-{arch}")),
+        block_count: 2,
+        context_length: 128,
+        hidden: 32,
+        ffn_hidden: 48,
+        q_heads: 4,
+        kv_heads: 2,
+        head_dim: 8,
+        rope_freq_base: 10_000.0,
+        rope_dim: 8,
+        rms_eps: 1e-6,
+        vocab_size: 64,
+    }
+}
+
+/// How a [`FakeSource`] fills the attention bias tensors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BiasMode {
+    /// No bias tensors in the source at all.
+    None,
+    /// Bias tensors present, all zeros (present but inert: proves
+    /// the forward applies the values, not just their presence).
+    Zero,
+    /// Bias tensors present with deterministic nonzero values.
+    NonZero,
+}
+
+/// An in-memory [`TensorSource`] holding a complete tiny weight set
+/// for a config, unless a test removes or replaces tensors.
+#[derive(Debug)]
+pub struct FakeSource {
+    tensors: HashMap<String, TensorData>,
+}
+
+impl FakeSource {
+    /// A complete weight set for `cfg`: every tensor the load
+    /// requires, plus biases per `biases`, plus the untied head
+    /// unless `tied`. Values are deterministic per tensor.
+    pub fn full(cfg: &LlamaConfig, tied: bool, biases: BiasMode) -> Self {
+        let mut tensors: HashMap<String, TensorData> = HashMap::new();
+        // Each tensor's values derive from its NAME, never from
+        // insertion order, so two sources that differ only in which
+        // optional tensors they carry (biases, the untied head)
+        // still hold identical values for every shared tensor. The
+        // bias and tied tests rely on exactly that.
+        fn seed_of(name: &str) -> u32 {
+            // FNV-1a over the name.
+            let mut hash = 0x811C_9DC5u32;
+            for byte in name.bytes() {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+            hash
+        }
+        let put = |tensors: &mut HashMap<String, TensorData>, name: String, shape: &[u64]| {
+            let count: u64 = shape.iter().product();
+            let seed = seed_of(&name);
+            tensors.insert(
+                name.clone(),
+                TensorData {
+                    name,
+                    shape: shape.to_vec(),
+                    data: deterministic_values(count as usize, seed),
+                },
+            );
+        };
+        let hidden = u64::from(cfg.hidden);
+        let vocab = u64::from(cfg.vocab_size);
+        let ffn = u64::from(cfg.ffn_hidden);
+        let q_w = u64::from(cfg.q_width());
+        let k_w = u64::from(cfg.k_width());
+        let v_w = u64::from(cfg.v_width());
+        put(
+            &mut tensors,
+            "token_embd.weight".to_string(),
+            &[hidden, vocab],
+        );
+        put(&mut tensors, "output_norm.weight".to_string(), &[hidden]);
+        if !tied {
+            put(&mut tensors, "output.weight".to_string(), &[hidden, vocab]);
+        }
+        for layer in 0..cfg.block_count {
+            let p = |suffix: &str| format!("blk.{layer}.{suffix}");
+            put(&mut tensors, p("attn_norm.weight"), &[hidden]);
+            put(&mut tensors, p("attn_q.weight"), &[hidden, q_w]);
+            put(&mut tensors, p("attn_k.weight"), &[hidden, k_w]);
+            put(&mut tensors, p("attn_v.weight"), &[hidden, v_w]);
+            if biases != BiasMode::None {
+                for (suffix, width) in [
+                    ("attn_q.bias", q_w),
+                    ("attn_k.bias", k_w),
+                    ("attn_v.bias", v_w),
+                ] {
+                    let name = p(suffix);
+                    let data = match biases {
+                        BiasMode::Zero => vec![0.0; width as usize],
+                        _ => deterministic_values(width as usize, seed_of(&name)),
+                    };
+                    tensors.insert(
+                        name.clone(),
+                        TensorData {
+                            name,
+                            shape: vec![width],
+                            data,
+                        },
+                    );
+                }
+            }
+            put(&mut tensors, p("attn_output.weight"), &[q_w, hidden]);
+            put(&mut tensors, p("ffn_norm.weight"), &[hidden]);
+            put(&mut tensors, p("ffn_gate.weight"), &[hidden, ffn]);
+            put(&mut tensors, p("ffn_up.weight"), &[hidden, ffn]);
+            put(&mut tensors, p("ffn_down.weight"), &[ffn, hidden]);
+        }
+        FakeSource { tensors }
+    }
+
+    /// Remove a tensor, for missing-tensor tests.
+    pub fn remove(&mut self, name: &str) {
+        self.tensors.remove(name);
+    }
+
+    /// Replace or insert a tensor, for shape and tied-head tests.
+    pub fn set(&mut self, tensor: TensorData) {
+        self.tensors.insert(tensor.name.clone(), tensor);
+    }
+
+    /// Look up a tensor the source holds.
+    pub fn get(&self, name: &str) -> Option<&TensorData> {
+        self.tensors.get(name)
+    }
+
+    /// Convert the whole set into [`TestTensor`]s for the GGUF byte
+    /// builder, for the end-to-end-through-the-real-loader test.
+    pub fn into_test_tensors(self) -> Vec<TestTensor> {
+        let mut out: Vec<TestTensor> = self
+            .tensors
+            .into_values()
+            .map(|t| TestTensor {
+                name: t.name,
+                dims: t.shape,
+                values: t.data,
+            })
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+}
+
+impl TensorSource for FakeSource {
+    fn tensor(&self, name: &str) -> Result<TensorData> {
+        self.tensors
+            .get(name)
+            .cloned()
+            .ok_or_else(|| LlamaError::MissingTensor {
+                name: name.to_string(),
+            })
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
 }

@@ -10,5 +10,9 @@ description = "The loader bridge of the iTaK Torch Rust engine (ARCHITECTURE.md 
 gguf = { path = "../gguf" }
 muse-glimmer = { path = "../muse-glimmer" }
 
+[dev-dependencies]
+cpu-compute = { path = "../cpu-compute" }
+tokenizer = { path = "../tokenizer" }
+
 [lints]
 workspace = true

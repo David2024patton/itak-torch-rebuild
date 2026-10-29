@@ -26,21 +26,24 @@ RULES:
 ## Proven state
 - The original engine is fully audited: feature inventory, the three stacked build blockers, and the measured Core usage surface are on record (proof: PLAN.md S2; TODO Phase 0 items T-0.1 and T-0.6, checked with proofs).
 - The hardware record is measured, not quoted: Glimmer 30B per-quant speed and VRAM on the RX 7900 XTX, 2-user concurrency, accuracy runs including the reasoning_strength default trap and its fix (proof: docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md; raw logs in bench/results-2026-10-26/).
-- The ROCm failure is diagnosed to the userland layer with four independent checks; the card and kernel driver are proven healthy by the flawless Vulkan runs (proof: benchmark report, Phase A ROCm section).
+- ROCm is fixed (2026-10-28): single Ubuntu ROCm 7.1 stack, HIP proven end to end from hello-world to a full 30B bench. Vulkan remains the serving backend on generation speed; HIP wins prompt processing. The failure had been diagnosed to the userland layer with the card and kernel driver proven healthy by the Vulkan runs (proof: benchmark report, Phase A ROCm section; TODO T-P.2).
 - The research base is filed: inference platform research and the Mamba-1, 2, 3 ingest with David's Mamba-3 variant graded against the real paper (proof: docs/research/).
-- The architecture is decided: Go platform plus Rust engine core, two processes, socket plus shared-memory seam (proof: DECISIONS.md, 2026-10-27).
+- The architecture is decided: Go platform plus Rust engine core, two processes, socket plus shared-memory seam (proof: DECISIONS.md, 2026-10-27; ARCHITECTURE.md, committed ef07956).
+- Wave 1 of the Rust workspace is landed: five crates, all standalone libraries today. gguf (strict GGUF v3 loader, fail-loud named errors), torch-math (reference f32 math core, every constant a parameter), tokenizer (real byte-level BPE over the model's own vocabulary), attention (KV cache with global and sliding-window ring layers, grouped-query attention), muse-glimmer (architecture skeleton, TODO T-P.3). Gates observed in the 2026-10-29 hygiene pass, not copied from builder reports: cargo test for the workspace 120 passed, 0 failed (gguf 27 including 1 doc test, torch-math 39, tokenizer 16 including 1 doc test, attention 15, muse-glimmer 23); cargo clippy clean under the workspace deny-warnings lints.
+- The Go platform is landed at scaffold-plus stage: diag registry, API-key auth, TTL response cache, priority scheduler whose lanes provably drain, engine client seam with named errors and a unix socket skeleton, HTTP server and the torchd daemon (proof: platform/ commits a45e5fe through 3dfff80; hygiene pass run: go test 34 passed, 0 failed; golangci-lint config in tree and clean per commit 3dfff80).
+- The salvage inventory is filed (proof: SALVAGE.md, module by module against the original tree). The blueprint set is fully committed: ARCHITECTURE.md, PLAN.md, TODO.md (proof: ef07956, f042064). Cargo.lock is committed (proof: 1b67489).
 
 ## In flight
-- muse-glimmer crate skeleton landed in the Rust workspace (TODO T-P.3, opened ahead of its Phase 2 gate on David's 2026-10-29 order): config parsed from the real file's GGUF metadata, the measured 39/13 layer pattern with its origin recorded, the full 14-tensor-per-layer weight inventory behind a TensorSource seam, and the structured forward with compute and KV storage trait-bound to the kernel and KV crates (proof: cargo build clean, cargo test 23 passed, cargo clippy clean, all under the workspace deny-warnings lints).
-- This repo: standard file set and research documents being published (this pass).
-- Nothing in code yet. Phase 1 has not started.
+- The crates are not yet wired together: no inter-crate dependencies exist, muse-glimmer's forward is structured with compute and KV storage behind traits it owns, and there is no itak-engine binary crate yet. The seam exists only as the platform-side skeleton.
+- Open reconciliation, loader naming: PLAN.md and TODO.md name the loader module itak-loader (TODO T-2.1); the built crate is named gguf. Nothing has been renamed; one name must win before the engine binary wires the crates together.
+- Record lag: TODO checkboxes trail the commits that cite them. T-2.3 (tokenizer) landed in 295a3ec and T-P.3 (muse-glimmer) in d4b3914, and both boxes still read open in TODO.md.
+- Glimmer weights are on the server (2026-10-28): /mnt/models on the 2TB Kioxia NVMe, byte-verified against the HF listings, alongside Qwen3.6-27B, Gemma-4-31B, DiffusionGemma-26B, Nemotron-Cascade-2-30B, North-Mini-Code-1.0, and Devstral-Small-2-24B. A llama-server (Vulkan build, Glimmer Q4_K_M + mmproj, 128K context, 4 slots) runs on the server's localhost:8080 and answers chat completions with the reasoning_strength=low injection working as verified in October.
 
 ## Blocked
-- Glimmer weights are back on the server (2026-10-28): /mnt/models on the 2TB Kioxia NVMe, byte-verified against the HF listings, alongside Qwen3.6-27B, Gemma-4-31B, DiffusionGemma-26B, Nemotron-Cascade-2-30B, North-Mini-Code-1.0, and Devstral-Small-2-24B. All load and generate on the current llama.cpp except DiffusionGemma, whose architecture string is not yet known to upstream llama.cpp (checked at master a7af149). A llama-server (Vulkan build, Glimmer Q4_K_M + mmproj, 128K context, 4 slots) runs on the server's localhost:8080 and answers chat completions with the reasoning_strength=low injection working as verified in October.
-- ROCm is FIXED (2026-10-28, was T-P.2): single Ubuntu ROCm 7.1 stack, HIP proven end to end from hello-world to a full 30B bench. Vulkan remains the serving backend on generation speed; HIP wins prompt processing. Detail in TODO T-P.2.
-- The original Torch tree still does not build; that is the condition this project exists to fix, gated on T-1.1.
+- The original Torch tree still does not build; that is the condition this project exists to fix, gated on T-1.1 (itak-core written to the measured call sites).
+- DiffusionGemma does not load on the current llama.cpp: its architecture string is not yet known upstream (checked at master a7af149). Reference-only; nothing in this repo waits on it except the comparison bench.
 
 ## Next moves
-1. Rebuild Core to the measured call sites and prove the original Torch compiles against it (TODO T-1.1, T-1.2, T-1.3)
-2. Scaffold the Rust workspace with itak-types mirroring the contracts (TODO T-1.4)
-3. Wire this repo's commit gates (TODO T-1.5)
+1. Settle the loader name (gguf vs itak-loader, TODO T-2.1) and sweep the TODO checkboxes against the commit record.
+2. Write itak-core to the measured call sites and prove the original Torch compiles against it (TODO T-1.1, T-1.2, T-1.3).
+3. Define the IPC contract and prove the Hello round trip (TODO T-1.6); the engine binary that assembles the five crates hangs on that seam.

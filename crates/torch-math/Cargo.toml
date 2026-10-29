@@ -1,0 +1,17 @@
+[package]
+name = "torch-math"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+description = "Reference f32 math primitives for the iTaK Torch engine: RMSNorm, RoPE, gated FFN activations, logit softcap and scale, matmul and matvec. Configurable everywhere the old Go native engine hardcoded: eps, RoPE base, softcap, scale are always parameters."
+keywords = ["inference", "tensor", "rope", "rmsnorm"]
+categories = ["mathematics", "science"]
+
+# No dependencies on purpose: this is the reference crate the SIMD and
+# GPU kernels are later verified against, so it stays dependency-free.
+# Package fields are explicit rather than workspace-inherited so the
+# crate builds identically no matter how the young workspace manifest
+# is reconciled; lint denial is enforced in src/lib.rs for the same
+# reason (David's rule: debugging and linting in every module from
+# birth, and the module carries its own gates).

@@ -1,0 +1,116 @@
+{
+ "backend": "vulkan",
+ "tag": "q5",
+ "accuracy": {
+  "math": {
+   "content": "Pencils are only sold by the pack.\n\nPacks needed\n84 pencils \u00f7 6 pencils/pack = 14 packs\n\nCost before coupon\n14 packs \u00d7 $4.50 / pack = $63.00\n\n15% off\nDiscount = 0.15 \u00d7 $63.00 = $9.45\nPrice after discount = $63.00 - $9.45\n\nPrice after discount = 0.85",
+   "usage": {
+    "completion_tokens": 512,
+    "prompt_tokens": 109,
+    "total_tokens": 621,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "seconds": 14.11
+  },
+  "go_code": {
+   "content": "",
+   "usage": {
+    "completion_tokens": 512,
+    "prompt_tokens": 98,
+    "total_tokens": 610,
+    "prompt_tokens_details": {
+     "cached_tokens": 49
+    }
+   },
+   "seconds": 14.15
+  },
+  "logic": {
+   "content": "",
+   "usage": {
+    "completion_tokens": 512,
+    "prompt_tokens": 112,
+    "total_tokens": 624,
+    "prompt_tokens_details": {
+     "cached_tokens": 49
+    }
+   },
+   "seconds": 14.12
+  },
+  "json": {
+   "content": "{\"name\":\"Jane Cooper\",\"age\":34,\"units\":3,\"sku\":\"SKU-2214\",\"date\":\"2026-03-03\",\"total\":129.99,\"city\":\"Austin\",\"state\":\"TX\"}",
+   "usage": {
+    "completion_tokens": 482,
+    "prompt_tokens": 131,
+    "total_tokens": 613,
+    "prompt_tokens_details": {
+     "cached_tokens": 49
+    }
+   },
+   "seconds": 13.32
+  },
+  "factual": {
+   "content": "The story takes place on the planet Gethen, which is also called Winter. Its inhabitants are the Gethenians. They are ambisexual hermaphrodites who are sexually undifferentiated for most of the month and only develop temporary male or female characteristics during the period of kemmer when they can mate with any other Gethenian.",
+   "usage": {
+    "completion_tokens": 336,
+    "prompt_tokens": 104,
+    "total_tokens": 440,
+    "prompt_tokens_details": {
+     "cached_tokens": 49
+    }
+   },
+   "seconds": 9.39
+  },
+  "summary": {
+   "content": "- Continuous batching swaps finished requests out and new ones in at every token step instead of waiting for a whole batch, raising GPU utilization by preventing short",
+   "usage": {
+    "completion_tokens": 512,
+    "prompt_tokens": 153,
+    "total_tokens": 665,
+    "prompt_tokens_details": {
+     "cached_tokens": 49
+    }
+   },
+   "seconds": 14.24
+  }
+ },
+ "reasoning": {
+  "low": {
+   "usage": {
+    "completion_tokens": 304,
+    "prompt_tokens": 109,
+    "total_tokens": 413,
+    "prompt_tokens_details": {
+     "cached_tokens": 0
+    }
+   },
+   "seconds": 8.46,
+   "content": "Pencils needed = 84\n\nPencils per pack = 6\n\nPacks required = 84 \u00f7 6\nPacks required = 14 packs\n\nPrice per pack = $4.50\n\nTotal before coupon = 14 \u00d7 $4.50\nTotal before coupon = $63.00\n\nCoupon = 15% off total\n\nDiscount amount = 15% \u00d7 $63.00\nDiscount amount = 0.15 \u00d7 $63.00\nDiscount amount = $9.45\n\nAmount paid = Total before coupon \u2212 Discount\nAmount paid = $63.00 \u2212 $9.45\nAmount paid = $53.55\n\nMaria pays **$53.55** for 14 packs of pencils."
+  },
+  "default_usage": {
+   "completion_tokens": 512,
+   "prompt_tokens": 109,
+   "total_tokens": 621,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   }
+  }
+ },
+ "concurrency": {
+  "wall_seconds": 15.44,
+  "per_user": [
+   {
+    "completion_tokens": 512,
+    "seconds": 15.43,
+    "tok_per_s": 33.18
+   },
+   {
+    "completion_tokens": 512,
+    "seconds": 15.43,
+    "tok_per_s": 33.18
+   }
+  ],
+  "aggregate_tok_per_s": 66.34
+ }
+}

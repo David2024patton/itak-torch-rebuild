@@ -1,0 +1,10 @@
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon RX 7900 XTX (RADV NAVI31) (radv) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+ggml_vulkan: 1 = Intel(R) UHD Graphics 770 (ADL-S GT1) (Intel open-source Mesa driver) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| muse-glimmer 30B Q4_K - Medium |  17.86 GiB |    27.85 B | Vulkan     | 999 |           pp512 |       711.28 ± 30.96 |
+| muse-glimmer 30B Q4_K - Medium |  17.86 GiB |    27.85 B | Vulkan     | 999 |           tg128 |         39.48 ± 0.10 |
+
+build: 5f5acfe (1)
+BENCH_EXIT:0

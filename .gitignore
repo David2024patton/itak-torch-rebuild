@@ -1,0 +1,15 @@
+# Model weights never live in this repo
+*.gguf
+*.safetensors
+*.bin
+models/
+
+# Rust
+target/
+
+# Go
+*.test
+
+# Local only
+.env
+ACCESS.md

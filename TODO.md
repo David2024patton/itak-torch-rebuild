@@ -1,0 +1,111 @@
+<!--
+INSTRUCTIONS FOR THIS FILE (user and AI: read before editing. Keep this header.)
+
+WHAT THIS FILE IS: the super-detailed task list for this project. It is the
+only place work items live. PLAN.md says why and in what order; ENDGOAL.md
+says what finished looks like; this file says exactly what remains to do.
+
+EXACT STRUCTURE:
+- Phases in order: "## Phase <n>: <name> (PLAN S<m>)".
+- Parked work in its own phase at the end: "## Parked".
+- Every item is one checkbox line: "- [ ] T-<phase>.<n> <task> (proof: <named
+  proof>) (PLAN S<m>)". Parked items use T-P.<n> and name what blocks them.
+
+RULES:
+- A box is checked ONLY when its named proof exists (a test, a log line, a
+  bench note, a live check). Never check a box on intention or partial work.
+- Emulation-proven and bench-proven are different claims; write which one.
+- Item IDs and (PLAN S<n>) tags are stable once published; never renumber
+  casually. A deliberate renumber updates PLAN.md in the same pass.
+- New work enters as new items at the end of their phase. Completed items
+  stay, checked, as the record.
+- No secrets, passwords, or tokens in this file, ever.
+-->
+# TODO: iTaK Torch Rebuild
+
+## Phase 0: Evidence base (PLAN S3)
+- [x] T-0.1 Audit the original iTaK Torch tree (Go engine, Mojo engines, design docs) and produce the complete feature inventory the rebuild must account for (proof: feature inventory in PLAN.md S2 audit paragraph; ingest corpus reviewed 2026-10-27) (PLAN S3)
+- [x] T-0.2 Benchmark Muse Glimmer 30B per quant on the RX 7900 XTX, Vulkan and HIP (proof: docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md with raw logs in bench/results-2026-10-26/) (PLAN S3)
+- [x] T-0.3 Diagnose the ROCm/HIP failure to root cause layer (proof: four-angle evidence in the benchmark report: bench wedge, CLI wedge, hello-world link failure, partial /opt/rocm.disabled tree) (PLAN S3)
+- [x] T-0.4 Research inference platforms and settings for Glimmer on this card (proof: docs/research/2026-10-26-inference-platforms-research.md) (PLAN S3)
+- [x] T-0.5 Ingest the Mamba-1, Mamba-2, and Mamba-3 papers and grade David's extrapolated Mamba-3 variant against the real paper (proof: docs/research/2026-10-27-mamba-papers-ingest.md) (PLAN S3)
+- [x] T-0.6 Grade the outside Core-reconstruction blueprint against the measured call sites (proof: four compile-breaking mismatches recorded in the ingest notes, 2026-10-27) (PLAN S3)
+
+## Phase 1: Foundations, Core and contracts (PLAN S4)
+- [ ] T-1.1 Write itak-core as a published, versioned Go module: pkg/types to the measured call-site surface (InferenceRequest/Response, ChatMessage, Role, TokenUsage, LatencyStats, ModelInfo, ModelParams) (proof: module builds; the original Torch tree copied beside it compiles against it, server build included) (PLAN S4)
+- [ ] T-1.2 Port pkg/debug (structured Logger with Info(component, msg), levels Error 0, Warn 1, Info 2, Debug 3) and pkg/event from their GOAgent ancestors (proof: original GOAgent tests adapted and passing in the new module) (PLAN S4)
+- [ ] T-1.3 Write pkg/health (HeartbeatConfig with RegistryClient) and pkg/registry (ServiceEndpoint with Module, Host, Port, Protocol, Healthy, Metadata) to the measured shapes (proof: compile against the original call sites in core_health.go and server.go) (PLAN S4)
+- [ ] T-1.4 Create the Rust workspace skeleton: crate boundaries per PLAN S2, itak-types mirroring the Go contracts with version fields, config loading where every limit is config with a default (proof: cargo build clean; a config test proves no operational limit is a compiled constant) (PLAN S4)
+- [ ] T-1.5 Wire the commit gates for this repo (gitleaks secret scan, shellcheck for bench scripts, markdown lint) (proof: gate script runs clean on the current tree) (PLAN S4)
+- [ ] T-1.6 Define the Go and Rust IPC contract in code: itak-types on the Rust side mirroring itak-core pkg/types, frame header with protocol version, the ARCHITECTURE.md Section 4 message set as types on both sides (proof: a Hello round trip over a Unix socket with shared-memory ring passes as a test in both repos; a major-version mismatch produces the named refusal on both sides) (PLAN S4)
+- [ ] T-1.7 Language gates from birth: .golangci.yml and clippy configuration in the tree plus CI running build, vet, lint, and tests on every push; test skips for missing environment pieces fail CI unless listed as explicit exceptions (proof: CI green on the skeleton tree; a deliberately skipped test in a scratch branch fails CI) (PLAN S4)
+- [ ] T-1.8 Security contracts in the skeleton: auth middleware shape, default bind 127.0.0.1 with an explicit LAN flag, request path confinement to configured directories, cluster join secret (proof: contract tests in pkg/auth and pkg/server prove an unauthenticated request is refused and an out-of-directory path is refused, against the skeleton server) (PLAN S4)
+
+## Phase 2: Rust engine core (PLAN S5)
+- [ ] T-2.1 itak-loader: GGUF parser and mmap weight access (proof: loads the Qwen2.5-7B test GGUF and dumps a tensor inventory matching llama.cpp's) (PLAN S5)
+- [ ] T-2.2 itak-kernels: Q4_K dequant and matmul, RMSNorm, RoPE, softmax (proof: unit tests against reference outputs computed by the Go native engine and llama.cpp) (PLAN S5)
+- [ ] T-2.3 Real BPE tokenizer (proof: token-for-token match with the reference tokenizer on the bench prompt set; the char tokenizer from the original native path is not acceptable) (PLAN S5)
+- [ ] T-2.4 KV-cached transformer forward for Llama and Qwen2 families with paged KV from itak-kv (proof: generates coherent text; per-token latency measured; no allocation inside the token loop, proven by an allocation counter test) (PLAN S5)
+- [ ] T-2.5 Sampling as config: temperature, top-p, top-k, penalties (proof: seeded determinism test at temp 0; config override test) (PLAN S5)
+- [ ] T-2.6 Minimal serve through the seam (socket control, shared-memory tokens) with an OpenAI-compatible chat endpoint (proof: end-to-end request from the Go platform stub; published speed comparison vs llama.cpp on the same model and prompts) (PLAN S5)
+- [ ] T-2.7 Loader truthfulness: full mainline ggml type table (BF16 is 30; fork-only types namespaced, never renumbered) with readers for every type in the teardown corpus, and a per-file coverage report; any required tensor missing, unreadable, or misshapen fails the load with the tensor named; no placeholder weights exist (proof: coverage reports for all thirteen dissected GGUF files in the test data, plus a BF16 type-30 regression test and a truncated-file test that fails loudly) (PLAN S5)
+- [ ] T-2.8 Architecture dispatch keyed on the file's own general.architecture string through the arch registry, the only load path; unknown strings refused by name; serve-path engine selection by capability, never by file size (proof: dispatch tests load gemma2, olmo2, and deepseek2 files through their own modules and refuse a bogus arch string with the supported list in the error) (PLAN S5)
+- [ ] T-2.9 Golden-output harness: reference generations from llama.cpp (the trusted path) for the bench prompt set at temperature 0, stored as test data (proof: harness in repo; the Stage 2 forward is diffed against these outputs, not against the original Go native engine) (PLAN S5)
+
+## Phase 3: Speculation and advanced inference (PLAN S6)
+- [ ] T-3.1 N-gram prompt-lookup drafting with SSM and KV state rollback (proof: acceptance rate logged on the bench prompt set; output identical to non-speculative at temp 0) (PLAN S6)
+- [ ] T-3.2 Rejection sampling verification path (proof: distribution test from the original FFI path's test cases) (PLAN S6)
+- [ ] T-3.3 Medusa tree drafting with heads loaded from versioned artifact files (proof: heads trained in Phase 7 load here; measured tok/s gain over baseline published; zero-init heads are not a passing state) (PLAN S6)
+- [ ] T-3.4 MTP decoding and early-exit drafting with auto-discovery calibration wired on (proof: calibration runs and the drafting mode flag demonstrably changes behaviour in a test, unlike the original's dead boolean) (PLAN S6)
+- [ ] T-3.5 Constrained decoding on the platform side: GBNF grammar, JSON mode, JSON schema, token healing (proof: schema conformance test suite from the original handlers) (PLAN S6)
+
+## Phase 4: GPU backend and hardware (PLAN S7)
+- [ ] T-4.1 itak-backend trait plus CPU SIMD backend (proof: engine serves on CPU only with the GPU backend disabled) (PLAN S7)
+- [ ] T-4.2 wgpu backend on Vulkan, RX 7900 XTX (proof: bench table vs the CPU backend and vs llama.cpp Vulkan numbers from Phase 0) (PLAN S7)
+- [ ] T-4.3 Hardware detection and auto-config that correctly identifies AMD GPUs on Linux (proof: regression test named for the original bug: the 7900 XTX reported as 0 MiB forcing CPU-only) (PLAN S7)
+
+## Phase 5: SSM hybrid and MoE streaming (PLAN S8)
+- [ ] T-5.1 itak-ssm: Mamba-2 mode selective scan (chunked SSD) (proof: parity test against the Mojo engine's scan on recorded inputs) (PLAN S8)
+- [ ] T-5.2 General three-term recurrence with data-dependent rotation on B and C, behind the mamba3 config flag, default off (proof: state-tracking checks: parity and modular arithmetic tasks from the Mamba-3 paper's suite) (PLAN S8)
+- [ ] T-5.3 MIMO rank as config (R = 1 is SISO) plus BCNorm and B, C biases in the block (proof: config test proving R changes shapes, not just labels; perplexity comparison SISO vs MIMO on a small model) (PLAN S8)
+- [ ] T-5.4 itak-moe: expert streaming from disk with pin and LRU cache and next-layer prefetch (proof: a model larger than VRAM serves; cache hit rates and per-token latency published) (PLAN S8)
+- [ ] T-5.5 Hybrid architecture family registered beside Llama and Qwen (SSM and attention mix ratio as config), Nemotron hybrid layout as the test fixture (proof: the 21 SSM, 17 MLP, 4 attention layer table from the Mojo engine loads and generates) (PLAN S8)
+
+## Phase 6: Go platform reattach (PLAN S9)
+- [ ] T-6.1 Server and handlers: OpenAI-compatible chat, completions, embeddings, models; Ollama compatibility (proof: the original handler test cases pass against the new engine through the seam) (PLAN S9)
+- [ ] T-6.2 Scheduler, continuous batching, chunked prefill, priority queue, slot manager, token budgets, rate limiting, A/B and payload-aware routing (proof: two-user fairness bench reproducing the Phase 0 concurrency shape) (PLAN S9)
+- [ ] T-6.3 Request caches: prefix, prompt, response, semantic (proof: cache hit metrics emitted through the diag channel) (PLAN S9)
+- [ ] T-6.4 Model operations: HF and OCI pulls, Ollama pull, integrity, versioning, warmup, prefault, GGUF export (proof: pull a model end to end and serve it) (PLAN S9)
+- [ ] T-6.5 Clustering, discovery, tenant isolation, graceful shutdown; observability: metrics export, request tracing, structured logs (proof: two-node local cluster test; tenant isolation test refuses cross-tenant access and logs the refusal) (PLAN S9)
+- [ ] T-6.6 Feature tier wired or absent: FeatureHub routes (guardrails, A/B routing, semantic cache, versioning, tracing) registered at server construction with startup diagnostics listing them, sampling parameters and grammar and JSON mode reaching the engine sampler, LoRA load calling the real adapter path, and no endpoint reporting success for work it did not do (proof: route registration test enumerates the shipped routes; a JSON-schema request returns schema-conforming output; an adapter load measurably changes generation) (PLAN S9)
+
+## Phase 7: Training stack (PLAN S10)
+- [ ] T-7.1 itak-train core: autograd, optimizers (AdamW, Adam8bit, Muon, GaLore), checkpointing (proof: gradient checks against finite differences) (PLAN S10)
+- [ ] T-7.2 SFT trainer plus LoRA end to end through the platform training API (proof: a small model fine-tunes and the adapter serves; eval harness shows the change) (PLAN S10)
+- [ ] T-7.3 Medusa head training run producing the versioned head files T-3.3 consumes (proof: trained heads file with version field; acceptance measured in the engine) (PLAN S10)
+- [ ] T-7.4 DPO, GRPO, ORPO trainers and the reward model (proof: short runs on a toy preference set move the reward metric in the expected direction) (PLAN S10)
+- [ ] T-7.5 Tokenizer trainer (proof: a BPE tokenizer trained on a corpus round-trips text losslessly) (PLAN S10)
+
+## Phase 8: .itf format, tools, research track (PLAN S11)
+- [ ] T-8.1 .itf format implementation: ITF1 header with version field, architecture and quantization metadata, memory tiers, latent state dims, per-tensor heat levels and SSM state sections (proof: format spec in docs/ plus a round-trip test GGUF to .itf to load) (PLAN S11)
+- [ ] T-8.2 itak-dissect: per-layer weight statistics producing measured heat maps (proof: heat map for a known model published; positional canned labels from the original dissector do not appear) (PLAN S11)
+- [ ] T-8.3 Latent Engine research log: byte encoding, patch compression, latent passes, EGGROLL crystallization experiments stay in the Mojo lab with results filed here (proof: experiment notes with measured outcomes, positive or negative) (PLAN S11)
+
+## Phase 9: Glimmer first-class and the audit closure (PLAN S13)
+This phase is the fast path ordered by David on 2026-10-29. It carries parked T-P.3 (the muse-glimmer module) and the T-P.1 bench (the DFlash depth sweep, run against the new stack). The blueprint is ARCHITECTURE.md; the evidence base is the four 2026-10-29 audit reports in ~/workspace/model-teardown/.
+- [ ] T-9.1 muse-glimmer arch module: tensor map and config from the dissection (52 layers; globals at 3, 7, 11, up to 51; hidden 6656; FFN 19968; 32 Q and 2 KV heads; head dim 128; RoPE base 500000; vocab 202048; untied Q5_K output head) (proof: the Glimmer GGUF loads with a complete coverage report, zero missing or substituted tensors) (PLAN S13)
+- [ ] T-9.2 Hybrid KV for Glimmer: 39 sliding-window ring buffers of exactly 2048 slots plus 13 paged global caches, wired into the forward step (proof: KV memory at 131072 context measured at or near the dissected estimate of about 1.7 GiB; a long-context generation completes without cache growth past the window on SWA layers) (PLAN S13)
+- [ ] T-9.3 Logit path per the file: final norm, softcap 20.0, logit scale 0.1961, all from the arch module (proof: logit comparison against the llama.cpp reference on a fixed prompt matches within tolerance at temperature 0) (PLAN S13)
+- [ ] T-9.4 Glimmer verified text on CPU through the Rust engine alone (proof: generated text on the bench prompt set matches the golden outputs from T-2.9 at temperature 0; the run is bench-noted with the commit hash) (PLAN S13)
+- [ ] T-9.5 Glimmer on the wgpu Vulkan backend on the 7900 XTX (proof: verified text as in T-9.4 plus a bench table against the recorded baselines: llama.cpp Vulkan 44.31 tok/s plain; hardware detection report names the 7900 XTX and its real VRAM) (PLAN S13)
+- [ ] T-9.6 DFlash companion on the new stack: the dflash arch loads through the same loader and arch seam, block drafting runs in the generation loop (proof: verified text identical to non-speculative at temperature 0, plus effective tok/s at or above the recorded 88.6 llama-server baseline) (PLAN S13)
+- [ ] T-9.7 DFlash depth and acceptance sweep on the new stack (the parked T-P.1 bench): draft depths swept, acceptance logged per depth, the winning depth recorded as config with its default (proof: sweep table in bench/ with the chosen default and its measured acceptance rate) (PLAN S13)
+- [ ] T-9.8 Glimmer served end to end on our own stack: authenticated OpenAI-compatible request to itakd, through the seam, answered by itak-engine, with sampling parameters honored (proof: live check script output filed in bench/; an unauthenticated request is refused; a temperature 0 request reproduces the T-9.4 output) (PLAN S13)
+- [ ] T-9.9 Conformance outcomes for the remaining corpus: gemma2, phi3, mistral (as its file declares), olmo2, starcoder2, and deepseek2 each reach their recorded expected outcome as arch modules land (generates verified text, or is refused by name for a stated reason) (proof: conformance table over all thirteen dissected files, updated in the test data, every row backed by a run) (PLAN S13)
+- [ ] T-9.10 Shape-specialized fused dequant and GEMV kernels for the two Glimmer shapes (FFN 6656 by 19968, attention projections) in the Q4_K and Q6_K mix (proof: decode bandwidth utilization measured against the dissected ceiling of 60 tok/s at this quant, reported as a percentage next to the 73.8 percent llama.cpp figure) (PLAN S13)
+
+## Parked
+- [ ] T-P.1 Run the DFlash draft-depth bench (n-max 4 vs the article's 16) (weights re-downloaded 2026-10-28 to the Kioxia NVMe at /mnt/models and byte-verified against the HF listings; Glimmer serving is live on the Vulkan build; the draft-depth bench is what remains) (PLAN S12)
+- [x] T-P.2 ROCm remediation: DONE 2026-10-28 on David's order, no reboot needed. The mixed stack (AMD amdrocm 10.1 bundle, half-disabled by a renamed /opt tree, alongside Ubuntu ROCm 7.1) was reduced to Ubuntu's 7.1 alone (53 packages purged). Root defect: Ubuntu's packaging splits the HIP clang from the runtime library, so hipcc links need -lamdhip64 explicitly and ggml-hip's CMake needs ROCM_PATH=/usr plus -DCMAKE_HIP_FLAGS=--rocm-device-lib-path=/usr/lib/rocm/llvm/lib/clang/20/amdgcn/bitcode. Proof: a HIP hello-world compiles, links, and runs a kernel on the 7900 XTX; the llama.cpp HIP build (master a7af149) benches Glimmer Q4_K_M at pp512 1157.9 t/s and tg128 41.1 t/s against Vulkan pp 991.9 and tg 44.2 on the same build. HIP wins prefill, Vulkan keeps generation and stays the serving pick (PLAN S12)
+- [ ] T-P.3 muse-glimmer architecture module for the engine registry (blocked on: Phase 2 dense families proven first) (PLAN S12)
+- [ ] T-P.4 Line-level verification of David's Mojo Mamba-3 variant: beta-term decay factor and data-dependent rotation angles (blocked on: nothing but scheduling; source is in the ingest corpus) (PLAN S12)

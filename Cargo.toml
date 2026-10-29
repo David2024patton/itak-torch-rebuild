@@ -12,8 +12,10 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/arch-llama",
     "crates/attention",
     "crates/gguf",
+    "crates/itak-loader",
     "crates/muse-glimmer",
     "crates/tokenizer",
     "crates/torch-math",

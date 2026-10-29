@@ -51,8 +51,12 @@ fn run(model_path: &str, out_path: &str) -> Result<(), String> {
     let file = GgufFile::open(Path::new(model_path)).map_err(|e| e.to_string())?;
     let info = file.tokenizer().map_err(|e| e.to_string())?;
     let md = file.metadata();
-    let model = md.opt_string("tokenizer.ggml.model").map_err(|e| e.to_string())?;
-    let pre = md.opt_string("tokenizer.ggml.pre").map_err(|e| e.to_string())?;
+    let model = md
+        .opt_string("tokenizer.ggml.model")
+        .map_err(|e| e.to_string())?;
+    let pre = md
+        .opt_string("tokenizer.ggml.pre")
+        .map_err(|e| e.to_string())?;
     let unk = md
         .opt_u32("tokenizer.ggml.unknown_token_id")
         .map_err(|e| e.to_string())?;

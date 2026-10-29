@@ -61,6 +61,19 @@ pub enum GlimmerError {
         /// Stable name of the step that refused (for example `embed`).
         step: &'static str,
     },
+    /// A forward step ran and failed: a shape mismatch, an
+    /// unsupported tensor dtype, or an error handed up from the
+    /// kernel or KV crates. Carries the step name plus the underlying
+    /// failure in its own words, so a real backend's refusals stay as
+    /// loud and specific as the skeleton's.
+    StepFailed {
+        /// Stable name of the step that failed (for example
+        /// `attention`).
+        step: &'static str,
+        /// The underlying failure, in the failing component's own
+        /// words.
+        detail: String,
+    },
     /// `forward` was called with zero tokens.
     EmptyInput,
     /// A token id is outside the model's vocabulary.
@@ -101,6 +114,9 @@ impl fmt::Display for GlimmerError {
             }
             GlimmerError::Unimplemented { step } => {
                 write!(f, "forward step is not implemented yet: {step}")
+            }
+            GlimmerError::StepFailed { step, detail } => {
+                write!(f, "forward step {step} failed: {detail}")
             }
             GlimmerError::EmptyInput => {
                 write!(f, "forward called with zero tokens")

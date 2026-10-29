@@ -42,6 +42,17 @@ pub enum GlimmerError {
         /// The full GGUF tensor name that was required.
         name: String,
     },
+    /// A tensor is present in the weight source but cannot be delivered
+    /// as stored (for example a ggml type the source cannot size or
+    /// read). Kept distinct from [`GlimmerError::MissingTensor`]: the
+    /// name exists, the bytes are unusable, and conflating the two
+    /// sends debugging in the wrong direction.
+    TensorUnreadable {
+        /// The full GGUF tensor name that was requested.
+        name: String,
+        /// Why the source refused it, in the source's own words.
+        detail: String,
+    },
     /// A forward step has no implementation yet. Skeleton stage: the
     /// math lives in the kernel crate, and until a real `Compute`
     /// implementation is wired in, the step refuses by name instead of
@@ -80,6 +91,12 @@ impl fmt::Display for GlimmerError {
                 write!(
                     f,
                     "required tensor is absent from the weight source: {name}"
+                )
+            }
+            GlimmerError::TensorUnreadable { name, detail } => {
+                write!(
+                    f,
+                    "tensor {name} is present in the weight source but unreadable: {detail}"
                 )
             }
             GlimmerError::Unimplemented { step } => {

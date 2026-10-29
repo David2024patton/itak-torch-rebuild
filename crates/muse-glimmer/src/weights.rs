@@ -12,8 +12,8 @@
 //! a missing one is a [`GlimmerError::MissingTensor`] naming it.
 //!
 //! Loading goes through the [`TensorSource`] trait. The loader crate
-//! (TODO T-2.1, the `gguf` crate in this workspace) implements it over a
-//! memory-mapped file once it lands; this crate never parses files.
+//! (TODO T-2.1, `itak-loader` in this workspace) implements it over the
+//! `gguf` crate's parsed file; this crate never parses files.
 //!
 //! The output head is untied: `output.weight` is a tensor of its own in
 //! the file. If it is absent, load fails. Substituting the embedding
@@ -99,8 +99,10 @@ impl TensorView {
 /// A source of tensors by name: the seam between this module and the
 /// loader.
 ///
-/// Implementor contract: return the tensor or fail with
-/// [`GlimmerError::MissingTensor`]. Never substitute, synthesize, or
+/// Implementor contract: return the tensor or fail loud. Absent names
+/// fail with [`GlimmerError::MissingTensor`]; names that are present but
+/// cannot be delivered as stored fail with
+/// [`GlimmerError::TensorUnreadable`]. Never substitute, synthesize, or
 /// zero-fill a tensor that was not found; silent placeholders are the
 /// defect this rebuild exists to remove.
 pub trait TensorSource {

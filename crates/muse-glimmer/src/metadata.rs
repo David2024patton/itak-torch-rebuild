@@ -1,10 +1,11 @@
 //! Read access to GGUF metadata, abstracted behind a trait.
 //!
 //! The config parser never touches a GGUF file directly. It reads through
-//! [`Metadata`], which the loader crate (TODO T-2.1, the `gguf` crate in
-//! this workspace) will implement over a parsed file. Keeping the parser
-//! behind this seam means config logic is testable with an in-memory map
-//! and the loader can be dropped in without touching this crate.
+//! [`Metadata`], which the loader crate (TODO T-2.1, `itak-loader` in
+//! this workspace) implements over the `gguf` crate's parsed file.
+//! Keeping the parser behind this seam means config logic is testable
+//! with an in-memory map and the loader can be dropped in without
+//! touching this crate.
 //!
 //! Implementor contract: GGUF stores integers at several widths. The
 //! getters coerce any integer width the file used into the requested

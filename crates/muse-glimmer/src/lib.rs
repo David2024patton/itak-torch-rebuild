@@ -26,8 +26,8 @@
 //!   substituted value. That is the audit's central lesson, applied.
 //!
 //! What is trait-bound, waiting on sibling crates: metadata and tensor
-//! access (the `gguf` loader crate, T-2.1, implements [`Metadata`] and
-//! [`TensorSource`]), the arithmetic (the kernels crate, T-2.2,
+//! access (the `itak-loader` crate, T-2.1, implements [`Metadata`] and
+//! [`TensorSource`] over the `gguf` crate), the arithmetic (the kernels crate, T-2.2,
 //! implements [`Compute`]), and KV storage (the KV crate, T-2.4,
 //! implements [`Cache`] with real ring and paged storage behind the
 //! position contract defined here). Until a real [`Compute`] is wired

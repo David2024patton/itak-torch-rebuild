@@ -1,0 +1,15 @@
+[package]
+name = "tokenizer"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Byte-level BPE tokenizer for the iTaK Torch rebuild: GGUF vocab/merges in, correct encode and decode out."
+
+[features]
+default = []
+# Emit diagnostic lines (loads, refusals, fallbacks) to stderr.
+debug-log = []
+
+[lints]
+workspace = true

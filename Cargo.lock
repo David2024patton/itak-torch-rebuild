@@ -16,6 +16,16 @@ name = "attention"
 version = "0.1.0"
 
 [[package]]
+name = "cpu-compute"
+version = "0.1.0"
+dependencies = [
+ "attention",
+ "gguf",
+ "muse-glimmer",
+ "torch-math",
+]
+
+[[package]]
 name = "gguf"
 version = "0.1.0"
 

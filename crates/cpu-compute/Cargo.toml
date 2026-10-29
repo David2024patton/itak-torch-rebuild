@@ -1,0 +1,16 @@
+[package]
+name = "cpu-compute"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CPU reference Compute backend for the Muse Glimmer architecture module: real f32 arithmetic via torch-math, dequantization via the gguf crate, and KV storage via the attention crate"
+
+[lints]
+workspace = true
+
+[dependencies]
+attention = { path = "../attention" }
+gguf = { path = "../gguf" }
+muse-glimmer = { path = "../muse-glimmer" }
+torch-math = { path = "../torch-math" }

@@ -32,7 +32,10 @@
 //! implements [`Cache`] with real ring and paged storage behind the
 //! position contract defined here). Until a real [`Compute`] is wired
 //! in, [`UnimplementedCompute`] makes the forward refuse at its first
-//! step, by name.
+//! step, by name. A real one now exists: the `cpu-compute` crate's
+//! `CpuCompute` does the arithmetic through `torch-math` and keeps KV
+//! state in the `attention` crate's cache, cross-checked against the
+//! position contract defined here.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -13,3 +13,6 @@ target/
 # Local only
 .env
 ACCESS.md
+
+# Python (golden harness)
+__pycache__/

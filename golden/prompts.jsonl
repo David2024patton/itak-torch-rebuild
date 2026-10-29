@@ -1,0 +1,15 @@
+{"id": "factual_capital", "category": "factual", "prompt": "The capital of France is"}
+{"id": "factual_science", "category": "factual", "prompt": "The chemical symbol for water is"}
+{"id": "factual_history", "category": "factual", "prompt": "The first person to walk on the Moon was"}
+{"id": "arithmetic_add", "category": "arithmetic", "prompt": "17 + 25 ="}
+{"id": "arithmetic_divide", "category": "arithmetic", "prompt": "144 / 12 ="}
+{"id": "arithmetic_word", "category": "arithmetic", "prompt": "A train travels 120 miles in 3 hours. Its average speed is"}
+{"id": "code_python", "category": "code", "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    return"}
+{"id": "code_go", "category": "code", "prompt": "package main\n\nfunc main() {\n\tfmt.Println("}
+{"id": "list_colors", "category": "list", "prompt": "The colors of the rainbow are red, orange, yellow,"}
+{"id": "list_days", "category": "list", "prompt": "Monday, Tuesday, Wednesday, Thursday,"}
+{"id": "list_counting", "category": "list", "prompt": "1, 2, 3, 4, 5, 6,"}
+{"id": "accented_french", "category": "accented", "prompt": "En français, on dit « bonjour » le matin et «"}
+{"id": "accented_german", "category": "accented", "prompt": "Die Hauptstadt von Österreich ist Wien. Die Hauptstadt der Schweiz ist"}
+{"id": "accented_spanish", "category": "accented", "prompt": "El niño come jamón y queso en el café de la"}
+{"id": "continuation_classic", "category": "continuation", "prompt": "The quick brown fox jumps over the"}

@@ -201,6 +201,7 @@ fn main() -> ExitCode {
         GemmShape::new(64, 256),
         GemmShape::new(64, 128),
         GemmShape::new(32, 128),
+        GemmShape::new(32, 256),
     ];
     let mut k10s: Vec<(String, K10Pipeline)> = Vec::new();
     let mut k11s: Vec<(String, K11Pipeline)> = Vec::new();

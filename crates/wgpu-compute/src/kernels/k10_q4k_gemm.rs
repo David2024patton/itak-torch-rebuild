@@ -142,19 +142,25 @@ impl GemmShape {
 }
 
 /// The tile geometry a device with these limits runs: the
-/// widest staged tile its granted workgroup storage holds.
-/// The candidates, widest first: a 64x256 tile (64 KiB, the
-/// RADV grant), a 64x128 tile (32 KiB), and a 32x128 tile
-/// (16 KiB, the floor two of the three session shapes need).
-/// `None` below the floor: no GEMM on that device (see the
-/// module docs for the fallback contract).
+/// first candidate, in measured preference order, whose
+/// staged tile its granted workgroup storage holds. The
+/// order is bench-settled, not width-settled (k10_bench on
+/// the serving stack, 2026-10-30, batch 64 over the real
+/// FFN tensors): the narrow 32x128 tile (16 KiB) beats
+/// 64x128 by ~6% and both 256-deep tiles by ~40%, because
+/// the kernel is bound by workgroup occupancy and staging
+/// barriers, not by tile capacity; the wider candidates
+/// stay in the list for device classes where that ordering
+/// could invert, still gated by the storage they need.
+/// `None` below the 16 KiB floor: no GEMM on that device
+/// (see the module docs for the fallback contract).
 #[must_use]
 pub fn shipped_shape(limits: &wgpu::Limits) -> Option<GemmShape> {
     let storage = limits.max_compute_workgroup_storage_size;
     [
-        GemmShape::new(64, 256),
-        GemmShape::new(64, 128),
         GemmShape::new(32, 128),
+        GemmShape::new(64, 128),
+        GemmShape::new(64, 256),
     ]
     .into_iter()
     .find(|shape| storage >= shape.tile_bytes())

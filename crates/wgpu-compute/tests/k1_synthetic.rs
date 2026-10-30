@@ -1,8 +1,10 @@
 //! K1 against a synthetic Q4_K tensor with known contents: the
 //! GPU result must match the CPU reference (the `gguf` crate's
 //! dequantizer plus `torch-math`'s matvec) within float
-//! reassociation noise, and the `Compute::proj` wiring must refuse
-//! a Q6_K tensor through K2 by name.
+//! reassociation noise, and the `Compute::proj` weight cache
+//! must refuse a tensor that arrives under a cached name with a
+//! different dtype. (Q6_K and Q5_K end-to-end proofs live in
+//! `k2_k3_synthetic.rs`; K2 and K3 landed after this file.)
 //!
 //! These tests need a discrete Vulkan GPU under the default
 //! selection policy. On a machine without one (a CI box, this
@@ -113,25 +115,32 @@ fn k1_proj_matches_cpu_reference_on_synthetic_rows() {
 }
 
 #[test]
-fn k1_proj_refuses_q6k_through_k2_by_name() {
+fn proj_refuses_a_dtype_change_under_a_cached_name() {
     let Some(backend) = backend_or_skip() else {
         return;
     };
-    // Geometry is never reached: the dtype routes first. The data
-    // length is the honest Q6_K size for [256, 1] anyway.
-    let view = TensorView {
-        name: "synthetic.q6k".to_string(),
+    let view = synthetic_tensor();
+    let input = lcg_input(7, 256);
+    backend.proj(&input, &view, 1).expect("first upload");
+    // The same name now carrying a Q6_K tensor: Q6_K has a
+    // kernel (K2), but not under this name. The cache identity
+    // check refuses before any dtype routing happens.
+    let impostor = TensorView {
+        name: "synthetic.q4k".to_string(),
         dtype: Dtype::Q6K,
-        shape: vec![256, 1],
-        data: Arc::from(vec![0u8; 210].into_boxed_slice()),
+        shape: vec![256, 3],
+        data: Arc::from(vec![0u8; 210 * 3].into_boxed_slice()),
     };
     let err = backend
-        .proj(&[0.0; 256], &view, 1)
-        .expect_err("Q6_K must refuse until K2 lands");
+        .proj(&input, &impostor, 1)
+        .expect_err("a dtype change under a cached name must refuse");
     match err {
         muse_glimmer::GlimmerError::StepFailed { step, detail } => {
             assert_eq!(step, "proj");
-            assert!(detail.contains("K2"), "refusal must name K2: {detail}");
+            assert!(
+                detail.contains("identity"),
+                "refusal must name the identity rule: {detail}"
+            );
         }
         other => panic!("expected StepFailed, got {other:?}"),
     }

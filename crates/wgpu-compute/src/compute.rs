@@ -1,14 +1,21 @@
 //! [`WgpuCompute`]: the wgpu backend behind `muse_glimmer::Compute`.
 //!
-//! What runs today: `proj` for Q4_K tensors, through kernel K1.
-//! Q6_K and Q5_K projections refuse through K2's and K3's modules;
-//! every other step refuses through its own kernel module (norms
-//! through K4, attention through K6, the FFN at its activation
-//! through K7, the embedding through K8). Nothing is silently
-//! substituted: BACKEND.md Section 6 puts per-op CPU fallback at
-//! load time as the caller's disclosed composition decision, so
-//! this backend never detours a step to the CPU behind the
-//! caller's back.
+//! What runs on the device: `proj` (and through it `lm_head`)
+//! for Q4_K, Q6_K, and Q5_K tensors, through kernels K1, K2,
+//! and K3 respectively, selected by the tensor's dtype; the
+//! norms and the residual add through K4; `swiglu_ffn` end to
+//! end (K1 gate and up, K7 activation, K2 down) with
+//! `attn_gate` through K7; and the embedding gather through
+//! K8. The one step that still refuses, by name, is
+//! `attention`: the K5 (RoPE plus KV append) and K6 (scores
+//! plus reduce) pipelines are built, but their composition
+//! over this backend (device KV residency mirroring
+//! `cpu-compute`'s backend-owned storage, behind the `Cache`
+//! trait's position contract) is not wired yet. Nothing is
+//! silently substituted: BACKEND.md Section 6 puts per-op CPU
+//! fallback at load time as the caller's disclosed composition
+//! decision, so this backend never detours a step to the CPU
+//! behind the caller's back.
 //!
 //! Data path, stated plainly: weight tensors upload once and are
 //! cached by name (per-tensor device buffers, BACKEND.md
@@ -22,14 +29,20 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use muse_glimmer::{
-    AttentionRequest, Cache, Compute, Dtype, GlimmerConfig, GlimmerError, LayerWeights, Result,
-    TensorView,
+    AttentionRequest, Cache, Compute, Dtype, GlimmerConfig, GlimmerError, LayerKind, LayerWeights,
+    Result, TensorView,
 };
 
 use crate::detect::{detect, DetectPolicy};
 use crate::device::GpuContext;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights};
-use crate::kernels::{k2_q6k_gemv, k3_q5k_gemv, k4_rmsnorm, k6_attention, k7_swiglu, k8_head};
+use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
+use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
+use crate::kernels::k4_rmsnorm::K4Pipeline;
+use crate::kernels::k5_rope_kv::K5Pipeline;
+use crate::kernels::k6_attention::{AttendGeom, GpuKvState, K6Pipeline};
+use crate::kernels::k7_swiglu::K7Pipeline;
+use crate::kernels::k8_head::K8Pipeline;
 
 use crate::diag::dbg_log;
 
@@ -58,15 +71,65 @@ fn dtype_id(dtype: Dtype) -> u32 {
     }
 }
 
+/// A weight tensor resident on the device, in whichever kernel's
+/// layout its dtype dictates. The cache keys these by tensor
+/// name, and the name is an identity: a later tensor arriving
+/// under a cached name with a different dtype or geometry is a
+/// refusal, not a re-upload.
+#[derive(Debug)]
+enum CachedWeights {
+    /// Q4_K, through kernel K1.
+    Q4K(K1Weights),
+    /// Q6_K, through kernel K2.
+    Q6K(K2Weights),
+    /// Q5_K, through kernel K3.
+    Q5K(K3Weights),
+}
+
+impl CachedWeights {
+    /// The (input width, output rows, raw byte length) the
+    /// cached upload was made from.
+    fn geometry(&self) -> (usize, usize, u64) {
+        match self {
+            CachedWeights::Q4K(w) => (w.in_features, w.out_rows, w.byte_len),
+            CachedWeights::Q6K(w) => (w.in_features, w.out_rows, w.byte_len),
+            CachedWeights::Q5K(w) => (w.in_features, w.out_rows, w.byte_len),
+        }
+    }
+
+    /// The kernel name this entry's dtype runs through, for
+    /// refusal messages.
+    fn kernel(&self) -> &'static str {
+        match self {
+            CachedWeights::Q4K(_) => "K1 (Q4_K)",
+            CachedWeights::Q6K(_) => "K2 (Q6_K)",
+            CachedWeights::Q5K(_) => "K3 (Q5_K)",
+        }
+    }
+}
+
 /// The wgpu [`Compute`] backend. Constructing one selects an
 /// adapter and opens a device (see [`crate::detect`]), so
 /// construction is the fallible step; a constructed backend has a
-/// live device and a compiled K1 pipeline.
+/// live device and every kernel pipeline compiled. Stateful in
+/// exactly one way, like `cpu-compute`: it owns the KV cache of
+/// the one sequence it is serving (device buffers plus a host
+/// mirror, in [`GpuKvState`]). Construct one per sequence, and
+/// call [`WgpuCompute::reset`] to abandon a sequence and start
+/// over.
 #[derive(Debug)]
 pub struct WgpuCompute {
     ctx: GpuContext,
     k1: K1Pipeline,
-    weights: RefCell<HashMap<String, K1Weights>>,
+    k2: K2Pipeline,
+    k3: K3Pipeline,
+    k4: K4Pipeline,
+    k5: K5Pipeline,
+    k6: K6Pipeline,
+    k7: K7Pipeline,
+    k8: K8Pipeline,
+    weights: RefCell<HashMap<String, CachedWeights>>,
+    kv: RefCell<Option<GpuKvState>>,
 }
 
 impl WgpuCompute {
@@ -88,7 +151,7 @@ impl WgpuCompute {
     ///
     /// [`crate::error::WgpuError::NoSuitableAdapter`], [`crate::error::WgpuError::DeviceRequest`],
     /// [`crate::error::WgpuError::LimitShortfall`], or [`crate::error::WgpuError::Pipeline`]
-    /// when device opening or K1 compilation fails.
+    /// when device opening or pipeline compilation fails.
     pub fn with_policy(policy: &DetectPolicy) -> crate::error::Result<Self> {
         Self::from_context(detect(policy)?)
     }
@@ -97,14 +160,30 @@ impl WgpuCompute {
     ///
     /// # Errors
     ///
-    /// [`crate::error::WgpuError::Pipeline`] when the K1 shader fails to compile.
+    /// [`crate::error::WgpuError::Pipeline`] when any kernel
+    /// shader fails to compile.
     pub fn from_context(ctx: GpuContext) -> crate::error::Result<Self> {
         let k1 = K1Pipeline::new(&ctx.device)?;
+        let k2 = K2Pipeline::new(&ctx.device)?;
+        let k3 = K3Pipeline::new(&ctx.device)?;
+        let k4 = K4Pipeline::new(&ctx.device)?;
+        let k5 = K5Pipeline::new(&ctx.device)?;
+        let k6 = K6Pipeline::new(&ctx.device)?;
+        let k7 = K7Pipeline::new(&ctx.device)?;
+        let k8 = K8Pipeline::new(&ctx.device)?;
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
             k1,
+            k2,
+            k3,
+            k4,
+            k5,
+            k6,
+            k7,
+            k8,
             weights: RefCell::new(HashMap::new()),
+            kv: RefCell::new(None),
         })
     }
 
@@ -114,51 +193,87 @@ impl WgpuCompute {
         &self.ctx
     }
 
-    /// Fetch the cached device copy of a Q4_K tensor, uploading it
-    /// on first use. A later tensor arriving under a cached name
-    /// with different geometry is a refusal, not a re-upload: the
-    /// name is the identity the loader gave it.
-    fn weights_for(&self, view: &TensorView, step: &'static str) -> Result<K1WeightsRef<'_>> {
+    /// Drop all stored KV state, device buffers and host mirror.
+    /// The next attention call rebuilds the state from its
+    /// config and expects the caller's sequence position to be 0
+    /// again. Mirrors `CpuCompute::reset`.
+    pub fn reset(&self) {
+        dbg_log!("gpu kv state reset");
+        *self.kv.borrow_mut() = None;
+    }
+
+    /// Ensure a device copy of `view`'s tensor exists in the
+    /// cache, uploading it through its dtype's kernel on first
+    /// use. A later tensor arriving under a cached name with a
+    /// different dtype or geometry is a refusal, not a
+    /// re-upload: the name is the identity the loader gave it.
+    fn ensure_uploaded(&self, view: &TensorView, step: &'static str) -> Result<()> {
         let (inn, out) = (view.shape[0] as usize, view.shape[1] as usize);
-        let mut cache = self.weights.borrow_mut();
-        if let Some(existing) = cache.get(&view.name) {
-            if existing.in_features != inn
-                || existing.out_rows != out
-                || existing.byte_len != view.data.len() as u64
-            {
+        {
+            let cache = self.weights.borrow();
+            if let Some(existing) = cache.get(&view.name) {
+                let (e_in, e_out, e_bytes) = existing.geometry();
+                let kind_matches = matches!(
+                    (view.dtype, existing),
+                    (Dtype::Q4K, CachedWeights::Q4K(_))
+                        | (Dtype::Q6K, CachedWeights::Q6K(_))
+                        | (Dtype::Q5K, CachedWeights::Q5K(_))
+                );
+                if !kind_matches || e_in != inn || e_out != out || e_bytes != view.data.len() as u64
+                {
+                    return Err(step_failed(
+                        step,
+                        format!(
+                            "tensor {} was already uploaded through {} as [{} x {}] ({} bytes) \
+                             but now arrives as [{inn} x {out}] ({} bytes) of another kind; \
+                             a tensor name is an identity in this backend, not a slot",
+                            view.name,
+                            existing.kernel(),
+                            e_in,
+                            e_out,
+                            e_bytes,
+                            view.data.len()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+        }
+        let uploaded = match view.dtype {
+            Dtype::Q4K => CachedWeights::Q4K(
+                self.k1
+                    .upload(&self.ctx, &view.name, &view.data, inn, out)
+                    .map_err(|e| step_failed(step, e.to_string()))?,
+            ),
+            Dtype::Q6K => CachedWeights::Q6K(
+                self.k2
+                    .upload(&self.ctx, &view.name, &view.data, inn, out)
+                    .map_err(|e| step_failed(step, e.to_string()))?,
+            ),
+            Dtype::Q5K => CachedWeights::Q5K(
+                self.k3
+                    .upload(&self.ctx, &view.name, &view.data, inn, out)
+                    .map_err(|e| step_failed(step, e.to_string()))?,
+            ),
+            other => {
                 return Err(step_failed(
                     step,
                     format!(
-                        "tensor {} was already uploaded as [{} x {}] ({} bytes) but now \
-                         arrives as [{inn} x {out}] ({} bytes); a tensor name is an \
-                         identity in this backend, not a slot",
+                        "tensor {} has dtype {} (ggml type id {}), which has no GPU kernel in \
+                         this backend yet (K1 covers Q4_K, K2 covers Q6_K, K3 covers Q5_K); \
+                         BACKEND.md Section 6 level L2 runs such types on the CPU backend \
+                         as a load-time composition decision, not inside this step",
                         view.name,
-                        existing.in_features,
-                        existing.out_rows,
-                        existing.byte_len,
-                        view.data.len()
+                        gguf::ggml::type_name(dtype_id(other)),
+                        dtype_id(other)
                     ),
-                ));
+                ))
             }
-            // The cache owns the buffer; the caller borrows it
-            // through the returned guard.
-            return Ok(K1WeightsRef {
-                weights: cache,
-                name: view.name.clone(),
-                _step: step,
-            });
-        }
-        let uploaded = self
-            .k1
-            .upload(&self.ctx, &view.name, &view.data, inn, out)
-            .map_err(|e| step_failed(step, e.to_string()))?;
-        let name = view.name.clone();
-        cache.insert(view.name.clone(), uploaded);
-        Ok(K1WeightsRef {
-            weights: cache,
-            name,
-            _step: step,
-        })
+        };
+        self.weights
+            .borrow_mut()
+            .insert(view.name.clone(), uploaded);
+        Ok(())
     }
 
     /// Shared projection body, mirroring `cpu-compute`'s: the FFN
@@ -191,99 +306,320 @@ impl WgpuCompute {
                 ),
             ));
         }
-        match weight.dtype {
-            Dtype::Q4K => {
-                let guard = self.weights_for(weight, step)?;
-                let weights = guard.get();
-                self.k1
-                    .run(&self.ctx, weights, x)
-                    .map_err(|e| step_failed(step, e.to_string()))
-            }
-            Dtype::Q6K => k2_q6k_gemv::refuse(step),
-            Dtype::Q5K => k3_q5k_gemv::refuse(step),
-            other => Err(step_failed(
+        self.ensure_uploaded(weight, step)?;
+        let cache = self.weights.borrow();
+        let cached = cache.get(&weight.name).ok_or_else(|| {
+            step_failed(
                 step,
                 format!(
-                    "tensor {} has dtype {} (ggml type id {}), which has no GPU kernel in \
-                     this backend yet (K1 covers Q4_K); BACKEND.md Section 6 level L2 \
-                     runs such types on the CPU backend as a load-time composition \
-                     decision, not inside this step",
+                    "tensor {} was uploaded but is missing from the cache",
+                    weight.name
+                ),
+            )
+        })?;
+        match (weight.dtype, cached) {
+            (Dtype::Q4K, CachedWeights::Q4K(w)) => self
+                .k1
+                .run(&self.ctx, w, x)
+                .map_err(|e| step_failed(step, e.to_string())),
+            (Dtype::Q6K, CachedWeights::Q6K(w)) => self
+                .k2
+                .run(&self.ctx, w, x)
+                .map_err(|e| step_failed(step, e.to_string())),
+            (Dtype::Q5K, CachedWeights::Q5K(w)) => self
+                .k3
+                .run(&self.ctx, w, x)
+                .map_err(|e| step_failed(step, e.to_string())),
+            _ => Err(step_failed(
+                step,
+                format!(
+                    "tensor {} changed kind between upload and run; the cache holds it \
+                     through {}, which its dtype does not select",
                     weight.name,
-                    gguf::ggml::type_name(dtype_id(other)),
-                    dtype_id(other)
+                    cached.kernel()
                 ),
             )),
         }
     }
 }
 
-/// A borrow of a cached [`K1Weights`] that keeps the cache's
-/// `RefCell` borrow alive for the duration of one projection. The
-/// guard exists because `run` needs `&K1Weights` while the cache
-/// map owns it.
-#[derive(Debug)]
-struct K1WeightsRef<'a> {
-    weights: std::cell::RefMut<'a, HashMap<String, K1Weights>>,
-    name: String,
-    _step: &'static str,
-}
-
-impl K1WeightsRef<'_> {
-    fn get(&self) -> &K1Weights {
-        self.weights
-            .get(&self.name)
-            .expect("the entry was inserted or found above")
-    }
-}
-
 impl Compute for WgpuCompute {
-    fn embed(
-        &self,
-        _table: &TensorView,
-        _tokens: &[u32],
-        _cfg: &GlimmerConfig,
-    ) -> Result<Vec<f32>> {
-        k8_head::refuse("embed")
+    fn embed(&self, table: &TensorView, tokens: &[u32], cfg: &GlimmerConfig) -> Result<Vec<f32>> {
+        self.k8.embed(&self.ctx, table, tokens, cfg)
     }
 
-    fn rms_norm(
-        &self,
-        _x: &[f32],
-        _weight: &TensorView,
-        _rows: usize,
-        _eps: f32,
-    ) -> Result<Vec<f32>> {
-        k4_rmsnorm::refuse("rms_norm")
+    fn rms_norm(&self, x: &[f32], weight: &TensorView, rows: usize, eps: f32) -> Result<Vec<f32>> {
+        let step = "rms_norm";
+        // The norm weight is a small F32 vector in the real file;
+        // dequantize it here (the same view-to-values step, with
+        // the same byte-length validation, that the CPU backend
+        // takes in its dequantize_view) and let K4 run the
+        // normalization itself on the device.
+        let ty = match weight.dtype {
+            Dtype::F32 => gguf::GgmlType::F32,
+            Dtype::F16 => gguf::GgmlType::F16,
+            Dtype::Q8_0 => gguf::GgmlType::Q8_0,
+            Dtype::Q4K => gguf::GgmlType::Q4K,
+            Dtype::Q5K => gguf::GgmlType::Q5K,
+            Dtype::Q6K => gguf::GgmlType::Q6K,
+            Dtype::Bf16 => gguf::GgmlType::Bf16,
+            other => {
+                return Err(step_failed(
+                    step,
+                    format!(
+                        "norm weight {} has dtype {} (ggml type id {}), which this backend \
+                         cannot dequantize for K4",
+                        weight.name,
+                        gguf::ggml::type_name(dtype_id(other)),
+                        dtype_id(other)
+                    ),
+                ))
+            }
+        };
+        let elements = weight.elements() as usize;
+        let expected = ty.byte_len(elements as u64).ok_or_else(|| {
+            step_failed(
+                step,
+                format!(
+                    "norm weight {} has {elements} elements, not a whole number of blocks",
+                    weight.name
+                ),
+            )
+        })?;
+        if expected != weight.data.len() as u64 {
+            return Err(step_failed(
+                step,
+                format!(
+                    "norm weight {} holds {} bytes but {elements} elements need {expected}",
+                    weight.name,
+                    weight.data.len()
+                ),
+            ));
+        }
+        let w = gguf::dequant::dequantize(ty, &weight.data, elements);
+        self.k4
+            .rms_norm(&self.ctx, x, &w, rows, eps)
+            .map_err(|e| step_failed(step, e.to_string()))
     }
 
-    fn rms_norm_plain(&self, _x: &[f32], _rows: usize, _eps: f32) -> Result<Vec<f32>> {
-        k4_rmsnorm::refuse("rms_norm_plain")
+    fn rms_norm_plain(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>> {
+        self.k4
+            .rms_norm_plain(&self.ctx, x, rows, eps)
+            .map_err(|e| step_failed("rms_norm_plain", e.to_string()))
     }
 
     fn proj(&self, x: &[f32], weight: &TensorView, rows: usize) -> Result<Vec<f32>> {
         self.proj_impl(x, weight, rows, "proj")
     }
 
-    fn attention(&self, _req: &AttentionRequest<'_>, _cache: &mut dyn Cache) -> Result<Vec<f32>> {
-        k6_attention::refuse("attention")
+    fn attention(&self, req: &AttentionRequest<'_>, cache: &mut dyn Cache) -> Result<Vec<f32>> {
+        let step = "attention";
+        let cfg = req.cfg;
+        // The validation mirrors cpu-compute's, the spec: the
+        // attention crate stores keys and values at one head
+        // dimension, the request's kind must be the config's, and
+        // the projections must be whole rows.
+        if cfg.key_length != cfg.value_length {
+            return Err(step_failed(
+                step,
+                format!(
+                    "key_length {} != value_length {}: the attention crate's KvCache stores keys and values at one head dimension",
+                    cfg.key_length, cfg.value_length
+                ),
+            ));
+        }
+        if cfg.layer_kind(req.layer) != Some(req.kind) {
+            return Err(step_failed(
+                step,
+                format!(
+                    "request kind {:?} does not match the config's kind for layer {}",
+                    req.kind, req.layer
+                ),
+            ));
+        }
+        let q_width = cfg.q_width() as usize;
+        let k_width = cfg.k_width() as usize;
+        let v_width = cfg.v_width() as usize;
+        if q_width == 0 || req.q.len() % q_width != 0 {
+            return Err(step_failed(
+                step,
+                format!(
+                    "query projection holds {} elements, not a whole number of {q_width}-wide rows",
+                    req.q.len()
+                ),
+            ));
+        }
+        let rows = req.q.len() / q_width;
+        if req.k.len() != rows * k_width || req.v.len() != rows * v_width {
+            return Err(step_failed(
+                step,
+                format!(
+                    "key/value projections hold {}/{} elements for {rows} rows, expected {}/{}",
+                    req.k.len(),
+                    req.v.len(),
+                    rows * k_width,
+                    rows * v_width
+                ),
+            ));
+        }
+
+        let start = cache.position();
+        let mut guard = self.kv.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(GpuKvState::build(cfg, step)?);
+        }
+        let state = guard.as_mut().expect("kv state was just built");
+        state.check_shape(cfg, step)?;
+        let appended = state
+            .host()
+            .next_position(req.layer)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        if appended != start {
+            return Err(step_failed(
+                step,
+                format!(
+                    "KV state for layer {} is at position {appended} but the sequence cache is at position {start}: \
+                     the two disagree, so attending would read the wrong history. \
+                     Pair one Cache with one WgpuCompute per sequence, or call WgpuCompute::reset \
+                     when a sequence is abandoned (a forward that failed midway leaves the KV state \
+                     ahead of the cache and also needs a reset)",
+                    req.layer
+                ),
+            ));
+        }
+
+        let head_dim = cfg.key_length as usize;
+        let q_heads = cfg.q_heads as usize;
+        let kv_heads = cfg.kv_heads as usize;
+        let window = match req.kind {
+            LayerKind::Global => None,
+            LayerKind::SlidingWindow => Some(cfg.sliding_window as usize),
+        };
+
+        // Rotate Q and K in place on the device, sliding layers
+        // only, at the SWA base; global layers are NoPE and pass
+        // through unrotated (src/models/muse-glimmer.cpp).
+        let q_buf = self.ctx.upload_f32("attention q", req.q);
+        let k_buf = self.ctx.upload_f32("attention k", req.k);
+        if req.kind == LayerKind::SlidingWindow {
+            self.k5
+                .rotate(
+                    &self.ctx,
+                    &q_buf,
+                    rows,
+                    q_heads,
+                    head_dim,
+                    start,
+                    cfg.rope_freq_base_swa,
+                )
+                .map_err(|e| step_failed(step, e.to_string()))?;
+            self.k5
+                .rotate(
+                    &self.ctx,
+                    &k_buf,
+                    rows,
+                    kv_heads,
+                    head_dim,
+                    start,
+                    cfg.rope_freq_base_swa,
+                )
+                .map_err(|e| step_failed(step, e.to_string()))?;
+        }
+        // The rotated keys come back exactly once: the host
+        // mirror appends what the device computed, so the mirror
+        // (positions, cross-checks, tests) and the device buffers
+        // can never drift apart in what they hold.
+        let k_rot = self
+            .ctx
+            .read_f32(&k_buf, req.k.len())
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        for i in 0..rows {
+            state
+                .host_mut()
+                .append(
+                    req.layer,
+                    &k_rot[i * k_width..(i + 1) * k_width],
+                    &req.v[i * v_width..(i + 1) * v_width],
+                    start + i,
+                )
+                .map_err(|e| step_failed(step, e.to_string()))?;
+        }
+        let (stored, first_pos) = {
+            let view = state
+                .host()
+                .view(req.layer)
+                .map_err(|e| step_failed(step, e.to_string()))?;
+            let first = view.position_at(0).ok_or_else(|| {
+                step_failed(
+                    step,
+                    "the layer's cache view is empty right after an append",
+                )
+            })?;
+            (view.len(), first)
+        };
+        let appended_total = state
+            .host()
+            .next_position(req.layer)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        let layer_kv = state.ensure_layer(&self.ctx, req.layer, k_width, appended_total, step)?;
+        // K5's second half: append the rotated K rows and the V
+        // rows into the layer's resident buffers, at the slots
+        // the cache semantics assign.
+        let v_buf = self.ctx.upload_f32("attention v", req.v);
+        self.k5
+            .append(
+                &self.ctx,
+                &k_buf,
+                &v_buf,
+                &layer_kv.k,
+                &layer_kv.v,
+                rows,
+                k_width,
+                start,
+                window,
+            )
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        // K6: scores plus the online-softmax reduce over the
+        // resident buffers.
+        let geom = AttendGeom {
+            rows,
+            q_heads,
+            kv_heads,
+            head_dim,
+            stored,
+            first_pos,
+            start_pos: start,
+            window,
+        };
+        let scores = self
+            .k6
+            .scores(&self.ctx, &q_buf, layer_kv, &geom)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        let out = self
+            .k6
+            .reduce(&self.ctx, &scores, layer_kv, &geom)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        dbg_log!(
+            "attention layer={} kind={:?} start={} rows={} stored={}",
+            req.layer,
+            req.kind,
+            start,
+            rows,
+            stored
+        );
+        Ok(out)
     }
 
-    fn attn_gate(&self, _attn_out: &[f32], _gate: &[f32]) -> Result<Vec<f32>> {
-        Err(step_failed(
-            "attn_gate",
-            "no GPU kernel for the attention gate elementwise step yet \
-             (sigmoid times attention output; it is not one of BACKEND.md \
-             Section 3's K1 to K8 kernels and lands with the elementwise family)",
-        ))
+    fn attn_gate(&self, attn_out: &[f32], gate: &[f32]) -> Result<Vec<f32>> {
+        self.k7
+            .attn_gate(&self.ctx, attn_out, gate)
+            .map_err(|e| step_failed("attn_gate", e.to_string()))
     }
 
-    fn add(&self, _a: &[f32], _b: &[f32]) -> Result<Vec<f32>> {
-        Err(step_failed(
-            "add",
-            "no standalone GPU kernel for the residual add yet; BACKEND.md \
-             Section 3 fuses it into K4 (RMSNorm plus residual), which has \
-             not landed",
-        ))
+    fn add(&self, a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
+        self.k4
+            .add(&self.ctx, a, b)
+            .map_err(|e| step_failed("add", e.to_string()))
     }
 
     fn swiglu_ffn(
@@ -294,11 +630,16 @@ impl Compute for WgpuCompute {
         _cfg: &GlimmerConfig,
     ) -> Result<Vec<f32>> {
         let step = "swiglu_ffn";
-        // Gate and up are Q4_K in the real file and run through K1
-        // here; the activation is where this step currently ends.
-        let _gate = self.proj_impl(x, &w.ffn_gate, rows, step)?;
-        let _up = self.proj_impl(x, &w.ffn_up, rows, step)?;
-        k7_swiglu::refuse(step)
+        // The FFN end to end: gate and up through K1 (Q4_K in the
+        // real file), the activation through K7, and the down
+        // projection through K2 (Q6_K).
+        let gate = self.proj_impl(x, &w.ffn_gate, rows, step)?;
+        let up = self.proj_impl(x, &w.ffn_up, rows, step)?;
+        let act = self
+            .k7
+            .swiglu(&self.ctx, &gate, &up)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        self.proj_impl(&act, &w.ffn_down, rows, step)
     }
 
     fn lm_head(&self, x: &[f32], head: &TensorView, cfg: &GlimmerConfig) -> Result<Vec<f32>> {

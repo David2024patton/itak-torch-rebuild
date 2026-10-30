@@ -2,13 +2,17 @@
 //! Section 3's priority order (bytes streamed per token on
 //! Glimmer, then position on the critical path).
 //!
-//! K1 is implemented. K2 to K8 are modules with their shapes and
-//! duties documented and a single named refusal where the
-//! `Compute` implementation calls them: nothing in this crate
-//! silently substitutes another path for a missing kernel
-//! (BACKEND.md Section 6's ladder puts per-op CPU fallback at load
-//! time, as a disclosed composition decision by the caller, not as
-//! a quiet detour inside a step).
+//! The full set is implemented: K1, K2, and K3 (the three GEMV
+//! kernels cover Glimmer's whole weight stream: Q4_K, Q6_K,
+//! Q5_K), K4 (norms and the residual add), K5 (RoPE plus KV
+//! append), K6 (grouped-query attention over the resident KV
+//! buffers K5 fills), K7 (the elementwise activations), and K8
+//! (the embedding gather and the head finishing math). Every
+//! `Compute` step runs on the device; nothing in this crate
+//! silently substitutes another path for a kernel (BACKEND.md
+//! Section 6's ladder puts per-op CPU fallback at load time, as
+//! a disclosed composition decision by the caller, not as a
+//! quiet detour inside a step).
 
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;

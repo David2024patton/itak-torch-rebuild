@@ -11,7 +11,7 @@
 //! a written selection policy, granted-limits verification, and
 //! the chosen adapter recorded for the health surface.
 //!
-//! What is real in this landing (TODO T-4.2, first tier):
+//! What is real in this landing (TODO T-4.2, first tiers):
 //!
 //! - **Device selection** ([`detect`]): Vulkan discrete GPU or a
 //!   named refusal listing every adapter seen. llvmpipe counts as
@@ -25,16 +25,32 @@
 //!   here and on the real file's tensors through the `k1_check`
 //!   example, and benched against llama.cpp's measured 708 GB/s
 //!   through the `k1_bench` example (results in BACKEND.md).
+//! - **K2, the Q6_K dequant GEMV** ([`kernels::k2_q6k_gemv`]):
+//!   17.1 percent of the stream (FFN down, attention V), same
+//!   tuned parallel shape as K1, with a host-side repack into a
+//!   word-aligned device layout (the 210-byte block is not a
+//!   whole number of words; the module docs own the reasoning).
+//!   Checked and benched through the `k2_check` and `k2_bench`
+//!   examples.
+//! - **K3, the Q5_K dequant GEMV** ([`kernels::k3_q5k_gemv`]):
+//!   the 202,048-row output head, two-dimensional dispatch over
+//!   the 65,535-workgroup cap. Checked and benched through the
+//!   `k3_check` and `k3_bench` examples.
 //!
-//! What is not here yet, by design: kernels K2 to K8 live in their
-//! own modules under [`kernels`] with their shapes documented,
-//! and every `Compute` step that needs one refuses through that
-//! module with a named [`muse_glimmer::GlimmerError::StepFailed`].
-//! A forward over this backend therefore runs its Q4_K
-//! projections on the GPU and stops, by name, at the first step
-//! whose kernel has not landed. Nothing falls back silently;
-//! per-op CPU composition is the caller's load-time decision
-//! (BACKEND.md Section 6, level L2).
+//! Also wired: K4 (RMSNorm, plain and weighted, plus the
+//! residual add) and K7 (SwiGLU and the attention gate), so the
+//! FFN runs end to end; K5 (RoPE plus KV append) and K6
+//! (grouped-query attention over device-resident KV buffers,
+//! with the `attention` crate's cache mirrored on the host for
+//! positions and cross-checks), so attention runs end to end;
+//! and K8 (the embedding gather in every dtype `cpu-compute`
+//! accepts, plus the scale-then-softcap head finishing kernel,
+//! proven against `muse_glimmer::softcap_scale` and held for
+//! the device-resident forward, since the model applies the
+//! finishing itself today). A forward over this backend
+//! therefore runs every step on the GPU. Nothing falls back
+//! silently; per-op CPU composition is the caller's load-time
+//! decision (BACKEND.md Section 6, level L2).
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -51,3 +67,10 @@ pub use detect::{detect, AdapterFacts, DetectPolicy};
 pub use device::GpuContext;
 pub use error::{Result, WgpuError};
 pub use kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Shape, K1Weights};
+pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};
+pub use kernels::k3_q5k_gemv::{K3Call, K3Pipeline, K3Shape, K3Weights};
+pub use kernels::k4_rmsnorm::K4Pipeline;
+pub use kernels::k5_rope_kv::K5Pipeline;
+pub use kernels::k6_attention::{AttendGeom, GpuKvState, K6Pipeline, LayerKv};
+pub use kernels::k7_swiglu::K7Pipeline;
+pub use kernels::k8_head::K8Pipeline;

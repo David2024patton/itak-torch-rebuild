@@ -1010,6 +1010,8 @@ dependencies = [
 name = "wgpu-compute"
 version = "0.1.0"
 dependencies = [
+ "attention",
+ "cpu-compute",
  "gguf",
  "muse-glimmer",
  "pollster",

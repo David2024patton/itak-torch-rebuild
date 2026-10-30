@@ -1,0 +1,20 @@
+[package]
+name = "itak-spec"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The speculative decoding loop of the iTaK Torch Rust engine (ARCHITECTURE.md module grid, SPEC-itak-spec): DFlash block drafting against the Glimmer target with exact-output verification, KV checkpoint/rewind rounds, and the rejection-sampling correction walk"
+
+[dependencies]
+cpu-compute = { path = "../cpu-compute" }
+dflash = { path = "../dflash" }
+muse-glimmer = { path = "../muse-glimmer" }
+
+[dev-dependencies]
+gguf = { path = "../gguf" }
+itak-loader = { path = "../itak-loader" }
+tokenizer = { path = "../tokenizer" }
+
+[lints]
+workspace = true

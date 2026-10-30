@@ -18,6 +18,7 @@ members = [
     "crates/gguf",
     "crates/itak-engine",
     "crates/itak-loader",
+    "crates/itak-spec",
     "crates/muse-glimmer",
     "crates/dflash",
     "crates/tokenizer",

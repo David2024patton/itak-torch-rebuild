@@ -95,6 +95,13 @@ pub enum GgufError {
         /// Type actually stored in the file.
         found: &'static str,
     },
+    /// A coverage check failed: one or more required tensors are missing,
+    /// unreadable, or misshapen. Each entry names the tensor and the
+    /// reason. The load is refused as a whole; there is no partial load.
+    CoverageIncomplete {
+        /// One `tensor <name>: <reason>` string per failing tensor.
+        failures: Vec<String>,
+    },
 }
 
 impl fmt::Display for GgufError {
@@ -146,12 +153,18 @@ impl fmt::Display for GgufError {
                 type_name,
             } => write!(
                 f,
-                "tensor {tensor}: unsupported type {type_name} (ggml type id {type_id}); this loader dequantizes F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K only"
+                "tensor {tensor}: unsupported type {type_name} (ggml type id {type_id}); this loader dequantizes F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q8_1, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K only"
             ),
             Self::InvalidFormat { context, detail } => {
                 write!(f, "invalid GGUF format in {context}: {detail}")
             }
             Self::MissingMetadata(key) => write!(f, "metadata key not found: {key}"),
+            Self::CoverageIncomplete { failures } => write!(
+                f,
+                "coverage incomplete: {} required tensor(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ),
             Self::MetadataTypeMismatch {
                 key,
                 expected,

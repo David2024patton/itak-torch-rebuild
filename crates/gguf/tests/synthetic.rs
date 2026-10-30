@@ -484,9 +484,12 @@ fn missing_tensor_is_a_hard_error() {
 
 #[test]
 fn unsupported_types_are_hard_errors_that_name_the_type() {
-    // Q3_K (11) and Q8_1 (9): the readers the old Go loader lacked. They
-    // must fail loudly here, never decode as something else.
-    for (type_id, name) in [(11u32, "Q3_K"), (9, "Q8_1")] {
+    // Q8_K (15) and IQ2_XXS (16): real mainline types with no reader in
+    // this loader (they are outside the teardown corpus). They must fail
+    // loudly, never decode as something else. The readers the old Go
+    // loader lacked (Q3_K, Q8_1, Q5_K) DO exist here; see the corpus
+    // tests below.
+    for (type_id, name) in [(15u32, "Q8_K"), (16, "IQ2_XXS")] {
         let file = GgufFile::from_bytes(build(
             &[],
             &[tensor("w", &[256], type_id, vec![0u8; 64])],
@@ -521,4 +524,190 @@ fn bad_element_count_is_rejected_at_parse() {
     let err = GgufFile::from_bytes(build(&[], &[tensor("w", &[100], 12, vec![0u8; 144])], 32))
         .unwrap_err();
     assert!(matches!(err, GgufError::BadElementCount { .. }));
+}
+
+// ---------- corpus types and coverage (T-2.7) ----------
+
+use gguf::{RequiredTensor, TensorStatus};
+
+/// One tensor per type in the teardown corpus (ARCHITECTURE.md 5.2), each
+/// with zero-filled payload of the exact on-disk length. Zero scales
+/// dequantize to zeros; the point here is that every corpus type parses,
+/// loads, and reports full coverage end to end.
+fn corpus_file() -> GgufFile {
+    let cases: Vec<TestTensor> = vec![
+        tensor("t.f32", &[4], 0, vec![0u8; 16]),
+        tensor("t.f16", &[3], 1, vec![0u8; 6]),
+        tensor("t.bf16", &[2], 30, vec![0u8; 4]),
+        tensor("t.q4_0", &[32], 2, vec![0u8; 18]),
+        tensor("t.q4_1", &[32], 3, vec![0u8; 20]),
+        tensor("t.q5_0", &[32], 6, vec![0u8; 22]),
+        tensor("t.q5_1", &[32], 7, vec![0u8; 24]),
+        tensor("t.q8_0", &[32], 8, vec![0u8; 34]),
+        tensor("t.q8_1", &[32], 9, vec![0u8; 36]),
+        tensor("t.q2_k", &[256], 10, vec![0u8; 84]),
+        tensor("t.q3_k", &[256], 11, vec![0u8; 110]),
+        tensor("t.q4_k", &[256], 12, vec![0u8; 144]),
+        tensor("t.q5_k", &[256], 13, vec![0u8; 176]),
+        tensor("t.q6_k", &[256], 14, vec![0u8; 210]),
+    ];
+    GgufFile::from_bytes(build(&[], &cases, 32)).unwrap()
+}
+
+#[test]
+fn every_corpus_type_loads_end_to_end() {
+    let file = corpus_file();
+    for info in file.tensors() {
+        let out = file
+            .load_f32(info.name())
+            .unwrap_or_else(|e| panic!("corpus type {} failed to load: {e}", info.type_name()));
+        assert_eq!(out.len() as u64, info.element_count(), "{}", info.name());
+    }
+}
+
+#[test]
+fn full_coverage_is_complete_for_a_corpus_file() {
+    let file = corpus_file();
+    let report = file.full_coverage();
+    assert!(
+        report.is_complete(),
+        "failures: {:?}",
+        report.failures().collect::<Vec<_>>()
+    );
+    assert_eq!(report.required_count(), 14);
+    assert_eq!(report.ok_count(), 14);
+    assert!(report.unchecked.is_empty());
+    // The same report passes the load gate.
+    let required: Vec<RequiredTensor> = file.tensor_names().map(RequiredTensor::named).collect();
+    assert!(file.verify_coverage(&required).is_ok());
+}
+
+#[test]
+fn q3_k_and_q8_1_load_values_end_to_end() {
+    // The two readers whose absence in the old Go loader caused silent
+    // placeholder weights; spot-check real values through the full
+    // parse-and-load path, not just the dequantizer.
+    let mut q3 = vec![0u8; 110];
+    q3[0] = 0x01; // hmask bit 0
+    q3[32] = 0b0000_0001; // qs[0] pair 0 = 1
+    q3[96] = 5; // scales[0] -> aux[0] = 5
+    q3[108..110].copy_from_slice(&F16_ONE.to_le_bytes());
+    let mut q8_1 = vec![0u8; 36];
+    q8_1[0..2].copy_from_slice(&F16_HALF.to_le_bytes());
+    q8_1[4] = 4;
+    let file = GgufFile::from_bytes(build(
+        &[],
+        &[
+            tensor("w.q3_k", &[256], 11, q3),
+            tensor("w.q8_1", &[32], 9, q8_1),
+        ],
+        32,
+    ))
+    .unwrap();
+    assert_eq!(file.load_f32("w.q3_k").unwrap()[0], 5.0);
+    assert_eq!(file.load_f32("w.q8_1").unwrap()[0], 2.0);
+}
+
+#[test]
+fn truncated_tensor_data_fails_loudly_and_names_the_tensor() {
+    let bytes = build(&[], &[tensor("payload.weight", &[4], 0, vec![0u8; 16])], 32);
+    // Cut inside the tensor data section: the directory still parses, so
+    // the refusal must be the bounds check naming the tensor.
+    let cut = bytes[..bytes.len() - 6].to_vec();
+    let err = GgufFile::from_bytes(cut).unwrap_err();
+    match &err {
+        GgufError::TensorOutOfBounds { tensor, .. } => {
+            assert_eq!(tensor, "payload.weight");
+        }
+        other => panic!("expected TensorOutOfBounds, got {other:?}"),
+    }
+    assert!(err.to_string().contains("payload.weight"));
+    // Cut in half (inside the header/directory): also a loud failure,
+    // never a partial parse.
+    let half = bytes[..bytes.len() / 2].to_vec();
+    let err = GgufFile::from_bytes(half).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GgufError::Truncated { .. } | GgufError::TensorOutOfBounds { .. }
+        ),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn misshapen_required_tensor_is_refused_by_name() {
+    let data: Vec<u8> = vec![0u8; 512 * 4 * 4];
+    let file = GgufFile::from_bytes(build(
+        &[],
+        &[tensor("blk.0.attn_q.weight", &[512, 4], 0, data)],
+        32,
+    ))
+    .unwrap();
+    let required = vec![RequiredTensor::shaped("blk.0.attn_q.weight", &[1024, 4])];
+    let report = file.coverage_report(&required);
+    assert!(!report.is_complete());
+    let failure = report.failures().next().unwrap();
+    assert_eq!(failure.name, "blk.0.attn_q.weight");
+    assert!(matches!(
+        failure.status,
+        TensorStatus::Misshapen {
+            ref expected,
+            ref found
+        } if expected == &vec![1024, 4] && found == &vec![512, 4]
+    ));
+    let err = file.verify_coverage(&required).unwrap_err();
+    assert!(matches!(err, GgufError::CoverageIncomplete { .. }));
+    let text = err.to_string();
+    assert!(text.contains("blk.0.attn_q.weight"), "{text}");
+    assert!(text.contains("misshapen"), "{text}");
+}
+
+#[test]
+fn coverage_names_missing_and_unreadable_together() {
+    // One requirement absent from the file, one present in a type with
+    // no reader: the gate error must name both, in one refusal.
+    let file = GgufFile::from_bytes(build(
+        &[],
+        &[
+            tensor("blk.0.ffn.weight", &[256], 15, vec![0u8; 292]),
+            tensor("token_embd.weight", &[4], 0, vec![0u8; 16]),
+        ],
+        32,
+    ))
+    .unwrap();
+    let required = vec![
+        RequiredTensor::named("output.weight"),
+        RequiredTensor::named("blk.0.ffn.weight"),
+        RequiredTensor::shaped("token_embd.weight", &[4]),
+    ];
+    let err = file.verify_coverage(&required).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("output.weight"), "{text}");
+    assert!(text.contains("missing"), "{text}");
+    assert!(text.contains("blk.0.ffn.weight"), "{text}");
+    assert!(text.contains("Q8_K"), "{text}");
+    // The passing entry and the failure count stay truthful.
+    let report = file.coverage_report(&required);
+    assert_eq!(report.ok_count(), 1);
+    assert_eq!(report.failures().count(), 2);
+}
+
+#[test]
+fn coverage_passes_and_lists_unchecked_extras() {
+    let file = GgufFile::from_bytes(build(
+        &[],
+        &[
+            tensor("a.weight", &[2, 2], 0, vec![0u8; 16]),
+            tensor("extra.weight", &[1], 0, vec![0u8; 4]),
+        ],
+        32,
+    ))
+    .unwrap();
+    let report = file
+        .verify_coverage(&[RequiredTensor::shaped("a.weight", &[2, 2])])
+        .unwrap();
+    assert!(report.is_complete());
+    assert_eq!(report.unchecked, vec!["extra.weight".to_string()]);
+    assert!(report.summary().contains("required=1"));
 }

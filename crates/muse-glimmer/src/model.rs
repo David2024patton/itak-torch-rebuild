@@ -497,6 +497,13 @@ mod tests {
             Ok(x.to_vec())
         }
 
+        fn rms_norm_scaleless(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>> {
+            self.events
+                .borrow_mut()
+                .push(format!("rms_norm_scaleless rows={rows} eps={eps}"));
+            Ok(x.to_vec())
+        }
+
         fn proj(&self, x: &[f32], _weight: &TensorView, _rows: usize) -> Result<Vec<f32>> {
             Ok(vec![0.0; x.len()])
         }

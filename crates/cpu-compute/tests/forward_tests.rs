@@ -644,7 +644,8 @@ fn tail_discriminates_tensors_eps_and_softcap_order() {
     // - three DIFFERENT norm weight vectors (post-attention,
     //   post-FFN, output), the output one with mixed signs, so
     //   reading any other tensor at the final norm changes the
-    //   numbers;
+    //   numbers; the two post-norm tensors double as placement
+    //   tripwires (see the reference note below);
     // - eps 0.5, far from the usual 1e-6, so a hardcoded epsilon
     //   anywhere in the chain fails by percent, not by ulps;
     // - one head row scaled to drive its raw logit to 30, far above
@@ -691,15 +692,24 @@ fn tail_discriminates_tensors_eps_and_softcap_order() {
     replace(&mut source, "blk.0.post_ffw_norm.weight", &[HIDDEN as u64], pf.clone());
     replace(&mut source, "output_norm.weight", &[HIDDEN as u64], on.clone());
 
-    // Reference final state for token 3, in the test's own math:
-    // embedding row, then the layer's two post norms, then the
-    // final norm, each with its own weights and the config eps.
+    // Reference final state for token 3, in the test's own math.
+    // INTEGRATION NOTE (2026-10-29, lanes 02 + 05): this reference
+    // was written against the pre-audit forward, where the post
+    // norms sat after the residual adds and so acted on the stream
+    // itself: emb -> pa -> pf -> on. The norm audit (lane 02) moved
+    // the post norms onto the branch outputs (sandwich: before the
+    // adds) and added the scaleless embedding norm. The branches
+    // are zeroed here, so both post norms act on zero vectors and
+    // contribute nothing; if the placement ever regresses, pa and
+    // pf re-enter the chain and this test fails. The stream is the
+    // embedding row after the scaleless embedding norm (a weighted
+    // norm with all-ones weights), and the only weighted norm left
+    // in the tail chain is the final norm with `on`.
     let emb_row: Vec<f32> = (0..HIDDEN).map(|i| emb_pattern_a(3, i)).collect();
-    let x1 = rms_w64(&emb_row, &pa, 0.5);
-    let x1f: Vec<f32> = x1.iter().map(|v| *v as f32).collect();
-    let x2 = rms_w64(&x1f, &pf, 0.5);
-    let x2f: Vec<f32> = x2.iter().map(|v| *v as f32).collect();
-    let n = rms_w64(&x2f, &on, 0.5);
+    let ones = vec![1.0f32; HIDDEN];
+    let x0 = rms_w64(&emb_row, &ones, 0.5);
+    let x0f: Vec<f32> = x0.iter().map(|v| *v as f32).collect();
+    let n = rms_w64(&x0f, &on, 0.5);
 
     // Head: row j is a scaled selector of channel j mod hidden,
     // except row 37, which is aimed at the strongest channel of n

@@ -25,6 +25,11 @@
 //!   an unimplemented step is a named [`GlimmerError`], never a
 //!   substituted value. That is the audit's central lesson, applied.
 //!
+//! - [`Sampler`]: sampling as config (TODO T-2.5): temperature,
+//!   top-k, top-p, and repetition/frequency/presence penalties over a
+//!   logit slice, drawn from a seeded RNG; temperature 0 is greedy and
+//!   never consults the RNG. See [`crate::sampling`].
+//!
 //! What is trait-bound, waiting on sibling crates: metadata and tensor
 //! access (the `itak-loader` crate, T-2.1, implements [`Metadata`] and
 //! [`TensorSource`] over the `gguf` crate), the arithmetic (the kernels crate, T-2.2,
@@ -48,6 +53,7 @@ pub mod error;
 pub mod layer;
 pub mod metadata;
 pub mod model;
+pub mod sampling;
 pub mod weights;
 
 #[cfg(test)]
@@ -61,4 +67,7 @@ pub use error::{GlimmerError, Result};
 pub use layer::{LayerKind, PatternSource};
 pub use metadata::{MapMetadata, Metadata};
 pub use model::{softcap_scale, GlimmerModel};
+pub use sampling::{
+    apply_penalties, distribution, greedy_token, Candidate, Sampler, SamplingConfig, SeededRng,
+};
 pub use weights::{expected_tensor_names, Dtype, LayerWeights, TensorSource, TensorView, Weights};

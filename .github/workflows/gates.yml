@@ -1,0 +1,74 @@
+# Gates CI (TODO T-1.7): build, vet, lint, and tests on every push.
+#
+# Owner's note (2026-10-29): gates are run locally day to day
+# (tools/gates.sh, golangci-lint, clippy). This workflow mirrors the
+# same gates for the repo record; whether Actions minutes run on the
+# owner's account is a separate account matter, tracked outside this
+# file. Nothing in here weakens a gate to make it pass.
+name: gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  commit-gates:
+    name: commit gates (secrets, shell, markdown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.28.0/gitleaks_8.28.0_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run commit gates
+        run: tools/gates.sh
+
+  go-platform:
+    name: go platform (build, vet, lint, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: platform
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Lint (golangci-lint, config in platform/.golangci.yml)
+        uses: golangci/golangci-lint-action@v8
+        with:
+          working-directory: platform
+      - name: Tests (skips fail unless excepted)
+        working-directory: ${{ github.workspace }}
+        run: tools/check-test-skips.sh go
+
+  rust-engine:
+    name: rust engine (build, fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (workspace floor is 1.85, see Cargo.toml)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Format check
+        run: cargo fmt --check
+      # Workspace lints deny warnings and clippy::all (root
+      # Cargo.toml), so a plain clippy run is already a hard gate.
+      - name: Clippy (deny-warnings via workspace lints)
+        run: cargo clippy --workspace --all-targets
+      - name: Tests (skips fail unless excepted)
+        run: tools/check-test-skips.sh rust

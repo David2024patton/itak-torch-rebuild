@@ -1,0 +1,15 @@
+# Clippy configuration for the Rust workspace (TODO T-1.7).
+#
+# The deny policy itself lives in the root Cargo.toml and is NOT
+# repeated here: [workspace.lints.rust] warnings = "deny" and
+# [workspace.lints.clippy] all = "deny", inherited by every member
+# crate. A clippy warning anywhere in the workspace is a build
+# failure, locally and in CI.
+#
+# This file only pins the values clippy needs to judge code against
+# the workspace's declared floor:
+#
+# msrv matches rust-version in [workspace.package] of Cargo.toml, so
+# clippy does not suggest APIs newer than the oldest toolchain this
+# workspace promises to build with.
+msrv = "1.85"

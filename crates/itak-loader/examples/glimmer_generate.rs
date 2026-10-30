@@ -72,6 +72,12 @@ fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> Tokenizer
 /// The `k` highest logits as (id, logit, softmax probability over
 /// the whole vocabulary), best first. Probabilities are computed in
 /// f64 from the forward's finished (softcapped, scaled) logits.
+///
+/// Ordering is fully deterministic: descending logit, ties broken
+/// by ascending token id. The greedy pick (rank 0) is therefore the
+/// FIRST maximum, the same choice a plain first-max scan makes;
+/// with an unspecified tie order, two runs could in principle
+/// continue a sequence with different tokens on an exact tie.
 fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32, f64)> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let denom: f64 = logits
@@ -83,6 +89,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32, f64)> {
         logits[b as usize]
             .partial_cmp(&logits[a as usize])
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
     });
     idx.truncate(k);
     idx.iter()
@@ -213,4 +220,43 @@ fn run(path: &str, prompt: &str, n_tokens: usize, ids_only: bool) -> Result<(), 
         println!("peak_rss_kb={kb}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::top_k;
+
+    #[test]
+    fn top_k_orders_by_logit_and_computes_softmax() {
+        // Softmax over the full vocabulary, computed by hand:
+        // denom = e^-2 + 1 + e^-1 = 1.5032147..., so the top entry
+        // holds 1 / denom and the runner-up e^-1 / denom.
+        let top = top_k(&[1.0, 3.0, 2.0], 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, 1);
+        assert_eq!(top[0].1, 3.0);
+        assert!((top[0].2 - 0.665_241).abs() < 1e-5, "got {}", top[0].2);
+        assert_eq!(top[1].0, 2);
+        assert!((top[1].2 - 0.244_728).abs() < 1e-5, "got {}", top[1].2);
+    }
+
+    #[test]
+    fn top_k_tie_breaks_to_the_lowest_id() {
+        // Three tokens share the maximum logit. Temperature-0
+        // decoding must pick one deterministically: the lowest id,
+        // matching a first-max scan, so a run is reproducible.
+        let top = top_k(&[2.0, 2.0, 1.0, 2.0], 4);
+        let ids: Vec<u32> = top.iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids, vec![0, 1, 3, 2]);
+    }
+
+    #[test]
+    fn top_k_greedy_pick_is_the_argmax() {
+        let logits = [0.5f32, -1.0, 4.25, 4.0, 0.0];
+        let top = top_k(&logits, 5);
+        assert_eq!(top[0].0, 2);
+        // The full table's probabilities sum to 1.
+        let sum: f64 = top.iter().map(|(_, _, p)| p).sum();
+        assert!((sum - 1.0).abs() < 1e-12, "got {sum}");
+    }
 }

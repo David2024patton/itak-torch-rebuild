@@ -376,6 +376,161 @@ mod tests {
         assert_eq!(calls.borrow().as_slice(), expected.as_slice());
     }
 
+    /// A compute probe for the forward's TAIL: it records every step
+    /// (with the norm's tensor name, row count, and epsilon), passes
+    /// activations through untouched, and returns scripted logits
+    /// from `lm_head`. The config it runs under overrides the tiny
+    /// fixture's eps, softcap, and scale with distinctive values
+    /// (0.05, 3.0, 0.25), so the assertions below fail if the tail
+    /// reads any other tensor, normalizes any other row count, or
+    /// finishes with any other constants than the config's own.
+    struct TailProbe {
+        events: std::rc::Rc<RefCell<Vec<String>>>,
+        scripted: Vec<f32>,
+    }
+
+    impl Compute for TailProbe {
+        fn embed(
+            &self,
+            _table: &TensorView,
+            tokens: &[u32],
+            cfg: &GlimmerConfig,
+        ) -> Result<Vec<f32>> {
+            self.events.borrow_mut().push("embed".to_string());
+            Ok(vec![0.0; tokens.len() * cfg.hidden as usize])
+        }
+
+        fn rms_norm(
+            &self,
+            x: &[f32],
+            weight: &TensorView,
+            rows: usize,
+            eps: f32,
+        ) -> Result<Vec<f32>> {
+            self.events.borrow_mut().push(format!(
+                "rms_norm name={} rows={rows} eps={eps}",
+                weight.name
+            ));
+            Ok(x.to_vec())
+        }
+
+        fn proj(&self, x: &[f32], _weight: &TensorView, _rows: usize) -> Result<Vec<f32>> {
+            Ok(vec![0.0; x.len()])
+        }
+
+        fn attention(
+            &self,
+            req: &AttentionRequest<'_>,
+            _cache: &mut dyn Cache,
+        ) -> Result<Vec<f32>> {
+            Ok(vec![0.0; req.q.len()])
+        }
+
+        fn attn_gate(&self, attn_out: &[f32], _gate: &[f32]) -> Result<Vec<f32>> {
+            Ok(attn_out.to_vec())
+        }
+
+        fn add(&self, a: &[f32], _b: &[f32]) -> Result<Vec<f32>> {
+            Ok(a.to_vec())
+        }
+
+        fn swiglu_ffn(
+            &self,
+            x: &[f32],
+            _w: &crate::weights::LayerWeights,
+            _rows: usize,
+            _cfg: &GlimmerConfig,
+        ) -> Result<Vec<f32>> {
+            Ok(vec![0.0; x.len()])
+        }
+
+        fn lm_head(
+            &self,
+            _x: &[f32],
+            head: &TensorView,
+            _cfg: &GlimmerConfig,
+        ) -> Result<Vec<f32>> {
+            self.events
+                .borrow_mut()
+                .push(format!("lm_head name={}", head.name));
+            Ok(self.scripted.clone())
+        }
+    }
+
+    #[test]
+    fn tail_uses_output_norm_and_output_head_with_config_scalars() {
+        let mut meta = tiny_metadata();
+        meta.insert_f32(crate::config::KEY_RMS_EPS, 0.05);
+        meta.insert_f32(crate::config::KEY_LOGIT_SOFTCAP, 3.0);
+        meta.insert_f32(crate::config::KEY_LOGIT_SCALE, 0.25);
+        let cfg = GlimmerConfig::from_metadata(&meta).expect("tail config");
+        let names = crate::weights::expected_tensor_names(&cfg)
+            .into_iter()
+            .map(|n| (n, ()))
+            .collect();
+        let weights = Weights::load(&AnySource { names }, &cfg).expect("tail weights");
+
+        let mut scripted = vec![0.0f32; cfg.vocab_size as usize];
+        scripted[0] = 30.0;
+        scripted[1] = -30.0;
+        scripted[2] = 3.0;
+        scripted[3] = 1.5;
+        let events = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let probe = Box::new(TailProbe {
+            events: events.clone(),
+            scripted,
+        });
+        let model = GlimmerModel::new(cfg, weights, probe);
+        let mut cache = PositionCache::new();
+        let logits = model.forward(&[1], &mut cache).expect("tail forward");
+        assert_eq!(cache.position(), 1);
+
+        // Every norm in the pass ran at the config's epsilon, and the
+        // last two steps of the pass are the tail itself: the final
+        // norm over exactly one row (the last position) reading
+        // output_norm.weight, then the head reading output.weight.
+        let events = events.borrow();
+        assert!(
+            events
+                .iter()
+                .filter(|e| e.starts_with("rms_norm"))
+                .all(|e| e.ends_with("eps=0.05")),
+            "every norm must run at the config epsilon: {events:?}"
+        );
+        let n = events.len();
+        assert_eq!(
+            events[n - 2],
+            "rms_norm name=output_norm.weight rows=1 eps=0.05"
+        );
+        assert_eq!(events[n - 1], "lm_head name=output.weight");
+
+        // Finishing is scale * (cap * tanh(z / cap)) with the config's
+        // own cap 3.0 and scale 0.25, computed here in f64.
+        let finish = |z: f64| 0.25 * 3.0 * (z / 3.0).tanh();
+        for (i, z) in [(0usize, 30.0f64), (1, -30.0), (2, 3.0), (3, 1.5)] {
+            let want = finish(z);
+            assert!(
+                (f64::from(logits[i]) - want).abs() < 1e-6,
+                "logit {i}: got {}, want {want}",
+                logits[i]
+            );
+        }
+        // The other composition order (cap applied to the scaled
+        // logit) gives a materially different answer at z = 30; the
+        // forward's output must not be that number.
+        let other_order = 3.0 * (0.25f64 * 30.0 / 3.0).tanh();
+        assert!((f64::from(logits[0]) - other_order).abs() > 1.0);
+        // Greedy decoding reads the finished logits: the scripted
+        // maximum at index 0 must still be the argmax after the
+        // (strictly monotone) finishing map.
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+            .map(|(i, _)| i);
+        assert_eq!(argmax, Some(0));
+    }
+
     #[test]
     fn softcap_scale_matches_the_formula() {
         let mut logits = vec![0.0, 20.0, -20.0, 1000.0];

@@ -508,6 +508,150 @@ fn attention_mixing_matches_a_naive_reference() {
     }
 }
 
+/// Test-local weighted RMSNorm in f64: `v[i] / sqrt(mean(v^2) + eps)
+/// * w[i]`, computed from the f32 fixture values. Shares no code
+/// with the backend or with `torch-math`.
+fn rms_w64(v: &[f32], w: &[f32], eps: f64) -> Vec<f64> {
+    let ms = v
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        / v.len() as f64;
+    let inv = 1.0 / (ms + eps).sqrt();
+    v.iter()
+        .zip(w.iter())
+        .map(|(x, wi)| f64::from(*x) * inv * f64::from(*wi))
+        .collect()
+}
+
+#[test]
+fn tail_discriminates_tensors_eps_and_softcap_order() {
+    // The tail audit test (lane 05). The fixtures above all use
+    // weight-1 norms, eps 1e-6, and small logits, which cannot catch
+    // a cross-wired tail: any norm tensor would do, any eps would
+    // do, and the softcap runs in its linear region where even its
+    // composition order with the scale is invisible. This fixture
+    // removes every one of those hiding places:
+    //
+    // - three DIFFERENT norm weight vectors (post-attention,
+    //   post-FFN, output), the output one with mixed signs, so
+    //   reading any other tensor at the final norm changes the
+    //   numbers;
+    // - eps 0.5, far from the usual 1e-6, so a hardcoded epsilon
+    //   anywhere in the chain fails by percent, not by ulps;
+    // - one head row scaled to drive its raw logit to 30, far above
+    //   the cap of 2.0, so the softcap saturates and the order of
+    //   scale vs cap is decided by a gap of 1.5, not by tolerance;
+    // - the embedding table and the head are different matrices by
+    //   construction, so a tied-head substitution fails too.
+    //
+    // Attention and FFN outputs are zeroed (Analytic style), so the
+    // expected logits are a closed form in the test's own f64 math.
+    let cfg = GlimmerConfig {
+        name: Some("tail audit model".to_string()),
+        block_count: 1,
+        context_length: 128,
+        hidden: HIDDEN as u32,
+        ffn_hidden: FFN as u32,
+        q_heads: 4,
+        kv_heads: 2,
+        key_length: HEAD_DIM as u32,
+        value_length: HEAD_DIM as u32,
+        rope_freq_base: 10_000.0,
+        rms_eps: 0.5,
+        sliding_window: 16,
+        logit_softcap: 2.0,
+        logit_scale: 0.25,
+        vocab_size: VOCAB as u32,
+        layers: vec![LayerKind::SlidingWindow],
+        pattern_source: PatternSource::MeasuredFallback,
+    };
+    let mut source = build_source(&cfg, Style::Analytic);
+
+    let pa: Vec<f32> = (0..HIDDEN).map(|i| 1.0 + 0.11 * i as f32).collect();
+    let pf: Vec<f32> = (0..HIDDEN).map(|i| 0.5 + 0.07 * i as f32).collect();
+    let on: Vec<f32> = (0..HIDDEN)
+        .map(|i| ((i * 37) % 13) as f32 * 0.3 - 1.2)
+        .collect();
+    let replace = |source: &mut MapSource, name: &str, shape: &[u64], values: Vec<f32>| {
+        source.tensors.insert(
+            name.to_string(),
+            f32_tensor(name, shape, values),
+        );
+    };
+    replace(&mut source, "blk.0.post_attention_norm.weight", &[HIDDEN as u64], pa.clone());
+    replace(&mut source, "blk.0.post_ffw_norm.weight", &[HIDDEN as u64], pf.clone());
+    replace(&mut source, "output_norm.weight", &[HIDDEN as u64], on.clone());
+
+    // Reference final state for token 3, in the test's own math:
+    // embedding row, then the layer's two post norms, then the
+    // final norm, each with its own weights and the config eps.
+    let emb_row: Vec<f32> = (0..HIDDEN).map(|i| emb_pattern_a(3, i)).collect();
+    let x1 = rms_w64(&emb_row, &pa, 0.5);
+    let x1f: Vec<f32> = x1.iter().map(|v| *v as f32).collect();
+    let x2 = rms_w64(&x1f, &pf, 0.5);
+    let x2f: Vec<f32> = x2.iter().map(|v| *v as f32).collect();
+    let n = rms_w64(&x2f, &on, 0.5);
+
+    // Head: row j is a scaled selector of channel j mod hidden,
+    // except row 37, which is aimed at the strongest channel of n
+    // with a weight that makes its raw logit exactly 30.
+    let (c_star, n_max) = n
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite reference"))
+        .expect("nonempty reference");
+    assert!(
+        *n_max > 0.5,
+        "fixture sanity: strongest normed channel is {n_max}, too weak to aim the saturating row"
+    );
+    let mut head = vec![0.0f32; HIDDEN * VOCAB];
+    for j in 0..VOCAB {
+        let s = 0.5 + 0.25 * (j % 5) as f32;
+        head[j * HIDDEN + (j % HIDDEN)] = s;
+    }
+    for v in head[37 * HIDDEN..38 * HIDDEN].iter_mut() {
+        *v = 0.0;
+    }
+    head[37 * HIDDEN + c_star] = (30.0 / n_max) as f32;
+    replace(&mut source, "output.weight", &[HIDDEN as u64, VOCAB as u64], head.clone());
+
+    let weights = Weights::load(&source, &cfg).expect("tail weights load");
+    let model = GlimmerModel::new(cfg, weights, Box::new(CpuCompute::new()));
+    let mut cache = PositionCache::new();
+    let logits = model.forward(&[3], &mut cache).expect("tail forward");
+    assert_eq!(logits.len(), VOCAB);
+
+    // Expected finished logits, from the fixture's own numbers.
+    for (j, got) in logits.iter().enumerate() {
+        let raw: f64 = head[j * HIDDEN..(j + 1) * HIDDEN]
+            .iter()
+            .zip(n.iter())
+            .map(|(h, nv)| f64::from(*h) * nv)
+            .sum();
+        let want = 0.25 * 2.0 * (raw / 2.0).tanh();
+        assert!(
+            (f64::from(*got) - want).abs() < 1e-4,
+            "logit {j}: got {got}, want {want} (raw {raw})"
+        );
+    }
+
+    // Temperature-0 behavior: the greedy pick over the finished
+    // logits is the saturating row, 37, by construction.
+    let argmax = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite logits"))
+        .map(|(i, _)| i);
+    assert_eq!(argmax, Some(37));
+    // Its finished value sits at the scale-times-cap bound (0.5),
+    // nowhere near the 2.0 the opposite composition order
+    // (cap * tanh(scale * z / cap)) would give at raw 30.
+    let other_order = 2.0 * (0.25f64 * 30.0 / 2.0).tanh();
+    assert!((f64::from(logits[37]) - 0.5 * (15.0f64).tanh()).abs() < 1e-5);
+    assert!((f64::from(logits[37]) - other_order).abs() > 1.0);
+}
+
 #[test]
 fn forward_is_deterministic() {
     let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 16);

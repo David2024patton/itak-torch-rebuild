@@ -325,6 +325,62 @@ mod tests {
     }
 
     #[test]
+    fn global_tensors_bind_by_name_and_content() {
+        // Each expected name serves DISTINCT bytes (its index in the
+        // expected-names list, as an f32). The three global fields
+        // must carry the bytes of their own names: if load ever
+        // cross-wired two of them (the final norm reading the head's
+        // bytes, say), the forward would still run and produce wrong
+        // numbers with no error anywhere. This test makes that swap
+        // fail here instead.
+        struct IndexedSource {
+            values: HashMap<String, f32>,
+        }
+        impl TensorSource for IndexedSource {
+            fn tensor(&self, name: &str) -> Result<TensorView> {
+                match self.values.get(name) {
+                    Some(v) => Ok(TensorView {
+                        name: name.to_string(),
+                        dtype: Dtype::F32,
+                        shape: vec![1],
+                        data: Arc::from(v.to_le_bytes().as_slice()),
+                    }),
+                    None => Err(GlimmerError::MissingTensor {
+                        name: name.to_string(),
+                    }),
+                }
+            }
+        }
+        let cfg = tiny_cfg();
+        let values: HashMap<String, f32> = expected_tensor_names(&cfg)
+            .into_iter()
+            .enumerate()
+            .map(|(i, n)| (n, i as f32))
+            .collect();
+        let source = IndexedSource { values };
+        let weights = Weights::load(&source, &cfg).expect("indexed source loads");
+        let served = |view: &TensorView| {
+            f32::from_le_bytes(view.data.iter().copied().collect::<Vec<u8>>()[..4].try_into().unwrap())
+        };
+        let expect = |name: &str| source.values[name];
+        assert_eq!(weights.embedding.name, "token_embd.weight");
+        assert_eq!(served(&weights.embedding), expect("token_embd.weight"));
+        assert_eq!(weights.final_norm.name, "output_norm.weight");
+        assert_eq!(served(&weights.final_norm), expect("output_norm.weight"));
+        assert_eq!(weights.output.name, "output.weight");
+        assert_eq!(served(&weights.output), expect("output.weight"));
+        assert_eq!(weights.layers[0].attn_norm.name, "blk.0.attn_norm.weight");
+        assert_eq!(
+            served(&weights.layers[0].attn_norm),
+            expect("blk.0.attn_norm.weight")
+        );
+        assert_eq!(
+            weights.layers[1].post_ffw_norm.name,
+            "blk.1.post_ffw_norm.weight"
+        );
+    }
+
+    #[test]
     fn dtype_ids_match_mainline_ggml() {
         assert_eq!(Dtype::from_ggml_id(0), Dtype::F32);
         assert_eq!(Dtype::from_ggml_id(12), Dtype::Q4K);

@@ -94,7 +94,7 @@ eps 0.5, cap 2.0, scale 0.25, and one head row aimed at the
 strongest normed channel with weight 30 / n, driving its raw logit
 to exactly 30, deep in saturation. All 128 finished logits match
 the hand computation to 1e-4, the saturating logit lands on
-scale * cap * tanh(15) (within 1e-5 of 0.5, and more than 1.0 from
+`scale * cap * tanh(15)` (within 1e-5 of 0.5, and more than 1.0 from
 the 2.0 the opposite composition order predicts), and the greedy
 argmax over the finished logits is the aimed token, 37.
 

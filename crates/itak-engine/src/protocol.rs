@@ -12,6 +12,14 @@
 //!   frame on every connection.
 //! - `{"op":"ping"}`: health probe.
 //! - `{"op":"debug"}`: self-report request.
+//! - `{"op":"chat_template"}`: ask for the model's own chat
+//!   template. The reply is a `chat_template` frame carrying the
+//!   template text from the GGUF metadata plus the `bos_token` and
+//!   `eos_token` texts the template's variables refer to; a model
+//!   whose file carries no template gets an `error` frame with
+//!   code `no_chat_template` (TODO T-9.16). The platform renders
+//!   the template; the engine only serves it, so the prompt the
+//!   model sees is built from the file's own format string.
 //! - `{"op":"embed","model":"...","input":["...","..."]}`: embed
 //!   one or more texts. The reply is one `embeddings` frame (below)
 //!   or an `error` frame. The vectors are mean-pooled token
@@ -181,6 +189,17 @@ pub fn embeddings_frame(model: &str, vectors: &[Vec<f32>]) -> Value {
                     .collect(),
             ),
         ),
+    ])
+}
+
+/// The chat template reply: the template text and the special
+/// token texts its variables refer to.
+pub fn chat_template_frame(template: &str, bos_token: &str, eos_token: &str) -> Value {
+    obj(vec![
+        ("op", Value::Str("chat_template".into())),
+        ("template", Value::Str(template.into())),
+        ("bos_token", Value::Str(bos_token.into())),
+        ("eos_token", Value::Str(eos_token.into())),
     ])
 }
 

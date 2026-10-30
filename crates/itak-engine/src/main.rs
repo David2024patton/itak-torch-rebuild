@@ -335,6 +335,22 @@ fn handle_conn(
                     return;
                 }
             }
+            "chat_template" => {
+                let reply = match &info.chat_template {
+                    Some(template) => protocol::chat_template_frame(
+                        template,
+                        &info.bos_token,
+                        &info.eos_token,
+                    ),
+                    None => protocol::error_frame(
+                        "no_chat_template",
+                        "the model file carries no tokenizer.chat_template",
+                    ),
+                };
+                if !send(&mut writer, &reply) {
+                    return;
+                }
+            }
             other => {
                 let msg = format!("unknown op {other:?}");
                 if !send(&mut writer, &protocol::error_frame("unknown_op", &msg)) {
@@ -536,6 +552,7 @@ fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64, lim
         ),
         ("coverage_found", Value::Num(info.coverage_found as f64)),
         ("busy", Value::Bool(st.active > 0)),
+        ("has_chat_template", Value::Bool(info.chat_template.is_some())),
         ("slots", Value::Num(limits.slots as f64)),
         ("active", Value::Num(st.active as f64)),
         ("queued", Value::Num(st.queued as f64)),
@@ -583,6 +600,9 @@ mod tests {
             context_length: 128,
             coverage_expected: 1,
             coverage_found: 1,
+            chat_template: None,
+            bos_token: String::new(),
+            eos_token: String::new(),
         })
     }
 

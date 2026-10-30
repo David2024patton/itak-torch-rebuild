@@ -63,6 +63,15 @@ pub struct ModelInfo {
     pub coverage_expected: usize,
     /// Coverage gate result: tensors found and verified.
     pub coverage_found: usize,
+    /// The model's own chat template from the GGUF metadata
+    /// (`tokenizer.chat_template`); None when the file carries
+    /// none, which the chat_template op refuses by name.
+    pub chat_template: Option<String>,
+    /// The BOS token's text ("" when the tokenizer has no BOS), for
+    /// the template's `bos_token` variable.
+    pub bos_token: String,
+    /// The EOS token's text ("" when the tokenizer has no EOS).
+    pub eos_token: String,
 }
 
 /// Live counters for the debug self-report.
@@ -245,6 +254,26 @@ pub fn load(config: &EngineConfig) -> Result<(Arc<ModelInfo>, Loaded), String> {
         .or_else(|| cfg.name.clone())
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "model".to_string());
+    let chat_template = file
+        .metadata()
+        .opt_string("tokenizer.chat_template")
+        .map_err(|e| format!("chat template key: {e}"))?
+        .map(str::to_string);
+    // The template's special-token variables, as text. A special
+    // token that does not decode is reported as empty rather than
+    // failing the load: the template op can still serve the
+    // template, and a template that needs the text will render
+    // visibly wrong instead of silently half-loading the model.
+    let token_text = |id: Option<u32>| -> String {
+        match id {
+            Some(id) => tokenizer
+                .decode_bytes(&[id])
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .unwrap_or_default(),
+            None => String::new(),
+        }
+    };
     let info = ModelInfo {
         name,
         path: path.display().to_string(),
@@ -255,6 +284,9 @@ pub fn load(config: &EngineConfig) -> Result<(Arc<ModelInfo>, Loaded), String> {
         context_length: cfg.context_length,
         coverage_expected,
         coverage_found,
+        chat_template,
+        bos_token: token_text(tokenizer.bos_id()),
+        eos_token: token_text(tokenizer.eos_id()),
     };
     Ok((
         Arc::new(info),

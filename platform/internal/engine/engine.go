@@ -45,6 +45,11 @@ var (
 	// queue is full (TODO T-9.14). The refusal is explicit and the
 	// caller may retry; nothing was queued silently.
 	ErrEngineBusy = errors.New("engine: busy")
+	// ErrNoChatTemplate means the model file carries no chat
+	// template (TODO T-9.16). The platform falls back to role
+	// flattening only with this named outcome in hand, never by
+	// silently assuming a format.
+	ErrNoChatTemplate = errors.New("engine: no chat template")
 )
 
 // GenerateRequest is one completion job handed to the engine. The
@@ -106,6 +111,16 @@ type EmbedResponse struct {
 type HealthStatus struct {
 	OK     bool   `json:"ok"`
 	Detail string `json:"detail"`
+}
+
+// ChatTemplate is the model's own chat template as the engine
+// serves it: the template text from the GGUF metadata and the
+// special-token texts its variables (bos_token, eos_token) refer
+// to. The platform renders it; the engine only reports it.
+type ChatTemplate struct {
+	Template string `json:"template"`
+	BOSToken string `json:"bos_token"`
+	EOSToken string `json:"eos_token"`
 }
 
 // Client is the platform's only view of the token engine.

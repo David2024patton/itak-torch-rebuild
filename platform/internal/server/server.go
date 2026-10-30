@@ -27,10 +27,12 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/auth"
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/cache"
+	"github.com/David2024patton/itak-torch-rebuild/platform/internal/chattemplate"
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/diag"
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/engine"
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/scheduler"
@@ -52,6 +54,17 @@ type Config struct {
 	CacheTTL time.Duration
 	// MaxConcurrent bounds simultaneous engine jobs; < 1 becomes 4.
 	MaxConcurrent int
+	// ChatTemplate, when set, is the chat template every chat
+	// request is rendered with (TODO T-9.16), overriding the
+	// engine-reported one. ChatBOSToken and ChatEOSToken supply its
+	// special-token variables. When unset, the template comes from
+	// the engine (the model's own GGUF template); a model with no
+	// template falls back to role flattening, visibly, in /debug.
+	ChatTemplate string
+	// ChatBOSToken is the bos_token value for a configured template.
+	ChatBOSToken string
+	// ChatEOSToken is the eos_token value for a configured template.
+	ChatEOSToken string
 	// Logger receives handler diagnostics; nil uses slog.Default().
 	Logger *slog.Logger
 }
@@ -65,6 +78,15 @@ type Server struct {
 	cache *cache.Cache[[]byte]
 	sched *scheduler.Scheduler
 	mux   http.Handler
+
+	// Chat template resolution (TODO T-9.16): resolved lazily and
+	// cached once the outcome is definitive (a template, or the
+	// engine's named no-template answer). Transient fetch errors
+	// are retried on the next request rather than cached.
+	tplMu     sync.Mutex
+	tpl       *engine.ChatTemplate
+	tplSource string // "", "config", "engine", "none"
+	tplDone   bool
 }
 
 // New builds the route table and modules.
@@ -273,9 +295,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.invalidRequest(w, msg.text, msg.param)
 		return
 	}
+	prompt, err := s.buildPrompt(r.Context(), req.Messages)
+	if err != nil {
+		// The model's own template could not be rendered. That is
+		// a named platform failure, never a silent fallback to
+		// flattening: the caller learns the prompt would be wrong.
+		s.log.Error("chat template render failed", "err", err)
+		s.writeError(w, http.StatusBadGateway, "chat_template_error", err.Error(), "")
+		return
+	}
 	greq := engine.GenerateRequest{
 		Model:            req.Model,
-		Prompt:           flattenMessages(req.Messages),
+		Prompt:           prompt,
 		MaxTokens:        req.MaxTokens,
 		Stop:             req.Stop,
 		Seed:             req.Seed,
@@ -478,6 +509,90 @@ func validateChat(req *chatRequest) *fieldError {
 	return nil
 }
 
+// chatTemplater is the optional engine-client capability the
+// template resolution probes for (the socket client and the
+// supervisor both offer it).
+type chatTemplater interface {
+	ChatTemplate(context.Context) (engine.ChatTemplate, error)
+}
+
+// resolveTemplate returns the chat template to render with, or nil
+// when the model has none (the flattening fallback). The outcome is
+// cached once definitive: a configured template wins outright; the
+// engine's own template is fetched once; the engine's named
+// ErrNoChatTemplate settles it as none. Any other fetch error is
+// logged and NOT cached, so a later request retries.
+func (s *Server) resolveTemplate(ctx context.Context) *engine.ChatTemplate {
+	s.tplMu.Lock()
+	defer s.tplMu.Unlock()
+	if s.tplDone {
+		return s.tpl
+	}
+	if s.cfg.ChatTemplate != "" {
+		s.tpl = &engine.ChatTemplate{
+			Template: s.cfg.ChatTemplate,
+			BOSToken: s.cfg.ChatBOSToken,
+			EOSToken: s.cfg.ChatEOSToken,
+		}
+		s.tplSource, s.tplDone = "config", true
+		return s.tpl
+	}
+	ct, ok := s.eng.(chatTemplater)
+	if !ok {
+		s.tplSource, s.tplDone = "none", true
+		return nil
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	tpl, err := ct.ChatTemplate(fetchCtx)
+	switch {
+	case err == nil:
+		s.tpl = &tpl
+		s.tplSource, s.tplDone = "engine", true
+		return s.tpl
+	case errors.Is(err, engine.ErrNoChatTemplate):
+		s.tplSource, s.tplDone = "none", true
+		return nil
+	default:
+		s.log.Warn("chat template fetch failed; will retry on the next request", "err", err)
+		return nil
+	}
+}
+
+// templateSource reports how the prompt is being built, for /debug:
+// "config", "engine", "none (role flattening)", or "unresolved".
+func (s *Server) templateSource() string {
+	s.tplMu.Lock()
+	defer s.tplMu.Unlock()
+	if s.tplSource == "none" {
+		return "none (role flattening)"
+	}
+	if s.tplSource == "" {
+		return "unresolved"
+	}
+	return s.tplSource
+}
+
+// buildPrompt produces the engine prompt for one chat request: the
+// model's own chat template rendered over the messages when the
+// model carries one (TODO T-9.16), role flattening when it carries
+// none. A render failure is an error, not a fallback.
+func (s *Server) buildPrompt(ctx context.Context, msgs []chatMessage) (string, error) {
+	tpl := s.resolveTemplate(ctx)
+	if tpl == nil {
+		return flattenMessages(msgs), nil
+	}
+	converted := make([]chattemplate.Message, len(msgs))
+	for i, m := range msgs {
+		converted[i] = chattemplate.Message{Role: m.Role, Content: m.Content}
+	}
+	return chattemplate.Render(tpl.Template, converted, chattemplate.Params{
+		BOSToken:            tpl.BOSToken,
+		EOSToken:            tpl.EOSToken,
+		AddGenerationPrompt: true,
+	})
+}
+
 func flattenMessages(msgs []chatMessage) string {
 	var sb strings.Builder
 	for _, m := range msgs {
@@ -579,11 +694,12 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 		h = engine.HealthStatus{OK: false, Detail: herr.Error()}
 	}
 	out := map[string]any{
-		"diag":      s.diag.Snapshot(),
-		"scheduler": s.sched.Stats(),
-		"cache":     s.cache.Stats(),
-		"engine":    map[string]any{"ok": h.OK, "detail": h.Detail},
-		"models":    s.cfg.Models,
+		"diag":          s.diag.Snapshot(),
+		"scheduler":     s.sched.Stats(),
+		"cache":         s.cache.Stats(),
+		"engine":        map[string]any{"ok": h.OK, "detail": h.Detail},
+		"models":        s.cfg.Models,
+		"chat_template": s.templateSource(),
 	}
 	// When the wired engine client can report on itself (the socket
 	// client can), its self-report rides along: loaded model,

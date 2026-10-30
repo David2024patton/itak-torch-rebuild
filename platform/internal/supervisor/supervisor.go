@@ -398,6 +398,16 @@ func (s *Supervisor) Embed(ctx context.Context, req engine.EmbedRequest) (engine
 	return c.Embed(ctx, req)
 }
 
+// ChatTemplate delegates to the live engine client, so the
+// platform's template probe works the same supervised or not.
+func (s *Supervisor) ChatTemplate(ctx context.Context) (engine.ChatTemplate, error) {
+	c := s.current()
+	if c == nil {
+		return engine.ChatTemplate{}, fmt.Errorf("%w: engine down (supervisor state: %+v)", engine.ErrUnavailable, s.State())
+	}
+	return c.ChatTemplate(ctx)
+}
+
 // Health reports the engine's health through the supervisor's own
 // state when no client is live, so /healthz can say why it is down.
 func (s *Supervisor) Health(ctx context.Context) (engine.HealthStatus, error) {

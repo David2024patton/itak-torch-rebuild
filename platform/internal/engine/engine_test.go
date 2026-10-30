@@ -90,6 +90,13 @@ func serveConn(conn net.Conn, ackProto int, ackOp string) {
 			if !write(map[string]any{"op": "debug_info", "model": "fake-1b", "generations": 3}) {
 				return
 			}
+		case "chat_template":
+			if !write(map[string]any{
+				"op": "chat_template", "template": "{% for message in messages %}X{% endfor %}",
+				"bos_token": "<s>", "eos_token": "</s>",
+			}) {
+				return
+			}
 		case "generate":
 			if !serveGenerate(write, f.Prompt) {
 				return
@@ -397,6 +404,78 @@ func TestUnixGenerateSamplingFieldsCrossTheWire(t *testing.T) {
 		if _, present := frame[key]; present {
 			t.Fatalf("unset %s leaked onto the wire: %v", key, frame)
 		}
+	}
+}
+
+func TestUnixChatTemplate(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	tpl, err := c.ChatTemplate(context.Background())
+	if err != nil {
+		t.Fatalf("ChatTemplate: %v", err)
+	}
+	if tpl.BOSToken != "<s>" || tpl.EOSToken != "</s>" || !strings.Contains(tpl.Template, "for message in messages") {
+		t.Fatalf("template = %+v, want the fake's template and special tokens", tpl)
+	}
+}
+
+// noTemplateEngine serves hello and answers the chat_template op
+// the way an engine whose model file carries no template does.
+func noTemplateEngine(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "engine.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				r := bufio.NewReader(conn)
+				for {
+					line, err := r.ReadBytes('\n')
+					if err != nil {
+						return
+					}
+					var f struct {
+						Op string `json:"op"`
+					}
+					if json.Unmarshal(line, &f) != nil {
+						return
+					}
+					var reply map[string]any
+					switch f.Op {
+					case "hello":
+						reply = map[string]any{"op": "hello_ack", "proto": 1}
+					case "chat_template":
+						reply = map[string]any{
+							"op": "error", "code": "no_chat_template",
+							"message": "the model file carries no tokenizer.chat_template",
+						}
+					default:
+						reply = map[string]any{"op": "pong"}
+					}
+					out, _ := json.Marshal(reply)
+					if _, err := conn.Write(append(out, '\n')); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return path
+}
+
+func TestUnixChatTemplateAbsentIsNamed(t *testing.T) {
+	c := dial(t, noTemplateEngine(t))
+	_, err := c.ChatTemplate(context.Background())
+	if !errors.Is(err, engine.ErrNoChatTemplate) {
+		t.Fatalf("ChatTemplate err = %v, want ErrNoChatTemplate", err)
 	}
 }
 

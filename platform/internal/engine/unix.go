@@ -409,6 +409,41 @@ func (c *UnixClient) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse
 	}
 }
 
+// chatTemplateFrame is the chat_template request/reply shape.
+type chatTemplateFrame struct {
+	Op       string `json:"op"`
+	Template string `json:"template,omitempty"`
+	BOSToken string `json:"bos_token,omitempty"`
+	EOSToken string `json:"eos_token,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Message  string `json:"message,omitempty"`
+}
+
+// ChatTemplate fetches the model's own chat template from the
+// engine (TODO T-9.16). A model whose file carries none answers
+// ErrNoChatTemplate, by name.
+func (c *UnixClient) ChatTemplate(ctx context.Context) (ChatTemplate, error) {
+	raw, err := c.exchangeAnyLocked(ctx, chatTemplateFrame{Op: "chat_template"})
+	if err != nil {
+		return ChatTemplate{}, err
+	}
+	var reply chatTemplateFrame
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return ChatTemplate{}, fmt.Errorf("%w: chat template reply is not JSON: %w", ErrHandshake, err)
+	}
+	switch reply.Op {
+	case "chat_template":
+		return ChatTemplate{Template: reply.Template, BOSToken: reply.BOSToken, EOSToken: reply.EOSToken}, nil
+	case "error":
+		if reply.Code == "no_chat_template" {
+			return ChatTemplate{}, fmt.Errorf("%w: %s", ErrNoChatTemplate, reply.Message)
+		}
+		return ChatTemplate{}, mapEngineError(genFrame{Code: reply.Code, Message: reply.Message})
+	default:
+		return ChatTemplate{}, fmt.Errorf("%w: got op %q, want %q", ErrHandshake, reply.Op, "chat_template")
+	}
+}
+
 // Close shuts the control connection down. Later calls refuse with
 // ErrClosed; generations already streaming on their own connections
 // are governed by their request contexts.

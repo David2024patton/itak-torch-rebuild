@@ -247,6 +247,117 @@ func TestChatSamplingFieldsReachTheEngine(t *testing.T) {
 	}
 }
 
+const chatMLTemplate = `{% for message in messages %}<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant
+{% endif %}`
+
+func newServerWithConfig(t *testing.T, eng engine.Client, mutate func(*server.Config)) *httptest.Server {
+	t.Helper()
+	cfg := server.Config{
+		Engine:   eng,
+		APIKey:   testKey,
+		Models:   []string{"glimmer"},
+		CacheTTL: time.Minute,
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	srv := server.New(cfg)
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(func() {
+		ts.Close()
+		srv.Close()
+	})
+	return ts
+}
+
+func lastPrompt(t *testing.T, fake *fakeEngine) string {
+	t.Helper()
+	got, ok := fake.lastRequest.Load().(engine.GenerateRequest)
+	if !ok {
+		t.Fatal("engine saw no generate request")
+	}
+	return got.Prompt
+}
+
+func TestChatUsesConfiguredTemplate(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, fake, func(c *server.Config) {
+		c.ChatTemplate = chatMLTemplate
+	})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("chat status = %d (%s)", code, body)
+	}
+	want := "<|im_start|>user\nSay hello<|im_end|>\n<|im_start|>assistant\n"
+	if got := lastPrompt(t, fake); got != want {
+		t.Fatalf("engine prompt = %q, want the templated %q", got, want)
+	}
+}
+
+// templatedEngine is a fake engine that also serves a chat template
+// through the optional client capability.
+type templatedEngine struct{ *fakeEngine }
+
+func (templatedEngine) ChatTemplate(context.Context) (engine.ChatTemplate, error) {
+	return engine.ChatTemplate{Template: chatMLTemplate}, nil
+}
+
+func TestChatUsesEngineTemplate(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, templatedEngine{fake}, nil)
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("chat status = %d (%s)", code, body)
+	}
+	want := "<|im_start|>user\nSay hello<|im_end|>\n<|im_start|>assistant\n"
+	if got := lastPrompt(t, fake); got != want {
+		t.Fatalf("engine prompt = %q, want the engine-templated %q", got, want)
+	}
+
+	// /debug reports where the template came from.
+	_, _, dbg := do(t, ts, http.MethodGet, "/debug", "", testKey)
+	if !strings.Contains(string(dbg), `"chat_template":"engine"`) {
+		t.Fatalf("debug missing chat_template source: %s", dbg)
+	}
+}
+
+// noTemplateEngine answers the template probe with the named
+// no-template outcome.
+type noTemplateEngine struct{ *fakeEngine }
+
+func (noTemplateEngine) ChatTemplate(context.Context) (engine.ChatTemplate, error) {
+	return engine.ChatTemplate{}, engine.ErrNoChatTemplate
+}
+
+func TestChatWithoutTemplateFallsBackToFlattening(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, noTemplateEngine{fake}, nil)
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("chat status = %d (%s)", code, body)
+	}
+	if got, want := lastPrompt(t, fake), "user: Say hello\nassistant:"; got != want {
+		t.Fatalf("engine prompt = %q, want the flattened %q", got, want)
+	}
+	_, _, dbg := do(t, ts, http.MethodGet, "/debug", "", testKey)
+	if !strings.Contains(string(dbg), `"chat_template":"none (role flattening)"`) {
+		t.Fatalf("debug missing the flattening note: %s", dbg)
+	}
+}
+
+func TestChatTemplateRenderFailureIsNamed(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, fake, func(c *server.Config) {
+		c.ChatTemplate = `{% set x = 1 %}hi`
+	})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusBadGateway || errorCode(t, body) != "chat_template_error" {
+		t.Fatalf("status = %d, body = %s; want 502 chat_template_error", code, body)
+	}
+}
+
 func TestChatValidation(t *testing.T) {
 	ts := newServer(t, &fakeEngine{})
 	cases := map[string]string{

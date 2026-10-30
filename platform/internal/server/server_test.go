@@ -350,7 +350,10 @@ func TestChatWithoutTemplateFallsBackToFlattening(t *testing.T) {
 func TestChatTemplateRenderFailureIsNamed(t *testing.T) {
 	fake := &fakeEngine{}
 	ts := newServerWithConfig(t, fake, func(c *server.Config) {
-		c.ChatTemplate = `{% set x = 1 %}hi`
+		// The length filter is outside the rendered subset, so
+		// this template cannot render and the failure must be
+		// the named chat_template_error, never a fallback.
+		c.ChatTemplate = `{% for message in messages %}{{ message['content'] | length }}{% endfor %}`
 	})
 	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
 	if code != http.StatusBadGateway || errorCode(t, body) != "chat_template_error" {

@@ -5,29 +5,44 @@
 // bounded subset the shipped templates actually use, and refuses
 // everything else by name instead of rendering it wrong:
 //
-//   - literal text and {{ }} print expressions: string literals,
-//     bos_token, eos_token, message['role'] / message['content']
-//     (or message.role / message.content), concatenation with +,
-//     and the | trim filter;
-//   - {% for message in messages %} ... {% endfor %};
-//   - {% if %} / {% elif %} / {% else %} / {% endif %} with == and
-//     != comparisons, bare truthiness, and `not`;
-//   - {% if add_generation_prompt %} and printing it is an error
-//     (it is a boolean flag, not text);
-//   - whitespace control ({{- -}} and {%- -%}) on both tag kinds.
+//   - literal text, {# comments #}, and {{ }} print expressions:
+//     string and number literals, list literals, names, attribute
+//     and subscript access (message['role'], message.role,
+//     loop.last), concatenation and numeric addition with +,
+//     comparisons (==, !=, in, not in), boolean logic (and, or,
+//     not) with Jinja's value-returning short-circuit, the postfix
+//     tests (is defined / none / string / boolean / mapping /
+//     iterable), inline conditionals (a if cond else b), method
+//     calls dict.get / str.split / dict.items, macro calls, the
+//     namespace() builtin, and the filters trim, lower, replace
+//     and join;
+//   - {% for x in expr %} ... {% endfor %} over lists, with the
+//     loop variable bound per iteration and loop.index / index0 /
+//     first / last / length available; tuple targets (for k, v in
+//     expr) bind pair items;
+//   - {% if %} / {% elif %} / {% else %} / {% endif %};
+//   - {% set name = expr %} and {% set ns.attr = expr %}, the
+//     namespace-mutation idiom templates use for cross-iteration
+//     state;
+//   - {% macro name(args) %} ... {% endmacro %}, registered when
+//     the definition renders and callable from print expressions;
+//   - whitespace control ({{- -}}, {%- -%}, {#- -#}) on all tags.
 //
-// Anything outside the subset (other statements like {% set %},
-// other filters, function calls such as raise_exception when the
-// branch containing it actually renders, loop.* variables) fails
-// with ErrUnsupported naming the construct. A chat request whose
-// template cannot be rendered is a named platform error, never a
-// silently flattened prompt: falling back is a decision the caller
-// makes with the error in hand, not something this package hides.
+// Anything outside the subset (other statements, other filters
+// such as length or tojson, unknown method calls, printing an
+// undefined name or a boolean) fails with ErrUnsupported naming
+// the construct, and a call like raise_exception('...') refuses
+// by name when the branch containing it actually renders. A chat
+// request whose template cannot be rendered is a named platform
+// error, never a silently flattened prompt: falling back is a
+// decision the caller makes with the error in hand, not something
+// this package hides.
 package chattemplate
 
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -60,7 +75,19 @@ func Render(template string, messages []Message, p Params) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	env := &env{params: p, messages: messages}
+	global := &scope{vars: map[string]value{}}
+	global.vars["bos_token"] = strValue(p.BOSToken)
+	global.vars["eos_token"] = strValue(p.EOSToken)
+	global.vars["add_generation_prompt"] = boolValue(p.AddGenerationPrompt)
+	msgVals := make([]value, len(messages))
+	for i, m := range messages {
+		msgVals[i] = dictValue(map[string]value{
+			"role":    strValue(m.Role),
+			"content": strValue(m.Content),
+		})
+	}
+	global.vars["messages"] = listValue(msgVals)
+	env := &env{global: global, cur: global, macros: map[string]*macroNode{}}
 	var sb strings.Builder
 	if err := renderNodes(nodes, env, &sb); err != nil {
 		return "", err
@@ -88,15 +115,20 @@ func tokenize(tmpl string) ([]token, error) {
 	rest := tmpl
 	trimNextLeft := false
 	for len(rest) > 0 {
-		iPrint := strings.Index(rest, "{{")
-		iStmt := strings.Index(rest, "{%")
-		i := -1
-		kind := tokText
-		if iPrint >= 0 && (iStmt < 0 || iPrint < iStmt) {
-			i, kind = iPrint, tokPrint
-		} else if iStmt >= 0 {
-			i, kind = iStmt, tokStmt
+		// The earliest of {{, {% and {# opens the next tag; a
+		// comment's body is never lexed, so tag lookalikes inside
+		// {# ... #} (the Glimmer template's header comment names
+		// the {%- -%} markers) stay inert.
+		i, kind := -1, tokText
+		for _, cand := range []struct {
+			mark string
+			kind tokKind
+		}{{"{{", tokPrint}, {"{%", tokStmt}, {"{#", tokText}} {
+			if j := strings.Index(rest, cand.mark); j >= 0 && (i < 0 || j < i) {
+				i, kind = j, cand.kind
+			}
 		}
+		isComment := i >= 0 && strings.HasPrefix(rest[i:], "{#")
 		if i < 0 {
 			text := rest
 			if trimNextLeft {
@@ -112,7 +144,6 @@ func tokenize(tmpl string) ([]token, error) {
 			text = strings.TrimLeft(text, " \t\r\n")
 			trimNextLeft = false
 		}
-		// Opening dash: {{- or {%-
 		j := i + 2
 		trimPrev := false
 		if j < len(rest) && rest[j] == '-' {
@@ -124,6 +155,18 @@ func tokenize(tmpl string) ([]token, error) {
 		}
 		if text != "" {
 			toks = append(toks, token{tokText, text})
+		}
+		if isComment {
+			end := strings.Index(rest[j:], "#}")
+			if end < 0 {
+				return nil, fmt.Errorf("%w: unclosed comment", ErrUnsupported)
+			}
+			inner := rest[j : j+end]
+			if strings.HasSuffix(inner, "-") {
+				trimNextLeft = true
+			}
+			rest = rest[j+end+2:]
+			continue
 		}
 		close := "}}"
 		if kind == tokStmt {
@@ -152,22 +195,41 @@ type textNode struct{ s string }
 
 func (textNode) nodeTag() {}
 
-type printNode struct{ expr *expr }
+type printNode struct{ expr *vExpr }
 
 func (printNode) nodeTag() {}
 
-type forNode struct{ body []node }
+type forNode struct {
+	vars []string // one name, or two for pair items
+	iter *vExpr
+	body []node
+}
 
 func (forNode) nodeTag() {}
 
 type branch struct {
-	cond *expr // nil on the else branch
+	cond *vExpr // nil on the else branch
 	body []node
 }
 
 type ifNode struct{ branches []branch }
 
 func (ifNode) nodeTag() {}
+
+type setNode struct {
+	target []string // a name, or name.attr for a namespace field
+	expr   *vExpr
+}
+
+func (setNode) nodeTag() {}
+
+type macroNode struct {
+	name   string
+	params []string
+	body   []node
+}
+
+func (macroNode) nodeTag() {}
 
 type parser struct {
 	toks []token
@@ -187,8 +249,8 @@ func parse(toks []token) ([]node, error) {
 }
 
 // parseBlock reads nodes until a statement whose keyword is a block
-// terminator (elif/else/endif/endfor); it returns that statement's
-// text as the stop value without consuming it.
+// terminator (elif/else/endif/endfor/endmacro); it returns that
+// statement's text as the stop value without consuming it.
 func (p *parser) parseBlock() (nodes []node, stop string, err error) {
 	for p.pos < len(p.toks) {
 		t := p.toks[p.pos]
@@ -207,26 +269,31 @@ func (p *parser) parseBlock() (nodes []node, stop string, err error) {
 			kw := stmtKeyword(t.body)
 			switch kw {
 			case "for":
-				if t.body != "for message in messages" {
-					return nil, "", fmt.Errorf("%w: {%% %s %%} (only 'for message in messages' is rendered)", ErrUnsupported, t.body)
-				}
-				p.pos++
-				body, stop, err := p.parseBlock()
+				n, err := p.parseFor()
 				if err != nil {
 					return nil, "", err
 				}
-				if stop != "endfor" {
-					return nil, "", fmt.Errorf("%w: for without endfor", ErrUnsupported)
-				}
-				p.pos++ // consume endfor
-				nodes = append(nodes, forNode{body})
+				nodes = append(nodes, n)
 			case "if":
 				n, err := p.parseIf()
 				if err != nil {
 					return nil, "", err
 				}
 				nodes = append(nodes, n)
-			case "elif", "else", "endif", "endfor":
+			case "set":
+				n, err := parseSet(t.body)
+				if err != nil {
+					return nil, "", err
+				}
+				nodes = append(nodes, n)
+				p.pos++
+			case "macro":
+				n, err := p.parseMacro()
+				if err != nil {
+					return nil, "", err
+				}
+				nodes = append(nodes, n)
+			case "elif", "else", "endif", "endfor", "endmacro":
 				return nodes, t.body, nil
 			default:
 				return nil, "", fmt.Errorf("%w: {%% %s %%}", ErrUnsupported, t.body)
@@ -236,13 +303,147 @@ func (p *parser) parseBlock() (nodes []node, stop string, err error) {
 	return nodes, "", nil
 }
 
+func (p *parser) parseFor() (node, error) {
+	// {% for x in expr %} or {% for k, v in expr %}
+	head := strings.TrimSpace(strings.TrimPrefix(p.toks[p.pos].body, "for"))
+	ep := &exprParser{s: head}
+	var vars []string
+	for {
+		ep.skipSpace()
+		name, err := ep.readIdent()
+		if err != nil {
+			return nil, err
+		}
+		vars = append(vars, name)
+		ep.skipSpace()
+		if ep.pos < len(ep.s) && ep.s[ep.pos] == ',' {
+			ep.pos++
+			continue
+		}
+		break
+	}
+	if len(vars) > 2 {
+		return nil, fmt.Errorf("%w: for with %d target names", ErrUnsupported, len(vars))
+	}
+	ep.skipSpace()
+	if !ep.eatWord("in") {
+		return nil, fmt.Errorf("%w: for without 'in': %q", ErrUnsupported, head)
+	}
+	iter, err := ep.parseCond()
+	if err != nil {
+		return nil, err
+	}
+	ep.skipSpace()
+	if ep.pos != len(ep.s) {
+		return nil, fmt.Errorf("%w: for head %q has trailing %q", ErrUnsupported, head, ep.s[ep.pos:])
+	}
+	p.pos++
+	body, stop, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	if stop != "endfor" {
+		return nil, fmt.Errorf("%w: for without endfor", ErrUnsupported)
+	}
+	p.pos++ // consume endfor
+	return forNode{vars: vars, iter: iter, body: body}, nil
+}
+
+func (p *parser) parseMacro() (node, error) {
+	// {% macro name(a, b) %}
+	head := strings.TrimSpace(strings.TrimPrefix(p.toks[p.pos].body, "macro"))
+	ep := &exprParser{s: head}
+	ep.skipSpace()
+	name, err := ep.readIdent()
+	if err != nil {
+		return nil, err
+	}
+	ep.skipSpace()
+	if ep.pos >= len(ep.s) || ep.s[ep.pos] != '(' {
+		return nil, fmt.Errorf("%w: macro %q without a parameter list", ErrUnsupported, name)
+	}
+	ep.pos++
+	var params []string
+	ep.skipSpace()
+	if ep.pos < len(ep.s) && ep.s[ep.pos] != ')' {
+		for {
+			ep.skipSpace()
+			param, err := ep.readIdent()
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, param)
+			ep.skipSpace()
+			if ep.pos < len(ep.s) && ep.s[ep.pos] == ',' {
+				ep.pos++
+				continue
+			}
+			break
+		}
+	}
+	ep.skipSpace()
+	if ep.pos >= len(ep.s) || ep.s[ep.pos] != ')' {
+		return nil, fmt.Errorf("%w: macro %q parameter list is unclosed", ErrUnsupported, name)
+	}
+	ep.pos++
+	ep.skipSpace()
+	if ep.pos != len(ep.s) {
+		return nil, fmt.Errorf("%w: macro head %q has trailing %q", ErrUnsupported, head, ep.s[ep.pos:])
+	}
+	p.pos++
+	body, stop, err := p.parseBlock()
+	if err != nil {
+		return nil, err
+	}
+	if stop != "endmacro" {
+		return nil, fmt.Errorf("%w: macro without endmacro", ErrUnsupported)
+	}
+	p.pos++ // consume endmacro
+	return macroNode{name: name, params: params, body: body}, nil
+}
+
+func parseSet(body string) (node, error) {
+	// {% set name = expr %} or {% set ns.attr = expr %}
+	rest := strings.TrimSpace(strings.TrimPrefix(body, "set"))
+	ep := &exprParser{s: rest}
+	ep.skipSpace()
+	head, err := ep.readIdent()
+	if err != nil {
+		return nil, err
+	}
+	target := []string{head}
+	ep.skipSpace()
+	if ep.pos < len(ep.s) && ep.s[ep.pos] == '.' {
+		ep.pos++
+		attr, err := ep.readIdent()
+		if err != nil {
+			return nil, err
+		}
+		target = append(target, attr)
+	}
+	ep.skipSpace()
+	if ep.pos >= len(ep.s) || ep.s[ep.pos] != '=' || strings.HasPrefix(ep.s[ep.pos:], "==") {
+		return nil, fmt.Errorf("%w: set without '=': %q", ErrUnsupported, body)
+	}
+	ep.pos++
+	e, err := ep.parseCond()
+	if err != nil {
+		return nil, err
+	}
+	ep.skipSpace()
+	if ep.pos != len(ep.s) {
+		return nil, fmt.Errorf("%w: set %q has trailing %q", ErrUnsupported, body, ep.s[ep.pos:])
+	}
+	return setNode{target: target, expr: e}, nil
+}
+
 func (p *parser) parseIf() (node, error) {
 	// p.toks[p.pos] is the {% if ... %} statement.
 	var branches []branch
 	for {
 		t := p.toks[p.pos]
 		kw := stmtKeyword(t.body)
-		var cond *expr
+		var cond *vExpr
 		if kw == "if" || kw == "elif" {
 			condText := strings.TrimSpace(strings.TrimPrefix(t.body, kw))
 			e, err := parseExpr(condText)
@@ -278,25 +479,142 @@ func stmtKeyword(stmt string) string {
 	return stmt
 }
 
-// ---- expressions -----------------------------------------------------
+// ---- values ----------------------------------------------------------
 
-// expr is a tiny expression tree: a value expression is a chain of
-// terms joined by + ; a condition wraps one with ==, !=, or not.
-// The node kinds share one struct for compactness.
-type expr struct {
-	kind  string // "concat", "eq", "ne", "not", "term"
-	terms []*term
-	lhs   *expr
-	rhs   *expr
-	sub   *expr
+type vKind int
+
+const (
+	vUndef vKind = iota
+	vNone
+	vBool
+	vNum
+	vStr
+	vList
+	vDict
+)
+
+// value is a Jinja value at render time. An undefined name resolves
+// to vUndef carrying the name: it is falsy and answers the defined
+// test, but printing one refuses by name instead of rendering
+// empty text the caller never asked for.
+type value struct {
+	kind vKind
+	name string // vUndef: the unresolved name
+	b    bool
+	n    float64
+	s    string
+	list []value
+	dict map[string]value
 }
 
-type term struct {
-	kind  string // "literal", "path", "call"
-	value string // literal text, or call name
-	path  []string
-	// filter is "" or "trim" (the only rendered filter).
-	filter string
+func strValue(s string) value            { return value{kind: vStr, s: s} }
+func boolValue(b bool) value             { return value{kind: vBool, b: b} }
+func numValue(n float64) value           { return value{kind: vNum, n: n} }
+func listValue(l []value) value          { return value{kind: vList, list: l} }
+func dictValue(d map[string]value) value { return value{kind: vDict, dict: d} }
+func undefValue(name string) value       { return value{kind: vUndef, name: name} }
+
+func (v value) truthy() bool {
+	switch v.kind {
+	case vUndef, vNone:
+		return false
+	case vBool:
+		return v.b
+	case vNum:
+		return v.n != 0
+	case vStr:
+		return v.s != ""
+	case vList:
+		return len(v.list) > 0
+	case vDict:
+		return len(v.dict) > 0
+	}
+	return false
+}
+
+// stringify renders a value into print output. Booleans and
+// undefined or none values refuse by name: a template printing one
+// is asking for text the subset does not define.
+func (v value) stringify() (string, error) {
+	switch v.kind {
+	case vStr:
+		return v.s, nil
+	case vNum:
+		return strconv.FormatFloat(v.n, 'f', -1, 64), nil
+	case vUndef:
+		return "", fmt.Errorf("%w: name %q is not defined", ErrUnsupported, v.name)
+	case vNone:
+		return "", fmt.Errorf("%w: cannot print none", ErrUnsupported)
+	case vBool:
+		return "", fmt.Errorf("%w: cannot print a boolean", ErrUnsupported)
+	default:
+		return "", fmt.Errorf("%w: cannot print a list or mapping", ErrUnsupported)
+	}
+}
+
+func valuesEqual(a, b value) bool {
+	if a.kind == vNone || b.kind == vNone {
+		return a.kind == b.kind
+	}
+	if a.kind == vUndef || b.kind == vUndef {
+		return a.kind == b.kind
+	}
+	if a.kind != b.kind {
+		return false
+	}
+	switch a.kind {
+	case vBool:
+		return a.b == b.b
+	case vNum:
+		return a.n == b.n
+	case vStr:
+		return a.s == b.s
+	}
+	return false
+}
+
+func valueIn(item, container value) (bool, error) {
+	switch container.kind {
+	case vList:
+		for _, el := range container.list {
+			if valuesEqual(item, el) {
+				return true, nil
+			}
+		}
+		return false, nil
+	case vDict:
+		if item.kind != vStr {
+			return false, fmt.Errorf("%w: 'in' over a mapping needs a string key", ErrUnsupported)
+		}
+		_, ok := container.dict[item.s]
+		return ok, nil
+	case vStr:
+		if item.kind != vStr {
+			return false, fmt.Errorf("%w: 'in' over a string needs a string", ErrUnsupported)
+		}
+		return strings.Contains(container.s, item.s), nil
+	}
+	return false, fmt.Errorf("%w: 'in' over a non-container", ErrUnsupported)
+}
+
+// ---- expressions -----------------------------------------------------
+
+// vExpr is the expression tree. One struct with per-kind fields,
+// in the compact style of the original subset.
+type vExpr struct {
+	kind string // lit, num, bool, none, name, listlit, attr, index,
+	// call, method, filter, add, eq, ne, in, notin, and, or, not,
+	// test, cond
+	s    string  // literal text, name, attribute, method or test name
+	n    float64 // numeric literal
+	b    bool    // boolean literal
+	args []*vExpr
+	kw   map[string]*vExpr
+	lhs  *vExpr
+	rhs  *vExpr
+	cond *vExpr
+	// filter arguments ride in args; the filtered value is lhs.
+	neg bool // test negation: "is not defined"
 }
 
 type exprParser struct {
@@ -304,9 +622,9 @@ type exprParser struct {
 	pos int
 }
 
-func parseExpr(s string) (*expr, error) {
+func parseExpr(s string) (*vExpr, error) {
 	p := &exprParser{s: s}
-	e, err := p.parseCondition()
+	e, err := p.parseCond()
 	if err != nil {
 		return nil, err
 	}
@@ -317,120 +635,394 @@ func parseExpr(s string) (*expr, error) {
 	return e, nil
 }
 
-func (p *exprParser) parseCondition() (*expr, error) {
-	p.skipSpace()
-	if p.eatWord("not") {
-		sub, err := p.parseCondition()
-		if err != nil {
-			return nil, err
-		}
-		return &expr{kind: "not", sub: sub}, nil
-	}
-	lhs, err := p.parseConcat()
+// parseCond parses inline conditionals: value if condition else other.
+func (p *exprParser) parseCond() (*vExpr, error) {
+	val, err := p.parseOr()
 	if err != nil {
 		return nil, err
 	}
 	p.skipSpace()
-	if strings.HasPrefix(p.s[p.pos:], "==") {
-		p.pos += 2
-		rhs, err := p.parseConcat()
-		if err != nil {
-			return nil, err
-		}
-		return &expr{kind: "eq", lhs: lhs, rhs: rhs}, nil
+	if !p.eatWord("if") {
+		return val, nil
 	}
-	if strings.HasPrefix(p.s[p.pos:], "!=") {
-		p.pos += 2
-		rhs, err := p.parseConcat()
+	cond, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	p.skipSpace()
+	if !p.eatWord("else") {
+		// Jinja: a missing else yields undefined. None of the
+		// shipped shapes use it, but it parses and evaluates.
+		return &vExpr{kind: "cond", lhs: val, cond: cond, rhs: &vExpr{kind: "none"}}, nil
+	}
+	other, err := p.parseCond()
+	if err != nil {
+		return nil, err
+	}
+	return &vExpr{kind: "cond", lhs: val, cond: cond, rhs: other}, nil
+}
+
+func (p *exprParser) parseOr() (*vExpr, error) {
+	lhs, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipSpace()
+		if !p.eatWord("or") {
+			return lhs, nil
+		}
+		rhs, err := p.parseAnd()
 		if err != nil {
 			return nil, err
 		}
-		return &expr{kind: "ne", lhs: lhs, rhs: rhs}, nil
+		lhs = &vExpr{kind: "or", lhs: lhs, rhs: rhs}
+	}
+}
+
+func (p *exprParser) parseAnd() (*vExpr, error) {
+	lhs, err := p.parseNot()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipSpace()
+		if !p.eatWord("and") {
+			return lhs, nil
+		}
+		rhs, err := p.parseNot()
+		if err != nil {
+			return nil, err
+		}
+		lhs = &vExpr{kind: "and", lhs: lhs, rhs: rhs}
+	}
+}
+
+func (p *exprParser) parseNot() (*vExpr, error) {
+	p.skipSpace()
+	if p.eatWord("not") {
+		sub, err := p.parseNot()
+		if err != nil {
+			return nil, err
+		}
+		return &vExpr{kind: "not", lhs: sub}, nil
+	}
+	return p.parseComparison()
+}
+
+func (p *exprParser) parseComparison() (*vExpr, error) {
+	lhs, err := p.parseAdditive()
+	if err != nil {
+		return nil, err
+	}
+	p.skipSpace()
+	// Postfix tests: expr is [not] <test>.
+	if p.eatWord("is") {
+		p.skipSpace()
+		neg := p.eatWord("not")
+		p.skipSpace()
+		name, err := p.readIdent()
+		if err != nil {
+			return nil, err
+		}
+		return &vExpr{kind: "test", s: name, lhs: lhs, neg: neg}, nil
+	}
+	for _, op := range []struct {
+		text string
+		kind string
+	}{
+		{"==", "eq"}, {"!=", "ne"},
+	} {
+		if strings.HasPrefix(p.s[p.pos:], op.text) {
+			p.pos += len(op.text)
+			rhs, err := p.parseAdditive()
+			if err != nil {
+				return nil, err
+			}
+			return &vExpr{kind: op.kind, lhs: lhs, rhs: rhs}, nil
+		}
+	}
+	if p.eatWord("not") {
+		p.skipSpace()
+		if !p.eatWord("in") {
+			return nil, fmt.Errorf("%w: 'not' without 'in' in comparison", ErrUnsupported)
+		}
+		rhs, err := p.parseAdditive()
+		if err != nil {
+			return nil, err
+		}
+		return &vExpr{kind: "notin", lhs: lhs, rhs: rhs}, nil
+	}
+	if p.eatWord("in") {
+		rhs, err := p.parseAdditive()
+		if err != nil {
+			return nil, err
+		}
+		return &vExpr{kind: "in", lhs: lhs, rhs: rhs}, nil
 	}
 	return lhs, nil
 }
 
-func (p *exprParser) parseConcat() (*expr, error) {
-	first, err := p.parseTerm()
+func (p *exprParser) parseAdditive() (*vExpr, error) {
+	lhs, err := p.parsePostfix()
 	if err != nil {
 		return nil, err
 	}
-	e := &expr{kind: "concat", terms: []*term{first}}
 	for {
 		p.skipSpace()
 		if p.pos < len(p.s) && p.s[p.pos] == '+' {
 			p.pos++
-			next, err := p.parseTerm()
+			rhs, err := p.parsePostfix()
 			if err != nil {
 				return nil, err
 			}
-			e.terms = append(e.terms, next)
+			lhs = &vExpr{kind: "add", lhs: lhs, rhs: rhs}
 			continue
 		}
-		return e, nil
+		return lhs, nil
 	}
 }
 
-func (p *exprParser) parseTerm() (*term, error) {
+// parsePostfix parses a primary plus its attribute, subscript,
+// method-call and filter suffixes, in order.
+func (p *exprParser) parsePostfix() (*vExpr, error) {
+	e, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		p.skipSpace()
+		if p.pos >= len(p.s) {
+			return e, nil
+		}
+		switch p.s[p.pos] {
+		case '.':
+			p.pos++
+			name, err := p.readIdent()
+			if err != nil {
+				return nil, err
+			}
+			p.skipSpace()
+			if p.pos < len(p.s) && p.s[p.pos] == '(' {
+				args, kw, err := p.parseArgs()
+				if err != nil {
+					return nil, err
+				}
+				e = &vExpr{kind: "method", s: name, lhs: e, args: args, kw: kw}
+			} else {
+				e = &vExpr{kind: "attr", s: name, lhs: e}
+			}
+		case '[':
+			p.pos++
+			idx, err := p.parseCond()
+			if err != nil {
+				return nil, err
+			}
+			p.skipSpace()
+			if p.pos >= len(p.s) || p.s[p.pos] != ']' {
+				return nil, fmt.Errorf("%w: missing ] in expression %q", ErrUnsupported, p.s)
+			}
+			p.pos++
+			e = &vExpr{kind: "index", lhs: e, rhs: idx}
+		case '|':
+			p.pos++
+			p.skipSpace()
+			name, err := p.readIdent()
+			if err != nil {
+				return nil, err
+			}
+			var args []*vExpr
+			p.skipSpace()
+			if p.pos < len(p.s) && p.s[p.pos] == '(' {
+				var kw map[string]*vExpr
+				args, kw, err = p.parseArgs()
+				if err != nil {
+					return nil, err
+				}
+				if len(kw) > 0 {
+					return nil, fmt.Errorf("%w: filter %q with keyword arguments", ErrUnsupported, name)
+				}
+			}
+			e = &vExpr{kind: "filter", s: name, lhs: e, args: args}
+		default:
+			return e, nil
+		}
+	}
+}
+
+func (p *exprParser) parsePrimary() (*vExpr, error) {
 	p.skipSpace()
 	if p.pos >= len(p.s) {
 		return nil, fmt.Errorf("%w: expression ends early", ErrUnsupported)
 	}
-	var t *term
 	switch c := p.s[p.pos]; {
 	case c == '\'' || c == '"':
 		lit, err := p.parseLiteral()
 		if err != nil {
 			return nil, err
 		}
-		t = &term{kind: "literal", value: lit}
-	case isIdentStart(c):
-		path, err := p.parsePath()
+		return &vExpr{kind: "lit", s: lit}, nil
+	case c == '(':
+		p.pos++
+		e, err := p.parseCond()
 		if err != nil {
 			return nil, err
 		}
-		// A call like raise_exception('...') parses, then refuses
-		// by name if the branch holding it actually renders.
 		p.skipSpace()
-		if p.pos < len(p.s) && p.s[p.pos] == '(' {
-			depth := 0
-			closed := false
-			for p.pos < len(p.s) && !closed {
-				switch p.s[p.pos] {
-				case '(':
-					depth++
-				case ')':
-					depth--
-					closed = depth == 0
+		if p.pos >= len(p.s) || p.s[p.pos] != ')' {
+			return nil, fmt.Errorf("%w: missing ) in expression %q", ErrUnsupported, p.s)
+		}
+		p.pos++
+		return e, nil
+	case c == '{':
+		p.pos++
+		var pairs []*vExpr // flattened key, value, key, value
+		p.skipSpace()
+		if p.pos < len(p.s) && p.s[p.pos] != '}' {
+			for {
+				k, err := p.parseCond()
+				if err != nil {
+					return nil, err
+				}
+				p.skipSpace()
+				if p.pos >= len(p.s) || p.s[p.pos] != ':' {
+					return nil, fmt.Errorf("%w: mapping literal without ':' in %q", ErrUnsupported, p.s)
 				}
 				p.pos++
+				v, err := p.parseCond()
+				if err != nil {
+					return nil, err
+				}
+				pairs = append(pairs, k, v)
+				p.skipSpace()
+				if p.pos < len(p.s) && p.s[p.pos] == ',' {
+					p.pos++
+					continue
+				}
+				break
 			}
-			if !closed {
-				return nil, fmt.Errorf("%w: unbalanced call in expression", ErrUnsupported)
-			}
-			t = &term{kind: "call", value: strings.Join(path, ".")}
-		} else {
-			t = &term{kind: "path", path: path}
 		}
+		p.skipSpace()
+		if p.pos >= len(p.s) || p.s[p.pos] != '}' {
+			return nil, fmt.Errorf("%w: missing } in mapping literal %q", ErrUnsupported, p.s)
+		}
+		p.pos++
+		return &vExpr{kind: "dictlit", args: pairs}, nil
+	case c == '[':
+		p.pos++
+		var elems []*vExpr
+		p.skipSpace()
+		if p.pos < len(p.s) && p.s[p.pos] != ']' {
+			for {
+				el, err := p.parseCond()
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, el)
+				p.skipSpace()
+				if p.pos < len(p.s) && p.s[p.pos] == ',' {
+					p.pos++
+					continue
+				}
+				break
+			}
+		}
+		p.skipSpace()
+		if p.pos >= len(p.s) || p.s[p.pos] != ']' {
+			return nil, fmt.Errorf("%w: missing ] in list literal %q", ErrUnsupported, p.s)
+		}
+		p.pos++
+		return &vExpr{kind: "listlit", args: elems}, nil
+	case c >= '0' && c <= '9':
+		start := p.pos
+		for p.pos < len(p.s) && (isIdentChar(p.s[p.pos]) || p.s[p.pos] == '.') {
+			p.pos++
+		}
+		n, err := strconv.ParseFloat(p.s[start:p.pos], 64)
+		if err != nil {
+			return nil, fmt.Errorf("%w: bad number %q", ErrUnsupported, p.s[start:p.pos])
+		}
+		return &vExpr{kind: "num", n: n}, nil
+	case isIdentStart(c):
+		name, err := p.readIdent()
+		if err != nil {
+			return nil, err
+		}
+		switch name {
+		case "true":
+			return &vExpr{kind: "bool", b: true}, nil
+		case "false":
+			return &vExpr{kind: "bool", b: false}, nil
+		case "none":
+			return &vExpr{kind: "none"}, nil
+		}
+		p.skipSpace()
+		if p.pos < len(p.s) && p.s[p.pos] == '(' {
+			args, kw, err := p.parseArgs()
+			if err != nil {
+				return nil, err
+			}
+			return &vExpr{kind: "call", s: name, args: args, kw: kw}, nil
+		}
+		return &vExpr{kind: "name", s: name}, nil
 	default:
 		return nil, fmt.Errorf("%w: unexpected %q in expression", ErrUnsupported, string(c))
 	}
-	// One optional filter: | trim. Anything else refuses by name.
+}
+
+// parseArgs parses "(a, b, k=v)" with p.pos at the '('.
+func (p *exprParser) parseArgs() (args []*vExpr, kw map[string]*vExpr, err error) {
+	p.pos++ // consume (
 	p.skipSpace()
-	if p.pos < len(p.s) && p.s[p.pos] == '|' {
+	if p.pos < len(p.s) && p.s[p.pos] == ')' {
 		p.pos++
-		p.skipSpace()
-		start := p.pos
-		for p.pos < len(p.s) && isIdentChar(p.s[p.pos]) {
-			p.pos++
-		}
-		name := p.s[start:p.pos]
-		if name != "trim" {
-			return nil, fmt.Errorf("%w: filter %q", ErrUnsupported, name)
-		}
-		t.filter = "trim"
+		return nil, nil, nil
 	}
-	return t, nil
+	for {
+		p.skipSpace()
+		// Keyword argument: ident '=' (but not '==').
+		save := p.pos
+		if p.pos < len(p.s) && isIdentStart(p.s[p.pos]) {
+			name, ierr := p.readIdent()
+			if ierr != nil {
+				return nil, nil, ierr
+			}
+			p.skipSpace()
+			if p.pos < len(p.s) && p.s[p.pos] == '=' && !strings.HasPrefix(p.s[p.pos:], "==") {
+				p.pos++
+				v, verr := p.parseCond()
+				if verr != nil {
+					return nil, nil, verr
+				}
+				if kw == nil {
+					kw = map[string]*vExpr{}
+				}
+				kw[name] = v
+				goto next
+			}
+			p.pos = save
+		}
+		{
+			v, verr := p.parseCond()
+			if verr != nil {
+				return nil, nil, verr
+			}
+			args = append(args, v)
+		}
+	next:
+		p.skipSpace()
+		if p.pos < len(p.s) && p.s[p.pos] == ',' {
+			p.pos++
+			continue
+		}
+		break
+	}
+	p.skipSpace()
+	if p.pos >= len(p.s) || p.s[p.pos] != ')' {
+		return nil, nil, fmt.Errorf("%w: missing ) in call %q", ErrUnsupported, p.s)
+	}
+	p.pos++
+	return args, kw, nil
 }
 
 func (p *exprParser) parseLiteral() (string, error) {
@@ -463,56 +1055,19 @@ func (p *exprParser) parseLiteral() (string, error) {
 	return "", fmt.Errorf("%w: unterminated string literal", ErrUnsupported)
 }
 
-// parsePath reads ident (.ident | ['key'])* into path segments.
-func (p *exprParser) parsePath() ([]string, error) {
-	readIdent := func() (string, error) {
-		p.skipSpace()
-		start := p.pos
-		for p.pos < len(p.s) && isIdentChar(p.s[p.pos]) {
-			p.pos++
-		}
-		if start == p.pos {
-			return "", fmt.Errorf("%w: expected a name in expression %q", ErrUnsupported, p.s)
-		}
-		return p.s[start:p.pos], nil
+func (p *exprParser) readIdent() (string, error) {
+	start := p.pos
+	for p.pos < len(p.s) && isIdentChar(p.s[p.pos]) {
+		p.pos++
 	}
-	first, err := readIdent()
-	if err != nil {
-		return nil, err
+	if start == p.pos {
+		return "", fmt.Errorf("%w: expected a name in expression %q", ErrUnsupported, p.s)
 	}
-	path := []string{first}
-	for {
-		p.skipSpace()
-		if p.pos < len(p.s) && p.s[p.pos] == '.' {
-			p.pos++
-			seg, err := readIdent()
-			if err != nil {
-				return nil, err
-			}
-			path = append(path, seg)
-			continue
-		}
-		if p.pos < len(p.s) && p.s[p.pos] == '[' {
-			p.pos++
-			p.skipSpace()
-			key, err := p.parseLiteral()
-			if err != nil {
-				return nil, err
-			}
-			p.skipSpace()
-			if p.pos >= len(p.s) || p.s[p.pos] != ']' {
-				return nil, fmt.Errorf("%w: missing ] in expression %q", ErrUnsupported, p.s)
-			}
-			p.pos++
-			path = append(path, key)
-			continue
-		}
-		return path, nil
-	}
+	return p.s[start:p.pos], nil
 }
 
 func (p *exprParser) skipSpace() {
-	for p.pos < len(p.s) && (p.s[p.pos] == ' ' || p.s[p.pos] == '\t') {
+	for p.pos < len(p.s) && (p.s[p.pos] == ' ' || p.s[p.pos] == '\t' || p.s[p.pos] == '\n' || p.s[p.pos] == '\r') {
 		p.pos++
 	}
 }
@@ -541,10 +1096,28 @@ func isIdentChar(c byte) bool {
 
 // ---- evaluation --------------------------------------------------------
 
+type scope struct {
+	vars   map[string]value
+	parent *scope
+}
+
+func (s *scope) lookup(name string) (value, bool) {
+	for cur := s; cur != nil; cur = cur.parent {
+		if v, ok := cur.vars[name]; ok {
+			return v, true
+		}
+	}
+	return value{}, false
+}
+
 type env struct {
-	params   Params
-	messages []Message
-	message  *Message // the loop variable, nil outside the loop
+	global *scope
+	cur    *scope
+	macros map[string]*macroNode
+}
+
+func (e *env) child(vars map[string]value) *env {
+	return &env{global: e.global, cur: &scope{vars: vars, parent: e.cur}, macros: e.macros}
 }
 
 func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
@@ -553,15 +1126,53 @@ func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 		case textNode:
 			sb.WriteString(n.s)
 		case printNode:
-			v, err := evalString(n.expr, e)
+			v, err := eval(n.expr, e)
 			if err != nil {
 				return err
 			}
-			sb.WriteString(v)
+			s, err := v.stringify()
+			if err != nil {
+				return err
+			}
+			sb.WriteString(s)
+		case setNode:
+			v, err := eval(n.expr, e)
+			if err != nil {
+				return err
+			}
+			if err := assign(e, n.target, v); err != nil {
+				return err
+			}
+		case macroNode:
+			e.macros[n.name] = &n
 		case forNode:
-			for i := range e.messages {
-				child := &env{params: e.params, messages: e.messages, message: &e.messages[i]}
-				if err := renderNodes(n.body, child, sb); err != nil {
+			iter, err := eval(n.iter, e)
+			if err != nil {
+				return err
+			}
+			if iter.kind != vList {
+				return fmt.Errorf("%w: for over a non-list value", ErrUnsupported)
+			}
+			for i, item := range iter.list {
+				vars := map[string]value{
+					"loop": dictValue(map[string]value{
+						"index":  numValue(float64(i + 1)),
+						"index0": numValue(float64(i)),
+						"first":  boolValue(i == 0),
+						"last":   boolValue(i == len(iter.list)-1),
+						"length": numValue(float64(len(iter.list))),
+					}),
+				}
+				if len(n.vars) == 2 {
+					if item.kind != vList || len(item.list) != 2 {
+						return fmt.Errorf("%w: for pair target over a non-pair item", ErrUnsupported)
+					}
+					vars[n.vars[0]] = item.list[0]
+					vars[n.vars[1]] = item.list[1]
+				} else {
+					vars[n.vars[0]] = item
+				}
+				if err := renderNodes(n.body, e.child(vars), sb); err != nil {
 					return err
 				}
 			}
@@ -573,11 +1184,11 @@ func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 					}
 					break
 				}
-				truth, err := evalBool(br.cond, e)
+				cond, err := eval(br.cond, e)
 				if err != nil {
 					return err
 				}
-				if truth {
+				if cond.truthy() {
 					if err := renderNodes(br.body, e, sb); err != nil {
 						return err
 					}
@@ -589,113 +1200,435 @@ func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 	return nil
 }
 
-func evalString(e *expr, env *env) (string, error) {
-	switch e.kind {
-	case "concat":
-		var sb strings.Builder
-		for _, t := range e.terms {
-			s, err := evalTerm(t, env)
+// assign implements {% set %}: a plain name binds in the current
+// scope; name.attr mutates the named mapping in place, which is
+// how namespace() state survives loop iterations.
+func assign(e *env, target []string, v value) error {
+	if len(target) == 1 {
+		e.cur.vars[target[0]] = v
+		return nil
+	}
+	base, ok := e.cur.lookup(target[0])
+	if !ok || base.kind != vDict {
+		return fmt.Errorf("%w: set %s.%s on a non-mapping", ErrUnsupported, target[0], target[1])
+	}
+	base.dict[target[1]] = v
+	return nil
+}
+
+func eval(x *vExpr, e *env) (value, error) {
+	switch x.kind {
+	case "lit":
+		return strValue(x.s), nil
+	case "num":
+		return numValue(x.n), nil
+	case "bool":
+		return boolValue(x.b), nil
+	case "none":
+		return value{kind: vNone}, nil
+	case "name":
+		if v, ok := e.cur.lookup(x.s); ok {
+			return v, nil
+		}
+		return undefValue(x.s), nil
+	case "listlit":
+		elems := make([]value, 0, len(x.args))
+		for _, a := range x.args {
+			v, err := eval(a, e)
 			if err != nil {
-				return "", err
+				return value{}, err
 			}
-			sb.WriteString(s)
+			elems = append(elems, v)
 		}
-		return sb.String(), nil
-	default:
-		return "", fmt.Errorf("%w: a condition cannot be printed", ErrUnsupported)
-	}
-}
-
-func evalBool(e *expr, env *env) (bool, error) {
-	switch e.kind {
-	case "not":
-		b, err := evalBool(e.sub, env)
-		return !b, err
+		return listValue(elems), nil
+	case "dictlit":
+		d := make(map[string]value, len(x.args)/2)
+		for i := 0; i+1 < len(x.args); i += 2 {
+			k, err := eval(x.args[i], e)
+			if err != nil {
+				return value{}, err
+			}
+			if k.kind != vStr {
+				return value{}, fmt.Errorf("%w: mapping literal key is not a string", ErrUnsupported)
+			}
+			v, err := eval(x.args[i+1], e)
+			if err != nil {
+				return value{}, err
+			}
+			d[k.s] = v
+		}
+		return dictValue(d), nil
+	case "attr":
+		base, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		return getAttr(base, x.s), nil
+	case "index":
+		base, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		idx, err := eval(x.rhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		return getIndex(base, idx)
+	case "add":
+		l, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		r, err := eval(x.rhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		return addValues(l, r)
 	case "eq", "ne":
-		l, err := evalString(e.lhs, env)
+		l, err := eval(x.lhs, e)
 		if err != nil {
-			return false, err
+			return value{}, err
 		}
-		r, err := evalString(e.rhs, env)
+		r, err := eval(x.rhs, e)
 		if err != nil {
-			return false, err
+			return value{}, err
 		}
-		if e.kind == "eq" {
-			return l == r, nil
+		eq := valuesEqual(l, r)
+		if x.kind == "ne" {
+			eq = !eq
 		}
-		return l != r, nil
-	case "concat":
-		// Bare truthiness: a boolean variable's value, or a
-		// non-empty string.
-		if len(e.terms) == 1 {
-			if b, ok := evalBoolTerm(e.terms[0], env); ok {
-				return b, nil
-			}
-		}
-		s, err := evalString(e, env)
+		return boolValue(eq), nil
+	case "in", "notin":
+		l, err := eval(x.lhs, e)
 		if err != nil {
-			return false, err
+			return value{}, err
 		}
-		return s != "", nil
-	default:
-		return false, fmt.Errorf("%w: expression kind %q", ErrUnsupported, e.kind)
-	}
-}
-
-// evalBoolTerm resolves a term that names a boolean flag.
-func evalBoolTerm(t *term, env *env) (value bool, ok bool) {
-	if t.kind == "path" && len(t.path) == 1 && t.path[0] == "add_generation_prompt" {
-		return env.params.AddGenerationPrompt, true
-	}
-	return false, false
-}
-
-func evalTerm(t *term, env *env) (string, error) {
-	var out string
-	switch t.kind {
-	case "literal":
-		out = t.value
+		r, err := eval(x.rhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		in, err := valueIn(l, r)
+		if err != nil {
+			return value{}, err
+		}
+		if x.kind == "notin" {
+			in = !in
+		}
+		return boolValue(in), nil
+	case "and":
+		l, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		if !l.truthy() {
+			return l, nil
+		}
+		return eval(x.rhs, e)
+	case "or":
+		l, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		if l.truthy() {
+			return l, nil
+		}
+		return eval(x.rhs, e)
+	case "not":
+		l, err := eval(x.lhs, e)
+		if err != nil {
+			return value{}, err
+		}
+		return boolValue(!l.truthy()), nil
+	case "test":
+		return evalTest(x, e)
+	case "cond":
+		c, err := eval(x.cond, e)
+		if err != nil {
+			return value{}, err
+		}
+		if c.truthy() {
+			return eval(x.lhs, e)
+		}
+		return eval(x.rhs, e)
+	case "filter":
+		return evalFilter(x, e)
+	case "method":
+		return evalMethod(x, e)
 	case "call":
-		return "", fmt.Errorf("%w: function call %s(...)", ErrUnsupported, t.value)
-	case "path":
-		s, err := resolvePath(t.path, env)
+		return evalCall(x, e)
+	}
+	return value{}, fmt.Errorf("%w: expression kind %q", ErrUnsupported, x.kind)
+}
+
+func getAttr(base value, name string) value {
+	if base.kind == vDict {
+		if v, ok := base.dict[name]; ok {
+			return v
+		}
+	}
+	if base.kind == vUndef {
+		return base
+	}
+	return undefValue(name)
+}
+
+func getIndex(base, idx value) (value, error) {
+	switch base.kind {
+	case vDict:
+		if idx.kind != vStr {
+			return value{}, fmt.Errorf("%w: mapping index is not a string", ErrUnsupported)
+		}
+		if v, ok := base.dict[idx.s]; ok {
+			return v, nil
+		}
+		return undefValue(idx.s), nil
+	case vList:
+		if idx.kind != vNum {
+			return value{}, fmt.Errorf("%w: list index is not a number", ErrUnsupported)
+		}
+		i := int(idx.n)
+		if i < 0 || i >= len(base.list) {
+			return value{}, fmt.Errorf("%w: list index %d out of range", ErrUnsupported, i)
+		}
+		return base.list[i], nil
+	case vUndef:
+		return base, nil
+	}
+	return value{}, fmt.Errorf("%w: indexing a non-container", ErrUnsupported)
+}
+
+func addValues(l, r value) (value, error) {
+	switch {
+	case l.kind == vStr && r.kind == vStr:
+		return strValue(l.s + r.s), nil
+	case l.kind == vNum && r.kind == vNum:
+		return numValue(l.n + r.n), nil
+	case l.kind == vList && r.kind == vList:
+		out := make([]value, 0, len(l.list)+len(r.list))
+		out = append(out, l.list...)
+		out = append(out, r.list...)
+		return listValue(out), nil
+	}
+	return value{}, fmt.Errorf("%w: '+' over values that do not add", ErrUnsupported)
+}
+
+func evalTest(x *vExpr, e *env) (value, error) {
+	v, err := eval(x.lhs, e)
+	if err != nil {
+		return value{}, err
+	}
+	var out bool
+	switch x.s {
+	case "defined":
+		out = v.kind != vUndef
+	case "undefined":
+		out = v.kind == vUndef
+	case "none":
+		out = v.kind == vNone
+	case "string":
+		out = v.kind == vStr
+	case "boolean":
+		out = v.kind == vBool
+	case "number":
+		out = v.kind == vNum
+	case "mapping":
+		out = v.kind == vDict
+	case "iterable":
+		out = v.kind == vList || v.kind == vDict || v.kind == vStr
+	default:
+		return value{}, fmt.Errorf("%w: test %q", ErrUnsupported, x.s)
+	}
+	if x.neg {
+		out = !out
+	}
+	return boolValue(out), nil
+}
+
+func evalFilter(x *vExpr, e *env) (value, error) {
+	base, err := eval(x.lhs, e)
+	if err != nil {
+		return value{}, err
+	}
+	argStr := func(i int) (string, error) {
+		if len(x.args) <= i {
+			return "", fmt.Errorf("%w: filter %q needs %d arguments", ErrUnsupported, x.s, i+1)
+		}
+		v, err := eval(x.args[i], e)
 		if err != nil {
 			return "", err
 		}
-		out = s
-	default:
-		return "", fmt.Errorf("%w: term kind %q", ErrUnsupported, t.kind)
+		if v.kind != vStr {
+			return "", fmt.Errorf("%w: filter %q argument is not a string", ErrUnsupported, x.s)
+		}
+		return v.s, nil
 	}
-	if t.filter == "trim" {
-		out = strings.TrimSpace(out)
+	switch x.s {
+	case "trim":
+		if base.kind != vStr {
+			return value{}, fmt.Errorf("%w: filter trim over a non-string", ErrUnsupported)
+		}
+		return strValue(strings.TrimSpace(base.s)), nil
+	case "lower":
+		if base.kind != vStr {
+			return value{}, fmt.Errorf("%w: filter lower over a non-string", ErrUnsupported)
+		}
+		return strValue(strings.ToLower(base.s)), nil
+	case "replace":
+		if base.kind != vStr {
+			return value{}, fmt.Errorf("%w: filter replace over a non-string", ErrUnsupported)
+		}
+		from, err := argStr(0)
+		if err != nil {
+			return value{}, err
+		}
+		to, err := argStr(1)
+		if err != nil {
+			return value{}, err
+		}
+		return strValue(strings.ReplaceAll(base.s, from, to)), nil
+	case "join":
+		if base.kind != vList {
+			return value{}, fmt.Errorf("%w: filter join over a non-list", ErrUnsupported)
+		}
+		sep, err := argStr(0)
+		if err != nil {
+			return value{}, err
+		}
+		parts := make([]string, 0, len(base.list))
+		for _, el := range base.list {
+			s, err := el.stringify()
+			if err != nil {
+				return value{}, err
+			}
+			parts = append(parts, s)
+		}
+		return strValue(strings.Join(parts, sep)), nil
 	}
-	return out, nil
+	return value{}, fmt.Errorf("%w: filter %q", ErrUnsupported, x.s)
 }
 
-func resolvePath(path []string, env *env) (string, error) {
-	switch path[0] {
-	case "bos_token":
-		if len(path) == 1 {
-			return env.params.BOSToken, nil
+func evalMethod(x *vExpr, e *env) (value, error) {
+	base, err := eval(x.lhs, e)
+	if err != nil {
+		return value{}, err
+	}
+	switch x.s {
+	case "get":
+		if base.kind != vDict {
+			return value{}, fmt.Errorf("%w: method get on a non-mapping", ErrUnsupported)
 		}
-	case "eos_token":
-		if len(path) == 1 {
-			return env.params.EOSToken, nil
+		if len(x.args) < 1 || len(x.args) > 2 {
+			return value{}, fmt.Errorf("%w: method get with %d arguments", ErrUnsupported, len(x.args))
 		}
-	case "add_generation_prompt":
-		return "", fmt.Errorf("%w: add_generation_prompt is a flag, not text", ErrUnsupported)
-	case "message":
-		if env.message == nil {
-			return "", fmt.Errorf("%w: message used outside the messages loop", ErrUnsupported)
+		key, err := eval(x.args[0], e)
+		if err != nil {
+			return value{}, err
 		}
-		if len(path) == 2 {
-			switch path[1] {
-			case "role":
-				return env.message.Role, nil
-			case "content":
-				return env.message.Content, nil
-			}
+		if key.kind != vStr {
+			return value{}, fmt.Errorf("%w: method get with a non-string key", ErrUnsupported)
+		}
+		if v, ok := base.dict[key.s]; ok {
+			return v, nil
+		}
+		if len(x.args) == 2 {
+			return eval(x.args[1], e)
+		}
+		return value{kind: vNone}, nil
+	case "split":
+		if base.kind != vStr {
+			return value{}, fmt.Errorf("%w: method split on a non-string", ErrUnsupported)
+		}
+		if len(x.args) != 1 {
+			return value{}, fmt.Errorf("%w: method split with %d arguments", ErrUnsupported, len(x.args))
+		}
+		sep, err := eval(x.args[0], e)
+		if err != nil {
+			return value{}, err
+		}
+		if sep.kind != vStr || sep.s == "" {
+			return value{}, fmt.Errorf("%w: method split with a bad separator", ErrUnsupported)
+		}
+		parts := strings.Split(base.s, sep.s)
+		out := make([]value, len(parts))
+		for i, part := range parts {
+			out[i] = strValue(part)
+		}
+		return listValue(out), nil
+	case "items":
+		if base.kind != vDict {
+			return value{}, fmt.Errorf("%w: method items on a non-mapping", ErrUnsupported)
+		}
+		// Pair items in sorted-key order: Go maps do not carry
+		// Jinja's insertion order, and no shipped shape iterates
+		// a mapping whose order affects the prompt.
+		keys := make([]string, 0, len(base.dict))
+		for k := range base.dict {
+			keys = append(keys, k)
+		}
+		sortStrings(keys)
+		out := make([]value, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, listValue([]value{strValue(k), base.dict[k]}))
+		}
+		return listValue(out), nil
+	}
+	return value{}, fmt.Errorf("%w: method call %s(...)", ErrUnsupported, x.s)
+}
+
+func sortStrings(s []string) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
 		}
 	}
-	return "", fmt.Errorf("%w: name %q", ErrUnsupported, strings.Join(path, "."))
+}
+
+func evalCall(x *vExpr, e *env) (value, error) {
+	if x.s == "namespace" {
+		d := map[string]value{}
+		for name, argExpr := range x.kw {
+			v, err := eval(argExpr, e)
+			if err != nil {
+				return value{}, err
+			}
+			d[name] = v
+		}
+		if len(x.args) > 0 {
+			return value{}, fmt.Errorf("%w: namespace() with positional arguments", ErrUnsupported)
+		}
+		return dictValue(d), nil
+	}
+	m, ok := e.macros[x.s]
+	if !ok {
+		// raise_exception and every other unknown call refuse by
+		// name when actually evaluated; untaken branches never
+		// reach here.
+		return value{}, fmt.Errorf("%w: function call %s(...)", ErrUnsupported, x.s)
+	}
+	vars := map[string]value{}
+	for i, param := range m.params {
+		if i < len(x.args) {
+			v, err := eval(x.args[i], e)
+			if err != nil {
+				return value{}, err
+			}
+			vars[param] = v
+		} else if kwExpr, ok := x.kw[param]; ok {
+			v, err := eval(kwExpr, e)
+			if err != nil {
+				return value{}, err
+			}
+			vars[param] = v
+		} else {
+			vars[param] = undefValue(param)
+		}
+	}
+	// Macros see the global scope plus their parameters, as in
+	// Jinja; the caller's locals do not leak in.
+	macroEnv := &env{global: e.global, cur: &scope{vars: vars, parent: e.global}, macros: e.macros}
+	var sb strings.Builder
+	if err := renderNodes(m.body, macroEnv, &sb); err != nil {
+		return value{}, err
+	}
+	return strValue(sb.String()), nil
 }

@@ -2,6 +2,7 @@ package chattemplate_test
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -106,11 +107,11 @@ func TestNotConditionAndEOS(t *testing.T) {
 func TestUnsupportedConstructsRefuseByName(t *testing.T) {
 	msgs := []chattemplate.Message{{Role: "user", Content: "x"}}
 	cases := map[string]string{
-		"set statement":  `{% set x = 1 %}hi`,
 		"length filter":  `{{ messages | length }}`,
+		"tojson filter":  `{{ messages | tojson }}`,
 		"unknown name":   `{{ model_name }}`,
 		"raise call":     `{{ raise_exception('nope') }}`,
-		"bad for":        `{% for m in messages %}x{% endfor %}`,
+		"bad for":        `{% for m in model_name %}x{% endfor %}`,
 		"print flag":     `{{ add_generation_prompt }}`,
 		"unclosed print": `{{ message['role'] `,
 		"stray endif":    `hi{% endif %}`,
@@ -137,5 +138,112 @@ func TestUntakenBranchIsNotEvaluated(t *testing.T) {
 		[]chattemplate.Message{{Role: "tool", Content: "x"}}, chattemplate.Params{})
 	if !errors.Is(err, chattemplate.ErrUnsupported) {
 		t.Fatalf("tool branch err = %v, want ErrUnsupported", err)
+	}
+}
+
+// ---- the extended subset (TODO T-9.17 fix) -------------------------
+//
+// The Glimmer file's own ATEM template uses macros, namespace
+// state, set, defined tests and the join/replace/lower filters.
+// These tests pin the constructs that template's taken paths need;
+// the golden test below renders the file's real template whole.
+
+func TestSetAndInlineConditional(t *testing.T) {
+	tmpl := `{% set x = 'yes' if add_generation_prompt else 'no' %}{{ x }}`
+	got := render(t, tmpl, nil, chattemplate.Params{AddGenerationPrompt: true})
+	if want := "yes"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	got = render(t, tmpl, nil, chattemplate.Params{})
+	if want := "no"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestMacroDefinitionAndCall(t *testing.T) {
+	tmpl := `{% macro wrap(c) %}<{{ c }}>{% endmacro %}{% for message in messages %}{{ wrap(message['content']) }}{% endfor %}`
+	got := render(t, tmpl, []chattemplate.Message{{Role: "user", Content: "hi"}},
+		chattemplate.Params{})
+	if want := "<hi>"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestNamespaceStateAcrossIterations(t *testing.T) {
+	tmpl := `{% set ns = namespace(seen=false) %}{% for m in messages %}{% if m['role'] == 'system' %}{% set ns.seen = true %}{% endif %}{% endfor %}{% if ns.seen %}HAS{% else %}NONE{% endif %}`
+	got := render(t, tmpl, []chattemplate.Message{
+		{Role: "user", Content: "u"},
+		{Role: "system", Content: "s"},
+	}, chattemplate.Params{})
+	if want := "HAS"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	got = render(t, tmpl, []chattemplate.Message{{Role: "user", Content: "u"}},
+		chattemplate.Params{})
+	if want := "NONE"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestDefinedTestsAndOrValue(t *testing.T) {
+	tmpl := `{% if knowledge_cutoff is defined %}DEF{% else %}UNDEF{% endif %}{% set r = missing or 'fallback' %}{{ r }}`
+	got := render(t, tmpl, nil, chattemplate.Params{})
+	if want := "UNDEFfallback"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func glimmerTemplate(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile("testdata/glimmer-atem.jinja")
+	if err != nil {
+		t.Fatalf("read the Glimmer ATEM template fixture: %v", err)
+	}
+	return string(b)
+}
+
+var glimmerParams = chattemplate.Params{
+	BOSToken:            "<|begin_of_text|>",
+	EOSToken:            "<|end_of_text|>",
+	AddGenerationPrompt: true,
+}
+
+// The file's real template, one user message: the default system
+// block renders (no system message given), with the cutoff and
+// reasoning lines the template synthesizes and the valid
+// recipients list joined from namespace state.
+func TestGlimmerATEMTemplateUserOnly(t *testing.T) {
+	got := render(t, glimmerTemplate(t), []chattemplate.Message{
+		{Role: "user", Content: "Capital of France? One word."},
+	}, glimmerParams)
+	want := "<|begin_of_text|>" +
+		"<|start|>system<|message|>You are a helpful AI assistant.\n" +
+		"Knowledge cutoff: 2026-01-04.\n\n" +
+		"Reasoning strength: high.\n\n" +
+		"# Valid recipients: \"self\", \"user\".<|eot|>" +
+		"<|start|>user<|message|>Capital of France? One word.<|eot|>" +
+		"<|start|>assistant"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// With a caller system message the template's system branch runs:
+// the replace chain, the lower-cased 'in' check that decides
+// whether to synthesize the reasoning line, and the recipients
+// block again.
+func TestGlimmerATEMTemplateWithSystem(t *testing.T) {
+	got := render(t, glimmerTemplate(t), []chattemplate.Message{
+		{Role: "system", Content: "Be terse."},
+		{Role: "user", Content: "Capital of France? One word."},
+	}, glimmerParams)
+	want := "<|begin_of_text|>" +
+		"<|start|>system<|message|>Be terse.\n\n" +
+		"Reasoning strength: high.\n\n" +
+		"# Valid recipients: \"self\", \"user\".<|eot|>" +
+		"<|start|>user<|message|>Capital of France? One word.<|eot|>" +
+		"<|start|>assistant"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

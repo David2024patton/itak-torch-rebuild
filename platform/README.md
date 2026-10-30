@@ -6,11 +6,15 @@ Rust engine owns the hot token loop. The two meet at one seam,
 `internal/engine.Client`, over a Unix socket with a JSON control
 protocol; tensors will move over shared memory when the Rust side lands.
 
-This is a skeleton built clean from the old platform's audit lessons:
+This platform is built clean from the old platform's audit lessons:
 interfaces and wiring are real, the engine sits behind the client
 interface, and nothing fakes success. An unconfigured engine answers
 with a named `engine_unavailable` error; an unimplemented engine
-operation answers `not_implemented`.
+operation answers `not_implemented`. Generation over the socket is
+real (streamed token events from the Rust engine); embeddings are
+the operation still answered `not_implemented`, because the socket
+protocol has no embedding operation yet. Serving the pair end to
+end is documented in the repo's SERVING.md.
 
 ## Module map (the grid)
 
@@ -19,7 +23,7 @@ operation answers `not_implemented`.
 | `cmd/torchd` | Daemon entrypoint: flags, env, signals, wiring |
 | `internal/server` | HTTP routes, validation, SSE streaming, error mapping |
 | `internal/auth` | The one API-key middleware (constant-time, fails closed) |
-| `internal/engine` | Client interface, named errors, Unix-socket skeleton |
+| `internal/engine` | Client interface, named errors, Unix-socket client (handshake, ping, debug self-report, streamed generate) |
 | `internal/scheduler` | Priority-lane concurrency gate; both lanes provably drain |
 | `internal/cache` | Exact-match response cache with TTL and injectable clock |
 | `internal/diag` | Diagnostics registry behind `/debug` (debugging from birth) |
@@ -31,6 +35,10 @@ export TORCH_API_KEY='your-key-here'
 go run ./cmd/torchd                      # 127.0.0.1:8091, no engine
 go run ./cmd/torchd -engine-socket /run/torch/engine.sock -models glimmer
 ```
+
+With `-engine-socket`, start the Rust engine first (see the repo's
+SERVING.md); the daemon logs whether the engine connected, and
+`/healthz` reports the engine's state either way.
 
 The daemon refuses to start without `TORCH_API_KEY` unless
 `TORCH_ALLOW_NO_AUTH=1` is set deliberately. The bind is loopback by
@@ -44,7 +52,7 @@ default; widening it is an explicit `-addr` decision.
 | `GET /v1/models` | yes | Configured model list |
 | `POST /v1/chat/completions` | yes | Validated; scheduler-gated; cached when not streaming; SSE with `stream: true`. Priority via `X-Torch-Priority: high` |
 | `POST /v1/embeddings` | yes | String or string-array input |
-| `GET /debug` | yes | Diag counters, scheduler depths, cache stats |
+| `GET /debug` | yes | Diag counters, scheduler depths, cache stats, engine self-report when the client offers one |
 
 ## Gates
 

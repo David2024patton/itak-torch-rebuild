@@ -6,10 +6,12 @@
 //! would guess. Beyond the familiar q/k/v/o projections, gate/up/down,
 //! and two norms, the real layers also carry Q and K norms (applied per
 //! head after the projections), an attention gate projection, and post
-//! norms after both residual adds. A template that never looks those
+//! norms on both sub-layer outputs. A template that never looks those
 //! names up silently runs without them; that is the original engine's
 //! defect, designed out here: [`Weights::load`] requires every name, and
-//! a missing one is a [`GlimmerError::MissingTensor`] naming it.
+//! a missing one is a [`GlimmerError::MissingTensor`] naming it. The two
+//! post norms are sandwich norms: they normalize their sub-layer's
+//! output before the residual add (norm audit, 2026-10-29).
 //!
 //! Loading goes through the [`TensorSource`] trait. The loader crate
 //! (TODO T-2.1, `itak-loader` in this workspace) implements it over the
@@ -130,8 +132,8 @@ pub struct LayerWeights {
     /// `attn_gate.weight`: projection producing the gate that scales the
     /// attention output (gated attention, present in the real file).
     pub attn_gate: TensorView,
-    /// `post_attention_norm.weight`: RMSNorm after the attention
-    /// residual add.
+    /// `post_attention_norm.weight`: sandwich RMSNorm on the
+    /// attention output, before the residual add.
     pub post_attention_norm: TensorView,
     /// `ffn_norm.weight`: pre-FFN RMSNorm.
     pub ffn_norm: TensorView,
@@ -142,7 +144,8 @@ pub struct LayerWeights {
     /// `ffn_down.weight`: FFN down projection (75 percent of the model's
     /// bytes live in the FFN tensors; this is the large one).
     pub ffn_down: TensorView,
-    /// `post_ffw_norm.weight`: RMSNorm after the FFN residual add.
+    /// `post_ffw_norm.weight`: sandwich RMSNorm on the FFN output,
+    /// before the residual add.
     pub post_ffw_norm: TensorView,
 }
 

@@ -52,8 +52,18 @@ pub trait Compute {
     /// RMSNorm over the last dimension of `x`, which holds `rows` rows.
     /// Used for the pre norms (width hidden or FFN input), the per-head
     /// Q and K norms (width head dim, rows = positions times heads),
-    /// the post norms, and the final norm.
+    /// the post norms, and the final norm. The weight is the tensor
+    /// the file stores, applied as the effective gain it is (the
+    /// norm-convention audit in `NORM-AUDIT-2026-10-29.md` records
+    /// why no shift is applied anywhere in this engine).
     fn rms_norm(&self, x: &[f32], weight: &TensorView, rows: usize, eps: f32) -> Result<Vec<f32>>;
+
+    /// Parameter-free RMSNorm over the last dimension of `x`, which
+    /// holds `rows` rows: no weight tensor exists for this step in
+    /// the file. Used exactly once in the forward, on the token
+    /// embeddings before the first layer (the architecture
+    /// RMS-normalizes its embeddings; see the norm audit).
+    fn rms_norm_scaleless(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>>;
 
     /// Linear projection `x` by `weight`, `[rows, in]` to `[rows, out]`,
     /// dequantizing the weight as needed.
@@ -116,6 +126,12 @@ impl Compute for UnimplementedCompute {
         _eps: f32,
     ) -> Result<Vec<f32>> {
         Err(GlimmerError::Unimplemented { step: "rms_norm" })
+    }
+
+    fn rms_norm_scaleless(&self, _x: &[f32], _rows: usize, _eps: f32) -> Result<Vec<f32>> {
+        Err(GlimmerError::Unimplemented {
+            step: "rms_norm_scaleless",
+        })
     }
 
     fn proj(&self, _x: &[f32], _weight: &TensorView, _rows: usize) -> Result<Vec<f32>> {

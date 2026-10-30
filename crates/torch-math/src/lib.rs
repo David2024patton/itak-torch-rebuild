@@ -44,7 +44,7 @@ pub mod rope;
 pub use activation::{geglu, gelu_tanh, silu, swiglu};
 pub use linalg::{matmul, matvec};
 pub use logits::{logit_scale, logit_softcap};
-pub use norm::rms_norm;
+pub use norm::{rms_norm, rms_norm_scaleless};
 pub use rope::{rope, rope_partial};
 
 /// Result type for `torch-math` operations.

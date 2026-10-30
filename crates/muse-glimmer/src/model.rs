@@ -1,22 +1,26 @@
 //! [`GlimmerModel`]: config plus weights plus compute, and the forward
 //! pass that ties them together.
 //!
-//! The forward is structured exactly as the architecture runs, per
-//! layer: pre-attention norm, Q/K/V projections, per-head Q and K
-//! norms, attention of the layer's kind, attention gate, output
-//! projection, residual add, post-attention norm, pre-FFN norm, SwiGLU
-//! FFN, residual add, post-FFN norm. Then the final norm, the untied
+//! The forward is structured exactly as the architecture runs: a
+//! parameter-free RMSNorm on the token embeddings, then per layer:
+//! pre-attention norm, Q/K/V projections, per-head Q and K norms,
+//! attention of the layer's kind, attention gate, output projection,
+//! post-attention norm, residual add, pre-FFN norm, SwiGLU FFN,
+//! post-FFN norm, residual add. Then the final norm, the untied
 //! head, and the logit softcap and scale, which are real arithmetic
 //! done here (they are a handful of scalar operations on the logit
 //! vector, not kernel work).
 //!
-//! Two placements are marked for verification at the integration stage,
-//! against the reference graph in llama.cpp, before any output of this
-//! forward is trusted numerically: the post norms are applied after
-//! each residual add (the Gemma-style pre/post pattern the tensor set
-//! implies), and the attention gate projection reads the same normed
-//! input as the Q/K/V projections. The structure makes both placements
-//! one-line changes if the reference disagrees.
+//! The norm placements and weight convention were settled by the
+//! norm audit of 2026-10-29 (`NORM-AUDIT-2026-10-29.md` in this
+//! crate): the post norms are sandwich norms, applied to each
+//! sub-layer's output BEFORE its residual add (the checkpoint's own
+//! config describes them as sitting between the sub-layer output and
+//! the residual), and every stored norm weight is applied plainly,
+//! as the effective gain the GGUF converter stored. One placement
+//! remains marked for verification against the reference graph: the
+//! attention gate projection reads the same normed input as the
+//! Q/K/V projections.
 //!
 //! Input validation (non-empty, token range) is done here, for real,
 //! before any compute step runs. Everything else delegates to
@@ -105,7 +109,10 @@ impl GlimmerModel {
         let rows = tokens.len();
         let c = &*self.compute;
 
-        let mut x = c.embed(&self.weights.embedding, tokens, cfg)?;
+        // The architecture RMS-normalizes the token embeddings
+        // (parameter-free: no weight tensor exists for this step).
+        let embedded = c.embed(&self.weights.embedding, tokens, cfg)?;
+        let mut x = c.rms_norm_scaleless(&embedded, rows, cfg.rms_eps)?;
 
         for (index, (kind, w)) in cfg
             .layers
@@ -119,6 +126,12 @@ impl GlimmerModel {
             let q = c.proj(&h, &w.attn_q, rows)?;
             let k = c.proj(&h, &w.attn_k, rows)?;
             let v = c.proj(&h, &w.attn_v, rows)?;
+            // Q/K norms: the checkpoint definition is scaleless with
+            // a scale factor on Q (3.87); the file materializes that
+            // as constant weight tensors (attn_q_norm all 3.87,
+            // attn_k_norm all 1.0, measured in integration run B),
+            // so the plain weighted norm below IS the definition,
+            // with no special case. See the norm audit.
             let q = c.rms_norm(&q, &w.attn_q_norm, rows * cfg.q_heads as usize, cfg.rms_eps)?;
             let k = c.rms_norm(
                 &k,
@@ -140,14 +153,17 @@ impl GlimmerModel {
             let gate = c.proj(&h, &w.attn_gate, rows)?;
             let attn = c.attn_gate(&attn, &gate)?;
             let out = c.proj(&attn, &w.attn_output, rows)?;
+            // Sandwich post norm: on the attention output, BEFORE
+            // the residual add (norm audit, 2026-10-29).
+            let out = c.rms_norm(&out, &w.post_attention_norm, rows, cfg.rms_eps)?;
             let after_attn = c.add(&residual, &out)?;
-            let after_attn = c.rms_norm(&after_attn, &w.post_attention_norm, rows, cfg.rms_eps)?;
 
-            let residual = after_attn;
-            let h = c.rms_norm(&residual, &w.ffn_norm, rows, cfg.rms_eps)?;
+            let h = c.rms_norm(&after_attn, &w.ffn_norm, rows, cfg.rms_eps)?;
             let ffn = c.swiglu_ffn(&h, w, rows, cfg)?;
-            let after_ffn = c.add(&residual, &ffn)?;
-            x = c.rms_norm(&after_ffn, &w.post_ffw_norm, rows, cfg.rms_eps)?;
+            // Sandwich post norm: on the FFN output, BEFORE the
+            // residual add.
+            let ffn = c.rms_norm(&ffn, &w.post_ffw_norm, rows, cfg.rms_eps)?;
+            x = c.add(&after_attn, &ffn)?;
         }
 
         let hidden = cfg.hidden as usize;
@@ -263,6 +279,11 @@ mod tests {
             Ok(vec![0.0; x.len()])
         }
 
+        fn rms_norm_scaleless(&self, x: &[f32], _rows: usize, _eps: f32) -> Result<Vec<f32>> {
+            self.record("rms_norm_scaleless");
+            Ok(vec![0.0; x.len()])
+        }
+
         fn proj(&self, x: &[f32], _weight: &TensorView, _rows: usize) -> Result<Vec<f32>> {
             self.record("proj");
             Ok(vec![0.0; x.len()])
@@ -361,15 +382,15 @@ mod tests {
             "attention",
             "proj", // gate
             "attn_gate",
-            "proj", // output
+            "proj",     // output
+            "rms_norm", // post-attention norm (sandwich: before the add)
             "add",
-            "rms_norm", // post-attention norm
             "rms_norm", // ffn pre-norm
             "swiglu_ffn",
+            "rms_norm", // post-ffn norm (sandwich: before the add)
             "add",
-            "rms_norm", // post-ffn norm
         ];
-        let mut expected: Vec<&str> = vec!["embed"];
+        let mut expected: Vec<&str> = vec!["embed", "rms_norm_scaleless"];
         expected.extend(one_layer);
         expected.extend(one_layer);
         expected.extend(["rms_norm", "lm_head"]);

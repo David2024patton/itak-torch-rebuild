@@ -395,6 +395,27 @@ impl Compute for CpuCompute {
         Ok(out)
     }
 
+    fn rms_norm_scaleless(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>> {
+        let step = "rms_norm_scaleless";
+        if rows == 0 || x.len() % rows != 0 {
+            return Err(step_failed(
+                step,
+                format!(
+                    "input holds {} elements, not a whole number of {rows} rows",
+                    x.len()
+                ),
+            ));
+        }
+        let width = x.len() / rows;
+        let mut out = Vec::with_capacity(x.len());
+        for r in 0..rows {
+            let row = torch_math::rms_norm_scaleless(&x[r * width..(r + 1) * width], eps)
+                .map_err(|e| step_failed(step, e.to_string()))?;
+            out.extend_from_slice(&row);
+        }
+        Ok(out)
+    }
+
     fn proj(&self, x: &[f32], weight: &TensorView, rows: usize) -> Result<Vec<f32>> {
         self.proj_impl(x, weight, rows, "proj")
     }
@@ -722,6 +743,32 @@ mod tests {
         // Row [0, 2]: rms = sqrt(2).
         let inv2 = 1.0 / (2.0f32 + 1e-6).sqrt();
         assert!((out[5] - 2.0 * inv2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rms_norm_scaleless_normalizes_each_row_without_a_weight() {
+        let c = CpuCompute::new();
+        // Two rows of width 4: [1,2,3,4] (mean square 7.5) and a
+        // constant row [2,2,2,2] (maps to ones). Independent f64
+        // reference values, eps 1e-5.
+        let out = c
+            .rms_norm_scaleless(&[1.0, 2.0, 3.0, 4.0, 2.0, 2.0, 2.0, 2.0], 2, 1e-5)
+            .expect("scaleless norm");
+        let want = [0.365148, 0.730296, 1.095444, 1.460593, 1.0, 1.0, 1.0, 1.0];
+        for (got, want) in out.iter().zip(want.iter()) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+        // A row count that does not divide the input refuses by name.
+        let err = c
+            .rms_norm_scaleless(&[1.0, 2.0, 3.0], 2, 1e-5)
+            .expect_err("ragged rows must refuse");
+        assert!(matches!(
+            err,
+            GlimmerError::StepFailed {
+                step: "rms_norm_scaleless",
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -360,19 +360,59 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn zero_attention_and_ffn_match_hand_computed_logits() {
-    // ASSUMPTION PINNED, one of the two placements muse-glimmer's
-    // model docs flag for verification: the post norms are applied
-    // AFTER each residual add (the Gemma-style pre/post pattern).
-    // With the attention output projection and the FFN down
-    // projection zeroed, neither sub-block can change the residual
-    // stream, so under that reading each layer maps the stream x to
-    // rms(rms(x)): one post-attention norm, one post-FFN norm. The
-    // expected logits below are computed by exactly that reading
-    // with test-local math. If the post norms ever move ahead of the
-    // adds, the count changes and this test fails visibly, which is
-    // what pinning an assumption means.
+    // CONVENTION PINNED by the norm audit (2026-10-29): the post
+    // norms are sandwich norms, applied to each sub-layer's output
+    // BEFORE its residual add, and the token embeddings are
+    // RMS-normed (scaleless) before the first layer. With the
+    // attention output projection and the FFN down projection
+    // zeroed, both sub-layer outputs are the zero vector, the post
+    // norms map zero to zero, and each layer is the identity on the
+    // residual stream. So exactly two norms ever touch the stream:
+    // the embedding norm and the final norm. The expected logits
+    // below are computed by exactly that reading with test-local
+    // math.
+    //
+    // The post norm weights are overridden to non-constant vectors
+    // (alternating 2.0 / 0.5 across channels) on purpose: with
+    // weight-1 post norms the placement would be numerically
+    // invisible here, because repeated RMSNorm is near-idempotent,
+    // and with constant post weights it would still be invisible,
+    // because RMSNorm erases any uniform rescaling of the stream
+    // and only the stream's direction reaches the logits. A
+    // channel-varying weight is the only kind that can steer the
+    // direction, so it is the only kind that makes the placement
+    // load-bearing in this test: under the after-the-add reading
+    // these weights steer the stream twice per layer, under the
+    // sandwich reading they never touch it.
     let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::SlidingWindow], 16);
-    let model = make_model(&cfg, Style::Analytic);
+    let mut source = build_source(&cfg, Style::Analytic);
+    let post_attn_w: Vec<f32> = (0..HIDDEN)
+        .map(|j| if j % 2 == 0 { 2.0 } else { 0.5 })
+        .collect();
+    // The same pattern, NOT the complement: a complementary pair
+    // would multiply back to a constant 1.0 per channel over one
+    // layer and steer nothing, a trap this fixture fell into once.
+    let post_ffw_w = post_attn_w.clone();
+    for layer in 0..2 {
+        source.tensors.insert(
+            format!("blk.{layer}.post_attention_norm.weight"),
+            f32_tensor(
+                &format!("blk.{layer}.post_attention_norm.weight"),
+                &[HIDDEN as u64],
+                post_attn_w.clone(),
+            ),
+        );
+        source.tensors.insert(
+            format!("blk.{layer}.post_ffw_norm.weight"),
+            f32_tensor(
+                &format!("blk.{layer}.post_ffw_norm.weight"),
+                &[HIDDEN as u64],
+                post_ffw_w.clone(),
+            ),
+        );
+    }
+    let weights = Weights::load(&source, &cfg).expect("synthetic weights load");
+    let model = GlimmerModel::new(cfg, weights, Box::new(CpuCompute::new()));
     let mut cache = PositionCache::new();
     let logits = model
         .forward(&[7, 42, 3], &mut cache)
@@ -380,17 +420,72 @@ fn zero_attention_and_ffn_match_hand_computed_logits() {
     assert_eq!(cache.position(), 3);
     assert_eq!(logits.len(), VOCAB);
 
-    // Last token is 3; its embedding row passes 2 norms per layer
-    // (4 total) plus the final norm, then the repeat-identity head,
-    // then the file's softcap and scale (cap 20, scale 0.5).
+    // Last token is 3; its embedding row passes the embedding norm
+    // and the final norm (the layers between are identities), then
+    // the repeat-identity head, then the file's softcap and scale
+    // (cap 20, scale 0.5).
     let mut x: Vec<f64> = (0..HIDDEN)
         .map(|i| f64::from(emb_pattern_a(3, i)))
         .collect();
-    for _ in 0..5 {
+    for _ in 0..2 {
         x = rms64(&x, 1e-6);
     }
     for (j, got) in logits.iter().enumerate() {
         let z = x[j % HIDDEN];
+        let want = 0.5 * 20.0 * (z / 20.0).tanh();
+        assert!(
+            (f64::from(*got) - want).abs() < 1e-4,
+            "logit {j}: got {got}, want {want}"
+        );
+    }
+}
+
+#[test]
+fn final_norm_weight_is_the_effective_gain_not_an_offset() {
+    // CONVENTION PINNED by the norm audit (2026-10-29): the final
+    // norm's stored weight is the actual output gain, applied
+    // plainly. (In the checkpoint definition this norm is the one
+    // norm whose weight is NOT an offset from one; the GGUF stores
+    // effective gains throughout.) The override below installs a
+    // mixed-sign, mixed-size final norm weight on the zeroed
+    // analytic model, under which the plain and (1 + w) readings
+    // disagree in sign as well as size: w = -1.0 at channels 2 mod 5
+    // flips those channels' signs under the plain reading and zeroes
+    // them under the shifted one. Expected logits are computed here
+    // from the formulas, in f64, sharing no code with the backend.
+    let cfg = test_config(vec![LayerKind::SlidingWindow], 16);
+    let mut source = build_source(&cfg, Style::Analytic);
+    let final_w: Vec<f32> = (0..HIDDEN)
+        .map(|j| match j % 5 {
+            0 => 2.0,
+            1 => 0.5,
+            2 => -1.0,
+            3 => 0.0,
+            _ => 1.25,
+        })
+        .collect();
+    source.tensors.insert(
+        "output_norm.weight".to_string(),
+        f32_tensor("output_norm.weight", &[HIDDEN as u64], final_w.clone()),
+    );
+    let weights = Weights::load(&source, &cfg).expect("synthetic weights load");
+    let model = GlimmerModel::new(cfg, weights, Box::new(CpuCompute::new()));
+    let mut cache = PositionCache::new();
+    let logits = model.forward(&[3], &mut cache).expect("forward runs");
+    assert_eq!(logits.len(), VOCAB);
+
+    // Stream for the single token: embedding norm only (the one
+    // layer is the identity, as in the sibling test). The final norm
+    // then multiplies channel c by final_w[c], plainly.
+    let x: Vec<f64> = (0..HIDDEN)
+        .map(|i| f64::from(emb_pattern_a(3, i)))
+        .collect();
+    let x = rms64(&x, 1e-6);
+    let ms = x.iter().map(|v| v * v).sum::<f64>() / HIDDEN as f64;
+    let inv = 1.0 / (ms + 1e-6).sqrt();
+    for (j, got) in logits.iter().enumerate() {
+        let c = j % HIDDEN;
+        let z = x[c] * inv * f64::from(final_w[c]);
         let want = 0.5 * 20.0 * (z / 20.0).tanh();
         assert!(
             (f64::from(*got) - want).abs() < 1e-4,
@@ -417,14 +512,17 @@ fn rope64(v: &[f64], position: usize, base: f64) -> Vec<f64> {
 
 #[test]
 fn attention_mixing_matches_a_naive_reference() {
-    // ASSUMPTIONS PINNED, both flagged in muse-glimmer's model docs:
-    // (1) the attention gate projection reads the same normed input
-    // as the Q/K/V projections. Here attn_gate is 0.25 * identity,
-    // so the gate values are 0.25 * h and the naive route below uses
-    // h (the normed input), never the raw residual; the opposite
-    // reading produces different numbers and would fail. (2) The
-    // post norms sit after the residual adds, as in the sibling
-    // test. Everything else (QK norms per head, RoPE at absolute
+    // READINGS PINNED: (1) the attention gate projection reads the
+    // same normed input as the Q/K/V projections (the one placement
+    // still flagged for verification in muse-glimmer's model docs).
+    // Here attn_gate is 0.25 * identity, so the gate values are
+    // 0.25 * h and the naive route below uses h (the normed input),
+    // never the raw residual; the opposite reading produces
+    // different numbers and would fail. (2) The norm conventions
+    // settled by the 2026-10-29 audit: the embeddings are
+    // RMS-normed scalelessly before layer 0, and the post norms are
+    // sandwich norms on the sub-layer outputs, before the residual
+    // adds. Everything else (QK norms per head, RoPE at absolute
     // positions, GQA grouping 2:1, causal masking, the gate's
     // sigmoid, the final norm, the softcap) is computed here from
     // the formulas, in f64, sharing no code with the backend.
@@ -444,7 +542,10 @@ fn attention_mixing_matches_a_naive_reference() {
                 .collect()
         })
         .collect();
-    let h: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
+    // The residual stream: embeddings after the scaleless embedding
+    // norm. The attention pre-norm then norms the stream again.
+    let stream: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
+    let h: Vec<Vec<f64>> = stream.iter().map(|x| rms64(x, eps)).collect();
     let q_of = |p: usize, head: usize| -> Vec<f64> {
         rope64(
             &rms64(&h[p][head * HEAD_DIM..(head + 1) * HEAD_DIM], eps),
@@ -493,11 +594,13 @@ fn attention_mixing_matches_a_naive_reference() {
         .zip(&h[p])
         .map(|(a, hv)| a / (1.0 + (-(0.25 * hv)).exp()))
         .collect();
-    // Output projection is identity; residual add; post norms.
-    let after: Vec<f64> = emb[p].iter().zip(&gated).map(|(x, g)| x + g).collect();
-    let a = rms64(&after, eps); // post-attention norm
-    let b = rms64(&a, eps); // post-FFN norm (FFN output is zero)
-    let n = rms64(&b, eps); // final norm
+    // Output projection is identity; the post-attention norm acts
+    // on the gated output (sandwich), then the residual add. The
+    // FFN output is zero, so its post norm contributes nothing and
+    // the stream passes to the final norm unchanged.
+    let post = rms64(&gated, eps); // post-attention norm
+    let after: Vec<f64> = stream[p].iter().zip(&post).map(|(x, g)| x + g).collect();
+    let n = rms64(&after, eps); // final norm
     for (j, got) in logits.iter().enumerate() {
         let z = n[j % HIDDEN];
         let want = 0.5 * 20.0 * (z / 20.0).tanh();

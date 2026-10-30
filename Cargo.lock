@@ -31,6 +31,13 @@ name = "gguf"
 version = "0.1.0"
 
 [[package]]
+name = "itak-kernels"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+]
+
+[[package]]
 name = "itak-loader"
 version = "0.1.0"
 dependencies = [

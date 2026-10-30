@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "The itak-backend module of ARCHITECTURE 3.1: the Backend trait, hardware detection and selection policy (BACKEND.md fallback ladder), and the CPU reference backend over torch-math and the gguf dequantizers"
+description = "The itak-backend module of ARCHITECTURE 3.1: the Backend trait, hardware detection and selection policy (BACKEND.md fallback ladder), the CPU reference backend over torch-math and the gguf dequantizers, and sysfs hardware detection (AMD VRAM from amdgpu sysfs, NVIDIA via nvidia-smi, CPU-only fallback) with auto-config"
 
 [lints]
 workspace = true
@@ -12,3 +12,7 @@ workspace = true
 [dependencies]
 gguf = { path = "../gguf" }
 torch-math = { path = "../torch-math" }
+# The detection half (hwdetect) adds no dependencies on purpose: it
+# reads sysfs files and runs nvidia-smi through std only, so it stays
+# auditable at a glance and builds identically anywhere the engine
+# builds (lane 16's rule, kept in the unified crate).

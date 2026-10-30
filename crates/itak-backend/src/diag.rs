@@ -27,6 +27,12 @@ pub fn set_debug_enabled(enabled: bool) {
     DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// The detection half's name for [`set_debug_enabled`] (lane 16's
+/// API, kept in the unified crate so both halves share one flag).
+pub fn set_debug(enabled: bool) {
+    set_debug_enabled(enabled);
+}
+
 /// Whether debug logging is active: the explicit flag, or
 /// `ITAK_BACKEND_DEBUG` present in the environment (any value other
 /// than `0`).
@@ -59,6 +65,18 @@ pub fn error(event: &str, fields: &str) {
         eprintln!("[itak-backend][error] event={event} {fields}");
     }
 }
+
+/// Free-form debug line for the detection half (lane 16's macro,
+/// kept in the unified crate): silent unless the debug flag is on,
+/// tagged `[itak-backend]` like the lines it originally emitted.
+macro_rules! dbg_log {
+    ($($arg:tt)*) => {
+        if $crate::diag::debug_enabled() {
+            eprintln!("[itak-backend] {}", format!($($arg)*));
+        }
+    };
+}
+pub(crate) use dbg_log;
 
 #[cfg(test)]
 mod tests {

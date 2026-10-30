@@ -32,8 +32,27 @@ pub enum GpuPolicy {
 /// and operators override it in config.
 pub const DEFAULT_VRAM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Default minimum dedicated VRAM, in MiB, for a GPU to be chosen
+/// by auto-config (lane 16's limit, shared by both configs in the
+/// unified crate).
+pub const DEFAULT_MIN_GPU_VRAM_MIB: u64 = 4096;
+
+/// Default fraction of the chosen GPU's VRAM the engine may budget
+/// for weights and KV state (lane 16's limit, shared by both
+/// configs in the unified crate).
+pub const DEFAULT_VRAM_BUDGET_FRACTION: f32 = 0.90;
+
 /// Configuration for [`crate::detect`] and backend construction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Integration 2026-10-29: this is the crate's one selection
+/// config. It carries lane 17's policy fields (`gpu_policy`,
+/// `allow_non_discrete_gpu`, `vram_reserve_bytes`) AND lane 16's
+/// auto-config limits (`min_gpu_vram_mib`, `vram_budget_fraction`,
+/// `prefer_gpu`), each with its default, so an operator tunes one
+/// struct. [`crate::autoconfig::AutoConfig`] remains the limits
+/// struct [`crate::autoconfig::auto_select`] was proven against;
+/// its defaults are the same constants defined here.
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendConfig {
     /// How the GPU backend participates in selection.
     pub gpu_policy: GpuPolicy,
@@ -46,6 +65,17 @@ pub struct BackendConfig {
     /// Bytes reserved against the sysfs VRAM total when the
     /// planning budget is computed.
     pub vram_reserve_bytes: u64,
+    /// Minimum dedicated VRAM, in MiB, for a GPU to be chosen by
+    /// the auto-config path. Below this the card cannot hold a
+    /// model this engine serves.
+    pub min_gpu_vram_mib: u64,
+    /// Fraction of the chosen GPU's VRAM the auto-config path may
+    /// budget for weights and KV state; the rest stays free for
+    /// the driver and other processes.
+    pub vram_budget_fraction: f32,
+    /// Operator switch for the auto-config path: when false,
+    /// selection is CPU even on a machine with a capable GPU.
+    pub prefer_gpu: bool,
 }
 
 impl Default for BackendConfig {
@@ -54,6 +84,9 @@ impl Default for BackendConfig {
             gpu_policy: GpuPolicy::Auto,
             allow_non_discrete_gpu: false,
             vram_reserve_bytes: DEFAULT_VRAM_RESERVE_BYTES,
+            min_gpu_vram_mib: DEFAULT_MIN_GPU_VRAM_MIB,
+            vram_budget_fraction: DEFAULT_VRAM_BUDGET_FRACTION,
+            prefer_gpu: true,
         }
     }
 }

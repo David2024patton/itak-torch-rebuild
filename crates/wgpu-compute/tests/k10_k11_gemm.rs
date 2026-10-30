@@ -152,23 +152,34 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// Assert two result sets agree within reassociation noise,
-/// scaled to the reference magnitude.
+/// Assert two result sets agree within reassociation noise.
+/// The fixture's random f16 headers give the weights a wide
+/// dynamic range (outputs reach ~1e3), so a per-element
+/// relative bound fails honest sums on cancellation alone:
+/// the GPU accumulates each dot in tiled vec4 order, the host
+/// reference in element order, and the difference is f32
+/// rounding at the scale of the largest partials. The bound
+/// is therefore relative to the result set's own magnitude
+/// scale (5e-5 of it, plus a small floor): a real indexing
+/// defect produces errors at the scale of the values
+/// themselves, orders above this band.
 fn check_close(label: &str, got: &[f32], want: &[f32]) {
     assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+    let scale = want.iter().fold(0.0f32, |a, w| a.max(w.abs()));
+    let tol = 2e-3 + 5e-5 * scale;
     let mut max_diff = 0.0f32;
-    let mut max_rel = 0.0f32;
     for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
         let diff = (g - w).abs();
-        let rel = diff / w.abs().max(1.0);
         max_diff = max_diff.max(diff);
-        max_rel = max_rel.max(rel);
         assert!(
-            diff <= 2e-3 + 1e-4 * w.abs(),
-            "{label}: element {i}: got {g}, want {w} (diff {diff})"
+            diff <= tol,
+            "{label}: element {i}: got {g}, want {w} (diff {diff}, tol {tol} at set scale {scale})"
         );
     }
-    eprintln!("{label}: max abs diff {max_diff:.3e}, max scaled rel {max_rel:.3e}");
+    eprintln!(
+        "{label}: max abs diff {max_diff:.3e} (set scale {scale:.3e}, rel {:.3e})",
+        max_diff / scale.max(1.0)
+    );
 }
 
 /// The shipped GEMM shape on this device, plus the narrow
@@ -176,9 +187,9 @@ fn check_close(label: &str, got: &[f32], want: &[f32]) {
 /// hold for every shape the fallback ladder can pick.
 fn shapes(backend: &WgpuCompute) -> Vec<GemmShape> {
     let mut out = Vec::new();
-    if let Some(s) = wgpu_compute::kernels::k10_q4k_gemm::shipped_shape(
-        &backend.context().device.limits(),
-    ) {
+    if let Some(s) =
+        wgpu_compute::kernels::k10_q4k_gemm::shipped_shape(&backend.context().device.limits())
+    {
         out.push(s);
     }
     let narrow = GemmShape::new(32, 128);
@@ -202,17 +213,13 @@ fn k10_gemm_matches_cpu_reference_across_batches() {
         .upload(ctx, "synthetic.q4k", &bytes, inn, out_rows)
         .expect("k1 upload");
     for shape in shapes(&backend) {
-        let gemm = K10Pipeline::with_shape_act(&ctx.device, shape, ACT_NONE)
-            .expect("k10 pipeline builds");
+        let gemm =
+            K10Pipeline::with_shape_act(&ctx.device, shape, ACT_NONE).expect("k10 pipeline builds");
         for batch in [1usize, 5, 16, 37, 64] {
             let x = lcg_input(100 + batch as u64, batch * inn);
             let got = gemm.run(ctx, &weights, &x).expect("k10 run");
             let want = reference_gemm(&w_ref, inn, out_rows, &x, None, batch);
-            check_close(
-                &format!("k10 {} batch {batch}", shape.name()),
-                &got,
-                &want,
-            );
+            check_close(&format!("k10 {} batch {batch}", shape.name()), &got, &want);
         }
     }
 }
@@ -283,11 +290,7 @@ fn k10_gemm_act_forms_match_cpu_reference() {
                 Some((&x_b_vec, b_stride, b_off, act)),
                 batch,
             );
-            check_close(
-                &format!("k10 {} act {act}", shape.name()),
-                &got,
-                &want,
-            );
+            check_close(&format!("k10 {} act {act}", shape.name()), &got, &want);
         }
     }
 }
@@ -306,17 +309,13 @@ fn k11_gemm_matches_cpu_reference_across_batches() {
         .upload(ctx, "synthetic.q6k", &bytes, inn, out_rows)
         .expect("k2 upload");
     for shape in shapes(&backend) {
-        let gemm = K11Pipeline::with_shape_act(&ctx.device, shape, ACT_NONE)
-            .expect("k11 pipeline builds");
+        let gemm =
+            K11Pipeline::with_shape_act(&ctx.device, shape, ACT_NONE).expect("k11 pipeline builds");
         for batch in [1usize, 5, 16, 37, 64] {
             let x = lcg_input(200 + batch as u64, batch * inn);
             let got = gemm.run(ctx, &weights, &x).expect("k11 run");
             let want = reference_gemm(&w_ref, inn, out_rows, &x, None, batch);
-            check_close(
-                &format!("k11 {} batch {batch}", shape.name()),
-                &got,
-                &want,
-            );
+            check_close(&format!("k11 {} batch {batch}", shape.name()), &got, &want);
         }
     }
 }

@@ -771,6 +771,7 @@ impl K10Pipeline {
                 label: Some("k10 run"),
             });
         call.encode(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
         let out = ctx.read_f32(&output_buffer, out_elems)?;
         dbg_log!(
             "k10 run: batch={batch} out_rows={} bytes_streamed={}",

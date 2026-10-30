@@ -589,6 +589,7 @@ impl K11Pipeline {
                 label: Some("k11 run"),
             });
         call.encode(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
         let out = ctx.read_f32(&output_buffer, out_elems)?;
         dbg_log!(
             "k11 run: batch={batch} out_rows={} bytes_streamed={}",

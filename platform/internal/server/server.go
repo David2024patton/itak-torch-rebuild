@@ -145,20 +145,35 @@ func (s *Server) invalidRequest(w http.ResponseWriter, message, param string) {
 	s.writeError(w, http.StatusBadRequest, "invalid_request", message, param)
 }
 
+// engineErrorStatus maps a named engine error to its honest HTTP
+// status and wire code. It is the single mapping both the plain
+// error path and the streaming terminal-error frame use, so a
+// failure carries the same name however it surfaces.
+func engineErrorStatus(err error) (status int, code string) {
+	switch {
+	case errors.Is(err, engine.ErrUnavailable):
+		return http.StatusServiceUnavailable, "engine_unavailable"
+	case errors.Is(err, engine.ErrNotImplemented):
+		return http.StatusNotImplemented, "not_implemented"
+	case errors.Is(err, engine.ErrBadRequest):
+		return http.StatusBadRequest, "invalid_request"
+	case errors.Is(err, engine.ErrEngineDied):
+		return http.StatusBadGateway, "engine_died"
+	case errors.Is(err, engine.ErrGenerationFailed):
+		return http.StatusBadGateway, "generation_failed"
+	default:
+		return http.StatusBadGateway, "engine_error"
+	}
+}
+
 // engineError maps a named engine error to its honest HTTP form.
 func (s *Server) engineError(w http.ResponseWriter, err error) {
 	s.diag.RecordEngineError()
-	switch {
-	case errors.Is(err, engine.ErrUnavailable):
-		s.writeError(w, http.StatusServiceUnavailable, "engine_unavailable", err.Error(), "")
-	case errors.Is(err, engine.ErrNotImplemented):
-		s.writeError(w, http.StatusNotImplemented, "not_implemented", err.Error(), "")
-	case errors.Is(err, engine.ErrBadRequest):
-		s.writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), "")
-	default:
+	status, code := engineErrorStatus(err)
+	if status == http.StatusBadGateway && code == "engine_error" {
 		s.log.Error("engine call failed", "err", err)
-		s.writeError(w, http.StatusBadGateway, "engine_error", err.Error(), "")
 	}
+	s.writeError(w, status, code, err.Error(), "")
 }
 
 func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
@@ -294,6 +309,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	sawDone := false
 	for ev := range ch {
+		if ev.Err != nil {
+			// Terminal error event (TODO T-9.12): the generation
+			// failed after it started. Nothing has been written
+			// yet on this path, so the failure answers with its
+			// honest HTTP status instead of a truncated 200.
+			s.engineError(w, ev.Err)
+			return
+		}
 		sb.WriteString(ev.Text)
 		if ev.Done {
 			sawDone = true
@@ -302,9 +325,16 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if !sawDone && r.Context().Err() != nil {
-		// The stream died with the client; no honest response exists.
-		s.diag.RecordEngineError()
+	if !sawDone {
+		if r.Context().Err() != nil {
+			// The stream died with the client; no honest response exists.
+			s.diag.RecordEngineError()
+			return
+		}
+		// The client closed the channel with neither a done nor an
+		// error event: a contract violation, reported as an engine
+		// death rather than served as a short completion.
+		s.engineError(w, fmt.Errorf("%w: generation stream ended without a terminal event", engine.ErrEngineDied))
 		return
 	}
 
@@ -372,6 +402,19 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, greq engine.
 		flusher.Flush()
 	}
 	for ev := range ch {
+		if ev.Err != nil {
+			// Terminal error event (TODO T-9.12): the 200 and any
+			// chunks are already gone, so the named failure rides
+			// the stream itself as an error frame and the stream
+			// ends without [DONE]. A client reading only tokens
+			// sees the failure by name, not a truncated answer.
+			_, code := engineErrorStatus(ev.Err)
+			s.diag.RecordEngineError()
+			b, _ := json.Marshal(errorBody{Error: apiError{Code: code, Message: ev.Err.Error()}})
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+			return
+		}
 		if ev.Done {
 			fr := ev.FinishReason
 			if fr == "" {

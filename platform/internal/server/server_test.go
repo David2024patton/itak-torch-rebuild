@@ -49,6 +49,19 @@ func (notImplEngine) Generate(context.Context, engine.GenerateRequest) (<-chan e
 	return nil, engine.ErrNotImplemented
 }
 
+// midFailEngine streams one token, then fails the generation the way
+// the socket client now reports a mid-stream engine failure: a
+// terminal event carrying the named error (TODO T-9.12).
+type midFailEngine struct{ *fakeEngine }
+
+func (midFailEngine) Generate(context.Context, engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+	ch := make(chan engine.TokenEvent, 2)
+	ch <- engine.TokenEvent{Text: "Hello", TokenID: 1}
+	ch <- engine.TokenEvent{Err: engine.ErrGenerationFailed}
+	close(ch)
+	return ch, nil
+}
+
 func newServer(t *testing.T, eng engine.Client) *httptest.Server {
 	t.Helper()
 	srv := server.New(server.Config{
@@ -180,6 +193,33 @@ func TestChatStreaming(t *testing.T) {
 	s := string(body)
 	if !strings.Contains(s, "Hello") || !strings.Contains(s, "data: [DONE]") {
 		t.Fatalf("stream body missing chunks or DONE: %s", s)
+	}
+}
+
+func TestChatMidStreamFailureNonStreamingIsNamedError(t *testing.T) {
+	ts := newServer(t, midFailEngine{&fakeEngine{}})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusBadGateway || errorCode(t, body) != "generation_failed" {
+		t.Fatalf("status = %d, body = %s; want 502 generation_failed, not a truncated 200", code, body)
+	}
+}
+
+func TestChatMidStreamFailureStreamingIsErrorFrame(t *testing.T) {
+	ts := newServer(t, midFailEngine{&fakeEngine{}})
+	streamBody := `{"model":"glimmer","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", streamBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("stream status = %d (%s)", code, body)
+	}
+	s := string(body)
+	if !strings.Contains(s, `"code":"generation_failed"`) {
+		t.Fatalf("stream body missing the named error frame: %s", s)
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("failed stream must not end with [DONE]: %s", s)
+	}
+	if !strings.Contains(s, "Hello") {
+		t.Fatalf("stream body missing the token sent before the failure: %s", s)
 	}
 }
 

@@ -31,6 +31,16 @@ var (
 	ErrClosed = errors.New("engine: client closed")
 	// ErrBadRequest means the engine rejected the request as invalid.
 	ErrBadRequest = errors.New("engine: bad request")
+	// ErrEngineDied means the engine process or its worker died,
+	// before the generation started or mid-stream. Supervision
+	// (TODO T-9.11) is what brings it back; this error is how the
+	// death is named to the caller, never a silently closed stream.
+	ErrEngineDied = errors.New("engine: engine died")
+	// ErrGenerationFailed means the engine refused or failed a
+	// generation it had already started (a forward or detokenize
+	// failure at a decode step). It arrives as the terminal
+	// TokenEvent's Err, not as Generate's return value.
+	ErrGenerationFailed = errors.New("engine: generation failed")
 )
 
 // GenerateRequest is one completion job handed to the engine.
@@ -45,11 +55,23 @@ type GenerateRequest struct {
 
 // TokenEvent is one streamed piece of a generation. Done marks the final
 // event; FinishReason is set on it ("stop", "length", ...).
+//
+// Err is set on exactly one kind of event: the terminal error event.
+// When a generation fails after it has started (the engine reports a
+// named failure, or the engine dies mid-stream), the client delivers
+// one last event with Err non-nil and Done false, then closes the
+// channel. A stream that ends without either a Done event or an Err
+// event is a contract violation by the client implementation, and
+// handlers treat it as an engine death rather than a short success.
 type TokenEvent struct {
 	Text         string `json:"text"`
 	TokenID      int32  `json:"token_id"`
 	Done         bool   `json:"done"`
 	FinishReason string `json:"finish_reason,omitempty"`
+	// Err is the terminal failure, set only on the final event of a
+	// failed generation. It is never serialized; the wire form is
+	// the protocol's error frame.
+	Err error `json:"-"`
 }
 
 // EmbedRequest asks for vectors for one or more inputs.
@@ -73,9 +95,9 @@ type HealthStatus struct {
 // Client is the platform's only view of the token engine.
 //
 // Generate returns a channel of token events. A non-nil error return
-// means generation never started; errors after that are the caller's
-// context ending or the channel closing early, and implementations close
-// the channel exactly once in all paths.
+// means generation never started. A failure after that is delivered
+// as one terminal TokenEvent with Err set (see TokenEvent), and
+// implementations close the channel exactly once in all paths.
 type Client interface {
 	Generate(ctx context.Context, req GenerateRequest) (<-chan TokenEvent, error)
 	Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, error)

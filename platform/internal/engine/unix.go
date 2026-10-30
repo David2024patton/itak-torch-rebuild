@@ -185,9 +185,11 @@ func (c *UnixClient) DebugInfo(ctx context.Context) (map[string]any, error) {
 // a refusal that arrives before any token (a bad prompt, a context
 // overflow, a model mismatch) is returned as the call's error, mapped
 // onto the named vocabulary, instead of surfacing as an empty stream.
-// An engine error after streaming has begun closes the channel
-// without a done event, which is how mid-generation failure shows up
-// under the Client contract today.
+// An engine failure after streaming has begun (a named error frame,
+// or the connection dying with the engine process) is delivered as
+// one terminal TokenEvent with Err set, so a mid-generation failure
+// reaches the caller by name instead of ending as a silently closed
+// stream (TODO T-9.12).
 func (c *UnixClient) Generate(ctx context.Context, req GenerateRequest) (<-chan TokenEvent, error) {
 	c.mu.Lock()
 	closed := c.closed
@@ -259,19 +261,38 @@ func (c *UnixClient) streamGenerate(ctx context.Context, out chan<- TokenEvent, 
 			started <- err
 		}
 	}
+	// fail delivers a post-start failure as the terminal event: the
+	// caller sees the named error, never a bare channel close.
+	fail := func(err error) {
+		select {
+		case out <- TokenEvent{Err: err}:
+		case <-ctx.Done():
+		}
+	}
 	for {
 		raw, err := c.r.ReadBytes('\n')
 		if err != nil {
-			if ctx.Err() != nil {
+			died := fmt.Errorf("%w: generate stream closed early: %w", ErrEngineDied, err)
+			switch {
+			case ctx.Err() != nil:
 				signal(ctx.Err())
-			} else {
-				signal(fmt.Errorf("%w: generate stream closed early: %w", ErrUnavailable, err))
+			case signaled:
+				// The connection died mid-generation: the engine
+				// process is gone or the socket broke under it.
+				fail(died)
+			default:
+				signal(died)
 			}
 			return
 		}
 		var f genFrame
 		if err := json.Unmarshal(raw, &f); err != nil {
-			signal(fmt.Errorf("%w: generate reply is not JSON: %w", ErrHandshake, err))
+			err := fmt.Errorf("%w: generate reply is not JSON: %w", ErrHandshake, err)
+			if signaled {
+				fail(err)
+			} else {
+				signal(err)
+			}
 			return
 		}
 		switch f.Op {
@@ -293,12 +314,21 @@ func (c *UnixClient) streamGenerate(ctx context.Context, out chan<- TokenEvent, 
 			}
 		case "error":
 			// Before the first token, the refusal is Generate's
-			// error return. After it, the error ends the stream: the
-			// channel closes without a done event.
-			signal(mapEngineError(f))
+			// error return. After it, the refusal is the terminal
+			// error event (TODO T-9.12).
+			if signaled {
+				fail(mapEngineError(f))
+			} else {
+				signal(mapEngineError(f))
+			}
 			return
 		default:
-			signal(fmt.Errorf("%w: unexpected op %q in generate stream", ErrHandshake, f.Op))
+			err := fmt.Errorf("%w: unexpected op %q in generate stream", ErrHandshake, f.Op)
+			if signaled {
+				fail(err)
+			} else {
+				signal(err)
+			}
 			return
 		}
 	}
@@ -314,6 +344,10 @@ func mapEngineError(f genFrame) error {
 		return fmt.Errorf("%w: %s", ErrBadRequest, msg)
 	case "not_implemented":
 		return fmt.Errorf("%w: %s", ErrNotImplemented, msg)
+	case "engine_died":
+		return fmt.Errorf("%w: %s", ErrEngineDied, msg)
+	case "forward_failed", "detokenize_failed":
+		return fmt.Errorf("%w: %s: %s", ErrGenerationFailed, f.Code, msg)
 	default:
 		return fmt.Errorf("engine: %s: %s", f.Code, msg)
 	}

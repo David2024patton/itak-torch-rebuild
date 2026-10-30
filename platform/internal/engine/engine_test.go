@@ -112,6 +112,13 @@ func serveGenerate(write func(map[string]any) bool, prompt string) bool {
 		return write(map[string]any{
 			"op": "error", "code": "forward_failed", "message": "decode step 2: boom",
 		})
+	case strings.Contains(prompt, "die-close"):
+		// One token, then the connection drops with no frame at
+		// all: the engine process dying mid-generation.
+		if !write(map[string]any{"op": "token", "text": " Paris", "token_id": 13796}) {
+			return false
+		}
+		return false
 	default:
 		if !write(map[string]any{"op": "token", "text": " Paris", "token_id": 13796}) {
 			return false
@@ -181,7 +188,7 @@ func TestUnixGenerateStartErrorIsBadRequest(t *testing.T) {
 	}
 }
 
-func TestUnixGenerateMidStreamErrorClosesWithoutDone(t *testing.T) {
+func TestUnixGenerateMidStreamErrorIsTerminalEvent(t *testing.T) {
 	c := dial(t, fakeEngine(t, 1, "hello_ack"))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -193,8 +200,38 @@ func TestUnixGenerateMidStreamErrorClosesWithoutDone(t *testing.T) {
 	for ev := range ch {
 		events = append(events, ev)
 	}
-	if len(events) != 1 || events[0].Text != " Paris" || events[0].Done {
-		t.Fatalf("events = %+v, want one token event and a close with no done", events)
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want one token event and one terminal error event", events)
+	}
+	if events[0].Text != " Paris" || events[0].Done || events[0].Err != nil {
+		t.Fatalf("event 0 = %+v, want the Paris token event", events[0])
+	}
+	last := events[1]
+	if last.Done || !errors.Is(last.Err, engine.ErrGenerationFailed) {
+		t.Fatalf("terminal event = %+v (err %v), want ErrGenerationFailed and no done", last, last.Err)
+	}
+	if !strings.Contains(last.Err.Error(), "decode step 2") {
+		t.Fatalf("terminal error = %v, want the engine's message carried", last.Err)
+	}
+}
+
+func TestUnixGenerateConnectionDeathIsEngineDiedEvent(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := c.Generate(ctx, engine.GenerateRequest{Prompt: "die-close please"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var events []engine.TokenEvent
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %+v, want one token event and one terminal error event", events)
+	}
+	if !errors.Is(events[1].Err, engine.ErrEngineDied) {
+		t.Fatalf("terminal err = %v, want ErrEngineDied", events[1].Err)
 	}
 }
 

@@ -40,12 +40,14 @@ pub mod linalg;
 pub mod logits;
 pub mod norm;
 pub mod rope;
+pub mod softmax;
 
 pub use activation::{geglu, gelu_tanh, silu, swiglu};
 pub use linalg::{matmul, matvec};
 pub use logits::{logit_scale, logit_softcap};
 pub use norm::rms_norm;
 pub use rope::{rope, rope_partial};
+pub use softmax::softmax;
 
 /// Result type for `torch-math` operations.
 pub type Result<T> = std::result::Result<T, MathError>;

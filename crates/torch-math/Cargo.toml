@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.75"
-description = "Reference f32 math primitives for the iTaK Torch engine: RMSNorm, RoPE, gated FFN activations, logit softcap and scale, matmul and matvec. Configurable everywhere the old Go native engine hardcoded: eps, RoPE base, softcap, scale are always parameters."
+description = "Reference f32 math primitives for the iTaK Torch engine: RMSNorm, RoPE, softmax, gated FFN activations, logit softcap and scale, matmul and matvec. Configurable everywhere the old Go native engine hardcoded: eps, RoPE base, softcap, scale are always parameters."
 keywords = ["inference", "tensor", "rope", "rmsnorm"]
 categories = ["mathematics", "science"]
 

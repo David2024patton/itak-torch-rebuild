@@ -159,6 +159,79 @@ fn k2_k3_shaders_compile_on_any_available_adapter() {
 }
 
 #[test]
+fn k12_k14_mmq_shaders_compile_on_any_available_adapter() {
+    use wgpu_compute::kernels::k12_q8_quant::K12QuantPipeline;
+    use wgpu_compute::kernels::k13_q4k_mmq::{K13Pipeline, MmqShape};
+    use wgpu_compute::kernels::k14_q6k_mmq::K14Pipeline;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping k12-k14 compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    // First device: wgpu's default limits (16 KiB of
+    // workgroup storage).
+    let (capped, _q1) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k12-k14 capped test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("capped device for k12-k14 test");
+    // The K12 quantizer builds under any granted storage
+    // (its only workgroup memory is the 2 KB reduction
+    // tree), in all three transform forms.
+    for act in [
+        wgpu_compute::kernels::k1_q4k_gemv::ACT_NONE,
+        wgpu_compute::kernels::k1_q4k_gemv::ACT_GATED,
+        wgpu_compute::kernels::k1_q4k_gemv::ACT_SWIGLU,
+    ] {
+        K12QuantPipeline::new(&capped, act).expect("k12 quantizer shader must compile");
+    }
+    // Under the default limits the MMQ staging does not
+    // fit, and the constructors must refuse that by name,
+    // not panic or silently degrade.
+    match K13Pipeline::for_device(&capped) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("k13 under default limits must be Ok(None), got a pipeline"),
+        Err(e) => panic!("k13 under default limits must be Ok(None), got error: {e}"),
+    }
+    match K14Pipeline::for_device(&capped) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("k14 under default limits must be Ok(None), got a pipeline"),
+        Err(e) => panic!("k14 under default limits must be Ok(None), got error: {e}"),
+    }
+    let err = match K13Pipeline::with_shape(&capped, MmqShape::new(32)) {
+        Ok(_) => panic!("k13 m32 must refuse a 16 KiB storage grant by name"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("workgroup memory"),
+        "refusal names the binding limit: {err}"
+    );
+    // Second device: the adapter's own limits. Where they
+    // grant the staging (the server's card), both MMQ
+    // shaders compile at their shipped shapes.
+    let (full, _q2) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k12-k14 full test"),
+        required_features: wanted,
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("full-limits device for k12-k14 test");
+    if let Ok(Some(_)) = K13Pipeline::for_device(&full) {
+        eprintln!("k13: shipped shape built on this adapter");
+    }
+    if let Ok(Some(_)) = K14Pipeline::for_device(&full) {
+        eprintln!("k14: shipped shape built on this adapter");
+    }
+}
+
+#[test]
 fn k4_to_k8_pipelines_compile_on_any_available_adapter() {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),

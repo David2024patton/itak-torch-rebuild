@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use cpu_compute::CpuCompute;
-use muse_glimmer::{GlimmerConfig, GlimmerModel, PositionCache, StderrDiag, Weights};
+use muse_glimmer::{Compute, GlimmerConfig, GlimmerModel, PositionCache, StderrDiag, Weights};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
 
 use crate::sampler::{Sampler, SamplerConfig};
@@ -83,6 +83,8 @@ pub struct Stats {
     pub active: usize,
     /// Jobs accepted and waiting for a slot.
     pub queued: usize,
+    /// Embedding batches completed.
+    pub embeddings: u64,
 }
 
 /// One event on a job's reply channel.
@@ -107,6 +109,29 @@ pub enum GenEvent {
         /// Human-readable detail.
         message: String,
     },
+}
+
+/// One unit of work handed from a connection thread to a worker:
+/// a generation, or an embedding batch (TODO T-9.15). Both ride the
+/// same bounded queue, so the concurrency contract covers both.
+pub enum Work {
+    /// A generation job.
+    Generate(Job),
+    /// An embedding job.
+    Embed(EmbedJob),
+}
+
+/// The outcome of an embedding batch: one vector per input, in
+/// order, or the named failure as (code, message).
+pub type EmbedOutcome = Result<Vec<Vec<f32>>, (String, String)>;
+
+/// One embedding job: a batch of texts and the channel the vectors
+/// (or the named failure) go back on.
+pub struct EmbedJob {
+    /// The input texts, in order.
+    pub inputs: Vec<String>,
+    /// Where the outcome goes.
+    pub reply: Sender<EmbedOutcome>,
 }
 
 /// One generation job handed from a connection thread to the worker.
@@ -256,18 +281,103 @@ pub fn run_worker(
     loaded: Loaded,
     stats: Arc<Mutex<Stats>>,
     default_max_tokens: usize,
-    jobs: Arc<Mutex<Receiver<Job>>>,
+    jobs: Arc<Mutex<Receiver<Work>>>,
 ) {
     loop {
-        let job = {
+        let work = {
             let rx = jobs.lock().unwrap_or_else(|p| p.into_inner());
             rx.recv()
         };
-        match job {
-            Ok(job) => run_job(&loaded, &stats, default_max_tokens, job),
+        match work {
+            Ok(Work::Generate(job)) => run_job(&loaded, &stats, default_max_tokens, job),
+            Ok(Work::Embed(job)) => run_embed(&loaded, &stats, job),
             Err(_) => return,
         }
     }
+}
+
+/// Run one embedding batch: tokenize each input (with BOS exactly
+/// when the file's metadata says the family takes one, the same
+/// rule generations follow), look the tokens up in the model's own
+/// embedding table through the compute backend's embed step, mean
+/// pool the rows, and L2-normalize. The result is a bag-of-embeddings
+/// vector: an honest product of the model's table, named as such,
+/// not a hidden-state pooling the engine does not do.
+fn run_embed(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, job: EmbedJob) {
+    {
+        let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+        st.queued = st.queued.saturating_sub(1);
+    }
+    let outcome = embed_batch(loaded, &job.inputs);
+    if outcome.is_ok() {
+        let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+        st.embeddings += 1;
+    }
+    let _ = job.reply.send(outcome);
+}
+
+fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (String, String)> {
+    let compute = CpuCompute::new();
+    let hidden = loaded.cfg.hidden as usize;
+    let mut out = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let body = loaded
+            .tokenizer
+            .encode(input)
+            .map_err(|e| ("bad_request".to_string(), format!("tokenize input: {e}")))?;
+        let mut ids: Vec<u32> = Vec::new();
+        if loaded.add_bos {
+            if let Some(bos) = loaded.tokenizer.bos_id() {
+                ids.push(bos);
+            }
+        }
+        ids.extend_from_slice(&body);
+        if ids.is_empty() {
+            return Err((
+                "bad_request".to_string(),
+                "input produced no tokens".to_string(),
+            ));
+        }
+        let rows = compute
+            .embed(&loaded.weights.embedding, &ids, &loaded.cfg)
+            .map_err(|e| ("forward_failed".to_string(), format!("embed lookup: {e}")))?;
+        let pooled = mean_pool(&rows, hidden, ids.len());
+        out.push(
+            l2_normalize(&pooled).ok_or_else(|| {
+                (
+                    "forward_failed".to_string(),
+                    "embedding pooled to a zero vector".to_string(),
+                )
+            })?,
+        );
+    }
+    Ok(out)
+}
+
+/// Mean of `n` rows of width `hidden`, laid out contiguously.
+fn mean_pool(rows: &[f32], hidden: usize, n: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; hidden];
+    for row in 0..n {
+        for (j, acc) in out.iter_mut().enumerate() {
+            *acc += rows[row * hidden + j];
+        }
+    }
+    if n > 0 {
+        let scale = 1.0 / n as f32;
+        for acc in out.iter_mut() {
+            *acc *= scale;
+        }
+    }
+    out
+}
+
+/// Scale a vector to unit length; None when it has no length.
+fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm == 0.0 || !norm.is_finite() {
+        return None;
+    }
+    Some(v.iter().map(|x| x / norm).collect())
 }
 
 fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize, job: Job) {
@@ -526,4 +636,47 @@ fn flush(reply: &Sender<GenEvent>, streamer: &mut Streamer, last_token: u32) -> 
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mean_pool_averages_rows() {
+        // Two rows of width 3.
+        let rows = [1.0, 2.0, 3.0, 3.0, 2.0, 1.0];
+        assert_eq!(mean_pool(&rows, 3, 2), vec![2.0, 2.0, 2.0]);
+        assert_eq!(mean_pool(&rows, 3, 1), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn l2_normalize_makes_unit_vectors_and_refuses_zero() {
+        let v = l2_normalize(&[3.0, 4.0]).expect("normalizes");
+        assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+        assert!(l2_normalize(&[0.0, 0.0]).is_none());
+    }
+
+    #[test]
+    fn pooled_cosine_ranks_the_related_pair_first() {
+        // The T-9.15 ranking shape at the pooling level: rows are
+        // token embeddings; two inputs sharing a token direction
+        // must land closer than an unrelated one.
+        let cat = mean_pool(&[1.0, 0.1, 0.9, 0.2], 2, 2); // tokens A, B
+        let cats = mean_pool(&[1.0, 0.1, 0.8, 0.3], 2, 2); // tokens A, B'
+        let car = mean_pool(&[-0.9, 1.0, -1.0, 0.8], 2, 2); // unrelated
+        let cos = |a: &[f32], b: &[f32]| -> f32 {
+            let an = l2_normalize(a).expect("a");
+            let bn = l2_normalize(b).expect("b");
+            an.iter().zip(bn.iter()).map(|(x, y)| x * y).sum()
+        };
+        assert!(
+            cos(&cat, &cats) > cos(&cat, &car),
+            "related {} should beat unrelated {}",
+            cos(&cat, &cats),
+            cos(&cat, &car)
+        );
+    }
 }

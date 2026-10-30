@@ -66,8 +66,9 @@ func serveConn(conn net.Conn, ackProto int, ackOp string) {
 			return
 		}
 		var f struct {
-			Op     string `json:"op"`
-			Prompt string `json:"prompt"`
+			Op     string   `json:"op"`
+			Prompt string   `json:"prompt"`
+			Input  []string `json:"input"`
 		}
 		if err := json.Unmarshal(line, &f); err != nil {
 			return
@@ -79,6 +80,10 @@ func serveConn(conn net.Conn, ackProto int, ackOp string) {
 			}
 		case "ping":
 			if !write(map[string]any{"op": "pong"}) {
+				return
+			}
+		case "embed":
+			if !serveEmbed(write, f.Input) {
 				return
 			}
 		case "debug":
@@ -95,6 +100,22 @@ func serveConn(conn net.Conn, ackProto int, ackOp string) {
 			}
 		}
 	}
+}
+
+// serveEmbed answers an embed request with one fixed vector per
+// input; an input of "refuse" scripts the named refusal an engine
+// without the operation (or with a full queue) would send.
+func serveEmbed(write func(map[string]any) bool, inputs []string) bool {
+	vecs := make([][]float32, 0, len(inputs))
+	for _, in := range inputs {
+		if in == "refuse" {
+			return write(map[string]any{
+				"op": "error", "code": "not_implemented", "message": "embed is not built",
+			})
+		}
+		vecs = append(vecs, []float32{0.1, 0.2, 0.3})
+	}
+	return write(map[string]any{"op": "embeddings", "model": "fake-1b", "embeddings": vecs})
 }
 
 // serveGenerate scripts the generate stream off the prompt text, so
@@ -251,9 +272,26 @@ func TestUnixGenerateConnectionDeathIsEngineDiedEvent(t *testing.T) {
 	}
 }
 
-func TestUnixEmbedStillNotImplemented(t *testing.T) {
+func TestUnixEmbedReturnsVectors(t *testing.T) {
 	c := dial(t, fakeEngine(t, 1, "hello_ack"))
-	if _, err := c.Embed(context.Background(), engine.EmbedRequest{}); !errors.Is(err, engine.ErrNotImplemented) {
+	resp, err := c.Embed(context.Background(), engine.EmbedRequest{
+		Model: "fake-1b", Input: []string{"cats", "dogs"},
+	})
+	if err != nil {
+		t.Fatalf("Embed: %v", err)
+	}
+	if resp.Model != "fake-1b" || len(resp.Vectors) != 2 {
+		t.Fatalf("Embed resp = %+v, want model fake-1b and 2 vectors", resp)
+	}
+	if len(resp.Vectors[0]) != 3 || resp.Vectors[0][0] != 0.1 {
+		t.Fatalf("vector 0 = %v, want the fake's [0.1 0.2 0.3]", resp.Vectors[0])
+	}
+}
+
+func TestUnixEmbedRefusalMapsByName(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	_, err := c.Embed(context.Background(), engine.EmbedRequest{Input: []string{"refuse"}})
+	if !errors.Is(err, engine.ErrNotImplemented) {
 		t.Fatalf("Embed err = %v, want ErrNotImplemented", err)
 	}
 }

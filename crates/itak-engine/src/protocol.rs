@@ -12,6 +12,12 @@
 //!   frame on every connection.
 //! - `{"op":"ping"}`: health probe.
 //! - `{"op":"debug"}`: self-report request.
+//! - `{"op":"embed","model":"...","input":["...","..."]}`: embed
+//!   one or more texts. The reply is one `embeddings` frame (below)
+//!   or an `error` frame. The vectors are mean-pooled token
+//!   embeddings from the model's own embedding table (the same
+//!   lookup the forward pass starts from), L2-normalized, in input
+//!   order (TODO T-9.15).
 //! - `{"op":"generate","model":"...","prompt":"...","max_tokens":N,
 //!   "temperature":F,"top_p":F,"stop":["..."]}`: one generation.
 //!   `max_tokens` absent or 0 means the engine's configured default;
@@ -134,6 +140,50 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
     })
 }
 
+/// A parsed embed request: the model name (empty means no
+/// preference) and the input texts, in order.
+pub fn parse_embed(frame: &Value) -> Result<(String, Vec<String>), String> {
+    let model = frame
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let items = frame
+        .get("input")
+        .and_then(Value::as_arr)
+        .ok_or_else(|| "embed frame has no input array".to_string())?;
+    if items.is_empty() {
+        return Err("embed frame has an empty input array".to_string());
+    }
+    let mut inputs = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_str() {
+            Some(s) if !s.is_empty() => inputs.push(s.to_string()),
+            _ => return Err("embed input entries must be non-empty strings".to_string()),
+        }
+    }
+    Ok((model, inputs))
+}
+
+/// The embeddings reply: one vector per input, in input order.
+pub fn embeddings_frame(model: &str, vectors: &[Vec<f32>]) -> Value {
+    obj(vec![
+        ("op", Value::Str("embeddings".into())),
+        ("model", Value::Str(model.into())),
+        (
+            "embeddings",
+            Value::Arr(
+                vectors
+                    .iter()
+                    .map(|v| {
+                        Value::Arr(v.iter().map(|&x| Value::Num(f64::from(x))).collect())
+                    })
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
 /// The handshake reply.
 pub fn hello_ack(detail: &str) -> Value {
     obj(vec![
@@ -222,5 +272,36 @@ mod tests {
     fn generate_without_prompt_is_a_named_error() {
         let frame = parse(r#"{"op":"generate"}"#).expect("frame");
         assert!(parse_generate(&frame).is_err());
+    }
+
+    #[test]
+    fn embed_frame_parses_and_validates() {
+        let frame = parse(r#"{"op":"embed","model":"glimmer","input":["a","b c"]}"#).expect("frame");
+        let (model, inputs) = parse_embed(&frame).expect("request");
+        assert_eq!(model, "glimmer");
+        assert_eq!(inputs, vec!["a".to_string(), "b c".to_string()]);
+
+        for bad in [
+            r#"{"op":"embed"}"#,
+            r#"{"op":"embed","input":[]}"#,
+            r#"{"op":"embed","input":[""]}"#,
+            r#"{"op":"embed","input":[3]}"#,
+        ] {
+            let frame = parse(bad).expect("frame");
+            assert!(parse_embed(&frame).is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn embeddings_frame_shape() {
+        let frame = embeddings_frame("glimmer", &[vec![0.5, -0.25], vec![1.0, 2.0]]);
+        let text = crate::json::stringify(&frame);
+        let back = parse(&text).expect("own output parses");
+        assert_eq!(
+            back.get("op").and_then(Value::as_str),
+            Some("embeddings")
+        );
+        let vecs = back.get("embeddings").and_then(Value::as_arr).expect("vecs");
+        assert_eq!(vecs.len(), 2);
     }
 }

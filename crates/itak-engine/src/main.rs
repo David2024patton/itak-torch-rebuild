@@ -41,7 +41,7 @@ use std::sync::mpsc::{channel, sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use engine::{EngineConfig, GenEvent, Job, ModelInfo, Stats};
+use engine::{EmbedJob, EmbedOutcome, EngineConfig, GenEvent, Job, ModelInfo, Stats, Work};
 use json::Value;
 
 /// One timestamped line to stderr: the engine's diagnostic channel
@@ -98,7 +98,7 @@ fn run() -> i32 {
     // `slots` jobs run at once, up to `max_queued` more wait, and a
     // submission past that is refused with the engine_busy code.
     let capacity = config.slots + config.max_queued;
-    let (job_tx, job_rx) = sync_channel::<Job>(capacity);
+    let (job_tx, job_rx) = sync_channel::<Work>(capacity);
     let job_rx = Arc::new(Mutex::new(job_rx));
     let default_max_tokens = config.default_max_tokens;
     for slot in 0..config.slots {
@@ -246,7 +246,7 @@ fn parse_args() -> Result<CliConfig, i32> {
 
 fn handle_conn(
     stream: UnixStream,
-    jobs: SyncSender<Job>,
+    jobs: SyncSender<Work>,
     info: Arc<ModelInfo>,
     stats: Arc<Mutex<Stats>>,
     started: Instant,
@@ -330,6 +330,11 @@ fn handle_conn(
                     return;
                 }
             }
+            "embed" => {
+                if !handle_embed(&frame, &mut writer, &jobs, &info, &stats, limits) {
+                    return;
+                }
+            }
             other => {
                 let msg = format!("unknown op {other:?}");
                 if !send(&mut writer, &protocol::error_frame("unknown_op", &msg)) {
@@ -345,7 +350,7 @@ fn handle_conn(
 fn handle_generate(
     frame: &Value,
     writer: &mut UnixStream,
-    jobs: &SyncSender<Job>,
+    jobs: &SyncSender<Work>,
     info: &Arc<ModelInfo>,
     stats: &Arc<Mutex<Stats>>,
     limits: Limits,
@@ -387,7 +392,7 @@ fn handle_generate(
     // The bounded queue is the concurrency contract: a submission
     // past capacity refuses by name instead of queueing without
     // limit, and the refusal names the state that refused it.
-    match jobs.try_send(job) {
+    match jobs.try_send(Work::Generate(job)) {
         Ok(()) => {
             let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
             st.queued += 1;
@@ -438,6 +443,68 @@ fn handle_generate(
     }
 }
 
+/// Run one embed frame to its reply frame: queue the batch behind
+/// the same bounded contract as generations, wait for the worker's
+/// vectors, and answer with the embeddings frame or the named
+/// error. Returns false when the connection is dead.
+fn handle_embed(
+    frame: &Value,
+    writer: &mut UnixStream,
+    jobs: &SyncSender<Work>,
+    info: &Arc<ModelInfo>,
+    stats: &Arc<Mutex<Stats>>,
+    limits: Limits,
+) -> bool {
+    let (model, inputs) = match protocol::parse_embed(frame) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return send(writer, &protocol::error_frame("bad_request", &e));
+        }
+    };
+    if !model.is_empty() && model != info.name {
+        let msg = format!(
+            "this engine serves model {:?}, not {:?}",
+            info.name, model
+        );
+        return send(writer, &protocol::error_frame("model_not_found", &msg));
+    }
+    let (reply_tx, reply_rx) = channel::<EmbedOutcome>();
+    let job = EmbedJob {
+        inputs,
+        reply: reply_tx,
+    };
+    match jobs.try_send(Work::Embed(job)) {
+        Ok(()) => {
+            let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+            st.queued += 1;
+        }
+        Err(TrySendError::Full(_)) => {
+            let msg = format!(
+                "engine busy: {} slot(s) running and the queue is full (max_queued {})",
+                limits.slots, limits.max_queued
+            );
+            return send(writer, &protocol::error_frame("engine_busy", &msg));
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return send(
+                writer,
+                &protocol::error_frame("engine_died", "the engine worker is gone"),
+            );
+        }
+    }
+    match reply_rx.recv() {
+        Ok(Ok(vectors)) => send(writer, &protocol::embeddings_frame(&info.name, &vectors)),
+        Ok(Err((code, message))) => send(writer, &protocol::error_frame(&code, &message)),
+        Err(_) => send(
+            writer,
+            &protocol::error_frame(
+                "engine_died",
+                "the engine worker stopped mid-embedding",
+            ),
+        ),
+    }
+}
+
 fn stats_busy(stats: &Arc<Mutex<Stats>>) -> bool {
     stats.lock().map(|st| st.active > 0).unwrap_or(false)
 }
@@ -474,6 +541,7 @@ fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64, lim
         ("queued", Value::Num(st.queued as f64)),
         ("max_queued", Value::Num(limits.max_queued as f64)),
         ("generations", Value::Num(st.generations as f64)),
+        ("embeddings", Value::Num(st.embeddings as f64)),
         ("tokens_generated", Value::Num(st.tokens_generated as f64)),
         (
             "last_prompt_tokens",
@@ -539,8 +607,9 @@ mod tests {
     fn full_queue_refuses_engine_busy_by_name() {
         // Capacity 1 and it is already full: the next submission is
         // refused with the engine_busy code, not queued, not run.
-        let (tx, _rx) = sync_channel::<Job>(1);
-        tx.try_send(dummy_job()).expect("fill the queue");
+        let (tx, _rx) = sync_channel::<Work>(1);
+        tx.try_send(Work::Generate(dummy_job()))
+            .expect("fill the queue");
         let (mut a, mut b) = UnixStream::pair().expect("stream pair");
         let frame = crate::json::parse(r#"{"op":"generate","prompt":"hello"}"#).expect("frame");
         let stats = Arc::new(Mutex::new(Stats::default()));

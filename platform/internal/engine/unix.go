@@ -61,9 +61,8 @@ type genFrame struct {
 // runs for minutes never blocks Health or DebugInfo on the control
 // connection; the engine runs a configured number of slots and
 // queues a bounded number of jobs behind them, refusing the rest
-// with ErrEngineBusy. Embed refuses with ErrNotImplemented: the
-// protocol has no embedding operation yet, and that is stated in
-// the error, not papered over.
+// with ErrEngineBusy. Embed runs the protocol's embed operation on
+// the control connection.
 type UnixClient struct {
 	conn       net.Conn
 	r          *bufio.Reader
@@ -107,6 +106,12 @@ func (c *UnixClient) handshake(ctx context.Context) error {
 // returns the raw reply line. Callers hold no lock; the method takes
 // it.
 func (c *UnixClient) exchangeLocked(ctx context.Context, send frame) ([]byte, error) {
+	return c.exchangeAnyLocked(ctx, send)
+}
+
+// exchangeAnyLocked is exchangeLocked for the other frame shapes
+// (generate is not one of them: it runs on its own connection).
+func (c *UnixClient) exchangeAnyLocked(ctx context.Context, send any) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
@@ -364,10 +369,44 @@ func mapEngineError(f genFrame) error {
 	}
 }
 
-// Embed is not built yet: the socket protocol has no embedding
-// operation. Named refusal, never a fabricated vector.
-func (c *UnixClient) Embed(context.Context, EmbedRequest) (EmbedResponse, error) {
-	return EmbedResponse{}, fmt.Errorf("%w: embed over socket", ErrNotImplemented)
+// embedFrame is the embed request and reply shape: the request
+// carries the inputs, the reply carries one vector per input in
+// order, or an error frame with a named code (TODO T-9.15).
+type embedFrame struct {
+	Op         string      `json:"op"`
+	Model      string      `json:"model,omitempty"`
+	Input      []string    `json:"input,omitempty"`
+	Embeddings [][]float32 `json:"embeddings,omitempty"`
+	Code       string      `json:"code,omitempty"`
+	Message    string      `json:"message,omitempty"`
+}
+
+// Embed runs the protocol's embed operation on the control
+// connection: the engine tokenizes each input and answers with
+// mean-pooled, L2-normalized vectors from the model's own embedding
+// table. An engine error frame maps onto the named vocabulary like
+// a generate refusal does.
+func (c *UnixClient) Embed(ctx context.Context, req EmbedRequest) (EmbedResponse, error) {
+	raw, err := c.exchangeAnyLocked(ctx, embedFrame{Op: "embed", Model: req.Model, Input: req.Input})
+	if err != nil {
+		return EmbedResponse{}, err
+	}
+	var reply embedFrame
+	if err := json.Unmarshal(raw, &reply); err != nil {
+		return EmbedResponse{}, fmt.Errorf("%w: embed reply is not JSON: %w", ErrHandshake, err)
+	}
+	switch reply.Op {
+	case "embeddings":
+		model := reply.Model
+		if model == "" {
+			model = req.Model
+		}
+		return EmbedResponse{Model: model, Vectors: reply.Embeddings}, nil
+	case "error":
+		return EmbedResponse{}, mapEngineError(genFrame{Code: reply.Code, Message: reply.Message})
+	default:
+		return EmbedResponse{}, fmt.Errorf("%w: got op %q, want %q", ErrHandshake, reply.Op, "embeddings")
+	}
 }
 
 // Close shuts the control connection down. Later calls refuse with

@@ -31,6 +31,10 @@ name = "gguf"
 version = "0.1.0"
 
 [[package]]
+name = "itak-backend"
+version = "0.1.0"
+
+[[package]]
 name = "itak-loader"
 version = "0.1.0"
 dependencies = [

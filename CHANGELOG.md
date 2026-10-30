@@ -17,6 +17,11 @@ RULES:
 -->
 # CHANGELOG: iTaK Torch Rebuild
 
+## 2026-10-30: Serving production gaps closed in the platform and engine (TODO T-9.11 to T-9.16)
+- Supervision (T-9.11, closed): torchd supervises itak-engine under a configured restart budget; a mid-generation death answers the in-flight request with the named ErrEngineDied error and the next request is served by the restarted engine (platform/internal/supervisor, commit 4f2dd5e, proven against a real child process that dies mid-generation).
+- Terminal stream errors (T-9.12, closed): a mid-generation failure reaches the HTTP client by name (502 or a terminal SSE error frame), never as a truncated 200 (commit 6806ae6, fault-injection proven at the socket and HTTP layers).
+- Sampling parity (T-9.13), multi-slot engine (T-9.14), embeddings over the seam (T-9.15), and chat templating (T-9.16) landed end to end (commits 4248eb2, 7163ead, 48f56ce, 311fa1b): seed/top-k/penalties in the protocol and sampler, --slots with a bounded queue and the engine_busy refusal, a real embed operation replacing the 501, and prompts rendered from the model's own GGUF chat template by a bounded Jinja-subset renderer. Their named live proofs on the real Glimmer file are filed as T-9.17, blocked on a server CPU window.
+
 ## 2026-10-29: Tokenizer proven token-for-token on Glimmer's real vocabulary (TODO T-2.3)
 - The Rust BPE tokenizer matches the production llama-server token for token on the 16-prompt bench set (16/16 identical, 16/16 decode round-trips exact), using Glimmer's own 202,048-token vocabulary and 439,802 merges extracted from the production GGUF by the new gguf `tokenizer_extract` example.
 - The first run failed one case, contractions: the pre-tokenizer had implemented the llama-3 split (contraction as its own piece), while llama.cpp routes `pre = llama4` to the GPT-4o pattern, where the contraction is a suffix of the word piece. `pretokenize.rs` and the crate docs now implement and document the GPT-4o pattern, with regression tests.

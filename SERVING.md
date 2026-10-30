@@ -61,6 +61,31 @@ Flags, each with an environment fallback; nothing is compiled in.
 | `--socket` | `ITAK_ENGINE_SOCKET` | `/tmp/itak-engine.sock` | Unix socket to bind |
 | `--model-name` | `ITAK_ENGINE_MODEL_NAME` | file metadata name, else file stem | Name requests must address |
 | `--default-max-tokens` | `ITAK_ENGINE_DEFAULT_MAX_TOKENS` | 128 | Generation cap when a request omits `max_tokens` |
+| `--slots` | `ITAK_ENGINE_SLOTS` | 1 | Concurrent generations, each with its own compute and KV state |
+| `--max-queued` | `ITAK_ENGINE_MAX_QUEUED` | 8 | Jobs that may wait for a slot; submissions past capacity refuse as `engine_busy` |
+
+## Platform supervision (torchd)
+
+Instead of starting the engine by hand, torchd can own it:
+
+```sh
+TORCH_API_KEY=<your-key> ./platform/torchd \
+  -engine-bin ./target/release/itak-engine \
+  -engine-model /path/to/model.gguf \
+  -engine-slots 1 -engine-max-queued 8 \
+  -engine-max-restarts 5 -engine-restart-window 5m
+```
+
+The supervisor starts the engine, waits for it to load and serve,
+and restarts it when it dies, within the restart budget (restarts
+allowed inside the window; a model that can no longer load
+exhausts the budget and stays down, visibly, instead of crash
+looping). A generation caught by a death answers with the named
+`engine_died` error; the next request is served by the restarted
+engine. The lifecycle (pid, restarts, exhaustion, last exit) is in
+the platform's `/debug` under `engine_debug.supervisor`. Without
+`-engine-bin`, `-engine-socket` dials an engine started separately,
+as in the quick start.
 
 Startup loads the model once (tens of seconds for a 30B file:
 parse, coverage gate, weights, tokenizer) and logs the result: name,
@@ -72,21 +97,30 @@ load failure exits non-zero with the named error.
 - One JSON object per line on the socket. Frame kinds: `hello` /
   `hello_ack` (protocol 1), `ping` / `pong`, `debug` /
   `debug_info`, `generate` answered by streamed `token` frames and a
-  terminal `done` frame, or an `error` frame with a named code.
+  terminal `done` frame, or an `error` frame with a named code;
+  `embed` answered by an `embeddings` frame; `chat_template`
+  answered by the model's template frame or the named
+  `no_chat_template` error.
 - The platform dials a fresh connection per generation, so a
   minutes-long generation never blocks health or debug traffic on
-  the control connection. The engine runs one generation at a time
-  (the CPU backend serves one sequence); further generate requests
-  queue at the engine.
+  the control connection. The engine runs a configured number of
+  generation slots (the CPU backend serves one sequence per slot
+  instance); further jobs queue in a bounded queue, and
+  submissions past its capacity refuse as `engine_busy`.
 - Error codes and their HTTP mapping: `bad_request`,
   `context_overflow`, `model_not_found`, and `protocol_mismatch`
   map to 400; `forward_failed`, `detokenize_failed`, and
-  `engine_died` map to 502. Embeddings have no protocol operation
-  yet and answer 501 `not_implemented`.
+  `engine_died` map to 502; `engine_busy` maps to 503. A failure
+  after streaming has begun reaches the client as a named terminal
+  error (an SSE error frame when streaming, the honest status when
+  not), never as a truncated 200.
 - `GET /debug` on the platform includes the engine's self-report
   as `engine_debug`: model identity and path, coverage expected and
-  found, generation and token counters, last job's prompt and cache
-  position, busy state, uptime.
+  found, generation, token, and embedding counters, the slot state
+  (slots, active, queued, max_queued), whether the model carries a
+  chat template, last job's prompt and cache position, uptime; and
+  `chat_template` says where prompts get their format (config,
+  engine, or none/role flattening).
 
 ## Honest state of the serving path
 
@@ -97,23 +131,28 @@ load failure exits non-zero with the named error.
   temperature 0), not to be fast; the GPU backend and the
   shape-specialized kernels are TODO T-9.5 and T-9.10, and until
   they land this path is a correctness proof, not a serving tier.
-- Sampling: temperature and top-p are honored by the engine's
-  sampler; stop strings are honored with hold-back, so a stop
-  string is never half-emitted. There is no seed in the protocol
-  (sampled runs are not reproducible across the seam yet), no
-  top-k, and no penalties; grammar and JSON mode are TODO T-3.5.
-- The platform flattens chat messages into a plain `role: content`
-  transcript with no chat template. That is the platform's current
-  request shape, and the engine treats it as a raw completion.
-- Supervision: if the engine process dies, in-flight generations
-  end as closed streams and new ones fail the dial; the platform
-  does not yet restart the engine (TODO list in TODO.md, Phase 9).
-  A mid-generation engine error likewise closes the stream without
-  a done event rather than arriving as a named terminal error.
-- One model per engine process, one generation at a time, token
-  events as JSON text on the socket. The shared-memory token rings
-  of ARCHITECTURE.md Section 4 are the later data plane, not this
-  one.
+- Sampling: temperature, top-p, top-k, a request seed, and the
+  presence/frequency penalties are honored by the engine's sampler
+  (seeded sampled runs are reproducible across the seam); stop
+  strings are honored with hold-back, so a stop string is never
+  half-emitted. Grammar and JSON mode are TODO T-3.5.
+- Chat format: chat requests are rendered with the model's own
+  GGUF chat template (a bounded Jinja subset; constructs outside
+  it refuse by name rather than rendering wrong). Only a model
+  whose file carries no template gets the plain `role: content`
+  flattening, and /debug says so.
+- Supervision: with `-engine-bin`, torchd restarts a dead engine
+  within its budget; in-flight generations end with the named
+  `engine_died` error, and an engine-reported mid-generation
+  failure arrives as a named terminal error event. Without
+  supervision, a dead engine stays dead until an operator acts.
+- Embeddings are mean-pooled token embeddings from the model's own
+  embedding table (the forward's lookup), L2-normalized: an honest
+  bag-of-embeddings, not hidden-state pooling.
+- One model per engine process, a configured number of generation
+  slots, token events as JSON text on the socket. The
+  shared-memory token rings of ARCHITECTURE.md Section 4 are the
+  later data plane, not this one.
 
 The 2026-10-30 smoke transcript (build, engine start, refusal
 checks, the end-to-end completion, and the engine-alone reference

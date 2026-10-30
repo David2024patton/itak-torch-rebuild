@@ -149,6 +149,127 @@ fn scale_defaults_to_one_over_sqrt_head_dim_and_is_a_parameter() {
     assert_eq!(AttentionParams::default(), params);
 }
 
+/// Independent f64 brute-force attention over an explicit visible
+/// set: no crate code, just the definition (scores scaled by
+/// 1/sqrt(head_dim), softmax, weighted value sum) for ONE query head
+/// reading ONE KV head. Used to pin the crate's mask and grouping
+/// against a second implementation.
+fn brute_force_head(
+    q: &[f64],
+    keys: &[Vec<f64>],
+    values: &[Vec<f64>],
+    visible: &[usize],
+) -> Vec<f64> {
+    let head_dim = q.len();
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let scores: Vec<f64> = visible
+        .iter()
+        .map(|&j| q.iter().zip(&keys[j]).map(|(a, b)| a * b).sum::<f64>() * scale)
+        .collect();
+    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    let mut out = vec![0.0; head_dim];
+    for (e, &j) in exps.iter().zip(visible.iter()) {
+        for (d, o) in out.iter_mut().enumerate() {
+            *o += (e / sum) * values[j][d];
+        }
+    }
+    out
+}
+
+fn to_f64(v: &[f32]) -> Vec<f64> {
+    v.iter().map(|x| f64::from(*x)).collect()
+}
+
+#[test]
+fn window_edge_membership_matches_brute_force() {
+    // Window 3, query at position 5: the visible set is exactly
+    // {3, 4, 5} (positions in (p - window, p]). Scores are all
+    // distinct, so including position 2 or excluding position 3
+    // changes the output well beyond tolerance; the marker value at
+    // position 2 (500) makes an off-by-one leak unmissable.
+    let head_dim = 2;
+    let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..6)
+        .map(|j| {
+            let k = vec![(j as f32) * 0.5 - 1.0, 0.25];
+            let v = if j == 2 {
+                vec![500.0, 500.0]
+            } else {
+                vec![(j as f32) * 3.0, 1.0 - (j as f32)]
+            };
+            (k, v)
+        })
+        .collect();
+    let cache = cache_with(LayerKind::windowed(3).unwrap(), 1, head_dim, &rows);
+    let view = cache.view(0).unwrap();
+    let q = vec![0.7f32, -0.4];
+    let out = gqa_attention(&q, 1, 1, &[5], &view, &AttentionParams::new()).unwrap();
+    let keys: Vec<Vec<f64>> = rows.iter().map(|(k, _)| to_f64(k)).collect();
+    let values: Vec<Vec<f64>> = rows.iter().map(|(_, v)| to_f64(v)).collect();
+    let want = brute_force_head(&to_f64(&q), &keys, &values, &[3, 4, 5]);
+    for d in 0..head_dim {
+        assert!(
+            close(out[d], want[d] as f32, 1e-5),
+            "dim {d}: got {}, brute force {}",
+            out[d],
+            want[d]
+        );
+    }
+    // The same query on a global layer sees all six positions and
+    // must differ (the marker at position 2 alone guarantees it).
+    let cache = cache_with(LayerKind::Global, 1, head_dim, &rows);
+    let view = cache.view(0).unwrap();
+    let out_global = gqa_attention(&q, 1, 1, &[5], &view, &AttentionParams::new()).unwrap();
+    assert!((out_global[0] - out[0]).abs() > 1.0);
+}
+
+#[test]
+fn gqa_grouping_through_softmax_matches_brute_force() {
+    // 4 query heads over 2 KV heads, 3 cached positions, head_dim 2.
+    // Every head's output is checked against the brute-force result
+    // for its OWN KV head (heads 0,1 -> KV 0; heads 2,3 -> KV 1)
+    // with real softmax weights, not the single-position weight-1
+    // shortcut of the sharing tests above.
+    let head_dim = 2;
+    let kv_rows: Vec<(Vec<f32>, Vec<f32>)> = vec![
+        (vec![1.0, 0.0, 0.0, 1.0], vec![2.0, 0.0, 0.0, 3.0]),
+        (vec![0.0, 1.0, 1.0, 0.0], vec![0.0, 5.0, 7.0, 0.0]),
+        (vec![1.0, 1.0, -1.0, 0.5], vec![1.0, 1.0, 1.0, 1.0]),
+    ];
+    let cache = cache_with(LayerKind::Global, 2, head_dim, &kv_rows);
+    let view = cache.view(0).unwrap();
+    // Distinct query per head so a head mix-up changes the numbers.
+    let q: Vec<f32> = vec![
+        1.0, 0.0, // head 0
+        0.0, 1.0, // head 1
+        1.0, 1.0, // head 2
+        -0.5, 0.25, // head 3
+    ];
+    let out = gqa_attention(&q, 1, 4, &[2], &view, &AttentionParams::new()).unwrap();
+    for h in 0..4 {
+        let kv = h / 2;
+        let keys: Vec<Vec<f64>> = kv_rows
+            .iter()
+            .map(|(k, _)| to_f64(&k[kv * head_dim..(kv + 1) * head_dim]))
+            .collect();
+        let values: Vec<Vec<f64>> = kv_rows
+            .iter()
+            .map(|(_, v)| to_f64(&v[kv * head_dim..(kv + 1) * head_dim]))
+            .collect();
+        let qh = to_f64(&q[h * head_dim..(h + 1) * head_dim]);
+        let want = brute_force_head(&qh, &keys, &values, &[0, 1, 2]);
+        for d in 0..head_dim {
+            assert!(
+                close(out[h * head_dim + d], want[d] as f32, 1e-5),
+                "head {h} dim {d}: got {}, brute force {}",
+                out[h * head_dim + d],
+                want[d]
+            );
+        }
+    }
+}
+
 #[test]
 fn attention_validation_is_named_errors_not_panics() {
     // Empty cache: a query has no visible keys.

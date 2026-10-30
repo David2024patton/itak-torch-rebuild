@@ -6,7 +6,7 @@ math family:
 | Module | Owns |
 | :--- | :--- |
 | `norm` | `rms_norm` with `eps` as a parameter (never a constant) |
-| `rope` | `rope` / `rope_partial`, configurable base (`500000` for Glimmer), llama.cpp pairing and partial-rotary conventions |
+| `rope` | `rope` / `rope_partial` (ggml NORMAL, interleaved pairs) and `rope_neox` / `rope_neox_partial` (ggml NEOX, split-half pairs; the pairing llama.cpp applies to Glimmer), configurable base (`500000` for Glimmer), partial-rotary support |
 | `softmax` | `softmax` over one row: max-subtracted for stability, `-inf` (mask) entries get exactly `0.0`, an all-masked row is a named error |
 | `activation` | `silu`, `gelu_tanh`, and the gated forms `swiglu` / `geglu` as separate functions |
 | `logits` | `logit_softcap` and `logit_scale`, both parameterized (Glimmer: cap `20.0`, scale `0.1961`) |

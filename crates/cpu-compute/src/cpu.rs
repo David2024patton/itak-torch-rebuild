@@ -316,6 +316,12 @@ impl CpuCompute {
     }
 
     /// Apply RoPE to every head of one position's projection row.
+    /// The pairing is ggml's NEOX (split-half), the convention
+    /// llama.cpp applies to Muse Glimmer: the file is an HF
+    /// conversion with unpermuted Q/K weights, and llama.cpp's graph
+    /// for the arch rotates pairs `(i, i + head_dim / 2)`. The
+    /// interleaved `torch_math::rope` would rotate the wrong channel
+    /// pairs against those weights (see crates/torch-math/ROPE-AUDIT.md).
     fn rope_row(
         row: &[f32],
         heads: usize,
@@ -326,7 +332,7 @@ impl CpuCompute {
     ) -> Result<Vec<f32>> {
         let mut out = Vec::with_capacity(row.len());
         for h in 0..heads {
-            let rotated = torch_math::rope(
+            let rotated = torch_math::rope_neox(
                 &row[h * head_dim..(h + 1) * head_dim],
                 position,
                 base,

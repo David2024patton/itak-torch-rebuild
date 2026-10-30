@@ -13,6 +13,7 @@ muse-glimmer = { path = "../muse-glimmer" }
 [dev-dependencies]
 cpu-compute = { path = "../cpu-compute" }
 tokenizer = { path = "../tokenizer" }
+wgpu-compute = { path = "../wgpu-compute" }
 
 [lints]
 workspace = true

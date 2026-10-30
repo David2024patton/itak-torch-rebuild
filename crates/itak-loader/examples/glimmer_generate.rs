@@ -4,7 +4,12 @@
 //! and weights behind the coverage gate, the `tokenizer` crate
 //! tokenizes, and `muse-glimmer`'s forward runs on `cpu-compute`.
 //!
-//! Usage: `glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only]`
+//! Usage: `glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only] [--gpu]`
+//!
+//! `--gpu` selects the `wgpu-compute` backend (full device
+//! residency: weight tensors upload to the card on first use and
+//! stay cached there) instead of the default `cpu-compute`
+//! reference. Same model, same forward, same output contract.
 //!
 //! The prompt ids are printed before any weight work happens, so the
 //! identical id sequence can be handed to a reference engine (the
@@ -33,15 +38,18 @@ use tokenizer::{TokenType, Tokenizer, TokenizerData};
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
-        eprintln!("usage: glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only]");
+        eprintln!(
+            "usage: glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only] [--gpu]"
+        );
         return ExitCode::from(2);
     };
     let ids_only = args.iter().any(|a| a == "--ids-only");
+    let gpu = args.iter().any(|a| a == "--gpu");
     let n_tokens: usize = args
         .get(3)
         .filter(|a| !a.starts_with("--"))
         .map_or(8, |a| a.parse().unwrap_or(8));
-    match run(path, prompt, n_tokens, ids_only) {
+    match run(path, prompt, n_tokens, ids_only, gpu) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("FAIL: {msg}");
@@ -118,7 +126,7 @@ fn peak_rss_kb() -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
-fn run(path: &str, prompt: &str, n_tokens: usize, ids_only: bool) -> Result<(), String> {
+fn run(path: &str, prompt: &str, n_tokens: usize, ids_only: bool, gpu: bool) -> Result<(), String> {
     let t_open = Instant::now();
     let file = gguf::GgufFile::open(Path::new(path)).map_err(|e| e.to_string())?;
     println!("phase=open_file ms={}", t_open.elapsed().as_millis());
@@ -178,12 +186,18 @@ fn run(path: &str, prompt: &str, n_tokens: usize, ids_only: bool) -> Result<(), 
     println!("phase=load_weights ms={}", t_load.elapsed().as_millis());
 
     let vocab = info.tokens.clone();
-    let model = GlimmerModel::with_diag(
-        cfg,
-        weights,
-        Box::new(cpu_compute::CpuCompute::new()),
-        Arc::new(StderrDiag),
+    let t_backend = Instant::now();
+    let backend: Box<dyn muse_glimmer::Compute> = if gpu {
+        Box::new(wgpu_compute::WgpuCompute::new().map_err(|e| e.to_string())?)
+    } else {
+        Box::new(cpu_compute::CpuCompute::new())
+    };
+    println!(
+        "phase=backend_open backend={} ms={}",
+        if gpu { "wgpu" } else { "cpu" },
+        t_backend.elapsed().as_millis()
     );
+    let model = GlimmerModel::with_diag(cfg, weights, backend, Arc::new(StderrDiag));
     let mut cache = PositionCache::new();
 
     let mut generated: Vec<u32> = Vec::new();

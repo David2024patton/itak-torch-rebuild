@@ -401,6 +401,7 @@ dependencies = [
  "gguf",
  "muse-glimmer",
  "tokenizer",
+ "wgpu-compute",
 ]
 
 [[package]]

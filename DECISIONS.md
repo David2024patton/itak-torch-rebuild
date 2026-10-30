@@ -62,6 +62,12 @@ RULES:
 - **Supersedes:** none
 - **By:** Lulu, from the benchmark evidence, reported to David 2026-10-26
 
+## 2026-10-30: The recorded Glimmer speed anchors (44.31 plain, 88.6 DFlash) are harness-relative
+- **Decided:** The 2026-10-28 anchors stay in the record with their harness named, and the Section 9 sweep harness (llama-server /completion, short raw prompts, fixed 256-token generations, temperature 0) is the comparison shape for depth/operating-point claims until T-9.7 re-runs it against our own stack. On that harness: plain 41.64 tok/s, DFlash depth 4 = 103.01, depth 6 = 107.39 (the operating point by SPEC 9.4's rule), depths 8+ collapse below or near plain. Full table: bench/gpu-proof-2026-10-30.md.
+- **Why:** The sweep did not reproduce the anchors within a few percent (plain -6.0%, depth 4 +16.3%, ratio 2.47x vs the recorded 2.00x), which the RUNBOOK defines as a finding, not rounding. The recorded numbers came from different shapes (llama-bench tg128 after pp512; the model-suite run), so cross-harness comparisons silently move both the rates and the ratio.
+- **Supersedes:** nothing; the 2026-10-26 serving pick and its measured basis stand, with the harness caveat attached
+- **By:** Lulu, from the 2026-10-30 sweep evidence, during David's approved pause window
+
 ## 2026-10-27 (historical, recorded from the failure): Shared code is published and versioned, never a relative folder
 - **Decided:** Any module another module depends on is a published, versioned artifact. Relative-path replaces in module files are forbidden in this project.
 - **Why:** The original iTaKCore lived only as ../Core beside the Torch tree on one machine. It was never pushed, the folder is gone, and the engine cannot be built. The measured usage surface is small (six importing files); the loss was never about size, only about the module never existing anywhere durable.

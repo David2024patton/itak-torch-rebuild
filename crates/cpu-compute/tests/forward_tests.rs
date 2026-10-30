@@ -399,18 +399,22 @@ fn zero_attention_and_ffn_match_hand_computed_logits() {
     }
 }
 
-/// Test-local RoPE in f64: adjacent pairs, pair i turning by
-/// position * base^(-2i / dim), the convention `torch-math`
-/// documents and llama.cpp uses.
+/// Test-local RoPE in f64: NEOX split-half pairs, pair i joining
+/// channels i and i + dim/2 and turning by position * base^(-2i /
+/// dim), the convention llama.cpp applies to Glimmer and the one
+/// `torch-math`'s `rope_neox` implements. Written from the
+/// definition here so the naive reference shares no code with the
+/// backend.
 fn rope64(v: &[f64], position: usize, base: f64) -> Vec<f64> {
     let mut out = v.to_vec();
     let dim = v.len() as f64;
-    for pair in 0..v.len() / 2 {
+    let half = v.len() / 2;
+    for pair in 0..half {
         let angle = position as f64 * base.powf(-((2 * pair) as f64) / dim);
         let (s, c) = angle.sin_cos();
-        let (a, b) = (out[2 * pair], out[2 * pair + 1]);
-        out[2 * pair] = a * c - b * s;
-        out[2 * pair + 1] = a * s + b * c;
+        let (a, b) = (out[pair], out[pair + half]);
+        out[pair] = a * c - b * s;
+        out[pair + half] = a * s + b * c;
     }
     out
 }

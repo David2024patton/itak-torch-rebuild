@@ -168,9 +168,12 @@ impl K3Shape {
 /// K-quants on RDNA3 (two rows per workgroup of 128, hybrid
 /// reduction), falling back to the same geometry with the
 /// workgroup-memory reduction when SUBGROUP was not granted.
-/// K3's own bench record lives in BACKEND.md's results; if it
-/// ever disagrees with this default, the default moves with
-/// the evidence.
+/// K3's own bench record (BACKEND.md's K2/K3 results section)
+/// tested this default against seven other shapes on the whole
+/// head and confirmed it: at 26 blocks per row, rows per
+/// workgroup pay and width does not, the inverse of K2's
+/// geometry. If a future matrix disagrees, the default moves
+/// with the evidence.
 #[must_use]
 pub fn shipped_shape(features: wgpu::Features) -> K3Shape {
     if features.contains(wgpu::Features::SUBGROUP) {

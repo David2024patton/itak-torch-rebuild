@@ -39,15 +39,18 @@
 //! measured on; the device traffic is 212/210 of that, recorded
 //! in BACKEND.md's results.
 //!
-//! The parallel shape is K1's tuned shape (see
+//! The parallel shape is K1's tuned structure (see
 //! `k1_q4k_gemv`'s module docs and BACKEND.md's tuning record):
 //! sixteen threads cooperate on one super-block, each thread
 //! owning sixteen elements (the four streams' quads at its byte
 //! offset within the half, the same assignment llama.cpp's
-//! `mul_mat_vec_q6_k.comp` uses); a workgroup covers several
-//! output rows so the activation quads each thread loads serve
-//! every row in the tile; and the reduction is either a
-//! workgroup-memory tree or the segmented subgroup butterfly
+//! `mul_mat_vec_q6_k.comp` uses); a workgroup covers one or
+//! more output rows so the activation quads each thread loads
+//! serve every row in the tile (K2's own bench matrix picked
+//! one row per 256-thread workgroup as this kernel's shipped
+//! tile, against K1's two rows of 128; see [`shipped_shape`]);
+//! and the reduction is either a workgroup-memory tree or the
+//! segmented subgroup butterfly
 //! plus a short shared-memory finish. No f16 activation variant
 //! is offered: K1's f16 experiment failed this crate's check
 //! tolerance and measured slower than its f32 twin, and this

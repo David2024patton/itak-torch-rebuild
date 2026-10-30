@@ -518,6 +518,138 @@ question for that kernel on its own numbers.
   any absolute whose canary is under roughly 100 GB/s. The
   sysfs DPM readouts on this host are not evidence.
 
+## BACKEND-RESULTS: K2 (Q6_K) and K3 (Q5_K) (2026-10-30)
+
+K2 and K3 landed in `crates/wgpu-compute`, following tuned
+K1's structure (sixteen threads per super-block, packed scale
+extraction, activation quads shared across the tile's rows,
+subgroup butterfly reduction with an LDS finish and a
+workgroup-memory tree fallback). `Compute::proj` and
+`Compute::lm_head` now dispatch by tensor dtype through a
+generalized name-keyed weight cache (Q4_K to K1, Q6_K to K2,
+Q5_K to K3; a name arriving with a different dtype or geometry
+refuses as an identity violation). The device binding floor
+in `device.rs` rose from 128 MiB to 1 GiB, as that constant's
+note always said K3 would require: the Q5_K head binds whole
+at 924,571,648 bytes, and the RADV adapter grants 2 GiB.
+
+K2 carries one layout concession, owned in its module docs:
+a Q6_K super-block is 210 bytes, not a whole number of words,
+so upload repacks each block into a 212-byte device stride
+(210 raw bytes plus two zero pad bytes) once, at load time.
+Every stream number below is computed on the RAW file bytes
+(the useful stream llama.cpp's 708 is also measured on); the
+device traffic is 212/210 of that. K3 needs no repack: 176
+bytes is 44 whole words, and the head's 202,048 rows run
+through the two-dimensional dispatch K1 proved (101,024
+workgroups at the shipped shape).
+
+**Window for everything below:** one sitting, 2026-10-30,
+production Glimmer llama-server resident and untouched
+(22,790,967,296 of 25,753,026,560 VRAM bytes in use, about
+2.8 GiB free; `/health` returned ok before and after every
+step; nothing was killed or restarted). Stream-probe canary
+in the same window: 871.9 GB/s in row mode. A healthy window
+by the amended bench-window law.
+
+**Correctness (against the `gguf` crate's CPU dequantizer
+plus `torch-math` matvec, the standing cross-check):**
+
+| Check | Geometry | Result |
+| :--- | :--- | :--- |
+| K2 synthetic, 1 and 2 rows | [256 x 3] Q6_K | pass (suite) |
+| K2 real, `blk.0.ffn_down.weight` | [19968 x 6656], 109,025,280 B | max rel err 6.879e-8, cosine 1.000000000, PASS (both shipped shapes) |
+| K3 synthetic, 1 and 2 rows | [256 x 3] Q5_K | pass (suite) |
+| K3 synthetic 2D grid | [256 x 140,000] Q5_K, 70,000 workgroups | pass (suite) |
+| K3 real, `output.weight` | [6656 x 202048], 924,571,648 B | max rel err 2.433e-7, cosine 1.000000000, PASS |
+
+**K2 bench matrix** (resident set: one `ffn_down` at
+109,025,280 raw bytes plus 26 `attn_v` tensors at 1,397,760
+= 145,367,040 raw bytes per iteration; 6,000 timed
+iterations plus 200 warmup; median of 3 runs; `k2_bench`):
+
+| Shape | Median GB/s | Runs |
+| :--- | ---: | :--- |
+| r1sg, workgroup 256 (SHIPPED) | 831.9 | 831.6, 832.4, 831.9 |
+| r2sg, workgroup 256 | 826.8 | 826.8, 826.8, 827.0 |
+| r1sg, workgroup 128 | 825.1 | 825.0, 825.4, 825.1 |
+| r1, workgroup 128 | 820.5 | 820.5, 820.7, 819.5 |
+| r2sg, workgroup 128 (first default) | 818.6 | 818.6, 818.6, 818.5 |
+| r2, workgroup 128 | 812.7 | 812.9, 812.7, 812.6 |
+| r4sg, workgroup 128 | 801.6 | 382.0 (window stumble, see below), 801.6, 802.0 |
+| r2sg, workgroup 64 | 799.4 | single run |
+| r4, workgroup 128 | 796.1 | 796.6, 794.9, 796.1 |
+
+The 382.0 run took 2.28 s against its siblings' 1.09 s: a
+window stumble, not a shape property, recorded here and
+excluded by the median. After the shipped default moved to
+r1sg at workgroup 256, a confirmation triple of the shipped
+configuration read 831.8, 832.2, 831.9. On Q6_K's geometry
+(the wide tensor is 6,656 rows of 78 blocks) one row per
+workgroup with more block-groups in flight per row beats
+K1's two-rows-of-128; the shipped default follows the
+evidence, per the rule stated when the shape was written.
+
+**K3 bench matrix** (the whole head resident: 924,571,648
+bytes per iteration; 2,000 timed iterations plus 200 warmup;
+median of 3 runs; `k3_bench --budget-mib 1024`):
+
+| Shape | Median GB/s | Runs |
+| :--- | ---: | :--- |
+| r2sg, workgroup 128 (SHIPPED, unchanged) | 813.2 | 813.8, 813.2, 813.2 |
+| r4sg, workgroup 128 | 793.4 | 793.8, 793.4, 792.9 |
+| r4, workgroup 128 | 791.5 | 791.6, 791.5, 791.2 |
+| r2, workgroup 128 | 766.7 | 766.4, 766.9, 766.7 |
+| r2sg, workgroup 256 | 761.5 | 761.6, 761.4, and a third in the same band |
+| r1sg, workgroup 128 | 748.0 | 748.4, 748.0, 747.7 |
+| r1, workgroup 128 | 691.1 | 690.4, 691.1, 691.1 |
+| r1sg, workgroup 256 | 689.8 | 689.8, 689.2, 690.1 |
+
+The head inverts K2's preference: at 26 blocks per row the
+activation quads are re-read per workgroup row, so rows per
+workgroup pay and width does not. K1's pick (two rows,
+workgroup 128, subgroup) is confirmed as K3's best and the
+shipped default does not move.
+
+**Ash verdict for K2 and K3 (Section 8 applied per kernel):**
+neither trigger fires for either kernel. Tuned K2 at 831.9
+GB/s is 117.5 percent of llama.cpp's measured 708 and 86.7
+percent of the card's 960 peak; tuned K3 at 813.2 GB/s is
+114.9 percent of 708 and 84.7 percent of peak. Both sit above
+the 637 line with more than 27 percent headroom, in the same
+efficiency band as tuned K1 (816.5, 85 percent of peak). No
+capability gap was met: the 2 GiB binding, the
+two-dimensional dispatch, subgroups, and timestamps were all
+exercised on the real file. No per-kernel gap above 5 percent
+traces to Naga codegen; the residual distance to peak is the
+same shape K1's record already analyzed. wgpu stays; no ash
+prototype was started.
+
+With K1, K2, and K3 all tuned, Glimmer's whole weight stream
+now has a measured kernel: byte-share-weighted (Section 3's
+77.3 / 17.1 / 5.5 split), the three medians compose to about
+818 GB/s of Tier 2 micro-bench bandwidth. That is a
+composition of micro-benches, stated as such; the Tier 1
+full-model number remains TODO T-4.2's bar and is not claimed
+here.
+
+**Recorded for the tree, not for these kernels:** the K4 to
+K8 track landed in this crate in parallel with this work
+(K4 norms and residual add, K5 RoPE and KV append, K6
+attention, K7 activations, K8 embedding gather and head
+finish), and `Compute` now wires every step. Three defects
+in that track surfaced while gating this landing and were
+fixed in passing: a WGSL type error in K8's half-precision
+gather (`pack2x16float` wrapped around `unpack2x16float`,
+rejected by Naga on the real adapter and invisible on
+adapter-less machines), a swapped residual/branch argument
+pair in the K4 test's fused-mode comparison (the kernel was
+right; the test composed the other order), and two lint
+slips (an argument-count allowance on K4's private helper, a
+digit grouping in a test seed). The full crate suite on the
+server's GPU after those fixes: 40 passed, 0 failed,
+including the cross-backend comparison against `cpu-compute`.
+
 ## Appendix: the adapter probe
 
 Lives in scratch (/tmp/wgpu-probe), not in this repo: it is a

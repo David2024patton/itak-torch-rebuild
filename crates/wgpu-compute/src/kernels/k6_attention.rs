@@ -201,6 +201,121 @@ fn reduce_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// The flash shader: scores, online softmax, and the
+/// value-weighted reduce fused into one kernel, one workgroup
+/// of 256 lanes per (query row, Q head), for the decode-shaped
+/// calls where the two-pass form's scores buffer and second
+/// dispatch are pure overhead. The math is the two-pass math,
+/// operation for operation: the score phase computes each
+/// tile's 256 scores with the scores kernel's thread-to-key
+/// mapping and dot order (masked keys get its -1e30 sentinel),
+/// stages them in workgroup memory, and the lanes under the
+/// head dim then run the reduce kernel's online-softmax loop
+/// over the tile in the same ascending order, carrying their
+/// (max, sum, accumulator) state across tiles in registers.
+/// The sequence of float operations per output element is the
+/// two-pass sequence, so the outputs agree with it to the bit
+/// in exact arithmetic and to reassociation noise in floats
+/// (the scores are computed identically; only their storage
+/// differs). The two-pass path stays for multi-row chunks,
+/// whose scores grids amortize the extra dispatch over many
+/// rows; the session selects by row count.
+const FLASH_SHADER: &str = r#"
+struct FlashParams {
+    rows: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    stored: u32,
+    first_pos: u32,
+    start_pos: u32,
+    window: u32,
+    ring: u32,
+    scale: f32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> params: FlashParams;
+
+var<workgroup> tile: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn flash_main(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat_wg = wid.y * params.grid_x + wid.x;
+    let head = flat_wg % params.q_heads;
+    let row = flat_wg / params.q_heads;
+    let lane = lid.x;
+    let kv_head = head / (params.q_heads / params.kv_heads);
+    let q_base = (row * params.q_heads + head) * params.head_dim;
+    let p = params.start_pos + row;
+
+    var m = -1.0e30;
+    var sum = 0.0;
+    var acc = 0.0;
+    for (var t0 = 0u; t0 < params.stored; t0 += 256u) {
+        // Score phase: lane l takes stored key t0 + l.
+        let idx = t0 + lane;
+        var sc = -1.0e30;
+        if (idx < params.stored) {
+            let kp = params.first_pos + idx;
+            var visible = kp <= p;
+            if (params.window != 0u && kp + params.window <= p) {
+                visible = false;
+            }
+            if (visible) {
+                var slot = kp;
+                if (params.ring != 0u) {
+                    slot = kp % params.ring;
+                }
+                let k_base = (slot * params.kv_heads + kv_head) * params.head_dim;
+                var s = 0.0;
+                for (var dd = 0u; dd < params.head_dim; dd++) {
+                    s += q[q_base + dd] * keys[k_base + dd];
+                }
+                sc = s * params.scale;
+            }
+        }
+        tile[lane] = sc;
+        workgroupBarrier();
+        // Reduce phase: the reduce kernel's loop over the
+        // tile, ascending, state carried across tiles.
+        if (lane < params.head_dim) {
+            let tile_len = min(256u, params.stored - t0);
+            for (var j = 0u; j < tile_len; j++) {
+                let s2 = tile[j];
+                if (s2 <= -1.0e29) {
+                    continue;
+                }
+                if (s2 > m) {
+                    let corr = exp(m - s2);
+                    acc *= corr;
+                    sum *= corr;
+                    m = s2;
+                }
+                let w = exp(s2 - m);
+                let kp = params.first_pos + t0 + j;
+                var slot = kp;
+                if (params.ring != 0u) {
+                    slot = kp % params.ring;
+                }
+                let v = values[(slot * params.kv_heads + kv_head) * params.head_dim + lane];
+                acc += w * v;
+                sum += w;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (lane < params.head_dim) {
+        out[q_base + lane] = acc / sum;
+    }
+}
+"#;
+
 /// The shape a [`GpuKvState`] was built from; the same discipline
 /// as `cpu-compute`'s (a backend instance serves one model shape;
 /// a different one arriving later is a refusal, not a rebuild).
@@ -650,15 +765,89 @@ impl K6ReduceCall {
     }
 }
 
-/// The compiled K6 pipelines (scores and reduce).
+/// One prepared flash dispatch: the fused scores + online
+/// softmax + reduce for decode-shaped calls. The position
+/// part of its geometry rewrites through
+/// [`K6FlashCall::set_geometry`]; its grid (one workgroup per
+/// query row and head) is position-independent, like the
+/// reduce call's.
+#[derive(Debug)]
+pub struct K6FlashCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    grid: (u32, u32),
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    ring: Option<usize>,
+}
+
+impl K6FlashCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k6 attention flash"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+
+    /// Point the flash at a new position window: `stored`
+    /// entries are visible, the oldest at absolute position
+    /// `first_pos`, the query rows starting at `start_pos`.
+    /// Same queue-ordering contract as the scores call's
+    /// setter.
+    pub fn set_geometry(
+        &mut self,
+        ctx: &GpuContext,
+        stored: usize,
+        first_pos: usize,
+        start_pos: usize,
+    ) {
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let params: [u32; 11] = [
+            self.rows as u32,
+            self.q_heads as u32,
+            self.kv_heads as u32,
+            self.head_dim as u32,
+            stored as u32,
+            first_pos as u32,
+            start_pos as u32,
+            self.window.map_or(0, |w| w as u32),
+            self.ring.map_or(0, |r| r as u32),
+            scale.to_bits(),
+            self.grid.0,
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        ctx.queue.write_buffer(&self.params, 0, &param_bytes);
+    }
+}
+
+/// The compiled K6 pipelines (scores, reduce, and the fused
+/// flash form).
 #[derive(Debug)]
 pub struct K6Pipeline {
     scores: wgpu::ComputePipeline,
     reduce: wgpu::ComputePipeline,
+    flash: wgpu::ComputePipeline,
 }
 
 impl K6Pipeline {
-    /// Compile both K6 pipelines on `device`.
+    /// Compile the K6 pipelines on `device`.
     ///
     /// # Errors
     ///
@@ -680,8 +869,13 @@ impl K6Pipeline {
         };
         let scores = build(SCORES_SHADER, "scores_main", "k6 attention scores");
         let reduce = build(REDUCE_SHADER, "reduce_main", "k6 attention reduce");
+        let flash = build(FLASH_SHADER, "flash_main", "k6 attention flash");
         dbg_log!("k6 pipelines built");
-        Ok(K6Pipeline { scores, reduce })
+        Ok(K6Pipeline {
+            scores,
+            reduce,
+            flash,
+        })
     }
 
     /// Validate the geometry both kernels are about to run.
@@ -867,6 +1061,71 @@ impl K6Pipeline {
         Ok(call)
     }
 
+    /// Prepare a flash dispatch: `q` (device buffer, `[rows,
+    /// q_width]`) against the layer's resident keys and
+    /// values, writing the attention output `[rows, q_width]`
+    /// into the caller's `out` buffer in the one fused kernel
+    /// (see [`FLASH_SHADER`]). The caller picks this form for
+    /// decode-shaped calls (the session: one row) and the
+    /// two-pass form for chunk shapes.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry.
+    pub fn prepare_flash(
+        &self,
+        ctx: &GpuContext,
+        q: &wgpu::Buffer,
+        kv: &LayerKv,
+        out: &wgpu::Buffer,
+        geom: &AttendGeom,
+    ) -> Result<K6FlashCall> {
+        Self::check_geom(geom)?;
+        let total_wg = (geom.rows * geom.q_heads) as u64;
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
+        let params_buf = ctx.uniform_buffer("k6 flash params", &[0u8; 44]);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k6 flash bind group"),
+            layout: &self.flash.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: kv.k.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: kv.v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut call = K6FlashCall {
+            pipeline: self.flash.clone(),
+            bind_group,
+            params: params_buf,
+            grid,
+            rows: geom.rows,
+            q_heads: geom.q_heads,
+            kv_heads: geom.kv_heads,
+            head_dim: geom.head_dim,
+            window: geom.window,
+            ring: geom.ring,
+        };
+        call.set_geometry(ctx, geom.stored, geom.first_pos, geom.start_pos);
+        Ok(call)
+    }
+
     /// Run the reduce kernel over a scores buffer from
     /// [`K6Pipeline::scores`] and the layer's resident values,
     /// returning the attention output `[rows, q_width]` on the
@@ -912,10 +1171,13 @@ mod tests {
     fn shaders_carry_their_entry_points() {
         assert!(SCORES_SHADER.contains("fn scores_main"));
         assert!(REDUCE_SHADER.contains("fn reduce_main"));
+        assert!(FLASH_SHADER.contains("fn flash_main"));
         // The mask sentinel and its guard must agree: scores
         // writes -1e30, the reduce skips anything at that depth.
         assert!(SCORES_SHADER.contains("-1.0e30"));
         assert!(REDUCE_SHADER.contains("-1.0e29"));
+        assert!(FLASH_SHADER.contains("-1.0e30"));
+        assert!(FLASH_SHADER.contains("-1.0e29"));
     }
 
     #[test]

@@ -63,7 +63,7 @@
 
 use crate::device::GpuContext;
 use crate::error::{Result, WgpuError};
-use crate::kernels::k1_q4k_gemv::grid_dims;
+use crate::kernels::k1_q4k_gemv::{grid_dims, K1ActGeom, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 
 use crate::diag::dbg_log;
 
@@ -224,7 +224,19 @@ pub fn repack_q6k(raw: &[u8]) -> Vec<u8> {
 /// the super-block, the quads of all four streams at byte
 /// offset `l0 = 4 * (t % 8)`, with scale index base
 /// `8h + (t % 8) / 4`.
-fn shader(shape: &K2Shape) -> String {
+/// The K2 shader with an activation mode (the vocabulary is
+/// K1's: [`ACT_GATED`], [`ACT_SWIGLU`]): K7's elementwise math
+/// applied to the activation quads inside the GEMV, against a
+/// second input stream at binding 4 addressed by the
+/// `b_stride_elems` / `b_off_elems` uniforms, with stream A's
+/// row stride carried by `a_stride_blocks`. The fusion is
+/// exact for the same reason as K1's: the transform is
+/// per-element over the same f32 values, with K7's own
+/// expressions, before any dot is taken. Q6_K has no min
+/// term, so no activation sums need the transformed values;
+/// the dots are the whole story. See
+/// [`crate::kernels::k1_q4k_gemv::llama_shader_act`].
+fn shader_act(shape: &K2Shape, act: u32) -> String {
     let rows = shape.rows;
     let wg = shape.workgroup;
     let groups = wg / 16;
@@ -297,18 +309,78 @@ fn shader(shape: &K2Shape) -> String {
         )
     };
 
+    // The activation fusion's pieces, empty for the plain
+    // GEMV (the same generated text as K1's; see its docs).
+    let act_decls = if act == ACT_NONE {
+        ""
+    } else {
+        r#"
+@group(0) @binding(4) var<storage, read> input_b: array<vec4<f32>>;
+
+// Logistic sigmoid, K7's branch-stable form (cpu-compute's):
+// the exponential's argument is never positive.
+fn sigmoid1(x: f32) -> f32 {
+    if (x >= 0.0) {
+        return 1.0 / (1.0 + exp(-x));
+    }
+    let e = exp(x);
+    return e / (1.0 + e);
+}
+"#
+    };
+    let act_apply = match act {
+        ACT_GATED => {
+            r#"
+fn act_apply(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(a.x * sigmoid1(b.x), a.y * sigmoid1(b.y),
+                     a.z * sigmoid1(b.z), a.w * sigmoid1(b.w));
+}
+"#
+        }
+        ACT_SWIGLU => {
+            r#"
+// SiLU, K7's quotient form: x * sigmoid(x) as the single
+// quotient the reference computes.
+fn silu1(x: f32) -> f32 {
+    return x / (1.0 + exp(-x));
+}
+
+fn act_apply(g: vec4<f32>, u: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(silu1(g.x) * u.x, silu1(g.y) * u.y,
+                     silu1(g.z) * u.z, silu1(g.w) * u.w);
+}
+"#
+        }
+        _ => "",
+    };
+    let decl = if act == ACT_NONE { "let" } else { "var" };
+    let act_transform = if act == ACT_NONE {
+        ""
+    } else {
+        r#"        let bb0 = (batch_row * params.b_stride_elems + params.b_off_elems) / 4u + blk * 64u;
+        xa = act_apply(xa, input_b[bb0 + yv]);
+        xb = act_apply(xb, input_b[bb0 + yv + 8u]);
+        xc = act_apply(xc, input_b[bb0 + yv + 16u]);
+        xd = act_apply(xd, input_b[bb0 + yv + 24u]);
+"#
+    };
+
     format!(
         r#"struct Params {{
     blocks_per_row: u32,
     out_rows: u32,
     grid_x: u32,
     batch: u32,
+    a_stride_blocks: u32,
+    b_stride_elems: u32,
+    b_off_elems: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
 @group(0) @binding(1) var<storage, read> input: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+{act_decls}{act_apply}
 
 var<workgroup> partials: array<f32, {partials_len}>;
 
@@ -376,11 +448,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         // with stream 0, xb with stream 1 (32 elements later),
         // xc with stream 2 (64 later), xd with stream 3 (96
         // later), exactly ggml's y offsets.
-        let xb0 = (batch_row * params.blocks_per_row + blk) * 64u;
-        let xa = input[xb0 + yv];
-        let xb = input[xb0 + yv + 8u];
-        let xc = input[xb0 + yv + 16u];
-        let xd = input[xb0 + yv + 24u];
+        let xb0 = (batch_row * params.a_stride_blocks + blk) * 64u;
+        {decl} xa = input[xb0 + yv];
+        {decl} xb = input[xb0 + yv + 8u];
+        {decl} xc = input[xb0 + yv + 16u];
+        {decl} xd = input[xb0 + yv + 24u];
+{act_transform}
         for (var r = 0u; r < {rows}u; r++) {{
             let row = row0 + r;
             if (row >= params.out_rows) {{
@@ -451,19 +524,30 @@ impl K2Call {
             label: Some("k2 q6_k gemv"),
             timestamp_writes: None,
         });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
     }
 }
 
-/// The compiled K2 pipeline, in one [`K2Shape`]. Compilation
-/// happens once, at backend construction, so Naga translation
-/// cost stays out of the token loop (BACKEND.md Section 4).
+/// The compiled K2 pipeline, in one [`K2Shape`] and one
+/// activation mode (K1's vocabulary). Compilation happens
+/// once, at backend construction, so Naga translation cost
+/// stays out of the token loop (BACKEND.md Section 4).
 #[derive(Debug)]
 pub struct K2Pipeline {
     pipeline: wgpu::ComputePipeline,
     shape: K2Shape,
+    act: u32,
 }
 
 impl K2Pipeline {
@@ -488,10 +572,28 @@ impl K2Pipeline {
     /// [`WgpuError::Pipeline`] on a shape the device cannot run
     /// or a shader wgpu rejects.
     pub fn with_shape(device: &wgpu::Device, shape: K2Shape) -> Result<Self> {
+        Self::with_shape_act(device, shape, ACT_NONE)
+    }
+
+    /// Compile an explicit [`K2Shape`] with an activation mode
+    /// (see [`shader_act`]): the fused form that applies K7's
+    /// elementwise math to the activation quads inside the
+    /// GEMV.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::Pipeline`] on a shape the device cannot run
+    /// or an unknown activation mode.
+    pub fn with_shape_act(device: &wgpu::Device, shape: K2Shape, act: u32) -> Result<Self> {
         shape.validate(device.features())?;
+        if act > ACT_SWIGLU {
+            return Err(WgpuError::Pipeline {
+                detail: format!("k2 activation mode {act} is not one this kernel defines"),
+            });
+        }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("k2 q6_k gemv shader"),
-            source: wgpu::ShaderSource::Wgsl(shader(&shape).into()),
+            source: wgpu::ShaderSource::Wgsl(shader_act(&shape, act).into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("k2 q6_k gemv pipeline"),
@@ -501,14 +603,25 @@ impl K2Pipeline {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        dbg_log!("k2 pipeline built: shape {}", shape.name());
-        Ok(K2Pipeline { pipeline, shape })
+        dbg_log!("k2 pipeline built: shape {} act {act}", shape.name());
+        Ok(K2Pipeline {
+            pipeline,
+            shape,
+            act,
+        })
     }
 
     /// The shape this pipeline runs.
     #[must_use]
     pub fn shape(&self) -> K2Shape {
         self.shape
+    }
+
+    /// The activation mode this pipeline runs (K1's
+    /// vocabulary: [`ACT_NONE`], [`ACT_GATED`], [`ACT_SWIGLU`]).
+    #[must_use]
+    pub fn act(&self) -> u32 {
+        self.act
     }
 
     /// Upload a Q6_K tensor's raw bytes into a fresh device
@@ -587,7 +700,9 @@ impl K2Pipeline {
     /// # Errors
     ///
     /// [`WgpuError::InvalidTensor`] when the batch the caller
-    /// declares is zero.
+    /// declares is zero, or when this pipeline carries an
+    /// activation mode (those prepare through
+    /// [`K2Pipeline::prepare_act`]).
     pub fn prepare(
         &self,
         ctx: &GpuContext,
@@ -595,6 +710,111 @@ impl K2Pipeline {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         batch: u32,
+    ) -> Result<K2Call> {
+        if self.act != ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 call".to_string(),
+                detail: format!(
+                    "this pipeline carries activation mode {}; prepare through prepare_act",
+                    self.act
+                ),
+            });
+        }
+        self.prepare_inner(ctx, weights, input, None, output, batch, None)
+    }
+
+    /// Prepare an activation dispatch: the GEMV over stream A
+    /// with K7's elementwise math applied against stream B
+    /// before any dot is taken. The geometry contract is
+    /// K1's (see [`K1Pipeline::prepare_act`]): whole-block
+    /// strides, B's addressed width equal to the weights'
+    /// input width.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] under the same conditions
+    /// as [`K1Pipeline::prepare_act`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_act(
+        &self,
+        ctx: &GpuContext,
+        weights: &K2Weights,
+        input_a: &wgpu::Buffer,
+        input_b: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: u32,
+        geom: &K1ActGeom,
+    ) -> Result<K2Call> {
+        if self.act == ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 call".to_string(),
+                detail: "this pipeline carries no activation mode; prepare through prepare"
+                    .to_string(),
+            });
+        }
+        if batch == 0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 act call".to_string(),
+                detail: "batch is zero".to_string(),
+            });
+        }
+        let width = weights.in_features;
+        let whole = |v: usize| v != 0 && v % BLOCK_ELEMS == 0;
+        if !whole(geom.a_stride_elems) || geom.a_stride_elems < width {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 act call".to_string(),
+                detail: format!(
+                    "stream A stride {} is not a whole number of {BLOCK_ELEMS}-element \
+                     blocks covering the width {width}",
+                    geom.a_stride_elems
+                ),
+            });
+        }
+        if !whole(geom.b_stride_elems)
+            || geom.b_off_elems % BLOCK_ELEMS != 0
+            || geom.b_off_elems + width > geom.b_stride_elems
+        {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 act call".to_string(),
+                detail: format!(
+                    "stream B segment (stride {}, offset {}) does not address a whole \
+                     {width}-wide segment in whole blocks",
+                    geom.b_stride_elems, geom.b_off_elems
+                ),
+            });
+        }
+        let rows = batch as usize;
+        let need_a = ((rows - 1) * geom.a_stride_elems + width) as u64 * 4;
+        let need_b = ((rows - 1) * geom.b_stride_elems + geom.b_off_elems + width) as u64 * 4;
+        let need_out = rows as u64 * weights.out_rows as u64 * 4;
+        if input_a.size() < need_a || input_b.size() < need_b || output.size() < need_out {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 act call".to_string(),
+                detail: format!(
+                    "buffer sizes (a {}, b {}, out {}) are below the geometry's needs \
+                     ({need_a}, {need_b}, {need_out})",
+                    input_a.size(),
+                    input_b.size(),
+                    output.size()
+                ),
+            });
+        }
+        self.prepare_inner(ctx, weights, input_a, Some(input_b), output, batch, Some(geom))
+    }
+
+    /// The shared prepare: bind the weights, the streams, and
+    /// the output, and write the seven-word uniform block (the
+    /// stream strides ride along, zeroed for the plain form).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner(
+        &self,
+        ctx: &GpuContext,
+        weights: &K2Weights,
+        input: &wgpu::Buffer,
+        input_b: Option<&wgpu::Buffer>,
+        output: &wgpu::Buffer,
+        batch: u32,
+        geom: Option<&K1ActGeom>,
     ) -> Result<K2Call> {
         if batch == 0 {
             return Err(WgpuError::InvalidTensor {
@@ -605,11 +825,23 @@ impl K2Pipeline {
         let total =
             u64::from(batch) * (weights.out_rows as u64).div_ceil(u64::from(self.shape.rows));
         let grid = grid_dims(total);
-        let params: [u32; 4] = [
-            (weights.in_features / BLOCK_ELEMS) as u32,
+        let blocks_per_row = (weights.in_features / BLOCK_ELEMS) as u32;
+        let (a_stride_blocks, b_stride_elems, b_off_elems) = match geom {
+            Some(g) => (
+                (g.a_stride_elems / BLOCK_ELEMS) as u32,
+                g.b_stride_elems as u32,
+                g.b_off_elems as u32,
+            ),
+            None => (blocks_per_row, 0, 0),
+        };
+        let params: [u32; 7] = [
+            blocks_per_row,
             weights.out_rows as u32,
             grid.0,
             batch,
+            a_stride_blocks,
+            b_stride_elems,
+            b_off_elems,
         ];
         let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
         let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -619,27 +851,34 @@ impl K2Pipeline {
             mapped_at_creation: false,
         });
         ctx.queue.write_buffer(&params_buffer, 0, &param_bytes);
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: weights.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: input.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: output.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        if let Some(b) = input_b {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: b.as_entire_binding(),
+            });
+        }
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k2 bind group"),
             layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: weights.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
         Ok(K2Call {
             pipeline: self.pipeline.clone(),
@@ -779,13 +1018,17 @@ mod tests {
 
     #[test]
     fn shader_carries_the_shape() {
-        let text = shader(&K2Shape::llama(4, 128).with_subgroup());
+        let text = shader_act(&K2Shape::llama(4, 128).with_subgroup(), ACT_NONE);
         assert!(text.contains("@workgroup_size(128)"));
         assert!(text.contains("subgroupShuffleXor"));
         assert!(text.contains("array<f32, 32>")); // 4 rows x 8 groups of partials
-        let tree = shader(&K2Shape::llama(2, 64));
+        assert!(!text.contains("input_b"));
+        let tree = shader_act(&K2Shape::llama(2, 64), ACT_NONE);
         assert!(tree.contains("@workgroup_size(64)"));
         assert!(tree.contains("array<f32, 128>")); // 2 rows x 64 lanes of partials
         assert!(!tree.contains("subgroupShuffleXor"));
+        let swiglu = shader_act(&K2Shape::llama(1, 256), ACT_SWIGLU);
+        assert!(swiglu.contains("silu1"));
+        assert!(swiglu.contains("act_apply(xa, input_b[bb0 + yv])"));
     }
 }

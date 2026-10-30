@@ -75,14 +75,19 @@ pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
 pub use device::GpuContext;
 pub use error::{Result, WgpuError};
-pub use kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Shape, K1Weights};
+pub use kernels::k1_q4k_gemv::{
+    K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
+};
 pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};
-pub use kernels::k3_q5k_gemv::{K3Call, K3Pipeline, K3Shape, K3Weights};
+pub use kernels::k3_q5k_gemv::{
+    K3Call, K3Pipeline, K3Shape, K3Weights, FINISH_NONE, FINISH_SCALE, FINISH_SOFTCAP,
+};
 pub use kernels::k4_rmsnorm::{K4Call, K4Pipeline};
 pub use kernels::k5_rope_kv::{K5AppendCall, K5Pipeline, K5RotateCall};
 pub use kernels::k6_attention::{
-    AttendGeom, DeviceKv, GpuKvState, K6Pipeline, K6ReduceCall, K6ScoresCall, LayerKv,
+    AttendGeom, DeviceKv, GpuKvState, K6FlashCall, K6Pipeline, K6ReduceCall, K6ScoresCall, LayerKv,
 };
 pub use kernels::k7_swiglu::{K7Call, K7Pipeline};
 pub use kernels::k8_head::{K8FinishCall, K8GatherRowsCall, K8Pipeline};
+pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
 pub use session::{ResidentSession, SessionStats};

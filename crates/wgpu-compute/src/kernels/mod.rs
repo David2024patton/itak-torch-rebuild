@@ -13,6 +13,12 @@
 //! Section 6's ladder puts per-op CPU fallback at load time, as
 //! a disclosed composition decision by the caller, not as a
 //! quiet detour inside a step).
+//!
+//! Past the numbered set, the K9 module is a fusion product
+//! for the device-resident forward: the attention preparation
+//! (the Q/K norms, the sliding layers' rotations, and the KV
+//! append) as one dispatch, proven against the K4/K5
+//! composition it replaces in that path only.
 
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
@@ -22,3 +28,4 @@ pub mod k5_rope_kv;
 pub mod k6_attention;
 pub mod k7_swiglu;
 pub mod k8_head;
+pub mod k9_attn_prep;

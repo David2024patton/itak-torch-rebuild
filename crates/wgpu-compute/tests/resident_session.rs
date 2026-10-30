@@ -325,9 +325,27 @@ fn resident_session_matches_trait_and_cpu() {
         "one submission per chunk, no exceptions"
     );
     assert_eq!(stats.readbacks, 6, "one logits readback per chunk");
-    assert!(
-        stats.dispatches > 6 * 100,
-        "the chain is the whole graph: {stats:?}"
+    // The dispatch count is the full 6-layer chain per chunk,
+    // at the fused count: the fixture's layers are all Q4_K,
+    // so every layer batches QKV+gate and pairs gate+up, and
+    // the norm chains fold the post norms into the next
+    // norms. On a chunk plan layer 0 records 10 dispatches
+    // (attn norm, batch, prep, scores, reduce, gated output,
+    // post chain, pair, fused down, boundary chain) and each
+    // later layer 9 (its attn norm rides the previous
+    // boundary chain); a chunk adds the gather, the embedding
+    // norm, the final norm, and the head (the fixture's head
+    // is Q5_K, so the finishing map is fused into it), and
+    // the embedding gather carries its norm fused, and the
+    // last layer's close folds the final norm in: 57 per
+    // chunk. Decode plans (one row) run the flash attention
+    // instead of scores + reduce, one fewer per layer: 51
+    // per chunk. Phase 1 is one 4-row prefill chunk and five
+    // decode chunks.
+    assert_eq!(
+        stats.dispatches,
+        57 + 5 * 51,
+        "the chain is the whole graph at the fused count: {stats:?}"
     );
 
     // Phase 2: a 70-token prompt, longer than the session's

@@ -478,6 +478,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Activation modes for the llama-family shader, baked in as
+/// a literal at generation time: the plain GEMV, the
+/// attention-gate form (the activation quads are multiplied by
+/// the branch-stable sigmoid of a second input stream before
+/// any dot product is taken, which is K7's gate multiply
+/// folded into the projection that consumes it), and the
+/// SwiGLU form (the quads become `silu(gate) * up` elementwise,
+/// K7's SwiGLU folded into the down projection that consumes
+/// it). Folding is exact, not approximate: the transform is
+/// per-element, applied to the same f32 values K7 would have
+/// read from the materialized activation buffer, with K7's
+/// own expressions, and every sum the kernel takes (the dots
+/// and the activation sums) is taken over the transformed
+/// quads, exactly as the unfused composition computes them
+/// over the transformed rows.
+pub const ACT_NONE: u32 = 0;
+/// Attention-gate activation: `a * sigmoid(b)`, K7's
+/// branch-stable sigmoid.
+pub const ACT_GATED: u32 = 1;
+/// SwiGLU activation: `silu(g) * u`, K7's quotient form.
+pub const ACT_SWIGLU: u32 = 2;
+
 /// The llama-family K1 shader for `shape`, generated with the
 /// tile geometry as literals so the compiler unrolls the row
 /// loop and sizes the reduction arrays exactly. The body follows
@@ -491,7 +513,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
 /// differently across its lanes; the set of (word, activation)
 /// pairs per thread is identical, and consecutive lanes here
 /// read consecutive words.)
-fn llama_shader(shape: &K1Shape) -> String {
+///
+/// The activation mode (see [`ACT_GATED`]
+/// and [`ACT_SWIGLU`]). The activated variants read a second
+/// input stream at binding 4, addressed by the `b_stride_elems`
+/// and `b_off_elems` uniforms: stream B's row for batch row
+/// `r` starts at element `r * b_stride_elems + b_off_elems`,
+/// and its width equals the weights' input width, so B is
+/// either a standalone activation buffer (stride = its width,
+/// offset 0), a segment of a wider concatenated buffer (the
+/// batched QKV layout's gate segment), or the second half of
+/// a paired gate/up buffer (stride = twice the width, offset
+/// = the width, binding the same buffer as stream A). Stream
+/// A's own row stride is the `a_stride_blocks` uniform, which
+/// the plain form sets to the weights' blocks per row and the
+/// paired SwiGLU form sets to twice that.
+fn llama_shader_act(shape: &K1Shape, act: u32) -> String {
     let rows = shape.rows;
     let wg = shape.workgroup;
     let groups = wg / 16;
@@ -604,18 +641,81 @@ fn llama_shader(shape: &K1Shape) -> String {
         )
     };
 
+    // The activation fusion's pieces, empty for the plain
+    // GEMV: a second input binding with K7's exact scalar
+    // forms, the per-component apply over a quad, and the
+    // transform block that rewrites the loaded quads before
+    // any sum is taken over them.
+    let act_decls = if act == ACT_NONE {
+        ""
+    } else {
+        r#"
+@group(0) @binding(4) var<storage, read> input_b: array<vec4<f32>>;
+
+// Logistic sigmoid, K7's branch-stable form (cpu-compute's):
+// the exponential's argument is never positive.
+fn sigmoid1(x: f32) -> f32 {
+    if (x >= 0.0) {
+        return 1.0 / (1.0 + exp(-x));
+    }
+    let e = exp(x);
+    return e / (1.0 + e);
+}
+"#
+    };
+    let act_apply = match act {
+        ACT_GATED => {
+            r#"
+fn act_apply(a: vec4<f32>, b: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(a.x * sigmoid1(b.x), a.y * sigmoid1(b.y),
+                     a.z * sigmoid1(b.z), a.w * sigmoid1(b.w));
+}
+"#
+        }
+        ACT_SWIGLU => {
+            r#"
+// SiLU, K7's quotient form: x * sigmoid(x) as the single
+// quotient the reference computes.
+fn silu1(x: f32) -> f32 {
+    return x / (1.0 + exp(-x));
+}
+
+fn act_apply(g: vec4<f32>, u: vec4<f32>) -> vec4<f32> {
+    return vec4<f32>(silu1(g.x) * u.x, silu1(g.y) * u.y,
+                     silu1(g.z) * u.z, silu1(g.w) * u.w);
+}
+"#
+        }
+        _ => "",
+    };
+    let decl = if act == ACT_NONE { "let" } else { "var" };
+    let act_transform = if act == ACT_NONE {
+        ""
+    } else {
+        r#"        let bb0 = (batch_row * params.b_stride_elems + params.b_off_elems) / 4u + blk * 64u;
+        xa = act_apply(xa, input_b[bb0 + yv]);
+        xbq = act_apply(xbq, input_b[bb0 + yv + 8u]);
+        xc = act_apply(xc, input_b[bb0 + yv + 32u]);
+        xd = act_apply(xd, input_b[bb0 + yv + 40u]);
+"#
+    };
+
     format!(
         r#"{enable_f16}struct Params {{
     blocks_per_row: u32,
     out_rows: u32,
     grid_x: u32,
     batch: u32,
+    a_stride_blocks: u32,
+    b_stride_elems: u32,
+    b_off_elems: u32,
 }}
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
 @group(0) @binding(1) var<storage, read> input: {input_decl};
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 @group(0) @binding(3) var<uniform> params: Params;
+{act_decls}{act_apply}
 
 var<workgroup> partials: array<f32, {partials_len}>;
 
@@ -668,12 +768,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
         // times. A pairs with sub-block 2h, B with 2h+1 (the
         // first word's high nibbles, 32 elements later), C and
         // D with 2h+4 and 2h+5 (the second word, 128 later).
-        let xb0 = (batch_row * params.blocks_per_row + blk) * 64u;
-        let xa = input[xb0 + yv];
-        let xbq = input[xb0 + yv + 8u];
-        let xc = input[xb0 + yv + 32u];
-        let xd = input[xb0 + yv + 40u];
-        let sa = dot(xa, {one});
+        let xb0 = (batch_row * params.a_stride_blocks + blk) * 64u;
+        {decl} xa = input[xb0 + yv];
+        {decl} xbq = input[xb0 + yv + 8u];
+        {decl} xc = input[xb0 + yv + 32u];
+        {decl} xd = input[xb0 + yv + 40u];
+{act_transform}        let sa = dot(xa, {one});
         let sb = dot(xbq, {one});
         let sc_ = dot(xc, {one});
         let sd = dot(xd, {one});
@@ -738,6 +838,20 @@ pub struct K1Weights {
     buffer: wgpu::Buffer,
 }
 
+/// Stream geometry for an activation dispatch (see
+/// [`K1Pipeline::prepare_act`]): element strides and the
+/// second stream's segment offset, all in elements and all
+/// whole Q4_K blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct K1ActGeom {
+    /// Row stride of stream A, in elements.
+    pub a_stride_elems: usize,
+    /// Row stride of stream B, in elements.
+    pub b_stride_elems: usize,
+    /// Element offset of stream B's segment within its row.
+    pub b_off_elems: usize,
+}
+
 /// One prepared K1 dispatch set: a bind group plus grid dimensions,
 /// built once for a (weights, input, output, batch) combination and
 /// encodable any number of times. The bench encodes the same call
@@ -756,19 +870,30 @@ impl K1Call {
             label: Some("k1 q4_k gemv"),
             timestamp_writes: None,
         });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
     }
 }
 
-/// The compiled K1 pipeline, in one [`K1Shape`]. Compilation
-/// happens once, at backend construction, so Naga translation
-/// cost stays out of the token loop (BACKEND.md Section 4).
+/// The compiled K1 pipeline, in one [`K1Shape`] and one
+/// activation mode. Compilation happens once, at backend
+/// construction, so Naga translation cost stays out of the
+/// token loop (BACKEND.md Section 4).
 #[derive(Debug)]
 pub struct K1Pipeline {
     pipeline: wgpu::ComputePipeline,
     shape: K1Shape,
+    act: u32,
 }
 
 impl K1Pipeline {
@@ -798,11 +923,42 @@ impl K1Pipeline {
     /// [`WgpuError::Pipeline`] on a shape the device cannot run
     /// or a shader wgpu rejects.
     pub fn with_shape(device: &wgpu::Device, shape: K1Shape) -> Result<Self> {
+        Self::with_shape_act(device, shape, ACT_NONE)
+    }
+
+    /// Compile an explicit [`K1Shape`] with an activation mode
+    /// (see [`ACT_GATED`] and [`ACT_SWIGLU`]): the fused form
+    /// that applies K7's elementwise math to the activation
+    /// quads inside the GEMV. Activation modes exist only for
+    /// the llama family with f32 activations: the legacy shader
+    /// is kept verbatim, and the f16 shapes' dots are taken in
+    /// f16, where an f32 elementwise stage has no exact place.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::Pipeline`] on a shape the device cannot run,
+    /// an unknown activation mode, or a mode combined with the
+    /// legacy or f16-activation shapes.
+    pub fn with_shape_act(device: &wgpu::Device, shape: K1Shape, act: u32) -> Result<Self> {
         shape.validate(device.features())?;
+        if act > ACT_SWIGLU {
+            return Err(WgpuError::Pipeline {
+                detail: format!("k1 activation mode {act} is not one this kernel defines"),
+            });
+        }
+        if act != ACT_NONE && (shape.legacy || shape.f16_activations) {
+            return Err(WgpuError::Pipeline {
+                detail: format!(
+                    "k1 activation mode {act} needs the llama family with f32 activations; \
+                     shape {} does not qualify",
+                    shape.name()
+                ),
+            });
+        }
         let source: String = if shape.legacy {
             SHADER_V2.to_string()
         } else {
-            llama_shader(&shape)
+            llama_shader_act(&shape, act)
         };
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("k1 q4_k gemv shader"),
@@ -816,14 +972,25 @@ impl K1Pipeline {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        dbg_log!("k1 pipeline built: shape {}", shape.name());
-        Ok(K1Pipeline { pipeline, shape })
+        dbg_log!("k1 pipeline built: shape {} act {act}", shape.name());
+        Ok(K1Pipeline {
+            pipeline,
+            shape,
+            act,
+        })
     }
 
     /// The shape this pipeline runs.
     #[must_use]
     pub fn shape(&self) -> K1Shape {
         self.shape
+    }
+
+    /// The activation mode this pipeline runs ([`ACT_NONE`],
+    /// [`ACT_GATED`], or [`ACT_SWIGLU`]).
+    #[must_use]
+    pub fn act(&self) -> u32 {
+        self.act
     }
 
     /// Upload a Q4_K tensor's raw bytes into a fresh device buffer.
@@ -889,6 +1056,97 @@ impl K1Pipeline {
         })
     }
 
+    /// Upload several Q4_K tensors that share an input width
+    /// into ONE device buffer, concatenated along the output
+    /// rows: a single dispatch over the concatenated weights
+    /// computes every part's rows, because the kernel addresses
+    /// weights by output row and knows nothing of tensor
+    /// boundaries. Each output row's arithmetic is the row's
+    /// own standalone dispatch's, unchanged; what the caller
+    /// saves is the dispatch count (the batched QKV and gate+up
+    /// projections of the resident forward). Each part is
+    /// `(raw bytes, in_features, out_rows)` and validated
+    /// exactly as [`K1Pipeline::upload`] validates.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on an empty part list, a
+    /// part [`K1Pipeline::upload`] would refuse, or parts whose
+    /// input widths disagree.
+    pub fn upload_multi(
+        &self,
+        ctx: &GpuContext,
+        name: &str,
+        parts: &[(&[u8], usize, usize)],
+    ) -> Result<K1Weights> {
+        if parts.is_empty() {
+            return Err(WgpuError::InvalidTensor {
+                name: name.to_string(),
+                detail: "no parts to concatenate".to_string(),
+            });
+        }
+        let in_features = parts[0].1;
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut out_rows = 0usize;
+        for (part_bytes, part_in, part_out) in parts {
+            if *part_in != in_features {
+                return Err(WgpuError::InvalidTensor {
+                    name: name.to_string(),
+                    detail: format!(
+                        "part input width {part_in} disagrees with the first part's {in_features}"
+                    ),
+                });
+            }
+            if in_features == 0 || in_features % BLOCK_ELEMS != 0 {
+                return Err(WgpuError::InvalidTensor {
+                    name: name.to_string(),
+                    detail: format!(
+                        "input width {in_features} is not a positive whole number of \
+                         {BLOCK_ELEMS}-element Q4_K blocks"
+                    ),
+                });
+            }
+            if *part_out == 0 {
+                return Err(WgpuError::InvalidTensor {
+                    name: name.to_string(),
+                    detail: "a part's output row count is zero".to_string(),
+                });
+            }
+            let expected = (in_features / BLOCK_ELEMS) * BLOCK_BYTES * part_out;
+            if part_bytes.len() != expected {
+                return Err(WgpuError::InvalidTensor {
+                    name: name.to_string(),
+                    detail: format!(
+                        "a part holds {} bytes but [{in_features}, {part_out}] of Q4_K \
+                         needs {expected}",
+                        part_bytes.len()
+                    ),
+                });
+            }
+            bytes.extend_from_slice(part_bytes);
+            out_rows += part_out;
+        }
+        ctx.check_tensor_fits(name, bytes.len() as u64)?;
+        let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(name),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&buffer, 0, &bytes);
+        dbg_log!(
+            "k1 upload {name}: {} bytes [{in_features} x {out_rows}] in {} parts",
+            bytes.len(),
+            parts.len()
+        );
+        Ok(K1Weights {
+            byte_len: bytes.len() as u64,
+            in_features,
+            out_rows,
+            buffer,
+        })
+    }
+
     /// Prepare a dispatch of `weights` over a batch of input rows.
     /// `input` must hold `batch * weights.in_features` elements in
     /// this pipeline's input precision (f32, or packed f16 when
@@ -900,7 +1158,9 @@ impl K1Pipeline {
     /// # Errors
     ///
     /// [`WgpuError::InvalidTensor`] when the buffer sizes disagree
-    /// with the batch the caller declares.
+    /// with the batch the caller declares, or when this pipeline
+    /// carries an activation mode (those prepare through
+    /// [`K1Pipeline::prepare_act`]).
     pub fn prepare(
         &self,
         ctx: &GpuContext,
@@ -908,6 +1168,124 @@ impl K1Pipeline {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
         batch: u32,
+    ) -> Result<K1Call> {
+        if self.act != ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 call".to_string(),
+                detail: format!(
+                    "this pipeline carries activation mode {}; prepare through prepare_act",
+                    self.act
+                ),
+            });
+        }
+        self.prepare_inner(ctx, weights, input, None, output, batch, None)
+    }
+
+    /// Prepare an activation dispatch (see [`ACT_GATED`] and
+    /// [`ACT_SWIGLU`]): the GEMV over stream A with K7's
+    /// elementwise math applied to A's quads against stream B
+    /// before any sum is taken. `input_a` rows are
+    /// `geom.a_stride_elems` apart (the weights' input width
+    /// for a plain activation buffer; twice it for the paired
+    /// gate/up layout, where `input_b` is `input_a` itself and
+    /// the up segment is addressed by the offset). Stream B's
+    /// geometry is `geom`'s stride and offset (see
+    /// [`llama_shader_act`]). Both strides and the offset are
+    /// whole Q4_K blocks, and B's addressed width equals the
+    /// weights' input width: the two fusions this serves pair
+    /// streams of equal width by construction (gate with the
+    /// attention output, up with the FFN gate).
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when this pipeline carries
+    /// no activation mode, the batch is zero, a stride or
+    /// offset is not a whole number of blocks, B's addressed
+    /// segment overruns its stride, or a buffer is smaller
+    /// than the geometry addresses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_act(
+        &self,
+        ctx: &GpuContext,
+        weights: &K1Weights,
+        input_a: &wgpu::Buffer,
+        input_b: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: u32,
+        geom: &K1ActGeom,
+    ) -> Result<K1Call> {
+        if self.act == ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 call".to_string(),
+                detail: "this pipeline carries no activation mode; prepare through prepare"
+                    .to_string(),
+            });
+        }
+        if batch == 0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 act call".to_string(),
+                detail: "batch is zero".to_string(),
+            });
+        }
+        let width = weights.in_features;
+        let whole = |v: usize| v != 0 && v % BLOCK_ELEMS == 0;
+        if !whole(geom.a_stride_elems) || geom.a_stride_elems < width {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 act call".to_string(),
+                detail: format!(
+                    "stream A stride {} is not a whole number of {BLOCK_ELEMS}-element \
+                     blocks covering the width {width}",
+                    geom.a_stride_elems
+                ),
+            });
+        }
+        if !whole(geom.b_stride_elems)
+            || geom.b_off_elems % BLOCK_ELEMS != 0
+            || geom.b_off_elems + width > geom.b_stride_elems
+        {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 act call".to_string(),
+                detail: format!(
+                    "stream B segment (stride {}, offset {}) does not address a whole \
+                     {width}-wide segment in whole blocks",
+                    geom.b_stride_elems, geom.b_off_elems
+                ),
+            });
+        }
+        let rows = batch as usize;
+        let need_a = ((rows - 1) * geom.a_stride_elems + width) as u64 * 4;
+        let need_b = ((rows - 1) * geom.b_stride_elems + geom.b_off_elems + width) as u64 * 4;
+        let need_out = rows as u64 * weights.out_rows as u64 * 4;
+        if input_a.size() < need_a || input_b.size() < need_b || output.size() < need_out {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 act call".to_string(),
+                detail: format!(
+                    "buffer sizes (a {}, b {}, out {}) are below the geometry's needs \
+                     ({need_a}, {need_b}, {need_out})",
+                    input_a.size(),
+                    input_b.size(),
+                    output.size()
+                ),
+            });
+        }
+        self.prepare_inner(ctx, weights, input_a, Some(input_b), output, batch, Some(geom))
+    }
+
+    /// The shared prepare: bind the weights, the streams, and
+    /// the output, and write the uniform block (four words for
+    /// the legacy shader, seven for the llama family, whose
+    /// extra words carry the stream strides the activation
+    /// forms address by).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner(
+        &self,
+        ctx: &GpuContext,
+        weights: &K1Weights,
+        input: &wgpu::Buffer,
+        input_b: Option<&wgpu::Buffer>,
+        output: &wgpu::Buffer,
+        batch: u32,
+        geom: Option<&K1ActGeom>,
     ) -> Result<K1Call> {
         if batch == 0 {
             return Err(WgpuError::InvalidTensor {
@@ -921,12 +1299,28 @@ impl K1Pipeline {
             u64::from(batch) * (weights.out_rows as u64).div_ceil(u64::from(self.shape.rows))
         };
         let grid = grid_dims(total);
-        let params: [u32; 4] = [
-            (weights.in_features / BLOCK_ELEMS) as u32,
-            weights.out_rows as u32,
-            grid.0,
-            batch,
-        ];
+        let blocks_per_row = (weights.in_features / BLOCK_ELEMS) as u32;
+        let params: Vec<u32> = if self.shape.legacy {
+            vec![blocks_per_row, weights.out_rows as u32, grid.0, batch]
+        } else {
+            let (a_stride_blocks, b_stride_elems, b_off_elems) = match geom {
+                Some(g) => (
+                    (g.a_stride_elems / BLOCK_ELEMS) as u32,
+                    g.b_stride_elems as u32,
+                    g.b_off_elems as u32,
+                ),
+                None => (blocks_per_row, 0, 0),
+            };
+            vec![
+                blocks_per_row,
+                weights.out_rows as u32,
+                grid.0,
+                batch,
+                a_stride_blocks,
+                b_stride_elems,
+                b_off_elems,
+            ]
+        };
         let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
         let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("k1 params"),
@@ -935,27 +1329,34 @@ impl K1Pipeline {
             mapped_at_creation: false,
         });
         ctx.queue.write_buffer(&params_buffer, 0, &param_bytes);
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: weights.buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: input.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: output.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        if let Some(b) = input_b {
+            entries.push(wgpu::BindGroupEntry {
+                binding: 4,
+                resource: b.as_entire_binding(),
+            });
+        }
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k1 bind group"),
             layout: &self.pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: weights.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: input.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: output.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &entries,
         });
         Ok(K1Call {
             pipeline: self.pipeline.clone(),
@@ -1126,13 +1527,25 @@ mod tests {
 
     #[test]
     fn llama_shader_carries_the_shape() {
-        let shader = llama_shader(&K1Shape::llama(4, 128).with_subgroup());
+        let shader = llama_shader_act(&K1Shape::llama(4, 128).with_subgroup(), ACT_NONE);
         assert!(shader.contains("@workgroup_size(128)"));
         assert!(shader.contains("subgroupShuffleXor"));
         assert!(shader.contains("array<f32, 32>")); // 4 rows x 8 groups of partials
-        let f16 = llama_shader(&K1Shape::llama(2, 64).with_f16());
+        assert!(!shader.contains("input_b"));
+        let f16 = llama_shader_act(&K1Shape::llama(2, 64).with_f16(), ACT_NONE);
         assert!(f16.starts_with("enable f16;"));
         assert!(f16.contains("array<vec4<f16>>"));
         assert!(f16.contains("@workgroup_size(64)"));
+    }
+
+    #[test]
+    fn llama_shader_act_variants_carry_the_fusion() {
+        let gated = llama_shader_act(&K1Shape::llama(2, 128), ACT_GATED);
+        assert!(gated.contains("input_b"));
+        assert!(gated.contains("sigmoid1"));
+        assert!(gated.contains("a_stride_blocks"));
+        let swiglu = llama_shader_act(&K1Shape::llama(2, 128), ACT_SWIGLU);
+        assert!(swiglu.contains("silu1"));
+        assert!(swiglu.contains("act_apply(xa, input_b[bb0 + yv])"));
     }
 }

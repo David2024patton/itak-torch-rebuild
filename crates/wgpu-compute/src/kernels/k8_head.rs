@@ -392,6 +392,126 @@ fn gather_rows_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Largest row width the fused gather+norm serves: 256
+/// lanes holding at most 32 strided elements each (the
+/// register-residency bound, the same shape as K4's chain).
+pub const GATHER_NORM_MAX_WIDTH: usize = 256 * 32;
+
+/// The fused gather+norm shaders: the multi-row gather and
+/// the weightless embedding norm in ONE dispatch (the
+/// resident forward chains them with nothing between). One
+/// workgroup per row; each lane dequantizes its strided
+/// share of the gathered row into registers, the row's
+/// sum of squares reduces through K4's partials tree, and
+/// the normed row is written from the registers: precisely
+/// the two-dispatch composition's values (the norm's
+/// reduction distribution is K4's, and the gather's element
+/// decoders are the gather shaders' own). Three storage
+/// families, mirroring the gathers.
+const GATHER_NORM_HEAD: &str = r#"
+struct GatherNormParams {
+    width: u32,
+    rows: u32,
+    dtype: u32,
+    grid_x: u32,
+    eps: f32,
+}
+
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: GatherNormParams;
+
+var<workgroup> partials: array<f32, 256>;
+var<workgroup> inv_shared: f32;
+"#;
+
+/// The shared gather+norm main, parameterized by the
+/// family's element load (an expression over `g`, the
+/// element's global index in the table).
+fn gather_norm_main(load: &str) -> String {
+    format!(
+        r#"
+@compute @workgroup_size(256)
+fn gather_norm_main(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {{
+    let row = wid.y * params.grid_x + wid.x;
+    // Whole-workgroup early out: every lane shares `row`.
+    if (row >= params.rows) {{
+        return;
+    }}
+    let lane = lid.x;
+    let base = tokens[row] * params.width;
+    var vals: array<f32, 32>;
+    var ss = 0.0;
+    var n = 0u;
+    for (var i = lane; i < params.width; i += 256u) {{
+        let g = base + i;
+        let x = {load};
+        vals[n] = x;
+        ss += x * x;
+        n += 1u;
+    }}
+    partials[lane] = ss;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {{
+        if (lane < stride) {{
+            partials[lane] += partials[lane + stride];
+        }}
+        workgroupBarrier();
+        stride >>= 1u;
+    }}
+    if (lane == 0u) {{
+        inv_shared = inverseSqrt(partials[0] / f32(params.width) + params.eps);
+    }}
+    workgroupBarrier();
+    let inv = inv_shared;
+    var m = 0u;
+    for (var i = lane; i < params.width; i += 256u) {{
+        out[row * params.width + i] = vals[m] * inv;
+        m += 1u;
+    }}
+}}
+"#
+    )
+}
+
+/// The F32 fused gather+norm shader.
+fn gather_norm_f32_shader() -> String {
+    format!(
+        "@group(0) @binding(0) var<storage, read> table: array<f32>;\n{GATHER_NORM_HEAD}{}",
+        gather_norm_main("table[g]")
+    )
+}
+
+/// The two-byte (F16 / BF16) fused gather+norm shader;
+/// dtype codes as in the gathers (0 = F16, 1 = BF16).
+fn gather_norm_half_shader() -> String {
+    format!(
+        "@group(0) @binding(0) var<storage, read> table: array<u32>;\n{GATHER_NORM_HEAD}\n\
+         fn half_at(g: u32) -> f32 {{\n    \
+             let bits = (table[g / 2u] >> (16u * (g % 2u))) & 0xFFFFu;\n    \
+             if (params.dtype == 0u) {{ return unpack2x16float(bits).x; }}\n    \
+             return bitcast<f32>(bits << 16u);\n}}\n{}",
+        gather_norm_main("half_at(g)")
+    )
+}
+
+/// The quantized fused gather+norm shader: the shared head,
+/// the gather's dequantizer helpers, and a dtype dispatch
+/// over them.
+fn gather_norm_quant_shader() -> String {
+    format!(
+        "@group(0) @binding(0) var<storage, read> table: array<u32>;\n{GATHER_NORM_HEAD}{QUANT_DEQUANT_HELPERS}\n\
+         fn dequant_any(g: u32) -> f32 {{\n    \
+             if (params.dtype == 0u) {{ return dequant_q4k(g); }}\n    \
+             if (params.dtype == 1u) {{ return dequant_q6k(g); }}\n    \
+             if (params.dtype == 2u) {{ return dequant_q5k(g); }}\n    \
+             return dequant_q8_0(g);\n}}\n{}",
+        gather_norm_main("dequant_any(g)")
+    )
+}
+
 /// The head finishing shader: scale, then tanh softcap.
 const FINISH_SHADER: &str = r#"
 struct FinishParams {
@@ -531,6 +651,9 @@ pub struct K8Pipeline {
     gather_rows_f32: wgpu::ComputePipeline,
     gather_rows_half: wgpu::ComputePipeline,
     gather_rows_quant: wgpu::ComputePipeline,
+    gather_norm_f32: wgpu::ComputePipeline,
+    gather_norm_half: wgpu::ComputePipeline,
+    gather_norm_quant: wgpu::ComputePipeline,
     finish: wgpu::ComputePipeline,
     scale: wgpu::ComputePipeline,
 }
@@ -574,6 +697,21 @@ impl K8Pipeline {
             "gather_rows_main",
             "k8 gather rows quant",
         );
+        let gather_norm_f32 = build(
+            &gather_norm_f32_shader(),
+            "gather_norm_main",
+            "k8 gather norm f32",
+        );
+        let gather_norm_half = build(
+            &gather_norm_half_shader(),
+            "gather_norm_main",
+            "k8 gather norm half",
+        );
+        let gather_norm_quant = build(
+            &gather_norm_quant_shader(),
+            "gather_norm_main",
+            "k8 gather norm quant",
+        );
         let finish = build(FINISH_SHADER, "finish_main", "k8 head finish");
         let scale = build(SCALE_SHADER, "scale_main", "k8 head scale");
         dbg_log!("k8 pipelines built");
@@ -584,6 +722,9 @@ impl K8Pipeline {
             gather_rows_f32,
             gather_rows_half,
             gather_rows_quant,
+            gather_norm_f32,
+            gather_norm_half,
+            gather_norm_quant,
             finish,
             scale,
         })
@@ -674,6 +815,96 @@ impl K8Pipeline {
             ],
         });
         dbg_log!("k8 gather rows prepared: rows={rows} width={width} dtype={dtype:?}");
+        Ok(K8GatherRowsCall {
+            pipeline: pipeline.clone(),
+            bind_group,
+            grid,
+        })
+    }
+
+    /// Prepare a fused gather+norm dispatch over device
+    /// buffers: `rows` token ids read from `tokens`, each
+    /// gathered row of the resident `table` RMS-normalized
+    /// (weightless, at `eps`) as it is gathered, written to
+    /// `out` as `[rows][width]`. The fused form of
+    /// [`K8Pipeline::prepare_gather_rows`] followed by the
+    /// embedding norm; the dtype acceptance matches the
+    /// gather's.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `"embed"` on a dtype
+    /// with no gather family, a zero geometry, or a width
+    /// past [`GATHER_NORM_MAX_WIDTH`] (the register-residency
+    /// bound; wider rows keep the two dispatches).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_gather_rows_norm(
+        &self,
+        ctx: &GpuContext,
+        table: &wgpu::Buffer,
+        tokens: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+        dtype: Dtype,
+    ) -> GlimmerResult<K8GatherRowsCall> {
+        let step = "embed";
+        if rows == 0 || width == 0 || width > GATHER_NORM_MAX_WIDTH {
+            return Err(step_failed(
+                step,
+                format!(
+                    "gather+norm of {rows} rows of width {width}: nothing to gather, or the \
+                     width is past the fused kernel's {GATHER_NORM_MAX_WIDTH}-element bound"
+                ),
+            ));
+        }
+        let (pipeline, code): (&wgpu::ComputePipeline, u32) = match dtype {
+            Dtype::F32 => (&self.gather_norm_f32, 0),
+            Dtype::F16 => (&self.gather_norm_half, CODE_F16),
+            Dtype::Bf16 => (&self.gather_norm_half, CODE_BF16),
+            Dtype::Q4K => (&self.gather_norm_quant, CODE_Q4_K),
+            Dtype::Q6K => (&self.gather_norm_quant, CODE_Q6_K),
+            Dtype::Q5K => (&self.gather_norm_quant, CODE_Q5_K),
+            Dtype::Q8_0 => (&self.gather_norm_quant, CODE_Q8_0),
+            other => {
+                return Err(step_failed(
+                    step,
+                    format!(
+                        "embedding dtype {} (ggml type id {}) has no gather family in this backend",
+                        gguf::ggml::type_name(dtype_id(other)),
+                        dtype_id(other)
+                    ),
+                ))
+            }
+        };
+        let grid = grid_dims(rows as u64);
+        let params: [u32; 5] = [width as u32, rows as u32, code, grid.0, eps.to_bits()];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k8 gather norm params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k8 gather norm bind group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: table.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: tokens.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        dbg_log!("k8 gather+norm prepared: rows={rows} width={width} dtype={dtype:?}");
         Ok(K8GatherRowsCall {
             pipeline: pipeline.clone(),
             bind_group,
@@ -1037,6 +1268,9 @@ mod tests {
         assert!(gather_quant_shader().contains("fn dequant_q6k"));
         assert!(gather_quant_shader().contains("fn dequant_q8_0"));
         assert!(FINISH_SHADER.contains("fn finish_main"));
+        assert!(gather_norm_f32_shader().contains("fn gather_norm_main"));
+        assert!(gather_norm_half_shader().contains("fn half_at"));
+        assert!(gather_norm_quant_shader().contains("fn dequant_any"));
         // The finish order is pinned: scale first, then the cap.
         assert!(FINISH_SHADER.contains("logits[i] * params.scale"));
         assert!(FINISH_SHADER.contains("params.cap * tanh"));

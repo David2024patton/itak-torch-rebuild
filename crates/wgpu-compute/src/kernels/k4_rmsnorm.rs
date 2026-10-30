@@ -144,6 +144,232 @@ mod mode {
     pub const WEIGHTED_RESIDUAL: u32 = 2;
 }
 
+/// The chain shader: two norm stages and the residual add
+/// between them in ONE dispatch, the fusion the resident
+/// forward's half-layer boundaries call for. Stage one is the
+/// fused post-norm (`stream = residual + norm(branch) *
+/// w_post`, at the post-norm eps); stage two is the next
+/// pre-norm over the result (`h = norm(stream) * w_pre`, at
+/// the file eps). The two stages chain with nothing between
+/// them in the forward, and fusing them is exact: the lane
+/// keeps its strided share of the intermediate row in
+/// registers between the stages, so stage two reduces over
+/// precisely the f32 values stage one wrote (it writes them
+/// to `out_stream` in the same pass, for the consumers that
+/// need the stream itself). Each stage's reduction is the
+/// norm shader's own distribution and partials tree, and each
+/// stage's per-element math is its mode's, term for term.
+///
+/// The register residency bounds the width: a lane holds
+/// `ceil(width / 256)` elements, capped at 32, so widths up
+/// to 8192 chain (the real hidden width is 6656, 26 per
+/// lane); wider rows refuse by name at prepare time.
+const CHAIN_SHADER: &str = r#"
+struct ChainParams {
+    width: u32,
+    total_rows: u32,
+    grid_x: u32,
+    eps_post: f32,
+    eps_pre: f32,
+}
+
+@group(0) @binding(0) var<storage, read> residual: array<f32>;
+@group(0) @binding(1) var<storage, read> branch: array<f32>;
+@group(0) @binding(2) var<storage, read> w_post: array<f32>;
+@group(0) @binding(3) var<storage, read> w_pre: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out_stream: array<f32>;
+@group(0) @binding(5) var<storage, read_write> out_normed: array<f32>;
+@group(0) @binding(6) var<uniform> params: ChainParams;
+
+var<workgroup> partials: array<f32, 256>;
+var<workgroup> inv_shared: f32;
+
+@compute @workgroup_size(256)
+fn chain_main(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * params.grid_x + wid.x;
+    // Whole-workgroup early out: every lane shares `row`, so
+    // the exit is uniform and the barriers below stay legal.
+    if (row >= params.total_rows) {
+        return;
+    }
+    let lane = lid.x;
+    let base = row * params.width;
+
+    // Stage one's reduction over the branch row.
+    var ss = 0.0;
+    for (var i = lane; i < params.width; i += 256u) {
+        let v = branch[base + i];
+        ss += v * v;
+    }
+    partials[lane] = ss;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+    if (lane == 0u) {
+        inv_shared = inverseSqrt(partials[0] / f32(params.width) + params.eps_post);
+    }
+    workgroupBarrier();
+    let inv_post = inv_shared;
+
+    // The intermediate row: written to the stream output and
+    // kept in registers for stage two's reduction.
+    var s_vals: array<f32, 32>;
+    var ss2 = 0.0;
+    var n = 0u;
+    for (var i = lane; i < params.width; i += 256u) {
+        var y = branch[base + i] * inv_post;
+        y = y * w_post[i];
+        let s = residual[base + i] + y;
+        s_vals[n] = s;
+        out_stream[base + i] = s;
+        ss2 += s * s;
+        n += 1u;
+    }
+    partials[lane] = ss2;
+    workgroupBarrier();
+    stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+    if (lane == 0u) {
+        inv_shared = inverseSqrt(partials[0] / f32(params.width) + params.eps_pre);
+    }
+    workgroupBarrier();
+    let inv_pre = inv_shared;
+
+    var m = 0u;
+    for (var i = lane; i < params.width; i += 256u) {
+        var y = s_vals[m] * inv_pre;
+        y = y * w_pre[i];
+        out_normed[base + i] = y;
+        m += 1u;
+    }
+}
+"#;
+
+/// Largest row width the chain shader serves: 256 lanes
+/// holding at most 32 strided elements each.
+pub const CHAIN_MAX_WIDTH: usize = 256 * 32;
+
+/// The close shader: the last layer's post-FFN norm and
+/// residual add, with the head's final norm folded in. Stage
+/// one is the chain shader's first stage (the stream takes
+/// the residual plus the post-normed branch, at the
+/// post-norm eps); the LAST row's workgroup then runs the
+/// final norm over its register-resident stream row (the
+/// head input is the final-normed stream, at the file eps)
+/// in the same dispatch, so the separate final-norm
+/// dispatch and the last-row copy both disappear from the
+/// resident forward's tail. The math is the two stages'
+/// composition exactly, under the chain shader's
+/// register-residency width bound.
+const CLOSE_SHADER: &str = r#"
+struct CloseParams {
+    width: u32,
+    total_rows: u32,
+    grid_x: u32,
+    eps_post: f32,
+    eps_final: f32,
+}
+
+@group(0) @binding(0) var<storage, read> residual: array<f32>;
+@group(0) @binding(1) var<storage, read> branch: array<f32>;
+@group(0) @binding(2) var<storage, read> w_post: array<f32>;
+@group(0) @binding(3) var<storage, read> w_final: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out_stream: array<f32>;
+@group(0) @binding(5) var<storage, read_write> out_head: array<f32>;
+@group(0) @binding(6) var<uniform> params: CloseParams;
+
+var<workgroup> partials: array<f32, 256>;
+var<workgroup> inv_shared: f32;
+
+@compute @workgroup_size(256)
+fn close_main(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * params.grid_x + wid.x;
+    // Whole-workgroup early out: every lane shares `row`, so
+    // the exit is uniform and the barriers below stay legal.
+    if (row >= params.total_rows) {
+        return;
+    }
+    let lane = lid.x;
+    let base = row * params.width;
+
+    var ss = 0.0;
+    for (var i = lane; i < params.width; i += 256u) {
+        let v = branch[base + i];
+        ss += v * v;
+    }
+    partials[lane] = ss;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+    if (lane == 0u) {
+        inv_shared = inverseSqrt(partials[0] / f32(params.width) + params.eps_post);
+    }
+    workgroupBarrier();
+    let inv_post = inv_shared;
+
+    var s_vals: array<f32, 32>;
+    var ss2 = 0.0;
+    var n = 0u;
+    for (var i = lane; i < params.width; i += 256u) {
+        var y = branch[base + i] * inv_post;
+        y = y * w_post[i];
+        let s = residual[base + i] + y;
+        s_vals[n] = s;
+        out_stream[base + i] = s;
+        ss2 += s * s;
+        n += 1u;
+    }
+
+    // Only the last row feeds the head; other rows are done.
+    if (row != params.total_rows - 1u) {
+        return;
+    }
+    partials[lane] = ss2;
+    workgroupBarrier();
+    stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+    if (lane == 0u) {
+        inv_shared = inverseSqrt(partials[0] / f32(params.width) + params.eps_final);
+    }
+    workgroupBarrier();
+    let inv_final = inv_shared;
+
+    var m = 0u;
+    for (var i = lane; i < params.width; i += 256u) {
+        var y = s_vals[m] * inv_final;
+        y = y * w_final[i];
+        out_head[i] = y;
+        m += 1u;
+    }
+}
+"#;
+
 /// One prepared K4 dispatch: a bind group plus grid dimensions,
 /// built once for a fixed (buffers, rows, width, mode, eps)
 /// combination and encodable any number of times into any
@@ -181,12 +407,15 @@ impl K4Call {
     }
 }
 
-/// The compiled K4 pipelines (norm and add), plus the dummy
-/// buffer the norm shader binds for inputs a mode does not read.
+/// The compiled K4 pipelines (norm, add, and the two-stage
+/// chain), plus the dummy buffer the norm shader binds for
+/// inputs a mode does not read.
 #[derive(Debug)]
 pub struct K4Pipeline {
     norm: wgpu::ComputePipeline,
     add: wgpu::ComputePipeline,
+    chain: wgpu::ComputePipeline,
+    close: wgpu::ComputePipeline,
     dummy: wgpu::Buffer,
 }
 
@@ -221,14 +450,44 @@ impl K4Pipeline {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        let chain_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("k4 norm chain shader"),
+            source: wgpu::ShaderSource::Wgsl(CHAIN_SHADER.into()),
+        });
+        let chain = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("k4 norm chain pipeline"),
+            layout: None,
+            module: &chain_module,
+            entry_point: Some("chain_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         let dummy = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("k4 dummy binding"),
             size: 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let close_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("k4 norm close shader"),
+            source: wgpu::ShaderSource::Wgsl(CLOSE_SHADER.into()),
+        });
+        let close = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("k4 norm close pipeline"),
+            layout: None,
+            module: &close_module,
+            entry_point: Some("close_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
         dbg_log!("k4 pipelines built");
-        Ok(K4Pipeline { norm, add, dummy })
+        Ok(K4Pipeline {
+            norm,
+            add,
+            chain,
+            close,
+            dummy,
+        })
     }
 
     /// Prepare a norm dispatch over device buffers: `x` read,
@@ -357,6 +616,180 @@ impl K4Pipeline {
             mode::WEIGHTED_RESIDUAL,
             eps,
         )
+    }
+
+    /// Prepare a two-stage norm chain over device buffers
+    /// (see [`CHAIN_SHADER`]): stage one writes
+    /// `out_stream = residual + rms_norm(branch) * w_post` at
+    /// `eps_post`; stage two writes
+    /// `out_normed = rms_norm(out_stream) * w_pre` at
+    /// `eps_pre`, reducing over the register-resident
+    /// intermediate row. Neither output aliases an input.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when `width` is zero or
+    /// past [`CHAIN_MAX_WIDTH`] (the register-residency bound;
+    /// wider rows keep the two-dispatch composition).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_norm_chain(
+        &self,
+        ctx: &GpuContext,
+        residual: &wgpu::Buffer,
+        branch: &wgpu::Buffer,
+        w_post: &wgpu::Buffer,
+        w_pre: &wgpu::Buffer,
+        out_stream: &wgpu::Buffer,
+        out_normed: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps_post: f32,
+        eps_pre: f32,
+    ) -> Result<K4Call> {
+        if width == 0 || width > CHAIN_MAX_WIDTH {
+            return Err(WgpuError::InvalidTensor {
+                name: "k4 norm chain".to_string(),
+                detail: format!(
+                    "width {width} is outside 1..={CHAIN_MAX_WIDTH}: the chain holds the \
+                     intermediate row in registers, 32 strided elements per lane at most"
+                ),
+            });
+        }
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(rows as u64);
+        let params: [u32; 5] = [
+            width as u32,
+            rows as u32,
+            grid.0,
+            eps_post.to_bits(),
+            eps_pre.to_bits(),
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k4 chain params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k4 chain bind group"),
+            layout: &self.chain.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: residual.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: branch.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_post.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: w_pre.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_stream.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: out_normed.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        Ok(K4Call {
+            pipeline: self.chain.clone(),
+            bind_group,
+            grid,
+        })
+    }
+
+    /// Prepare a close dispatch over device buffers (see
+    /// [`CLOSE_SHADER`]): `out_stream = residual +
+    /// rms_norm(branch) * w_post` at `eps_post` for every
+    /// row, and for the last row additionally
+    /// `out_head = rms_norm(out_stream last row) * w_final`
+    /// at `eps_final`, from the register-resident row.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when `width` is zero or
+    /// past [`CHAIN_MAX_WIDTH`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_norm_close(
+        &self,
+        ctx: &GpuContext,
+        residual: &wgpu::Buffer,
+        branch: &wgpu::Buffer,
+        w_post: &wgpu::Buffer,
+        w_final: &wgpu::Buffer,
+        out_stream: &wgpu::Buffer,
+        out_head: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps_post: f32,
+        eps_final: f32,
+    ) -> Result<K4Call> {
+        if width == 0 || width > CHAIN_MAX_WIDTH {
+            return Err(WgpuError::InvalidTensor {
+                name: "k4 norm close".to_string(),
+                detail: format!(
+                    "width {width} is outside 1..={CHAIN_MAX_WIDTH}: the close holds the \
+                     intermediate row in registers, 32 strided elements per lane at most"
+                ),
+            });
+        }
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(rows as u64);
+        let params: [u32; 5] = [
+            width as u32,
+            rows as u32,
+            grid.0,
+            eps_post.to_bits(),
+            eps_final.to_bits(),
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k4 close params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k4 close bind group"),
+            layout: &self.close.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: residual.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: branch.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: w_post.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: w_final.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: out_stream.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: out_head.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        Ok(K4Call {
+            pipeline: self.close.clone(),
+            bind_group,
+            grid,
+        })
     }
 
     /// Prepare a residual add over device buffers: `a + b`
@@ -593,6 +1026,13 @@ mod tests {
         assert!(NORM_SHADER.contains("fn norm_main"));
         assert!(NORM_SHADER.contains("mode: u32"));
         assert!(ADD_SHADER.contains("fn add_main"));
+        assert!(CHAIN_SHADER.contains("fn chain_main"));
+        assert!(CLOSE_SHADER.contains("fn close_main"));
+        // The chain's two epsilons are separate uniforms: the
+        // post stage's hardcoded 1e-8 must not leak into the
+        // pre stage's file eps.
+        assert!(CHAIN_SHADER.contains("eps_post"));
+        assert!(CHAIN_SHADER.contains("eps_pre"));
     }
 
     #[test]

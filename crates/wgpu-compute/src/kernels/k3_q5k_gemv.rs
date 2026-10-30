@@ -52,6 +52,15 @@ use crate::kernels::k1_q4k_gemv::grid_dims;
 use crate::diag::dbg_log;
 
 /// Elements per Q5_K super-block.
+/// Finish modes for the head's fused finishing map (the
+/// `finish_mode` uniform): no map, scale only, scale plus
+/// tanh softcap.
+pub const FINISH_NONE: u32 = 0;
+/// Finish mode: multiply each logit by the scale.
+pub const FINISH_SCALE: u32 = 1;
+/// Finish mode: scale, then `cap * tanh(x / cap)`.
+pub const FINISH_SOFTCAP: u32 = 2;
+
 const BLOCK_ELEMS: usize = 256;
 /// Bytes per Q5_K super-block.
 const BLOCK_BYTES: usize = 176;
@@ -233,7 +242,7 @@ fn shader(shape: &K3Shape) -> String {
                 for (var g = 0u; g < {groups}u; g++) {{
                     s += partials[r * {groups}u + g];
                 }}
-                output[batch_row * params.out_rows + row0 + r] = s;
+                output[batch_row * params.out_rows + row0 + r] = finish_apply(s);
             }}
         }}
     }}"#
@@ -258,7 +267,7 @@ fn shader(shape: &K3Shape) -> String {
     if (lane == 0u) {{
         for (var r = 0u; r < {rows}u; r++) {{
             if (row0 + r < params.out_rows) {{
-                output[batch_row * params.out_rows + row0 + r] = partials[r * {wg}u];
+                output[batch_row * params.out_rows + row0 + r] = finish_apply(partials[r * {wg}u]);
             }}
         }}
     }}"#,
@@ -272,6 +281,27 @@ fn shader(shape: &K3Shape) -> String {
     out_rows: u32,
     grid_x: u32,
     batch: u32,
+    finish_mode: u32,
+    finish_scale: f32,
+    finish_cap: f32,
+}}
+
+// The head finishing map, applied once per output element at
+// the reduction's final store (the resident session fuses
+// K8's finish into the head this way; the trait path keeps
+// the separate dispatch). Mode 0 returns the sum untouched
+// (bitwise the plain kernel); mode 1 applies the logit
+// scale; mode 2 applies the scale and the tanh softcap, in
+// K8's finish shader's exact expression order.
+fn finish_apply(v: f32) -> f32 {{
+    if (params.finish_mode == 1u) {{
+        return v * params.finish_scale;
+    }}
+    if (params.finish_mode == 2u) {{
+        let x = v * params.finish_scale;
+        return params.finish_cap * tanh(x / params.finish_cap);
+    }}
+    return v;
 }}
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
@@ -424,6 +454,15 @@ impl K3Call {
             label: Some("k3 q5_k gemv"),
             timestamp_writes: None,
         });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
@@ -566,6 +605,62 @@ impl K3Pipeline {
         output: &wgpu::Buffer,
         batch: u32,
     ) -> Result<K3Call> {
+        self.prepare_inner(ctx, weights, input, output, batch, FINISH_NONE, 1.0, 0.0)
+    }
+
+    /// Prepare a dispatch with the head finishing map fused
+    /// into the reduction's final store: `mode` is
+    /// [`FINISH_SCALE`] (multiply by `scale`) or
+    /// [`FINISH_SOFTCAP`] (scale, then `cap * tanh(x / cap)`,
+    /// K8's finish expressions). The composition it replaces
+    /// applies the same map as a second pass over the logits;
+    /// the fused form is the same math per element, applied
+    /// once at the only store of each element.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on a zero batch, an
+    /// unknown mode, or a softcap mode with a non-positive
+    /// cap (the separate finish kernel refuses the same).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_with_finish(
+        &self,
+        ctx: &GpuContext,
+        weights: &K3Weights,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: u32,
+        mode: u32,
+        scale: f32,
+        cap: f32,
+    ) -> Result<K3Call> {
+        if mode != FINISH_SCALE && mode != FINISH_SOFTCAP {
+            return Err(WgpuError::InvalidTensor {
+                name: "k3 call".to_string(),
+                detail: format!("finish mode {mode} is not a finishing mode"),
+            });
+        }
+        if mode == FINISH_SOFTCAP && cap <= 0.0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k3 call".to_string(),
+                detail: format!("softcap {cap} is not positive"),
+            });
+        }
+        self.prepare_inner(ctx, weights, input, output, batch, mode, scale, cap)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner(
+        &self,
+        ctx: &GpuContext,
+        weights: &K3Weights,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: u32,
+        finish_mode: u32,
+        finish_scale: f32,
+        finish_cap: f32,
+    ) -> Result<K3Call> {
         if batch == 0 {
             return Err(WgpuError::InvalidTensor {
                 name: "k3 call".to_string(),
@@ -575,11 +670,14 @@ impl K3Pipeline {
         let total =
             u64::from(batch) * (weights.out_rows as u64).div_ceil(u64::from(self.shape.rows));
         let grid = grid_dims(total);
-        let params: [u32; 4] = [
+        let params: [u32; 7] = [
             (weights.in_features / BLOCK_ELEMS) as u32,
             weights.out_rows as u32,
             grid.0,
             batch,
+            finish_mode,
+            finish_scale.to_bits(),
+            finish_cap.to_bits(),
         ];
         let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
         let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {

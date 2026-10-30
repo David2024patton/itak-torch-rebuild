@@ -35,7 +35,7 @@ use muse_glimmer::{
 
 use crate::detect::{detect, DetectPolicy};
 use crate::device::GpuContext;
-use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights};
+use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -43,6 +43,7 @@ use crate::kernels::k5_rope_kv::K5Pipeline;
 use crate::kernels::k6_attention::{AttendGeom, GpuKvState, K6Pipeline};
 use crate::kernels::k7_swiglu::K7Pipeline;
 use crate::kernels::k8_head::K8Pipeline;
+use crate::kernels::k9_attn_prep::K9Pipeline;
 
 use crate::diag::dbg_log;
 
@@ -121,13 +122,17 @@ impl CachedWeights {
 pub struct WgpuCompute {
     ctx: GpuContext,
     k1: K1Pipeline,
+    k1_gated: K1Pipeline,
+    k1_swiglu: K1Pipeline,
     k2: K2Pipeline,
+    k2_swiglu: K2Pipeline,
     k3: K3Pipeline,
     k4: K4Pipeline,
     k5: K5Pipeline,
     k6: K6Pipeline,
     k7: K7Pipeline,
     k8: K8Pipeline,
+    k9: K9Pipeline,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -164,24 +169,38 @@ impl WgpuCompute {
     /// shader fails to compile.
     pub fn from_context(ctx: GpuContext) -> crate::error::Result<Self> {
         let k1 = K1Pipeline::new(&ctx.device)?;
+        let k1_gated =
+            K1Pipeline::with_shape_act(&ctx.device, crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()), ACT_GATED)?;
+        let k1_swiglu =
+            K1Pipeline::with_shape_act(&ctx.device, crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()), ACT_SWIGLU)?;
         let k2 = K2Pipeline::new(&ctx.device)?;
+        let k2_swiglu = K2Pipeline::with_shape_act(
+            &ctx.device,
+            crate::kernels::k2_q6k_gemv::shipped_shape(ctx.device.features()),
+            ACT_SWIGLU,
+        )?;
         let k3 = K3Pipeline::new(&ctx.device)?;
         let k4 = K4Pipeline::new(&ctx.device)?;
         let k5 = K5Pipeline::new(&ctx.device)?;
         let k6 = K6Pipeline::new(&ctx.device)?;
         let k7 = K7Pipeline::new(&ctx.device)?;
         let k8 = K8Pipeline::new(&ctx.device)?;
+        let k9 = K9Pipeline::new(&ctx.device)?;
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
             k1,
+            k1_gated,
+            k1_swiglu,
             k2,
+            k2_swiglu,
             k3,
             k4,
             k5,
             k6,
             k7,
             k8,
+            k9,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -201,9 +220,30 @@ impl WgpuCompute {
         &self.k1
     }
 
+    /// The K1 pipeline with the attention-gate activation
+    /// fused in (the resident session's output projection).
+    /// See [`WgpuCompute::k1`].
+    pub(crate) fn k1_gated(&self) -> &K1Pipeline {
+        &self.k1_gated
+    }
+
+    /// The K1 pipeline with the SwiGLU activation fused in
+    /// (the resident session's down projection, when the down
+    /// tensor is Q4_K). See [`WgpuCompute::k1`].
+    pub(crate) fn k1_swiglu(&self) -> &K1Pipeline {
+        &self.k1_swiglu
+    }
+
     /// The K2 (Q6_K GEMV) pipeline. See [`WgpuCompute::k1`].
     pub(crate) fn k2(&self) -> &K2Pipeline {
         &self.k2
+    }
+
+    /// The K2 pipeline with the SwiGLU activation fused in
+    /// (the resident session's down projection, when the down
+    /// tensor is Q6_K). See [`WgpuCompute::k1`].
+    pub(crate) fn k2_swiglu(&self) -> &K2Pipeline {
+        &self.k2_swiglu
     }
 
     /// The K3 (Q5_K GEMV) pipeline. See [`WgpuCompute::k1`].
@@ -215,12 +255,6 @@ impl WgpuCompute {
     /// [`WgpuCompute::k1`].
     pub(crate) fn k4(&self) -> &K4Pipeline {
         &self.k4
-    }
-
-    /// The K5 (RoPE and KV append) pipeline. See
-    /// [`WgpuCompute::k1`].
-    pub(crate) fn k5(&self) -> &K5Pipeline {
-        &self.k5
     }
 
     /// The K6 (grouped-query attention) pipeline. See
@@ -239,6 +273,14 @@ impl WgpuCompute {
     /// See [`WgpuCompute::k1`].
     pub(crate) fn k8(&self) -> &K8Pipeline {
         &self.k8
+    }
+
+    /// The K9 (fused attention preparation) pipeline. Only the
+    /// device-resident session prepares its calls; the trait
+    /// implementation composes K4 and K5 instead. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k9(&self) -> &K9Pipeline {
+        &self.k9
     }
 
     /// Drop all stored KV state, device buffers and host mirror.

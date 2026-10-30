@@ -184,3 +184,58 @@ not per request.
   reason. Every crate this task touched or depends on
   (wgpu-compute, muse-glimmer, cpu-compute, attention, gguf,
   tokenizer, itak-loader) is green in its own run.
+
+## Fusion pass (2026-10-30, later): 1,071 -> 445 dispatches per token
+
+The kernel-count work named above, done in measured stages.
+Every stage gated the same way: wgpu-compute suites green
+locally and on the server GPU, clippy clean, and the
+real-file Stage 1 + 64-token run exact (first-token prob
+0.403462, generated ids matching the known-good stream
+through all 64 tokens). Decode numbers are the bench
+method's clean-run means over steps 8..64, 3 runs each;
+medians run 1 ms coarser. Baseline for the pass: 1,071
+dispatches/token at ~33.0 ms mean (~29-30 tok/s).
+
+| stage | what fused | dispatches/token | ms/token (mean) |
+| --- | --- | ---: | ---: |
+| A | K9 attention prep: Q/K norms + RoPE + KV append, one dispatch (was K4 x2 + K5 x3 per layer) | 889 | ~32.7 |
+| C+D+E | Batched QKV(+gate) GEMV (upload_multi concat), gate sigmoid fused into the output projection's activation (K1 gated form), FFN gate+up pair with SwiGLU fused into the down projection (K1/K2 act forms) | 655 | ~28.4 |
+| F | Flash attention for decode rows (scores + online softmax + V reduce in one kernel; chunk plans keep two-pass) | 603 | ~28.7 (within noise at 69-token context; the win grows with stored length) |
+| G | K4 norm chains: post-attention norm + FFN norm in one dispatch, and the boundary chain (post-FFN norm + next layer's attention norm), the intermediate row register-resident | 500 | ~25.5 |
+| batch3 | Partial QKV batch for the 26 layers whose V is Q6_K: Q, K, gate concatenated (gate is the third segment), V separate; K9 takes a separate V stride | 448 | ~25.1 |
+| F6b | Head finishing (scale / tanh softcap) fused into the Q5_K head kernel's final store; bitwise identical on the server GPU | 447 | ~25.2 (within noise) |
+| F6a+F6c | Embedding gather + weightless norm in one dispatch (bitwise identical); final norm folded into the last layer's close (the close emits the head input, the last-row copy disappears) | 445 | ~25.2 |
+
+Final decode: **445 dispatches/token at ~25.2 ms/token,
+about 39.7 tok/s**, against llama.cpp's 44.31 tok/s
+(22.57 ms). The gap did not close; what remains is not
+dispatch count in the fusion sense. Per-layer decode is
+now 8 sequential kernels (Q4_K-V layers) or 9 (Q6_K-V
+layers): batch, prep, flash, gated output, norm chain,
+FFN pair, fused down, boundary chain. Every one consumes
+the previous one's full output, so no two can merge
+without cross-workgroup synchronization the platform does
+not offer. The honest decomposition at 445:
+
+- Weight + KV streaming floor: ~19.5 ms (14.89 GiB/token at
+  the kernels' measured ~818 GB/s).
+- The remaining ~5.7 ms rides on the ~445 kernel
+  boundaries (the pass measured a consistent ~12-15 us of
+  pipeline drain per dependent GEMV-class boundary, ~2 us
+  for tiny kernels), plus ~1 ms readback sync and the
+  host's per-token record/sample work inside the step time.
+
+Named next levers, in order: (1) multi-row decode batching
+(amortizes boundaries and weight streams across tokens;
+out of scope for this pass, and it is the lever that
+remains if the target must be beaten), (2) an in-chain
+per-kernel timestamp profile to split the ~5.7 ms between
+boundary drain and in-chain stream slowdown precisely,
+(3) host-side overlap: an on-GPU argmax head so the
+per-token readback shrinks from 808 KB of logits to one
+index, letting recording of the next chunk start earlier.
+Prefill spot-check after the pass: warm 64-row chunks run
+at ~78 tok/s or better (258-token prompt, marginal rate),
+at or above the 69 tok/s baseline; chunk plans keep the
+two-pass attention by design.

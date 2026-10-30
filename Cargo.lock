@@ -31,6 +31,14 @@ name = "gguf"
 version = "0.1.0"
 
 [[package]]
+name = "itak-backend"
+version = "0.1.0"
+dependencies = [
+ "gguf",
+ "torch-math",
+]
+
+[[package]]
 name = "itak-engine"
 version = "0.1.0"
 dependencies = [

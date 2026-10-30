@@ -184,3 +184,159 @@ engine's behavior, not as per-position diffs.
   convention from the llama.cpp muse-glimmer graph source. One
   layer's first divergence will name the defect; guessing further
   from end-to-end numbers will not.
+
+
+## Follow-up (2026-10-29 evening): conventions settled from source, forward fixed, Stage 1 re-run
+
+The conventions were settled by reading llama.cpp's own source on
+the server: `src/models/muse-glimmer.cpp` (the graph),
+`conversion/muse_glimmer.py` (the converter), plus
+`llama-graph.cpp` (`build_norm`), `llama-model.cpp`
+(`llama_model_rope_type`, n_rot defaults), and `llama-hparams.cpp`
+(SWA pattern). No convention below is a guess; each carries its
+citation. Commits: a777db6 (muse-glimmer), 1956b27 (torch-math),
+082d7fd (cpu-compute). Raw record of the re-run on the server in
+`~/itak-run-c/` (`run.log`, `run.err`).
+
+### Verdict of the re-run
+
+The divergence is gone. Our generated ids are
+`[13796, 26, 1573, 373, 290, 2167, 26899, 1212]`, exactly the
+reference ids, all 8 positions, and the per-position probabilities
+track the reference to within 0.015 (f32 reference math vs
+llama.cpp kernel accumulation). The decode freeze is gone with
+it: every decode step's distribution answers the fed token and
+matches the reference step for step.
+
+### Settled conventions
+
+Wrong in our code, fixed:
+
+1. **Post-norm placement and eps.** The reference applies each
+   post norm to the sub-block's branch output, then adds the
+   untouched residual: `x = x + rms_norm(branch, post_w)` with a
+   hardcoded eps of 1e-8 (`muse-glimmer.cpp`: `post_norm_eps =
+   1e-8f`, applied at the attention and FFN branches). Ours
+   normalized the sum `residual + branch` at the file eps 1e-5,
+   renormalizing the whole residual stream 104 times per token.
+   Fixed in `muse-glimmer::model` (`POST_NORM_EPS`).
+2. **Embedding norm missing.** The graph runs a weightless
+   RMSNorm over the embedding output before layer 0
+   (`muse-glimmer.cpp`: `build_norm(inpL, nullptr, nullptr, ...)`,
+   which is plain `ggml_rms_norm` in `llama-graph.cpp`). Ours fed
+   raw embeddings into layer 0. Added as a distinct
+   `Compute::rms_norm_plain` step, called right after `embed`.
+   There is no embedding scale factor anywhere in the graph.
+3. **RoPE on the wrong layers.** RoPE runs on the sliding-window
+   layers ONLY; the 13 global layers are NoPE
+   (`muse-glimmer.cpp`: "RoPE runs on the SWA layers, NoPE on
+   full ones"). Ours rotated every layer. `CpuCompute::attention`
+   now rotates only `LayerKind::SlidingWindow`, at the SWA base
+   (`rope.freq_base_swa` when the file carries it, else the train
+   base, per `llama-model.cpp`; the config now resolves and stores
+   it. This file carries no SWA key, so 500000 either way.)
+4. **RoPE pairing.** llama.cpp's rope type for this arch is
+   `LLAMA_ROPE_TYPE_NORM` (`llama-model.cpp`), ggml's adjacent-pair
+   mode, and the converter unpermuted Q/K into that layout
+   (`muse_glimmer.py`: `permute` with `qk_order = NORM`). A new
+   `torch_math::rope_interleaved` implements that pairing under
+   its own name, and the Glimmer backend calls it; the half-split
+   NEOX form stays in `torch_math::rope` for the llama/qwen2
+   families, whose reference uses it (sibling fix 13643e0, from
+   the Qwen2.5 layer diff). The pairings pair different channels
+   and are not interchangeable.
+5. **Head finishing order.** The graph scales first, then
+   softcaps: `ggml_scale` by `logit_scale`, then `build_softcap`
+   (`cap * tanh(z / cap)`), `muse-glimmer.cpp` head block. Ours
+   capped then scaled. Monotone either way, so this never moved
+   argmax (Run B diagnosis item 6 was right); it did move every
+   probability. The unit test that pinned the wrong order is
+   rewritten with knee values that tell the orders apart
+   (z = 20, cap = 20, scale = 0.5: 9.2423 settled, 7.6159 wrong).
+
+Already matching the source, verified and left alone:
+
+- **RMSNorm form is plain `x * w` everywhere in the graph.**
+  Run B diagnosis item 1 is settled as NOT a graph-side error:
+  the Gemma-style (1 + w) shift was folded into the stored
+  weights at conversion for the four per-layer norms only
+  (`muse_glimmer.py`: `norm_shift` returns 1.0 for names ending
+  `layernorm.weight`, 0.0 otherwise; the final norm was
+  deliberately unshifted, which is why `output_norm` centers on
+  zero while block norms center near 1). All other norms (pre,
+  QK, final, embedding) use the file eps 1e-5 via `build_norm`.
+- **Attention gate.** Gate projection reads the same normed
+  pre-attention input as Q/K/V; `sigmoid(gate)` multiplies the
+  attention output elementwise before the output projection
+  (`muse-glimmer.cpp`). Ours already did exactly this.
+- **QK norms.** Per-head RMSNorm over head_dim with the stored
+  weights, after the projections, before RoPE. The stored
+  weights are synthesized by the converter (q_norm = constant
+  `qk_scale_factor` = 3.87, matching the measured constant
+  vector; k_norm = ones), so plain application is correct.
+- **RoPE geometry.** Full head_dim rotation (n_rot = 128; the
+  file carries no `rope.dimension_count` and no `rope.freq_base_swa`
+  key, both confirmed by a full metadata strings scan; defaults
+  in `llama-model.cpp`), base 500000, and the SWA pattern
+  (globals at il % 4 == 3) matches our derived pattern.
+
+### Decode freeze: what it was
+
+No discrete cache bug exists. A new intermediate-scale test
+(8 layers with globals at 3 and 7, 32 Q heads over 2 KV heads,
+head dim 16, hidden 512, the real eps, base, cap, and scale;
+`cpu-compute/tests/forward_tests.rs`) measures decode
+sensitivity directly: prefill a prompt, then feed token 7 vs
+token 42 and compare logits, plus a one-shot equivalence check.
+Sensitivity was healthy at that scale (above the 1e-3 assertion
+floor; the freeze signature in Run B was about 1e-6) both before
+and after the fixes, and the cache position cross-check, the
+attention crate's absolute-position masks and views, and the
+incremental-vs-one-shot proofs all hold at every scale tested.
+The freeze was the convention errors compounding over 52 layers:
+post norms renormalizing the residual stream after every
+sub-block (each new token's contribution repeatedly rescaled
+against the whole stream), a missing embedding norm, and RoPE
+rotating the global layers' Q/K with position garbage. Two more
+regression tests pin the fixed conventions decisively: a
+tiny-branch test (attention output scaled 1e-4, so the branch
+RMS sits near sqrt(1e-8)) separates the post-norm eps and
+placement readings by more than an order of magnitude, and the
+naive-reference attention proof now runs for both layer kinds,
+rotating only the sliding one.
+
+Gates: `cargo test --workspace` 196 passed, 0 failed, and
+`cargo clippy --workspace --all-targets` clean, both on the
+final tree (including `attention_mixing_matches_a_naive_reference`,
+re-confirmed green after the sibling RoPE commits landed; it had
+failed transiently mid-flight while these edits and the sibling
+pairing flip crossed in the shared tree).
+
+### Re-run (Stage 1, same protocol as Run B)
+
+Same prompt, same ids `[200000, 954, 7963, 323, 11698, 373]`,
+same server, CPU-only reference runner on our side (prefill
+1,545,093 ms, decode about 47 s/token, peak RSS 38,189,888 KiB;
+the production GPU server untouched). Per position, reference
+top-1 vs ours:
+
+| pos | reference | p (ref) | ours | p (ours) |
+|----:|-----------|--------:|------|---------:|
+| 1 | 13796 " Paris" | 0.3962 | 13796 " Paris" | 0.4035 |
+| 2 | 26 "." | 0.4721 | 26 "." | 0.4818 |
+| 3 | 1573 " It" | 0.2794 | 1573 " It" | 0.2759 |
+| 4 | 373 " is" | 0.8585 | 373 " is" | 0.8563 |
+| 5 | 290 " the" | 0.3078 | 290 " the" | 0.3066 |
+| 6 | 2167 " most" | 0.3561 | 2167 " most" | 0.3507 |
+| 7 | 26899 " popul" | 0.5940 | 26899 " popul" | 0.5793 |
+| 8 | 1212 "ous" | 0.9996 | 1212 "ous" | 0.9996 |
+
+Generated text: " Paris. It is the most populous", identical to
+the reference. Top-5 mass at position 1: ours 0.6252, reference
+0.6221; in Run B ours held 0.00016 (top-1 p 4.4e-5 on the wrong
+token). Top-5 id sets match the reference exactly at positions
+2, 3, 4, 5, 7, 8; at positions 1 and 6 the fifth slot is a
+near-tie swap (position 1: ours 1437 " also" 0.0316 vs reference
+5711 " known" 0.0323; position 6: ours 7257 " country" 0.0315 vs
+reference 5376 " center" 0.0312), consistent with f32-vs-kernel
+accumulation noise at the boundary, not a structural difference.

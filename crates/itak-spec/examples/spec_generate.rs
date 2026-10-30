@@ -3,7 +3,13 @@
 //! the token-identity guarantee checked against a plain greedy run of
 //! the same target in the same process.
 //!
-//! Usage: `spec_generate <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt]`
+//! Usage: `spec_generate <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file]`
+//!
+//! `mode` is `both` (default), `plain` (run only phase A and write the
+//! stream to `stream_file`), or `spec` (run only phase B, reading the
+//! expected stream from `stream_file`). Splitting the phases into two
+//! processes halves the peak memory: this runner's first server attempt
+//! was OOM-killed with both phases' weight sets resident.
 //!
 //! Phase A runs the plain greedy baseline (prefill plus single-token
 //! steps). Phase B runs a [`SpecSession`] at temperature 0 with the
@@ -45,7 +51,12 @@ fn main() -> ExitCode {
     let prompt = args
         .get(5)
         .map_or("The capital of France is", String::as_str);
-    match run(target_path, draft_path, prompt, n_tokens, depth) {
+    let mode = args.get(6).map_or("both", String::as_str);
+    let stream_file = args
+        .get(7)
+        .map_or("plain_stream.txt", String::as_str)
+        .to_string();
+    match run(target_path, draft_path, prompt, n_tokens, depth, mode, &stream_file) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(msg) => {
@@ -89,6 +100,8 @@ fn run(
     prompt: &str,
     n_tokens: usize,
     depth: usize,
+    mode: &str,
+    stream_file: &str,
 ) -> Result<bool, String> {
     let total = Instant::now();
 
@@ -138,17 +151,20 @@ fn run(
     let eos: Vec<u32> = info.eos_token_id.into_iter().collect();
     phase("load models + tokenizer", t);
 
-    // Borrowed target tensors for the draft, owned by the speculator.
-    let source = itak_loader::DflashTensorSource::new(&target_file);
-    let embedding = source
-        .tensor("token_embd.weight")
-        .map_err(|e| e.to_string())?;
-    let output_head = source.tensor("output.weight").map_err(|e| e.to_string())?;
-
-    // ---- Phase A: plain greedy baseline.
+    // ---- Phase A: plain greedy baseline (skipped in spec-only mode,
+    // where the expected stream is read from the stream file).
     let t = Instant::now();
+    let plain_stream = if mode == "spec" {
+        let text = std::fs::read_to_string(stream_file).map_err(|e| e.to_string())?;
+        let ids: Vec<u32> = text
+            .split_whitespace()
+            .map(|w| w.parse().map_err(|_| format!("bad token id {w:?} in {stream_file}")))
+            .collect::<Result<_, _>>()?;
+        println!("expected stream read from {stream_file}: {ids:?}");
+        ids
+    } else {
     let gweights = itak_loader::load_weights(&target_file, &gcfg).map_err(|e| e.to_string())?;
-    let plain_stream = {
+    let stream = {
         let target = GlimmerModel::new(gcfg.clone(), gweights, Box::new(CpuCompute::new()));
         let mut cache = PositionCache::new();
         let tp = Instant::now();
@@ -180,11 +196,26 @@ fn run(
         );
         stream
     };
+    let text: String = stream.iter().map(|id| format!("{id} ")).collect();
+    std::fs::write(stream_file, text).map_err(|e| e.to_string())?;
+    println!("plain stream written to {stream_file}");
+    stream
+    };
     let plain_wall = t.elapsed().as_secs_f64();
     phase("phase A plain greedy", t);
+    if mode == "plain" {
+        println!("PLAIN ONLY: phase B skipped by mode");
+        phase("total", total);
+        return Ok(true);
+    }
 
     // ---- Phase B: speculative session, temperature 0.
     let t = Instant::now();
+    let source = itak_loader::DflashTensorSource::new(&target_file);
+    let embedding = source
+        .tensor("token_embd.weight")
+        .map_err(|e| e.to_string())?;
+    let output_head = source.tensor("output.weight").map_err(|e| e.to_string())?;
     let gweights = itak_loader::load_weights(&target_file, &gcfg).map_err(|e| e.to_string())?;
     let compute = Rc::new(CpuCompute::new());
     let target = GlimmerModel::new(

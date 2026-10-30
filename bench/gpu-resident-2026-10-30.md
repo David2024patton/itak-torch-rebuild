@@ -272,7 +272,7 @@ builds):
 | prompt | t64x256 | t32x128 (shipped) |
 | --- | ---: | ---: |
 | 254 tokens | 5,062 / 4,957 ms (50 tok/s) | 3,495 / 3,534 ms (72 tok/s) |
-| 1,024 tokens | 17,744 ms (58 tok/s, one run) | 11,773 / 11,810 ms (87 tok/s) |
+| 1,024 tokens | 17,744 / 17,647 ms (58 tok/s) | 11,773 / 11,810 ms (87 tok/s) |
 
 Marginal rate between the two lengths: 60 tok/s at
 t64x256, **93 tok/s at the shipped t32x128**, against the

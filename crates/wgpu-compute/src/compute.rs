@@ -37,6 +37,9 @@ use crate::detect::{detect, DetectPolicy};
 use crate::device::GpuContext;
 use crate::kernels::k10_q4k_gemm::K10Pipeline;
 use crate::kernels::k11_q6k_gemm::K11Pipeline;
+use crate::kernels::k12_q8_quant::K12QuantPipeline;
+use crate::kernels::k13_q4k_mmq::K13Pipeline;
+use crate::kernels::k14_q6k_mmq::K14Pipeline;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
@@ -140,6 +143,11 @@ pub struct WgpuCompute {
     k10_swiglu: Option<K10Pipeline>,
     k11: Option<K11Pipeline>,
     k11_swiglu: Option<K11Pipeline>,
+    k12: K12QuantPipeline,
+    k12_gated: K12QuantPipeline,
+    k12_swiglu: K12QuantPipeline,
+    k13: Option<K13Pipeline>,
+    k14: Option<K14Pipeline>,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -209,6 +217,19 @@ impl WgpuCompute {
         let k10_swiglu = K10Pipeline::for_device(&ctx.device, ACT_SWIGLU)?;
         let k11 = K11Pipeline::for_device(&ctx.device, ACT_NONE)?;
         let k11_swiglu = K11Pipeline::for_device(&ctx.device, ACT_SWIGLU)?;
+        // The prefill MMQ set: the quantizer (K12) is
+        // unconditional (its workgroup footprint is two
+        // 256-entry arrays), while the product kernels
+        // (K13/K14) are optional on the same terms as the
+        // GEMMs: a device granting too little workgroup
+        // storage for their staging sets gets `None`, and the
+        // resident session keeps its GEMM chunk plans there
+        // (the K13 module docs own the fallback contract).
+        let k12 = K12QuantPipeline::new(&ctx.device, ACT_NONE)?;
+        let k12_gated = K12QuantPipeline::new(&ctx.device, ACT_GATED)?;
+        let k12_swiglu = K12QuantPipeline::new(&ctx.device, ACT_SWIGLU)?;
+        let k13 = K13Pipeline::for_device(&ctx.device)?;
+        let k14 = K14Pipeline::for_device(&ctx.device)?;
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -229,6 +250,11 @@ impl WgpuCompute {
             k10_swiglu,
             k11,
             k11_swiglu,
+            k12,
+            k12_gated,
+            k12_swiglu,
+            k13,
+            k14,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -343,6 +369,42 @@ impl WgpuCompute {
     /// See [`WgpuCompute::k10`].
     pub(crate) fn k11_swiglu(&self) -> Option<&K11Pipeline> {
         self.k11_swiglu.as_ref()
+    }
+
+    /// The K12 (Q8_1 activation quantizer) pipeline. Only the
+    /// device-resident session prepares its calls, for chunk
+    /// plans at or past the GEMM row threshold when an MMQ
+    /// product pipeline exists to consume the quantized form.
+    /// See [`WgpuCompute::k1`].
+    pub(crate) fn k12(&self) -> &K12QuantPipeline {
+        &self.k12
+    }
+
+    /// The K12 pipeline with the attention-gate activation
+    /// applied before quantization. See [`WgpuCompute::k12`].
+    pub(crate) fn k12_gated(&self) -> &K12QuantPipeline {
+        &self.k12_gated
+    }
+
+    /// The K12 pipeline with the SwiGLU activation applied
+    /// before quantization. See [`WgpuCompute::k12`].
+    pub(crate) fn k12_swiglu(&self) -> &K12QuantPipeline {
+        &self.k12_swiglu
+    }
+
+    /// The K13 (Q4_K MMQ) pipeline, when this device grants
+    /// the workgroup storage its staging set needs. Only the
+    /// device-resident session prepares its calls; `None` is
+    /// the session's signal to keep the GEMM form. See
+    /// [`WgpuCompute::k10`].
+    pub(crate) fn k13(&self) -> Option<&K13Pipeline> {
+        self.k13.as_ref()
+    }
+
+    /// The K14 (Q6_K MMQ) pipeline, when this device grants
+    /// the workgroup storage. See [`WgpuCompute::k13`].
+    pub(crate) fn k14(&self) -> Option<&K14Pipeline> {
+        self.k14.as_ref()
     }
 
     /// Drop all stored KV state, device buffers and host mirror.

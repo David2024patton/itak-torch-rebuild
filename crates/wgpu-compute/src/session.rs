@@ -73,6 +73,9 @@ use crate::diag::dbg_log;
 use crate::error::WgpuError;
 use crate::kernels::k10_q4k_gemm::K10Call;
 use crate::kernels::k11_q6k_gemm::K11Call;
+use crate::kernels::k12_q8_quant::K12QuantCall;
+use crate::kernels::k13_q4k_mmq::K13Call;
+use crate::kernels::k14_q6k_mmq::K14Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
@@ -98,13 +101,16 @@ const POST_NORM_EPS: f32 = 1e-8;
 const MAX_CHUNK_ROWS: usize = 64;
 
 /// Chunk row count at which a plan's projections switch from
-/// the GEMV kernels to the tiled GEMM kernels (K10/K11, when
-/// the backend built them): the GEMM stages each weight tile
-/// once per chunk, so past a handful of rows it beats
-/// re-streaming the weights per row, and below it the GEMV's
-/// decode-tuned shape is the right tool. Decode plans (one
-/// row) never reach this threshold. The bench record behind
-/// the value is in bench/gpu-resident-2026-10-30.md.
+/// the GEMV kernels to the matrix-matrix kernels: the MMQ
+/// pair (K12 quantize plus K13/K14, when the backend built
+/// them) first, the tiled GEMM kernels (K10/K11, when the
+/// backend built them) behind them as the named fallback.
+/// The matrix forms stage each weight tile once per chunk,
+/// so past a handful of rows they beat re-streaming the
+/// weights per row, and below it the GEMV's decode-tuned
+/// shape is the right tool. Decode plans (one row) never
+/// reach this threshold. The bench record behind the value
+/// is in bench/gpu-resident-2026-10-30.md.
 const GEMM_MIN_ROWS: usize = 16;
 
 /// Cap on the attention scores scratch, in elements
@@ -204,12 +210,15 @@ impl ProjWeights {
 }
 
 /// One prepared projection dispatch in a forward plan: a
-/// GEMV call on decode-shaped plans, or its GEMM counterpart
-/// on chunk plans past [`GEMM_MIN_ROWS`] when the backend
-/// built the GEMM pipelines. The two forms bind the same
-/// resident weight buffers and the same `[rows][width]`
-/// activation layout, so the choice is per-plan and invisible
-/// to the chain's step order.
+/// GEMV call on decode-shaped plans, or its matrix-matrix
+/// counterpart on chunk plans past [`GEMM_MIN_ROWS`] when
+/// the backend built the matrix pipelines: the MMQ pair
+/// (a K12 quantize dispatch feeding a K13/K14 product
+/// dispatch) when the device built the MMQ set, the GEMM
+/// dispatch (K10/K11) behind it as the fallback. The forms
+/// bind the same resident weight buffers and the same
+/// `[rows][width]` activation layout, so the choice is
+/// per-plan and invisible to the chain's step order.
 #[derive(Debug)]
 enum ProjCall {
     /// K1 dispatch.
@@ -222,6 +231,20 @@ enum ProjCall {
     GemmQ4K(K10Call),
     /// K11 (Q6_K GEMM) dispatch.
     GemmQ6K(K11Call),
+    /// K12 quantize + K13 (Q4_K MMQ) dispatches.
+    MmqQ4K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K13Call,
+    },
+    /// K12 quantize + K14 (Q6_K MMQ) dispatches.
+    MmqQ6K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K14Call,
+    },
 }
 
 impl ProjCall {
@@ -233,6 +256,24 @@ impl ProjCall {
             ProjCall::Q5K(c) => c.encode_into(pass),
             ProjCall::GemmQ4K(c) => c.encode_into(pass),
             ProjCall::GemmQ6K(c) => c.encode_into(pass),
+            ProjCall::MmqQ4K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+            ProjCall::MmqQ6K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+        }
+    }
+
+    /// Compute dispatches this projection records into the
+    /// open pass: one for every form but the MMQ pair, whose
+    /// quantize is a dispatch of its own.
+    fn dispatches(&self) -> u64 {
+        match self {
+            ProjCall::MmqQ4K { .. } | ProjCall::MmqQ6K { .. } => 2,
+            _ => 1,
         }
     }
 }
@@ -283,27 +324,105 @@ fn upload_proj(
     }
 }
 
+/// Try the MMQ form of a plain Q4_K projection: the K12
+/// plain quantize of `input` feeding the K13 product. `None`
+/// (with the refusal logged by name) when the device built
+/// no K13 pipeline or a prepare refuses the shape: the
+/// caller then takes the GEMM form. This is the fallback
+/// ladder's composition step, at plan-build time; it never
+/// substitutes inside a dispatch.
+fn try_mmq_q4k(
+    backend: &WgpuCompute,
+    weights: &K1Weights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    let ctx = backend.context();
+    let mmq = backend.k13()?;
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!("mmq q4k refused at the quantize prepare: {e}; the gemm form serves it");
+            return None;
+        }
+    };
+    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::MmqQ4K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("mmq q4k refused at the product prepare: {e}; the gemm form serves it");
+            None
+        }
+    }
+}
+
+/// Try the MMQ form of a plain Q6_K projection (K12 plain
+/// quantize feeding K14). See [`try_mmq_q4k`] for the
+/// fallback contract.
+fn try_mmq_q6k(
+    backend: &WgpuCompute,
+    weights: &K2Weights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    let ctx = backend.context();
+    let mmq = backend.k14()?;
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!("mmq q6k refused at the quantize prepare: {e}; the gemm form serves it");
+            return None;
+        }
+    };
+    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::MmqQ6K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("mmq q6k refused at the product prepare: {e}; the gemm form serves it");
+            None
+        }
+    }
+}
+
 /// Prepare one projection dispatch over resident buffers.
 /// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
-/// families dispatch through the GEMM kernels (K10/K11) when
-/// the backend built them; below the threshold, and for
-/// Q5_K (the one-row head) at any size, the GEMV kernels run.
-/// Both forms consume the same resident buffers, so the
-/// choice never changes the chain's data layout.
+/// families dispatch through the matrix-matrix forms: the
+/// MMQ pair when the backend built it, the GEMM kernels
+/// (K10/K11) behind them when it built those; below the
+/// threshold, and for Q5_K (the one-row head) at any size,
+/// the GEMV kernels run. Every form consumes the same
+/// resident buffers, so the choice never changes the
+/// chain's data layout.
+#[allow(clippy::too_many_arguments)]
 fn prepare_proj(
     backend: &WgpuCompute,
     weights: &ProjWeights,
     input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: usize,
     step: &'static str,
 ) -> Result<ProjCall> {
     let ctx = backend.context();
-    let gemm = batch >= GEMM_MIN_ROWS;
+    let matrix = batch >= GEMM_MIN_ROWS;
     let batch = batch as u32;
     match weights {
         ProjWeights::Q4K(w) => {
-            if gemm {
+            if matrix {
+                if let Some(c) = try_mmq_q4k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                    return Ok(c);
+                }
                 if let Some(g) = backend.k10() {
                     return g
                         .prepare(ctx, w, input, output, batch)
@@ -318,7 +437,10 @@ fn prepare_proj(
                 .map_err(|e| we(e, step))
         }
         ProjWeights::Q6K(w) => {
-            if gemm {
+            if matrix {
+                if let Some(c) = try_mmq_q6k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                    return Ok(c);
+                }
                 if let Some(g) = backend.k11() {
                     return g
                         .prepare(ctx, w, input, output, batch)
@@ -342,16 +464,19 @@ fn prepare_proj(
 
 /// Prepare the gated output projection (a Q4_K projection
 /// whose activation is the attention rows gated by a second
-/// stream): the GEMM's gated form on chunk plans past
-/// [`GEMM_MIN_ROWS`] when the backend built it, K1's gated
-/// form otherwise. The geometry contract is the same
-/// [`K1ActGeom`] either way.
+/// stream): on chunk plans past [`GEMM_MIN_ROWS`], the MMQ
+/// form (the gated K12 quantize feeding K13) when the
+/// backend built it, the GEMM's gated form behind it, K1's
+/// gated form otherwise. The geometry contract is the same
+/// [`K1ActGeom`] in every form.
 #[allow(clippy::too_many_arguments)]
 fn prepare_gated_proj(
     backend: &WgpuCompute,
     weights: &K1Weights,
     input_a: &wgpu::Buffer,
     input_b: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: usize,
     geom: &K1ActGeom,
@@ -359,6 +484,35 @@ fn prepare_gated_proj(
 ) -> Result<ProjCall> {
     let ctx = backend.context();
     if batch >= GEMM_MIN_ROWS {
+        if let Some(mmq) = backend.k13() {
+            let quant = backend.k12_gated().prepare_act(
+                ctx,
+                input_a,
+                input_b,
+                q8_qs,
+                q8_ds,
+                batch as u32,
+                weights.in_features,
+                geom,
+            );
+            match quant {
+                Ok(quant) => match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch as u32) {
+                    Ok(mmq) => return Ok(ProjCall::MmqQ4K { quant, mmq }),
+                    Err(e) => {
+                        dbg_log!(
+                            "mmq gated q4k refused at the product prepare: {e}; \
+                                 the gemm form serves it"
+                        );
+                    }
+                },
+                Err(e) => {
+                    dbg_log!(
+                        "mmq gated q4k refused at the quantize prepare: {e}; \
+                         the gemm form serves it"
+                    );
+                }
+            }
+        }
         if let Some(g) = backend.k10_gated() {
             return g
                 .prepare_act(ctx, weights, input_a, input_b, output, batch as u32, geom)
@@ -374,25 +528,60 @@ fn prepare_gated_proj(
 }
 
 /// Prepare a SwiGLU-fused down projection over whichever
-/// family the down weights belong to: the GEMM's SwiGLU form
-/// on chunk plans past [`GEMM_MIN_ROWS`] when the backend
-/// built it, the family's GEMV SwiGLU form otherwise.
+/// family the down weights belong to: on chunk plans past
+/// [`GEMM_MIN_ROWS`], the MMQ form (the SwiGLU K12 quantize
+/// feeding the family's product kernel) when the backend
+/// built it, the GEMM's SwiGLU form behind it, the family's
+/// GEMV SwiGLU form otherwise.
 #[allow(clippy::too_many_arguments)]
 fn prepare_swiglu_proj(
     backend: &WgpuCompute,
     weights: &ProjWeights,
     input_a: &wgpu::Buffer,
     input_b: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: usize,
     geom: &K1ActGeom,
     step: &'static str,
 ) -> Result<ProjCall> {
     let ctx = backend.context();
-    let gemm = batch >= GEMM_MIN_ROWS;
+    let matrix = batch >= GEMM_MIN_ROWS;
     match weights {
         ProjWeights::Q4K(w) => {
-            if gemm {
+            if matrix {
+                if let Some(mmq) = backend.k13() {
+                    let quant = backend.k12_swiglu().prepare_act(
+                        ctx,
+                        input_a,
+                        input_b,
+                        q8_qs,
+                        q8_ds,
+                        batch as u32,
+                        w.in_features,
+                        geom,
+                    );
+                    match quant {
+                        Ok(quant) => {
+                            match mmq.prepare(ctx, w, q8_qs, q8_ds, output, batch as u32) {
+                                Ok(mmq) => return Ok(ProjCall::MmqQ4K { quant, mmq }),
+                                Err(e) => {
+                                    dbg_log!(
+                                        "mmq swiglu q4k refused at the product prepare: {e}; \
+                                         the gemm form serves it"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            dbg_log!(
+                                "mmq swiglu q4k refused at the quantize prepare: {e}; \
+                                 the gemm form serves it"
+                            );
+                        }
+                    }
+                }
                 if let Some(g) = backend.k10_swiglu() {
                     return g
                         .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
@@ -407,7 +596,38 @@ fn prepare_swiglu_proj(
                 .map_err(|e| we(e, step))
         }
         ProjWeights::Q6K(w) => {
-            if gemm {
+            if matrix {
+                if let Some(mmq) = backend.k14() {
+                    let quant = backend.k12_swiglu().prepare_act(
+                        ctx,
+                        input_a,
+                        input_b,
+                        q8_qs,
+                        q8_ds,
+                        batch as u32,
+                        w.in_features,
+                        geom,
+                    );
+                    match quant {
+                        Ok(quant) => {
+                            match mmq.prepare(ctx, w, q8_qs, q8_ds, output, batch as u32) {
+                                Ok(mmq) => return Ok(ProjCall::MmqQ6K { quant, mmq }),
+                                Err(e) => {
+                                    dbg_log!(
+                                        "mmq swiglu q6k refused at the product prepare: {e}; \
+                                         the gemm form serves it"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            dbg_log!(
+                                "mmq swiglu q6k refused at the quantize prepare: {e}; \
+                                 the gemm form serves it"
+                            );
+                        }
+                    }
+                }
                 if let Some(g) = backend.k11_swiglu() {
                     return g
                         .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
@@ -764,6 +984,18 @@ struct Scratch {
     ffn_act: wgpu::Buffer,
     /// Attention scores, `[rows][q_heads][scores_cap]`.
     scores: wgpu::Buffer,
+    /// K12's quantized activations: the packed int8 words,
+    /// `[rows][blocks][8]` u32, blocks counted at the widest
+    /// projection input a plan quantizes (hidden, attention,
+    /// or FFN width). One buffer serves every MMQ projection
+    /// in the chain: dispatches inside a pass are totally
+    /// ordered, each projection's quantize immediately
+    /// precedes its product, and no two quantized forms are
+    /// ever live at once.
+    q8_qs: wgpu::Buffer,
+    /// K12's quantized activation scales: one `vec4<f32>`
+    /// per block, beside [`Scratch::q8_qs`].
+    q8_ds: wgpu::Buffer,
     /// The last row of stream A, copied out for the head,
     /// `[hidden]`.
     last_row: wgpu::Buffer,
@@ -804,6 +1036,9 @@ impl Scratch {
         let kv_width = cfg.k_width() as usize;
         let ffn = cfg.ffn_hidden as usize;
         let vocab = cfg.vocab_size as usize;
+        // Q8_1 blocks at the widest width any projection in
+        // the chain quantizes (see the field docs).
+        let q8_blocks = hidden.max(q_width).max(ffn).div_ceil(32);
         Scratch {
             tokens: ctx.scratch_buffer("session tokens", (rows * 4) as u64),
             stream_a: act("session stream a", rows * hidden),
@@ -823,6 +1058,8 @@ impl Scratch {
             ffn_up: act("session ffn up", rows * ffn),
             ffn_act: act("session ffn act", rows * ffn),
             scores: act("session scores", rows * cfg.q_heads as usize * scores_cap),
+            q8_qs: act("session q8 qs", rows * q8_blocks * 8),
+            q8_ds: act("session q8 ds", rows * q8_blocks * 4),
             last_row: act("session last row", hidden),
             head_in: act("session head in", hidden),
             logits: act("session logits", vocab),
@@ -1194,7 +1431,16 @@ impl ChunkPlan {
             // the K4/K5 composition the trait path still runs
             // as the reference.
             let (proj_q, proj_k, proj_v, prep) = if let Some(batch) = &layer.attn_batch {
-                let call = prepare_proj(backend, batch, &scratch.h, &scratch.qkv, rows, "proj")?;
+                let call = prepare_proj(
+                    backend,
+                    batch,
+                    &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
+                    &scratch.qkv,
+                    rows,
+                    "proj",
+                )?;
                 let stride = batch.out_rows();
                 let (proj_v, v_in, v_stride, v_off) = if layer.batch_has_v {
                     (None, &scratch.qkv, stride, q_width + kv_width)
@@ -1203,6 +1449,8 @@ impl ChunkPlan {
                         backend,
                         need(&layer.attn_v)?,
                         &scratch.h,
+                        &scratch.q8_qs,
+                        &scratch.q8_ds,
                         &scratch.v,
                         rows,
                         "proj",
@@ -1246,6 +1494,8 @@ impl ChunkPlan {
                     backend,
                     need(&layer.attn_q)?,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.q,
                     rows,
                     "proj",
@@ -1254,6 +1504,8 @@ impl ChunkPlan {
                     backend,
                     need(&layer.attn_k)?,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.k,
                     rows,
                     "proj",
@@ -1262,6 +1514,8 @@ impl ChunkPlan {
                     backend,
                     need(&layer.attn_v)?,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.v,
                     rows,
                     "proj",
@@ -1359,6 +1613,8 @@ impl ChunkPlan {
                             ow,
                             &scratch.attn,
                             &scratch.qkv,
+                            &scratch.q8_qs,
+                            &scratch.q8_ds,
                             &scratch.branch,
                             rows,
                             &K1ActGeom {
@@ -1374,6 +1630,8 @@ impl ChunkPlan {
                             backend,
                             need(&layer.attn_gate)?,
                             &scratch.h,
+                            &scratch.q8_qs,
+                            &scratch.q8_ds,
                             &scratch.gate,
                             rows,
                             "proj",
@@ -1383,6 +1641,8 @@ impl ChunkPlan {
                             ow,
                             &scratch.attn,
                             &scratch.gate,
+                            &scratch.q8_qs,
+                            &scratch.q8_ds,
                             &scratch.branch,
                             rows,
                             &K1ActGeom {
@@ -1398,6 +1658,8 @@ impl ChunkPlan {
                             backend,
                             need(&layer.attn_gate)?,
                             &scratch.h,
+                            &scratch.q8_qs,
+                            &scratch.q8_ds,
                             &scratch.gate,
                             rows,
                             "proj",
@@ -1413,6 +1675,8 @@ impl ChunkPlan {
                             backend,
                             &layer.attn_output,
                             &scratch.attn_gated,
+                            &scratch.q8_qs,
+                            &scratch.q8_ds,
                             &scratch.branch,
                             rows,
                             "proj",
@@ -1424,6 +1688,8 @@ impl ChunkPlan {
                         backend,
                         need(&layer.attn_gate)?,
                         &scratch.h,
+                        &scratch.q8_qs,
+                        &scratch.q8_ds,
                         &scratch.gate,
                         rows,
                         "proj",
@@ -1439,6 +1705,8 @@ impl ChunkPlan {
                         backend,
                         &layer.attn_output,
                         &scratch.attn_gated,
+                        &scratch.q8_qs,
+                        &scratch.q8_ds,
                         &scratch.branch,
                         rows,
                         "proj",
@@ -1504,6 +1772,8 @@ impl ChunkPlan {
                     backend,
                     pair,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.ffn_pair,
                     rows,
                     "swiglu_ffn",
@@ -1518,6 +1788,8 @@ impl ChunkPlan {
                     &layer.ffn_down,
                     &scratch.ffn_pair,
                     &scratch.ffn_pair,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.branch,
                     rows,
                     &geom,
@@ -1529,6 +1801,8 @@ impl ChunkPlan {
                     backend,
                     need(&layer.ffn_gate)?,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.ffn_gate,
                     rows,
                     "swiglu_ffn",
@@ -1537,6 +1811,8 @@ impl ChunkPlan {
                     backend,
                     need(&layer.ffn_up)?,
                     &scratch.h,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.ffn_up,
                     rows,
                     "swiglu_ffn",
@@ -1552,6 +1828,8 @@ impl ChunkPlan {
                     backend,
                     &layer.ffn_down,
                     &scratch.ffn_act,
+                    &scratch.q8_qs,
+                    &scratch.q8_ds,
                     &scratch.branch,
                     rows,
                     "swiglu_ffn",
@@ -1653,6 +1931,18 @@ impl ChunkPlan {
                     dispatch_count -= 1;
                 }
             }
+            // The matrix-form accounting above counts every
+            // projection as one dispatch; an MMQ projection
+            // records two (its K12 quantize is a dispatch of
+            // its own), so add the extras back per call.
+            dispatch_count += proj_q.dispatches() - 1;
+            dispatch_count += proj_k.as_ref().map_or(0, |c| c.dispatches() - 1);
+            dispatch_count += proj_v.as_ref().map_or(0, |c| c.dispatches() - 1);
+            dispatch_count += proj_gate.as_ref().map_or(0, |c| c.dispatches() - 1);
+            dispatch_count += proj_o.dispatches() - 1;
+            dispatch_count += proj_fg.dispatches() - 1;
+            dispatch_count += proj_fu.as_ref().map_or(0, |c| c.dispatches() - 1);
+            dispatch_count += proj_fd.dispatches() - 1;
             layer_plans.push(LayerPlan {
                 attn_norm,
                 proj_q,
@@ -1727,6 +2017,8 @@ impl ChunkPlan {
                 backend,
                 output,
                 &scratch.head_in,
+                &scratch.q8_qs,
+                &scratch.q8_ds,
                 &scratch.logits,
                 1,
                 "lm_head",

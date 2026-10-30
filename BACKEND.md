@@ -336,6 +336,188 @@ engine processes from parallel work on the card, the identical
 bench binary read about 17 GB/s. Bench reports on this host
 must state their window, as this one does.
 
+## BACKEND-RESULTS: the K1 tuning pass (2026-10-30)
+
+The v2 kernel (one workgroup per row, one lane per super-block)
+was restructured in llama.cpp's own direction. What was adopted
+from the ggml-vulkan sources on the server
+(`~/llama.cpp/ggml/src/ggml-vulkan/`, read before writing):
+
+- `mul_mat_vec_q4_k.comp`: sixteen threads cooperate on one
+  super-block, each owning sixteen elements (two `u32` qs
+  words) unpacked by byte-unpack into vec4s, with the
+  scale/min arithmetic factored against per-sub-block
+  activation sums.
+- `ggml-vulkan.cpp`: on RDNA3 the row split for K-quants is
+  `rm_kq` 2 rows per workgroup (4 is GCN only); the large
+  variant runs subgroup size times four threads (128 here)
+  with a hybrid subgroup plus shared-memory reduction.
+- The tuned kernel is therefore: two rows per workgroup of
+  128, sixteen threads per super-block, packed extraction of
+  the twelve scale bytes into per-sub-block scale/min in one
+  unpack per half, activation quads loaded once per
+  super-block and shared by both rows and all sixteen lanes,
+  subgroup butterfly reduction with an LDS finish (a plain
+  LDS tree variant remains as the no-subgroup fallback,
+  selected at device setup from granted features).
+
+One directed idea was evaluated and rejected on paper, with
+the reasoning recorded so it is not retried blind: shared
+memory DEQUANT STAGING. A GEMV consumes every dequantized
+value exactly once, so staging dequantized tiles in workgroup
+memory buys a barrier and a round trip for zero reuse; scale
+staging loses the same way, because all sixteen lanes extract
+their scales in parallel in the same instruction slots one
+staging lane would spend serially. ggml's GEMV stages nothing
+either; its shared memory carries reduction partials, as does
+the tuned kernel's.
+
+### Correctness first (real tensor, before any bench counted)
+
+`k1_check` on the real `blk.0.ffn_gate.weight` [6656 x 19968]
+Q4_K against the `gguf` crate's CPU dequant plus matvec
+(pass bar: max rel err below 1e-4 and cosine above 0.999999;
+f32 reassociation in a different order lands around 1e-6, so
+the bar leaves two orders of headroom and still catches any
+layout error, which is off by whole dequantized values):
+
+| Shape | Max rel err | Cosine | Verdict |
+| :--- | ---: | ---: | :--- |
+| v2 (legacy) | 2.980e-7 | 1.000000000 | pass |
+| r1, r2, r4 (LDS reduction) | 1.341e-7 | 1.000000000 | pass |
+| r2sg, r4sg (subgroup) | 1.267e-7 | 1.000000000 | pass |
+| r2f16 | 5.869e-4 | 0.999999621 | FAIL |
+| r4sgf16 | 5.870e-4 | 0.999999621 | FAIL |
+
+The first check round caught a real defect in the new shader:
+every llama shape read the qs plane one word early (the plane
+starts at word 4, after `d`, `dmin` and the twelve scale
+bytes); v2 passing while all new shapes failed identically is
+what isolated it to the port, not the design.
+
+The f16 result is the tolerance call the pass owed: the f16
+shapes hold per-sub-block dots in f16 and combine in f32
+(strictly tighter than ggml's f16 pipeline, whose running
+temp is f16), and they still land at rel 5.9e-4 on the real
+tensor, outside the crate's 1e-4 bar. f16 activations are
+therefore NOT taken: the variants remain benchable under
+explicit names, they are never selected by `shipped_shape`,
+and the bench below shows the rejection cost nothing, because
+both f16 shapes also measured SLOWER than their f32 twins on
+this card (activation traffic was never the bottleneck once
+the dequant mix was fixed).
+
+### The two windows (read this before the numbers)
+
+This host produced two disjoint bench windows in one night,
+and the difference is the window, proven three ways: the
+first landing's own v2 binary re-read 24.4 GB/s in the bad
+window against its 216.5 from the good one; the dequant-free
+stream probe read 12.8 GB/s in the bad window against 746.9
+in a good one; and per-process GPU engine counters showed no
+tenant computing during the bad window's matrix (the same
+effect the first landing's residency note recorded at about
+17 GB/s under parallel tenants). In the bad window (around
+04:29 UTC, VRAM free 98 MiB, two Qwen3-Embedding llama-servers
+and production resident) every kernel compressed toward a
+~140 GB/s ceiling: probe 12.8, v2 24.4, and the llama shapes
+137.2 to 141.0, medians of three at 6,000 iterations on a
+93,929,472-byte subset. That matrix is kept in the bench log
+and carries exactly one usable signal: inside one window, the
+restructure beat v2 by about 5.7 times. No absolute from that
+window is used anywhere in the verdict.
+
+The healthy window opened minutes later (around 04:44 UTC)
+after the co-tenants released the card (VRAM free 2,824 MiB,
+production resident and answering `/health` before and
+after). One caution for future bench work on this host:
+`pp_dpm_mclk` read 96 MHz in BOTH windows, including during
+816 GB/s runs that are physically impossible at that memory
+clock, so the sysfs clock readout is unreliable evidence
+here; a same-window stream-probe canary is the test that
+counts, and a canary under roughly 100 GB/s means the
+window, not the kernel, is the story.
+
+### Healthy-window matrix (the verdict numbers)
+
+Established harness discipline: the six largest Q4_K tensors
+as the resident set (160 MiB budget, 167,731,200 bytes
+streamed per iteration, the same set as the first landing),
+6,000 timed iterations plus 200 warmup (longer than the
+first landing's 2,000 plus 50), median of three runs, every
+run within 0.3 percent of its siblings:
+
+| Shape | Median GB/s | Note |
+| :--- | ---: | :--- |
+| v2 (legacy) | 342.6 | same kernel as the 216.5 landing; windows differ |
+| r1 (1 row, LDS) | 713.3 | the restructure alone already clears 708 |
+| r2f16 | 737.6 | tolerance-failed AND slower than r2 |
+| r4 (4 rows, LDS) | 770.7 | |
+| r2 (2 rows, LDS) | 779.0 | |
+| r4sgf16 | 780.1 | tolerance-failed |
+| r4sg (4 rows, subgroup) | 794.3 | |
+| r2sg, workgroup 64 | 802.9 | spot check |
+| r2sg, workgroup 256 | 808.9 | spot check |
+| **r2sg, workgroup 128 (SHIPPED)** | **816.5** | shipped-default confirmation runs: 817.4 |
+
+The winner is two rows per workgroup of 128 with the
+subgroup reduction, which is also the configuration
+ggml-vulkan itself picks for K-quants on RDNA3 (`rm_kq` 2,
+large workgroup, hybrid reduction): the independent tuning
+converged on the reference's own answer for this silicon.
+`shipped_shape` selects r2sg when the device grants
+SUBGROUP and r2 (same kernel, LDS reduction) otherwise; the
+shipped default passed its own `k1_check` at rel 1.267e-7
+and the synthetic GPU suite on the server (3 of 3).
+
+What 816.5 GB/s is, stated plainly: 115 percent of
+llama.cpp's measured 708 GB/s, 128 percent of the 637 GB/s
+trigger line, and 85 percent of the card's 960 GB/s peak,
+which is the efficiency band ARCHITECTURE.md sets for
+specialized kernels. One honest scope note: 708 is
+llama.cpp's full-model decode rate through a serving loop;
+816.5 is a K1 micro-bench over the FFN-dominated resident
+set, which is exactly the Tier 2 comparison this document
+prescribes (kernels benched at Glimmer shapes against
+llama.cpp's number). Within that prescribed comparison the
+tuned WGSL kernel beats the reference.
+
+### The ash verdict, restated on tuned numbers
+
+This supersedes the first landing's computed verdict above,
+which stood on the untuned v2 number. Section 8's three
+triggers, against the tuned K1:
+
+1. Tuned wgpu still under 90 percent of the reference (637
+   GB/s): DOES NOT FIRE. 816.5 GB/s is over the line with 28
+   percent headroom, and over llama.cpp's own number by 15
+   percent.
+2. A capability gap blocks a required kernel: DOES NOT
+   FIRE. Subgroups, SHADER_F16 and timestamps are all
+   exposed and exercised; nothing K1 needed was missing.
+3. A gap over 5 percent traced to Naga codegen: DOES NOT
+   FIRE. There is no gap; the WGSL kernel beat the
+   reference path's measured number.
+
+**Verdict: wgpu stays the only GPU stack. The raw-Vulkan
+(ash) path is not needed, no prototype is started, and the
+question is closed for K1.** Section 8 stays armed as
+written for the kernels that follow: K2 and K3 take the same
+per-kernel comparison when they land, and a future kernel
+that lands under its line after tuning reopens the ash
+question for that kernel on its own numbers.
+
+### Follow-ups from the tuning pass
+
+- TODO T-4.2 stays open, unchanged: the full Tier 1 bench
+  table (a complete forward pass) still needs a scheduled
+  window with the card to itself.
+- Bench-window law, amended from this night's evidence:
+  record VRAM free and the co-tenant list with every matrix,
+  run a stream-probe canary in the same window, and distrust
+  any absolute whose canary is under roughly 100 GB/s. The
+  sysfs DPM readouts on this host are not evidence.
+
 ## Appendix: the adapter probe
 
 Lives in scratch (/tmp/wgpu-probe), not in this repo: it is a

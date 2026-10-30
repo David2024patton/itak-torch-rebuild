@@ -50,4 +50,4 @@ pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
 pub use device::GpuContext;
 pub use error::{Result, WgpuError};
-pub use kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Weights};
+pub use kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Shape, K1Weights};

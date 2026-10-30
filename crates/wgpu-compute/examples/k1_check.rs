@@ -5,20 +5,23 @@
 //! real-file proofs use.
 //!
 //! Usage:
-//!   k1_check [--model PATH] [--tensor NAME] [--seed N]
+//!   k1_check [--model PATH] [--tensor NAME] [--seed N] [--variant NAME]
 //!
 //! Defaults: the Glimmer Q4_K_M file on the server and its first
 //! FFN gate tensor. Run it on the machine whose GPU is under test
 //! (the 7900 XTX server): the default selection policy refuses
 //! machines without a discrete Vulkan GPU, and this tool reports
 //! that as a SKIP (exit 0), not a failure. A real mismatch exits 1.
+//!
+//! `--variant` selects the K1 shape under test (see
+//! `K1Shape::from_name`); the default is the shipped shape for
+//! the device, i.e. exactly what `Compute::proj` would run.
 
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use gguf::{GgmlType, GgufFile};
-use muse_glimmer::{Compute, Dtype, TensorView};
+use wgpu_compute::kernels::k1_q4k_gemv::{shipped_shape, K1Pipeline, K1Shape};
 use wgpu_compute::{DetectPolicy, WgpuCompute, WgpuError};
 
 /// Deterministic pseudo-random f32s in [-0.5, 0.5): a 64-bit LCG,
@@ -49,6 +52,7 @@ fn main() -> ExitCode {
     let seed: u64 = arg(&args, "--seed")
         .and_then(|s| s.parse().ok())
         .unwrap_or(42);
+    let variant = arg(&args, "--variant").unwrap_or_else(|| "shipped".to_string());
 
     let file = match GgufFile::open(Path::new(&model)) {
         Ok(f) => f,
@@ -106,18 +110,49 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    println!("adapter: {}", backend.context().adapter.name);
+    let ctx = backend.context();
+    println!("adapter: {}", ctx.adapter.name);
 
-    let view = TensorView {
-        name: tensor.clone(),
-        dtype: Dtype::Q4K,
-        shape: vec![dims[0], dims[1]],
-        data: Arc::from(bytes.into_boxed_slice()),
+    let shape = if variant == "shipped" {
+        shipped_shape(ctx.device.features())
+    } else {
+        match K1Shape::from_name(&variant) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "unknown variant {variant:?} (expected v2, r<rows>[sg][f16], or shipped)"
+                );
+                return ExitCode::from(2);
+            }
+        }
     };
-    let got = match backend.proj(&input, &view, 1) {
+    println!(
+        "shape: {} (rows {}, workgroup {}, subgroup {}, f16 activations {}, legacy {})",
+        shape.name(),
+        shape.rows,
+        shape.workgroup,
+        shape.subgroup,
+        shape.f16_activations,
+        shape.legacy
+    );
+    let pipeline = match K1Pipeline::with_shape(&ctx.device, shape) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("k1 pipeline for shape {} failed: {e}", shape.name());
+            return ExitCode::from(2);
+        }
+    };
+    let weights = match pipeline.upload(ctx, &tensor, &bytes, inn, out) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("upload of {tensor} failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let got = match pipeline.run(ctx, &weights, &input) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("gpu proj failed: {e}");
+            eprintln!("gpu run failed: {e}");
             return ExitCode::from(2);
         }
     };

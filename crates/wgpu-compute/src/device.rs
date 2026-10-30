@@ -45,21 +45,42 @@ pub struct GpuContext {
     pub max_buffer_size: u64,
     /// Granted `max_storage_buffer_binding_size`.
     pub max_binding_size: u64,
+    /// Features the device was actually granted (the subset of
+    /// the adapter's features this crate asked for: SUBGROUP and
+    /// SHADER_F16, the two the tuned K1 shapes select on).
+    /// Kernels read this, through `device.features()`, at
+    /// pipeline construction; a shape whose feature is absent
+    /// refuses by name there.
+    pub features: wgpu::Features,
 }
 
 impl GpuContext {
     /// Open a device on `adapter` with the adapter's own limits and
     /// verify the granted limits against this crate's floor.
     pub(crate) fn open(adapter: &wgpu::Adapter, facts: AdapterFacts) -> Result<Self> {
+        // Ask for the features the tuned kernels select on, when
+        // the adapter offers them (BACKEND.md Section 2 measured
+        // both present on the server stack). Asking only for what
+        // the adapter has keeps device creation infallible on
+        // lesser stacks; the kernels then fall back by name at
+        // pipeline construction (see shipped_shape).
+        let wanted = wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16;
+        let required_features = adapter.features() & wanted;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wgpu-compute device"),
-            required_features: wgpu::Features::empty(),
+            required_features,
             required_limits: adapter.limits(),
             ..Default::default()
         }))
         .map_err(|e| WgpuError::DeviceRequest {
             detail: e.to_string(),
         })?;
+        let features = device.features();
+        dbg_log!(
+            "device features granted: subgroup={} shader_f16={}",
+            features.contains(wgpu::Features::SUBGROUP),
+            features.contains(wgpu::Features::SHADER_F16)
+        );
         let limits = device.limits();
         // wgpu reports the binding cap as u32; this crate's
         // accounting is u64 throughout, so widen once, here.
@@ -96,6 +117,7 @@ impl GpuContext {
             adapter: facts,
             max_buffer_size: limits.max_buffer_size,
             max_binding_size: binding_size,
+            features,
             device,
             queue,
         })

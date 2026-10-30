@@ -6,6 +6,13 @@
 //!
 //! Usage:
 //!   k1_bench [--model PATH] [--budget-mib N] [--iters N] [--warmup N]
+//!            [--variant NAME] [--wg N]
+//!
+//! `--variant` selects the K1 shape (see `K1Shape::from_name`:
+//! `v2` is the first landing's kernel; `r2`, `r4sgf16`, ... are
+//! the llama-family tunings; `shipped` is whatever
+//! `K1Pipeline::new` would build on this device). `--wg`
+//! overrides the workgroup size of a llama-family shape.
 //!
 //! The resident set is capped by --budget-mib because this bench
 //! runs beside whatever already holds VRAM on the card (on the
@@ -22,7 +29,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use gguf::{GgmlType, GgufFile};
-use wgpu_compute::kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Weights};
+use wgpu_compute::kernels::k1_q4k_gemv::{pack_input_f16, K1Call, K1Pipeline, K1Shape, K1Weights};
 use wgpu_compute::{DetectPolicy, WgpuCompute, WgpuError};
 
 /// llama.cpp Vulkan's measured effective bandwidth on this card
@@ -99,6 +106,8 @@ fn main() -> ExitCode {
     let warmup: u32 = arg(&args, "--warmup")
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
+    let variant = arg(&args, "--variant").unwrap_or_else(|| "shipped".to_string());
+    let wg_override: Option<u32> = arg(&args, "--wg").and_then(|s| s.parse().ok());
     let budget = budget_mib * 1024 * 1024;
 
     let file = match GgufFile::open(Path::new(&model)) {
@@ -156,8 +165,39 @@ fn main() -> ExitCode {
         }
     };
     let ctx = backend.context();
-    let pipeline = K1Pipeline::new(&ctx.device).expect("k1 pipeline");
+    let mut shape = if variant == "shipped" {
+        wgpu_compute::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features())
+    } else {
+        match K1Shape::from_name(&variant) {
+            Some(s) => s,
+            None => {
+                eprintln!(
+                    "unknown variant {variant:?} (expected v2, r<rows>[sg][f16], or shipped)"
+                );
+                return ExitCode::from(2);
+            }
+        }
+    };
+    if let Some(wg) = wg_override {
+        shape.workgroup = wg;
+    }
+    let pipeline = match K1Pipeline::with_shape(&ctx.device, shape) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("k1 pipeline for shape {} failed: {e}", shape.name());
+            return ExitCode::from(2);
+        }
+    };
     println!("adapter: {}", ctx.adapter.name);
+    println!(
+        "shape: {} (rows {}, workgroup {}, subgroup {}, f16 activations {}, legacy {})",
+        shape.name(),
+        shape.rows,
+        shape.workgroup,
+        shape.subgroup,
+        shape.f16_activations,
+        shape.legacy
+    );
     if let Some(state) = vram_state() {
         println!("{state}");
     }
@@ -178,7 +218,11 @@ fn main() -> ExitCode {
             }
         };
         let input = lcg_input(7, *inn);
-        let in_bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let in_bytes: Vec<u8> = if shape.input_is_f16() {
+            pack_input_f16(&input)
+        } else {
+            input.iter().flat_map(|v| v.to_le_bytes()).collect()
+        };
         let input_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bench input"),
             size: in_bytes.len() as u64,

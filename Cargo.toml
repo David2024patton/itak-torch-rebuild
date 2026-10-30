@@ -17,6 +17,7 @@ members = [
     "crates/cpu-compute",
     "crates/gguf",
     "crates/itak-loader",
+    "crates/itak-types",
     "crates/muse-glimmer",
     "crates/tokenizer",
     "crates/torch-math",

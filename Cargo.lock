@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "itak-types"
+version = "0.1.0"
+
+[[package]]
 name = "muse-glimmer"
 version = "0.1.0"
 

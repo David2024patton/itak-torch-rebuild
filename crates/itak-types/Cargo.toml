@@ -1,0 +1,19 @@
+[package]
+name = "itak-types"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The shared Go/Rust IPC contract for the iTaK Torch rebuild: pkg/types mirrors, the Section 4 frame header and message set, the token ring seam, and the Hello handshake with its named version refusal."
+
+[features]
+default = []
+# Emit diagnostic lines (handshake events, refusals) to stderr.
+debug-log = []
+
+# No dependencies on purpose: this crate is the contract both sides of
+# the seam compile against, so it stays std-only like the rest of the
+# workspace. The JSON payload codec is hand-rolled in src/json.rs.
+
+[lints]
+workspace = true

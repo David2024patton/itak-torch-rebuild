@@ -99,6 +99,16 @@ pub enum GlimmerError {
         /// What is wrong with the value.
         detail: String,
     },
+    /// A dimension measurement was requested with a shape or config
+    /// that cannot describe one: a tensor length that does not match
+    /// its declared rows and cols, a zero column count, a config
+    /// field outside its meaningful range. Named instead of panicking
+    /// or returning a number computed from a different shape than the
+    /// caller declared.
+    InvalidDimension {
+        /// What is wrong with the request.
+        detail: String,
+    },
 }
 
 impl fmt::Display for GlimmerError {
@@ -154,6 +164,9 @@ impl fmt::Display for GlimmerError {
             }
             GlimmerError::InvalidSampling { field, detail } => {
                 write!(f, "sampling config field {field} is invalid: {detail}")
+            }
+            GlimmerError::InvalidDimension { detail } => {
+                write!(f, "dimension measurement request is invalid: {detail}")
             }
         }
     }

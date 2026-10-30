@@ -17,12 +17,16 @@
 //! the `muse_glimmer::trace` module): header lines naming the tool,
 //! the model shape, and the prompt ids, then one line per stage
 //! (`embed`, `layer.<i>.mid`, `layer.<i>.out`, `final_norm`,
-//! `logits`) carrying whole-tensor and last-row statistics, then the
-//! prefill top-5 in Run B's table format for a direct cross-check
-//! against its position-1 numbers. `--out` writes the trace lines
-//! to a file instead of stdout so the dump can be committed next to
-//! a reference dump and diffed. `--ids-only` stops after printing
-//! the prompt ids, before any weight work.
+//! `logits`) carrying whole-tensor and last-row statistics, then one
+//! dimension line per stage (version 1, documented in the
+//! `muse_glimmer::dimension` module: participation ratio, plus the
+//! TwoNN estimate when the prompt has enough positions for it to
+//! run), then the prefill top-5 in Run B's table format for a direct
+//! cross-check against its position-1 numbers. `--out` writes the
+//! trace and dimension lines to a file instead of stdout so the dump
+//! can be committed next to a reference dump and diffed.
+//! `--ids-only` stops after printing the prompt ids, before any
+//! weight work.
 //!
 //! This is a correctness tool, not a benchmark: one 30B prefill on
 //! `cpu-compute` is minutes-class, exactly as Run B measured.
@@ -33,7 +37,10 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use muse_glimmer::{GlimmerModel, PositionCache, StderrDiag, TraceLog};
+use muse_glimmer::{
+    DimensionConfig, DimensionLog, DimensionProbe, GlimmerModel, PositionCache, StderrDiag,
+    TraceLog, TraceSink,
+};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
 
 /// The prompt ids Integration Run B fed both engines, from
@@ -118,6 +125,22 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(u32, f32, f64)> {
         .collect()
 }
 
+/// Forwards every capture to both the trace log and the dimension
+/// log, so one traced prefill produces both dumps. Harness glue in
+/// the same spirit as `data_from_info`: the two sinks stay separate
+/// library modules; the tee lives here.
+struct TeeTrace<'a> {
+    trace: &'a mut TraceLog,
+    dims: &'a mut DimensionLog,
+}
+
+impl TraceSink for TeeTrace<'_> {
+    fn capture(&mut self, stage: &str, tensor: &[f32], rows: usize, cols: usize) {
+        self.trace.capture(stage, tensor, rows, cols);
+        self.dims.capture(stage, tensor, rows, cols);
+    }
+}
+
 fn run(
     path: &str,
     prompt: &str,
@@ -182,10 +205,23 @@ fn run(
     );
     let mut cache = PositionCache::new();
     let mut log = TraceLog::new(first_n);
+    // The dimension probe shares the model's diagnostic channel, so
+    // a stage whose TwoNN gate refuses (the default prompt has 6
+    // positions, below the 32-point minimum) says so on stderr
+    // beside the run's other refusals, and its dim line shows
+    // twonn=na.
+    let mut dims = DimensionLog::new(DimensionProbe::with_diag(
+        DimensionConfig::default(),
+        Arc::new(StderrDiag),
+    ));
+    let mut tee = TeeTrace {
+        trace: &mut log,
+        dims: &mut dims,
+    };
 
     let t_prefill = Instant::now();
     let logits = model
-        .forward_traced(&ids, &mut cache, &mut log)
+        .forward_traced(&ids, &mut cache, &mut tee)
         .map_err(|e| e.to_string())?;
     println!(
         "phase=traced_prefill ms={} prompt_tokens={} stages={}",
@@ -194,7 +230,8 @@ fn run(
         log.records().len()
     );
 
-    let lines = log.lines();
+    let mut lines = log.lines();
+    lines.extend(dims.lines());
     match out {
         Some(out_path) => {
             let mut text = lines.join("\n");

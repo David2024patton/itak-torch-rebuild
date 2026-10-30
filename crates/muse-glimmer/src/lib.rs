@@ -30,6 +30,11 @@
 //!   logit slice, drawn from a seeded RNG; temperature 0 is greedy and
 //!   never consults the RNG. See [`crate::sampling`].
 //!
+//! - [`DimensionProbe`]: activation dimensionality for the trace
+//!   tooling (participation ratio of the covariance spectrum, TwoNN
+//!   intrinsic dimension), the collapse detector for the fractal
+//!   memory experiments. See [`crate::dimension`].
+//!
 //! What is trait-bound, waiting on sibling crates: metadata and tensor
 //! access (the `itak-loader` crate, T-2.1, implements [`Metadata`] and
 //! [`TensorSource`] over the `gguf` crate), the arithmetic (the kernels crate, T-2.2,
@@ -49,6 +54,7 @@ pub mod cache;
 pub mod compute;
 pub mod config;
 pub mod diag;
+pub mod dimension;
 pub mod error;
 pub mod layer;
 pub mod metadata;
@@ -64,6 +70,10 @@ pub use cache::{Cache, PositionCache};
 pub use compute::{AttentionRequest, Compute, UnimplementedCompute};
 pub use config::{GlimmerConfig, ARCHITECTURE};
 pub use diag::{Diag, NullDiag, StderrDiag};
+pub use dimension::{
+    participation_ratio, twonn_dimension, DimensionConfig, DimensionEntry, DimensionLog,
+    DimensionProbe, DimensionReport,
+};
 pub use error::{GlimmerError, Result};
 pub use layer::{LayerKind, PatternSource};
 pub use metadata::{MapMetadata, Metadata};

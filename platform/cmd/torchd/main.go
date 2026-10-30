@@ -27,6 +27,7 @@ import (
 
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/engine"
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/server"
+	"github.com/David2024patton/itak-torch-rebuild/platform/internal/supervisor"
 )
 
 func main() { os.Exit(run()) }
@@ -34,6 +35,11 @@ func main() { os.Exit(run()) }
 func run() int {
 	addr := flag.String("addr", "127.0.0.1:8091", "listen address (default loopback only)")
 	socket := flag.String("engine-socket", "", "path to the Rust engine unix socket; empty = no engine configured")
+	engineBin := flag.String("engine-bin", "", "path to the itak-engine binary to supervise; set with -engine-model. Supervision restarts the engine within the restart budget when it dies (TODO T-9.11)")
+	engineModel := flag.String("engine-model", "", "GGUF file the supervised engine loads (--model)")
+	engineName := flag.String("engine-name", "", "model name the supervised engine serves (--model-name); empty = the file's own name")
+	engineMaxRestarts := flag.Int("engine-max-restarts", 5, "supervised engine: restarts allowed inside -engine-restart-window before the engine stays down")
+	engineRestartWindow := flag.Duration("engine-restart-window", 5*time.Minute, "supervised engine: restart budget window")
 	models := flag.String("models", "glimmer", "comma-separated model ids advertised on /v1/models")
 	maxConcurrent := flag.Int("max-concurrent", 4, "maximum simultaneous engine jobs")
 	cacheTTL := flag.Duration("cache-ttl", 5*time.Minute, "response cache TTL; 0 disables caching")
@@ -51,7 +57,14 @@ func run() int {
 		log.Warn("TORCH_ALLOW_NO_AUTH=1: running WITHOUT authentication; every route is open")
 	}
 
-	eng, closeEngine := dialEngine(*socket, log)
+	var eng engine.Client
+	var closeEngine func()
+	if *engineBin != "" {
+		eng, closeEngine = superviseEngine(*engineBin, *engineModel, *engineName, *socket,
+			*engineMaxRestarts, *engineRestartWindow, log)
+	} else {
+		eng, closeEngine = dialEngine(*socket, log)
+	}
 	if closeEngine != nil {
 		defer closeEngine()
 	}
@@ -106,6 +119,43 @@ func dialEngine(socketPath string, log *slog.Logger) (engine.Client, func()) {
 	}
 	log.Info("engine connected", "socket", socketPath)
 	return client, func() { _ = client.Close() }
+}
+
+// superviseEngine starts itak-engine under the supervisor: torchd
+// owns the process, restarts it within the configured budget when
+// it dies, and serves the next request from the restarted engine
+// (TODO T-9.11). A failed initial start is not fatal and is not
+// hidden, matching dialEngine's behavior: the platform runs with
+// the engine marked unavailable and /healthz says so.
+func superviseEngine(bin, model, name, socketPath string, maxRestarts int, window time.Duration, log *slog.Logger) (engine.Client, func()) {
+	if model == "" {
+		log.Error("engine-bin set without engine-model; starting with engine unavailable")
+		return engine.Unavailable{}, nil
+	}
+	if socketPath == "" {
+		socketPath = "/tmp/itak-engine.sock"
+	}
+	args := []string{"--model", model, "--socket", socketPath}
+	if name != "" {
+		args = append(args, "--model-name", name)
+	}
+	sup := supervisor.New(supervisor.Config{
+		Command:     bin,
+		Args:        args,
+		SocketPath:  socketPath,
+		MaxRestarts: maxRestarts,
+		Window:      window,
+		Logger:      log,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 130*time.Second)
+	defer cancel()
+	if err := sup.Start(ctx); err != nil {
+		log.Error("supervised engine failed to start; starting with engine unavailable", "err", err)
+		return engine.Unavailable{}, nil
+	}
+	log.Info("engine supervised", "bin", bin, "model", model, "socket", socketPath,
+		"max_restarts", maxRestarts, "restart_window", window)
+	return sup, sup.Stop
 }
 
 func splitModels(csv string) []string {

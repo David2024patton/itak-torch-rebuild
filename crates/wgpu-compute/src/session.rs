@@ -67,6 +67,8 @@ use crate::compute::WgpuCompute;
 use crate::device::GpuContext;
 use crate::diag::dbg_log;
 use crate::error::WgpuError;
+use crate::kernels::k10_q4k_gemm::K10Call;
+use crate::kernels::k11_q6k_gemm::K11Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
@@ -88,6 +90,16 @@ const POST_NORM_EPS: f32 = 1e-8;
 /// row; prefill chunks the prompt under this cap and the
 /// scores budget below.
 const MAX_CHUNK_ROWS: usize = 64;
+
+/// Chunk row count at which a plan's projections switch from
+/// the GEMV kernels to the tiled GEMM kernels (K10/K11, when
+/// the backend built them): the GEMM stages each weight tile
+/// once per chunk, so past a handful of rows it beats
+/// re-streaming the weights per row, and below it the GEMV's
+/// decode-tuned shape is the right tool. Decode plans (one
+/// row) never reach this threshold. The bench record behind
+/// the value is in bench/gpu-resident-2026-10-30.md.
+const GEMM_MIN_ROWS: usize = 16;
 
 /// Cap on the attention scores scratch, in elements
 /// (rows x query heads x stored positions): 2^24 f32 values,
@@ -180,7 +192,13 @@ impl ProjWeights {
     }
 }
 
-/// One prepared projection dispatch in a forward plan.
+/// One prepared projection dispatch in a forward plan: a
+/// GEMV call on decode-shaped plans, or its GEMM counterpart
+/// on chunk plans past [`GEMM_MIN_ROWS`] when the backend
+/// built the GEMM pipelines. The two forms bind the same
+/// resident weight buffers and the same `[rows][width]`
+/// activation layout, so the choice is per-plan and invisible
+/// to the chain's step order.
 #[derive(Debug)]
 enum ProjCall {
     /// K1 dispatch.
@@ -189,6 +207,10 @@ enum ProjCall {
     Q6K(K2Call),
     /// K3 dispatch.
     Q5K(K3Call),
+    /// K10 (Q4_K GEMM) dispatch.
+    GemmQ4K(K10Call),
+    /// K11 (Q6_K GEMM) dispatch.
+    GemmQ6K(K11Call),
 }
 
 impl ProjCall {
@@ -198,6 +220,8 @@ impl ProjCall {
             ProjCall::Q4K(c) => c.encode_into(pass),
             ProjCall::Q6K(c) => c.encode_into(pass),
             ProjCall::Q5K(c) => c.encode_into(pass),
+            ProjCall::GemmQ4K(c) => c.encode_into(pass),
+            ProjCall::GemmQ6K(c) => c.encode_into(pass),
         }
     }
 }
@@ -249,6 +273,12 @@ fn upload_proj(
 }
 
 /// Prepare one projection dispatch over resident buffers.
+/// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
+/// families dispatch through the GEMM kernels (K10/K11) when
+/// the backend built them; below the threshold, and for
+/// Q5_K (the one-row head) at any size, the GEMV kernels run.
+/// Both forms consume the same resident buffers, so the
+/// choice never changes the chain's data layout.
 fn prepare_proj(
     backend: &WgpuCompute,
     weights: &ProjWeights,
@@ -258,23 +288,132 @@ fn prepare_proj(
     step: &'static str,
 ) -> Result<ProjCall> {
     let ctx = backend.context();
+    let gemm = batch >= GEMM_MIN_ROWS;
     let batch = batch as u32;
     match weights {
-        ProjWeights::Q4K(w) => backend
-            .k1()
-            .prepare(ctx, w, input, output, batch)
-            .map(ProjCall::Q4K)
-            .map_err(|e| we(e, step)),
-        ProjWeights::Q6K(w) => backend
-            .k2()
-            .prepare(ctx, w, input, output, batch)
-            .map(ProjCall::Q6K)
-            .map_err(|e| we(e, step)),
+        ProjWeights::Q4K(w) => {
+            if gemm {
+                if let Some(g) = backend.k10() {
+                    return g
+                        .prepare(ctx, w, input, output, batch)
+                        .map(ProjCall::GemmQ4K)
+                        .map_err(|e| we(e, step));
+                }
+            }
+            backend
+                .k1()
+                .prepare(ctx, w, input, output, batch)
+                .map(ProjCall::Q4K)
+                .map_err(|e| we(e, step))
+        }
+        ProjWeights::Q6K(w) => {
+            if gemm {
+                if let Some(g) = backend.k11() {
+                    return g
+                        .prepare(ctx, w, input, output, batch)
+                        .map(ProjCall::GemmQ6K)
+                        .map_err(|e| we(e, step));
+                }
+            }
+            backend
+                .k2()
+                .prepare(ctx, w, input, output, batch)
+                .map(ProjCall::Q6K)
+                .map_err(|e| we(e, step))
+        }
         ProjWeights::Q5K(w) => backend
             .k3()
             .prepare(ctx, w, input, output, batch)
             .map(ProjCall::Q5K)
             .map_err(|e| we(e, step)),
+    }
+}
+
+/// Prepare the gated output projection (a Q4_K projection
+/// whose activation is the attention rows gated by a second
+/// stream): the GEMM's gated form on chunk plans past
+/// [`GEMM_MIN_ROWS`] when the backend built it, K1's gated
+/// form otherwise. The geometry contract is the same
+/// [`K1ActGeom`] either way.
+#[allow(clippy::too_many_arguments)]
+fn prepare_gated_proj(
+    backend: &WgpuCompute,
+    weights: &K1Weights,
+    input_a: &wgpu::Buffer,
+    input_b: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: usize,
+    geom: &K1ActGeom,
+    step: &'static str,
+) -> Result<ProjCall> {
+    let ctx = backend.context();
+    if batch >= GEMM_MIN_ROWS {
+        if let Some(g) = backend.k10_gated() {
+            return g
+                .prepare_act(ctx, weights, input_a, input_b, output, batch as u32, geom)
+                .map(ProjCall::GemmQ4K)
+                .map_err(|e| we(e, step));
+        }
+    }
+    backend
+        .k1_gated()
+        .prepare_act(ctx, weights, input_a, input_b, output, batch as u32, geom)
+        .map(ProjCall::Q4K)
+        .map_err(|e| we(e, step))
+}
+
+/// Prepare a SwiGLU-fused down projection over whichever
+/// family the down weights belong to: the GEMM's SwiGLU form
+/// on chunk plans past [`GEMM_MIN_ROWS`] when the backend
+/// built it, the family's GEMV SwiGLU form otherwise.
+#[allow(clippy::too_many_arguments)]
+fn prepare_swiglu_proj(
+    backend: &WgpuCompute,
+    weights: &ProjWeights,
+    input_a: &wgpu::Buffer,
+    input_b: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: usize,
+    geom: &K1ActGeom,
+    step: &'static str,
+) -> Result<ProjCall> {
+    let ctx = backend.context();
+    let gemm = batch >= GEMM_MIN_ROWS;
+    match weights {
+        ProjWeights::Q4K(w) => {
+            if gemm {
+                if let Some(g) = backend.k10_swiglu() {
+                    return g
+                        .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
+                        .map(ProjCall::GemmQ4K)
+                        .map_err(|e| we(e, step));
+                }
+            }
+            backend
+                .k1_swiglu()
+                .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
+                .map(ProjCall::Q4K)
+                .map_err(|e| we(e, step))
+        }
+        ProjWeights::Q6K(w) => {
+            if gemm {
+                if let Some(g) = backend.k11_swiglu() {
+                    return g
+                        .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
+                        .map(ProjCall::GemmQ6K)
+                        .map_err(|e| we(e, step));
+                }
+            }
+            backend
+                .k2_swiglu()
+                .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
+                .map(ProjCall::Q6K)
+                .map_err(|e| we(e, step))
+        }
+        ProjWeights::Q5K(_) => Err(GlimmerError::StepFailed {
+            step,
+            detail: "a swiglu-fused down projection has no Q5_K form".to_string(),
+        }),
     }
 }
 
@@ -1173,23 +1312,20 @@ impl ChunkPlan {
                         } else {
                             q_width + kv_width
                         };
-                        let call = backend
-                            .k1_gated()
-                            .prepare_act(
-                                ctx,
-                                ow,
-                                &scratch.attn,
-                                &scratch.qkv,
-                                &scratch.branch,
-                                rows as u32,
-                                &K1ActGeom {
-                                    a_stride_elems: q_width,
-                                    b_stride_elems: batch.out_rows(),
-                                    b_off_elems: gate_off,
-                                },
-                            )
-                            .map(ProjCall::Q4K)
-                            .map_err(|e| we(e, "proj"))?;
+                        let call = prepare_gated_proj(
+                            backend,
+                            ow,
+                            &scratch.attn,
+                            &scratch.qkv,
+                            &scratch.branch,
+                            rows,
+                            &K1ActGeom {
+                                a_stride_elems: q_width,
+                                b_stride_elems: batch.out_rows(),
+                                b_off_elems: gate_off,
+                            },
+                            "proj",
+                        )?;
                         (None, None, call, true)
                     } else if matches!(layer.attn_gate, Some(ProjWeights::Q4K(_))) {
                         let proj_gate = prepare_proj(
@@ -1200,23 +1336,20 @@ impl ChunkPlan {
                             rows,
                             "proj",
                         )?;
-                        let call = backend
-                            .k1_gated()
-                            .prepare_act(
-                                ctx,
-                                ow,
-                                &scratch.attn,
-                                &scratch.gate,
-                                &scratch.branch,
-                                rows as u32,
-                                &K1ActGeom {
-                                    a_stride_elems: q_width,
-                                    b_stride_elems: q_width,
-                                    b_off_elems: 0,
-                                },
-                            )
-                            .map(ProjCall::Q4K)
-                            .map_err(|e| we(e, "proj"))?;
+                        let call = prepare_gated_proj(
+                            backend,
+                            ow,
+                            &scratch.attn,
+                            &scratch.gate,
+                            &scratch.branch,
+                            rows,
+                            &K1ActGeom {
+                                a_stride_elems: q_width,
+                                b_stride_elems: q_width,
+                                b_off_elems: 0,
+                            },
+                            "proj",
+                        )?;
                         (Some(proj_gate), None, call, true)
                     } else {
                         let proj_gate = prepare_proj(
@@ -1338,42 +1471,16 @@ impl ChunkPlan {
                     b_stride_elems: 2 * ffn,
                     b_off_elems: ffn,
                 };
-                let proj_fd = match &layer.ffn_down {
-                    ProjWeights::Q4K(dw) => backend
-                        .k1_swiglu()
-                        .prepare_act(
-                            ctx,
-                            dw,
-                            &scratch.ffn_pair,
-                            &scratch.ffn_pair,
-                            &scratch.branch,
-                            rows as u32,
-                            &geom,
-                        )
-                        .map(ProjCall::Q4K)
-                        .map_err(|e| we(e, "swiglu_ffn"))?,
-                    ProjWeights::Q6K(dw) => backend
-                        .k2_swiglu()
-                        .prepare_act(
-                            ctx,
-                            dw,
-                            &scratch.ffn_pair,
-                            &scratch.ffn_pair,
-                            &scratch.branch,
-                            rows as u32,
-                            &geom,
-                        )
-                        .map(ProjCall::Q6K)
-                        .map_err(|e| we(e, "swiglu_ffn"))?,
-                    _ => {
-                        return Err(GlimmerError::StepFailed {
-                            step: "session",
-                            detail: "an ffn pair was uploaded beside a down projection \
-                                     with no fused swiglu form"
-                                .to_string(),
-                        })
-                    }
-                };
+                let proj_fd = prepare_swiglu_proj(
+                    backend,
+                    &layer.ffn_down,
+                    &scratch.ffn_pair,
+                    &scratch.ffn_pair,
+                    &scratch.branch,
+                    rows,
+                    &geom,
+                    "swiglu_ffn",
+                )?;
                 (proj_fg, None, None, proj_fd)
             } else {
                 let proj_fg = prepare_proj(

@@ -21,7 +21,9 @@
 use std::sync::Arc;
 
 use gguf::{GgufError, GgufFile, MetadataValue};
-use muse_glimmer::{Dtype, GlimmerError, Metadata, Result as GlimmerResult, TensorSource, TensorView};
+use muse_glimmer::{
+    Dtype, GlimmerError, Metadata, Result as GlimmerResult, TensorSource, TensorView,
+};
 
 use crate::diag;
 
@@ -46,10 +48,7 @@ impl<'a> GgufMetadata<'a> {
     /// is worth a diag line even though the trait answer is `None`.
     fn note_unreadable(&self, key: &str, err: &GgufError) {
         if self.file.metadata().get(key).is_some() {
-            diag::debug(
-                "metadata_unreadable",
-                &format!("key={key} reason={err}"),
-            );
+            diag::debug("metadata_unreadable", &format!("key={key} reason={err}"));
         }
     }
 }
@@ -161,6 +160,193 @@ fn map_tensor_error(name: &str, err: GgufError) -> GlimmerError {
             name: name.to_string(),
         },
         other => GlimmerError::TensorUnreadable {
+            name: name.to_string(),
+            detail: other.to_string(),
+        },
+    }
+}
+
+/// dflash's [`Metadata`](dflash::Metadata) trait over one parsed
+/// GGUF file. Same translation discipline as [`GgufMetadata`]: an
+/// unreadable-but-present key earns a diag line, never a fabricated
+/// value.
+#[derive(Debug)]
+pub struct DflashMetadata<'a> {
+    file: &'a GgufFile,
+}
+
+impl<'a> DflashMetadata<'a> {
+    /// Wrap a parsed file.
+    pub fn new(file: &'a GgufFile) -> Self {
+        Self { file }
+    }
+
+    /// The wrapped file.
+    pub fn file(&self) -> &'a GgufFile {
+        self.file
+    }
+
+    fn note_unreadable(&self, key: &str, err: &GgufError) {
+        if self.file.metadata().get(key).is_some() {
+            diag::debug("metadata_unreadable", &format!("key={key} reason={err}"));
+        }
+    }
+}
+
+impl dflash::Metadata for DflashMetadata<'_> {
+    fn get_string(&self, key: &str) -> Option<String> {
+        match self.file.metadata().get_string(key) {
+            Ok(v) => Some(v.to_string()),
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_u32(&self, key: &str) -> Option<u32> {
+        match self.file.metadata().get_u32(key) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_f32(&self, key: &str) -> Option<f32> {
+        match self.file.metadata().get_f32(key) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.file.metadata().get_bool(key) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_u32_array(&self, key: &str) -> Option<Vec<u32>> {
+        match self.file.metadata().get_u32_array(key) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        match self.file.metadata().get_array(key) {
+            Ok(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        MetadataValue::Bool(v) => out.push(*v),
+                        other => {
+                            diag::debug(
+                                "metadata_unreadable",
+                                &format!(
+                                    "key={key} reason=array element is {}, not bool",
+                                    other.type_name()
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(out)
+            }
+            Err(e) => {
+                self.note_unreadable(key, &e);
+                None
+            }
+        }
+    }
+
+    fn get_array_len(&self, key: &str) -> Option<usize> {
+        match self.file.metadata().get(key) {
+            Some(MetadataValue::Array(items)) => Some(items.len()),
+            Some(_) => {
+                diag::debug(
+                    "metadata_unreadable",
+                    &format!("key={key} reason=stored value is not an array"),
+                );
+                None
+            }
+            None => None,
+        }
+    }
+}
+
+/// dflash's [`TensorSource`](dflash::TensorSource) trait over one
+/// parsed GGUF file. Unlike the muse-glimmer adapter, which serves
+/// raw stored views, this one serves tensors dequantized to f32
+/// (the dflash module's `TensorData` contract) through the `gguf`
+/// crate's own loader, so dtype support is exactly the `gguf`
+/// crate's and anything else refuses by name.
+#[derive(Debug)]
+pub struct DflashTensorSource<'a> {
+    file: &'a GgufFile,
+}
+
+impl<'a> DflashTensorSource<'a> {
+    /// Wrap a parsed file.
+    pub fn new(file: &'a GgufFile) -> Self {
+        Self { file }
+    }
+
+    /// The wrapped file.
+    pub fn file(&self) -> &'a GgufFile {
+        self.file
+    }
+}
+
+impl dflash::TensorSource for DflashTensorSource<'_> {
+    fn tensor(&self, name: &str) -> dflash::Result<dflash::TensorData> {
+        let info = self
+            .file
+            .tensor_info(name)
+            .map_err(|e| map_dflash_tensor_error(name, e))?;
+        let data = self
+            .file
+            .load_f32(name)
+            .map_err(|e| map_dflash_tensor_error(name, e))?;
+        diag::debug(
+            "tensor_served",
+            &format!(
+                "name={name} type={} elements={}",
+                info.type_name(),
+                info.element_count()
+            ),
+        );
+        Ok(dflash::TensorData {
+            name: name.to_string(),
+            shape: info.dims().to_vec(),
+            data,
+        })
+    }
+
+    fn has_tensor(&self, name: &str) -> bool {
+        self.file.has_tensor(name)
+    }
+}
+
+/// Translate a `gguf` refusal into the dflash module's vocabulary.
+fn map_dflash_tensor_error(name: &str, err: GgufError) -> dflash::DflashError {
+    match err {
+        GgufError::MissingTensor(_) => dflash::DflashError::MissingTensor {
+            name: name.to_string(),
+        },
+        other => dflash::DflashError::TensorUnreadable {
             name: name.to_string(),
             detail: other.to_string(),
         },

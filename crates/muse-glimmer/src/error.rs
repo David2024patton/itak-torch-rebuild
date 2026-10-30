@@ -74,6 +74,18 @@ pub enum GlimmerError {
         /// words.
         detail: String,
     },
+    /// A captured-states forward was asked to capture a layer index
+    /// the model does not have. Capture is additive tooling for the
+    /// speculation stack (SPEC-itak-spec Q1: a draft model consumes
+    /// target layer inputs at named layers); an out-of-range request
+    /// is refused by name before any compute runs, never clamped to
+    /// the nearest real layer.
+    CaptureLayerOutOfRange {
+        /// The layer index that was requested.
+        layer: usize,
+        /// The model's layer count, so the valid range is visible.
+        block_count: u32,
+    },
     /// `forward` was called with zero tokens.
     EmptyInput,
     /// A token id is outside the model's vocabulary.
@@ -117,6 +129,12 @@ impl fmt::Display for GlimmerError {
             }
             GlimmerError::StepFailed { step, detail } => {
                 write!(f, "forward step {step} failed: {detail}")
+            }
+            GlimmerError::CaptureLayerOutOfRange { layer, block_count } => {
+                write!(
+                    f,
+                    "capture requested layer {layer} but the model has {block_count} layers"
+                )
             }
             GlimmerError::EmptyInput => {
                 write!(f, "forward called with zero tokens")

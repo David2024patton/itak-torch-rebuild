@@ -87,7 +87,27 @@ impl CoverageReport {
 /// Run the inventory check of `file` against the expectation derived
 /// from `cfg`.
 pub fn coverage(file: &GgufFile, cfg: &GlimmerConfig) -> CoverageReport {
-    let expected = expected_tensor_names(cfg);
+    coverage_for(file, expected_tensor_names(cfg))
+}
+
+/// Run the inventory check of `file` against the dflash module's
+/// expectation derived from `cfg`. The module's optional tensors
+/// (its own embedding table and head, the per-layer post norms) join
+/// the expectation when the file carries them, so `unexpected`
+/// keeps its meaning: names nobody accounted for, which for this
+/// arch includes the variant gates the load refuses by name.
+pub fn coverage_dflash(file: &GgufFile, cfg: &dflash::DflashConfig) -> CoverageReport {
+    let mut expected = dflash::expected_tensor_names(cfg);
+    for name in dflash::optional_tensor_names(cfg) {
+        if file.has_tensor(&name) {
+            expected.push(name);
+        }
+    }
+    coverage_for(file, expected)
+}
+
+/// The shared inventory check over an explicit expectation list.
+fn coverage_for(file: &GgufFile, expected: Vec<String>) -> CoverageReport {
     let mut present = Vec::new();
     let mut missing = Vec::new();
     for name in &expected {

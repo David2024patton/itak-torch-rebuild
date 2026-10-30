@@ -19,6 +19,7 @@ members = [
     "crates/itak-engine",
     "crates/itak-loader",
     "crates/muse-glimmer",
+    "crates/dflash",
     "crates/tokenizer",
     "crates/torch-math",
     "crates/wgpu-compute",

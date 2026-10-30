@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "The loader bridge of the iTaK Torch Rust engine (ARCHITECTURE.md module grid): implements the muse-glimmer architecture module's Metadata and TensorSource traits over the gguf crate, and verifies a file's tensor inventory against the arch module's expected tensor names, failing by name on any miss"
 
 [dependencies]
+dflash = { path = "../dflash" }
 gguf = { path = "../gguf" }
 muse-glimmer = { path = "../muse-glimmer" }
 

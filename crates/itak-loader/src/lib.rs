@@ -46,10 +46,11 @@ pub mod coverage;
 pub mod diag;
 pub mod error;
 
-pub use adapter::{GgufMetadata, GgufTensorSource};
-pub use coverage::{coverage, CoverageReport};
+pub use adapter::{DflashMetadata, DflashTensorSource, GgufMetadata, GgufTensorSource};
+pub use coverage::{coverage, coverage_dflash, CoverageReport};
 pub use error::{LoaderError, Result};
 
+use dflash::DflashConfig;
 use gguf::GgufFile;
 use muse_glimmer::{GlimmerConfig, Weights};
 
@@ -91,6 +92,55 @@ pub fn load_weights(file: &GgufFile, cfg: &GlimmerConfig) -> Result<Weights> {
     diag::debug(
         "weights_loaded",
         &format!("layers={}", weights.layers.len()),
+    );
+    Ok(weights)
+}
+
+/// Parse the DFlash draft config from a parsed GGUF file's metadata
+/// (SPEC-itak-spec E3).
+///
+/// # Errors
+/// The dflash module's own errors, unwrapped: a missing key is
+/// [`DflashError::MissingMetadata`](dflash::DflashError) naming the
+/// key, a wrong `general.architecture` is a refusal naming what the
+/// file declares.
+pub fn load_dflash_config(file: &GgufFile) -> dflash::Result<DflashConfig> {
+    let cfg = DflashConfig::from_metadata(&DflashMetadata::new(file))?;
+    diag::debug(
+        "dflash_config_loaded",
+        &format!(
+            "arch={} layers={} hidden={} vocab={} block_size={} target_layers={:?}",
+            dflash::ARCHITECTURE,
+            cfg.block_count,
+            cfg.hidden,
+            cfg.vocab_size,
+            cfg.block_size,
+            cfg.target_layers
+        ),
+    );
+    Ok(cfg)
+}
+
+/// Load the full DFlash weight set from a parsed GGUF file, gated
+/// on the inventory check exactly as [`load_weights`] gates the
+/// target's: coverage runs first and fails by name on any miss.
+///
+/// # Errors
+/// [`LoaderError::MissingTensors`] when the inventory is incomplete;
+/// the dflash module's errors (as [`LoaderError::Dflash`]) when a
+/// present tensor cannot be delivered as stored, or when the file
+/// carries a variant this module refuses.
+pub fn load_dflash_weights(file: &GgufFile, cfg: &DflashConfig) -> Result<dflash::Weights> {
+    coverage_dflash(file, cfg).require_complete()?;
+    let weights = dflash::Weights::load(&DflashTensorSource::new(file), cfg)?;
+    diag::debug(
+        "dflash_weights_loaded",
+        &format!(
+            "layers={} target_hidden={} conditioning_width={}",
+            weights.layers.len(),
+            weights.target_hidden,
+            weights.conditioning_width()
+        ),
     );
     Ok(weights)
 }

@@ -26,6 +26,9 @@ pub enum LoaderError {
     /// it could not take). Passed through unwrapped in kind so callers
     /// can match on the arch module's own error variants.
     Glimmer(GlimmerError),
+    /// The dflash module refused something. Same pass-through rule
+    /// as [`LoaderError::Glimmer`].
+    Dflash(dflash::DflashError),
     /// The GGUF loader refused something (parse or read failure).
     Gguf(GgufError),
 }
@@ -40,6 +43,7 @@ impl fmt::Display for LoaderError {
                 names.join(", ")
             ),
             LoaderError::Glimmer(e) => write!(f, "{e}"),
+            LoaderError::Dflash(e) => write!(f, "{e}"),
             LoaderError::Gguf(e) => write!(f, "{e}"),
         }
     }
@@ -50,6 +54,7 @@ impl std::error::Error for LoaderError {
         match self {
             LoaderError::MissingTensors(_) => None,
             LoaderError::Glimmer(e) => Some(e),
+            LoaderError::Dflash(e) => Some(e),
             LoaderError::Gguf(e) => Some(e),
         }
     }
@@ -58,6 +63,12 @@ impl std::error::Error for LoaderError {
 impl From<GlimmerError> for LoaderError {
     fn from(e: GlimmerError) -> Self {
         Self::Glimmer(e)
+    }
+}
+
+impl From<dflash::DflashError> for LoaderError {
+    fn from(e: dflash::DflashError) -> Self {
+        Self::Dflash(e)
     }
 }
 

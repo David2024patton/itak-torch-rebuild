@@ -461,10 +461,7 @@ fn attention_mixing_matches_a_naive_reference() {
     let stream: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
     let h: Vec<Vec<f64>> = stream.iter().map(|x| rms64(x, eps)).collect();
 
-    for (kind, rotate) in [
-        (LayerKind::Global, false),
-        (LayerKind::SlidingWindow, true),
-    ] {
+    for (kind, rotate) in [(LayerKind::Global, false), (LayerKind::SlidingWindow, true)] {
         let cfg = test_config(vec![kind], 16);
         let model = make_model(&cfg, Style::Attention);
         let mut cache = PositionCache::new();
@@ -487,9 +484,8 @@ fn attention_mixing_matches_a_naive_reference() {
                 k
             }
         };
-        let v_of = |p: usize, kv: usize| -> Vec<f64> {
-            h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec()
-        };
+        let v_of =
+            |p: usize, kv: usize| -> Vec<f64> { h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec() };
 
         // Attention for the last position (p = 1) only; its output
         // is what the returned logits are computed from.
@@ -526,11 +522,7 @@ fn attention_mixing_matches_a_naive_reference() {
         // then the residual add against the embedding-normed stream.
         // The FFN branch is zero, so the stream passes it unchanged.
         let post = rms64(&gated, post_eps);
-        let after: Vec<f64> = stream[p]
-            .iter()
-            .zip(&post)
-            .map(|(x, g)| x + g)
-            .collect();
+        let after: Vec<f64> = stream[p].iter().zip(&post).map(|(x, g)| x + g).collect();
         let n = rms64(&after, eps); // final norm
         for (j, got) in logits.iter().enumerate() {
             let z = n[j % HIDDEN];
@@ -942,7 +934,10 @@ mod block_and_spec {
             .forward(&seq, &mut whole_cache)
             .expect("one-shot forward runs");
         let d = max_diff(&block[(seq.len() - 1) * vocab..], &last);
-        assert!(d <= 1e-6, "forward disagrees with forward_block's last row by {d}");
+        assert!(
+            d <= 1e-6,
+            "forward disagrees with forward_block's last row by {d}"
+        );
     }
 
     #[test]
@@ -1184,4 +1179,80 @@ mod block_and_spec {
             other => panic!("expected StepFailed, got {other:?}"),
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// Captured layer inputs (E3): the additive capture the DFlash draft's
+// conditioning consumes. Proven three ways: the capturing pass returns
+// bit-identical logits to the plain pass on the same weights; the
+// layer-0 capture equals the closed-form weightless RMSNorm of the
+// embedding rows; and the block capturing variant captures the same
+// rows as the single forward variant.
+// ---------------------------------------------------------------------
+
+#[test]
+fn capturing_forward_is_additive_and_captures_true_layer_inputs() {
+    let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 16);
+    let tokens = [5u32, 9, 3];
+
+    // Plain forward on one freshly built model.
+    let plain = make_model(&cfg, Style::Random);
+    let mut cache = PositionCache::new();
+    let plain_logits = plain.forward(&tokens, &mut cache).expect("plain forward");
+    assert_eq!(cache.position(), 3);
+
+    // Capturing forward on an identically built model.
+    let source = build_source(&cfg, Style::Random);
+    let weights = Weights::load(&source, &cfg).expect("weights load");
+    let emb_view = source
+        .tensors
+        .get("token_embd.weight")
+        .expect("embedding tensor")
+        .clone();
+    let model = GlimmerModel::new(cfg.clone(), weights, Box::new(CpuCompute::new()));
+    let mut cache = PositionCache::new();
+    let (logits, captures) = model
+        .forward_capturing(&tokens, &mut cache, &[0, 1])
+        .expect("capturing forward");
+    assert_eq!(logits, plain_logits, "capture must not change the logits");
+    assert_eq!(cache.position(), 3);
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0].layer, 0);
+    assert_eq!(captures[1].layer, 1);
+
+    // Layer 0's input is the embedding output after the weightless
+    // RMSNorm: closed form, from the embedding bytes themselves.
+    let emb_row = |token: u32| -> Vec<f64> {
+        let start = token as usize * HIDDEN * 4;
+        emb_view.data[start..start + HIDDEN * 4]
+            .chunks_exact(4)
+            .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+            .collect()
+    };
+    for (r, &token) in tokens.iter().enumerate() {
+        let expected = rms64(&emb_row(token), 1e-6);
+        let actual = &captures[0].rows[r * HIDDEN..(r + 1) * HIDDEN];
+        for (a, e) in actual.iter().zip(expected.iter()) {
+            assert!(
+                (f64::from(*a) - e).abs() < 1e-5,
+                "layer 0 capture row {r}: got {a}, expected {e}"
+            );
+        }
+    }
+    // Layer 1's input is layer 0's output: a different tensor than
+    // layer 0's input (the random weights guarantee the layer moved
+    // the residual), with the same shape.
+    assert_eq!(captures[1].rows.len(), 3 * HIDDEN);
+    assert_ne!(captures[1].rows, captures[0].rows);
+
+    // The block variant captures the same rows and its last-row
+    // logits equal the single forward's.
+    let block_model = make_model(&cfg, Style::Random);
+    let mut cache = PositionCache::new();
+    let (block_logits, block_captures) = block_model
+        .forward_block_capturing(&tokens, &mut cache, &[1, 0])
+        .expect("block capturing forward");
+    assert_eq!(block_captures, captures);
+    let last = &block_logits[(tokens.len() - 1) * VOCAB..tokens.len() * VOCAB];
+    assert_eq!(last, plain_logits.as_slice());
 }

@@ -48,6 +48,27 @@ use crate::weights::Weights;
 /// (src/models/muse-glimmer.cpp: `post_norm_eps`).
 pub(crate) const POST_NORM_EPS: f32 = 1e-8;
 
+/// The residual stream entering one layer during a forward pass,
+/// captured by the captured-states forward variants
+/// ([`GlimmerModel::forward_capturing`] and
+/// [`GlimmerModel::forward_block_capturing`]).
+///
+/// `rows` is row-major `[tokens][hidden]`: the exact values the
+/// layer's pre-attention norm read during this pass, which for
+/// layer 0 is the embedding output after its weightless RMSNorm and
+/// for every later layer is the previous layer's output. This is
+/// the tensor llama.cpp's target graph exposes as `t_layer_inp`
+/// (src/models/muse-glimmer.cpp) and the conditioning input the
+/// DFlash draft consumes at the layers its own metadata names
+/// (SPEC-itak-spec Q1, settled 2026-10-30).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerInputCapture {
+    /// The layer whose input this is.
+    pub layer: usize,
+    /// Row-major `[tokens][hidden]` residual rows entering `layer`.
+    pub rows: Vec<f32>,
+}
+
 /// A Muse Glimmer model ready (structurally) to run.
 pub struct GlimmerModel {
     config: GlimmerConfig,
@@ -125,16 +146,8 @@ impl GlimmerModel {
             ),
         );
 
-        let x = self.forward_rows(tokens, cache)?;
-
-        let cfg = &self.config;
-        let rows = tokens.len();
-        let c = &*self.compute;
-        let hidden = cfg.hidden as usize;
-        let last = &x[(rows - 1) * hidden..rows * hidden];
-        let normed = c.rms_norm(last, &self.weights.final_norm, 1, cfg.rms_eps)?;
-        let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
-        softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
+        let (x, _) = self.forward_rows(tokens, cache, &[])?;
+        let logits = self.finish_last(&x, tokens.len())?;
 
         cache.advance(tokens.len());
         self.diag.event(
@@ -142,6 +155,54 @@ impl GlimmerModel {
             &format!("logits={} position={}", logits.len(), cache.position()),
         );
         Ok(logits)
+    }
+
+    /// [`GlimmerModel::forward`] plus captured layer inputs: runs the
+    /// identical pass and additionally returns, for each layer index
+    /// in `capture_layers`, the residual rows that entered that
+    /// layer ([`LayerInputCapture`], in ascending layer order).
+    ///
+    /// Capture is additive by construction: the layer loop's math,
+    /// step order, and cache contract are `forward`'s, and the only
+    /// extra work is cloning the residual at the named layers. The
+    /// speculation stack's DFlash proposer consumes these rows
+    /// (SPEC-itak-spec Q1); nothing in the verified forward path
+    /// depends on them.
+    ///
+    /// A capture index at or past the layer count is refused with
+    /// [`GlimmerError::CaptureLayerOutOfRange`] before any compute
+    /// runs, and (like every refusal) leaves the cache untouched.
+    pub fn forward_capturing(
+        &self,
+        tokens: &[u32],
+        cache: &mut dyn Cache,
+        capture_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<LayerInputCapture>)> {
+        self.validate_tokens(tokens)?;
+        self.validate_capture(capture_layers)?;
+        self.diag.event(
+            "forward_capturing.begin",
+            &format!(
+                "tokens={} position={} capture={capture_layers:?}",
+                tokens.len(),
+                cache.position()
+            ),
+        );
+
+        let (x, captures) = self.forward_rows(tokens, cache, capture_layers)?;
+        let logits = self.finish_last(&x, tokens.len())?;
+
+        cache.advance(tokens.len());
+        self.diag.event(
+            "forward_capturing.end",
+            &format!(
+                "logits={} captured={} position={}",
+                logits.len(),
+                captures.len(),
+                cache.position()
+            ),
+        );
+        Ok((logits, captures))
     }
 
     /// Block forward with per-position logits (SPEC-itak-spec
@@ -172,10 +233,94 @@ impl GlimmerModel {
             ),
         );
 
-        let x = self.forward_rows(tokens, cache)?;
+        let (x, _) = self.forward_rows(tokens, cache, &[])?;
+        let out = self.finish_block(&x, tokens.len())?;
 
+        cache.advance(tokens.len());
+        self.diag.event(
+            "forward_block.end",
+            &format!(
+                "rows={} logits={} position={}",
+                tokens.len(),
+                out.len(),
+                cache.position()
+            ),
+        );
+        Ok(out)
+    }
+
+    /// [`GlimmerModel::forward_block`] plus captured layer inputs:
+    /// the block variant of [`GlimmerModel::forward_capturing`], for
+    /// a verify round that also feeds a DFlash proposer. Same
+    /// additive-capture contract and same refusal rules.
+    pub fn forward_block_capturing(
+        &self,
+        tokens: &[u32],
+        cache: &mut dyn Cache,
+        capture_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<LayerInputCapture>)> {
+        self.validate_tokens(tokens)?;
+        self.validate_capture(capture_layers)?;
+        self.diag.event(
+            "forward_block_capturing.begin",
+            &format!(
+                "tokens={} position={} capture={capture_layers:?}",
+                tokens.len(),
+                cache.position()
+            ),
+        );
+
+        let (x, captures) = self.forward_rows(tokens, cache, capture_layers)?;
+        let out = self.finish_block(&x, tokens.len())?;
+
+        cache.advance(tokens.len());
+        self.diag.event(
+            "forward_block_capturing.end",
+            &format!(
+                "rows={} logits={} captured={} position={}",
+                tokens.len(),
+                out.len(),
+                captures.len(),
+                cache.position()
+            ),
+        );
+        Ok((out, captures))
+    }
+
+    /// Every capture index must name a real layer. Checked before
+    /// any compute runs so a bad request cannot consume cache
+    /// positions or backend state.
+    fn validate_capture(&self, capture_layers: &[usize]) -> Result<()> {
+        for &layer in capture_layers {
+            if layer >= self.config.block_count as usize {
+                return Err(GlimmerError::CaptureLayerOutOfRange {
+                    layer,
+                    block_count: self.config.block_count,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The head application `forward` performs: final norm and
+    /// lm_head over the LAST row of the final hidden states, then
+    /// the file's softcap and scale.
+    fn finish_last(&self, x: &[f32], rows: usize) -> Result<Vec<f32>> {
         let cfg = &self.config;
-        let rows = tokens.len();
+        let c = &*self.compute;
+        let hidden = cfg.hidden as usize;
+        let last = &x[(rows - 1) * hidden..rows * hidden];
+        let normed = c.rms_norm(last, &self.weights.final_norm, 1, cfg.rms_eps)?;
+        let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
+        softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
+        Ok(logits)
+    }
+
+    /// The head application `forward_block` performs: final norm,
+    /// lm_head, softcap and scale for EVERY row, row-major
+    /// `[rows][vocab]`.
+    fn finish_block(&self, x: &[f32], rows: usize) -> Result<Vec<f32>> {
+        let cfg = &self.config;
         let c = &*self.compute;
         let hidden = cfg.hidden as usize;
         let vocab = cfg.vocab_size as usize;
@@ -187,32 +332,33 @@ impl GlimmerModel {
             softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
             out.extend_from_slice(&logits);
         }
-
-        cache.advance(tokens.len());
-        self.diag.event(
-            "forward_block.end",
-            &format!(
-                "rows={} logits={} position={}",
-                rows,
-                out.len(),
-                cache.position()
-            ),
-        );
         Ok(out)
     }
 
-    /// The shared body of both forward entry points: embedding,
+    /// The shared body of all forward entry points: embedding,
     /// the weightless embedding norm, and the per-layer loop,
-    /// returning the final hidden states `[tokens.len(), hidden]`.
+    /// returning the final hidden states `[tokens.len(), hidden]`
+    /// plus any requested layer-input captures.
     /// Reads and appends KV through `cache` (via the compute
     /// backend's attention step) but does not advance the position
     /// contract: the entry points advance it once their head
     /// application has succeeded, so a refused pass leaves the cache
     /// untouched.
-    fn forward_rows(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
+    ///
+    /// Capture is a clone of the residual at the top of the named
+    /// layers' iterations, taken before that layer's pre-attention
+    /// norm reads it. It performs no compute calls, so a capturing
+    /// pass makes exactly the step sequence a plain pass makes.
+    fn forward_rows(
+        &self,
+        tokens: &[u32],
+        cache: &mut dyn Cache,
+        capture_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<LayerInputCapture>)> {
         let cfg = &self.config;
         let rows = tokens.len();
         let c = &*self.compute;
+        let mut captures: Vec<LayerInputCapture> = Vec::new();
 
         let mut x = c.embed(&self.weights.embedding, tokens, cfg)?;
         // The reference graph normalizes the embedding output with a
@@ -226,6 +372,12 @@ impl GlimmerModel {
             .zip(self.weights.layers.iter())
             .enumerate()
         {
+            if capture_layers.contains(&index) {
+                captures.push(LayerInputCapture {
+                    layer: index,
+                    rows: x.clone(),
+                });
+            }
             let residual = x;
 
             let h = c.rms_norm(&residual, &w.attn_norm, rows, cfg.rms_eps)?;
@@ -266,7 +418,7 @@ impl GlimmerModel {
             x = c.add(&residual, &ffn)?;
         }
 
-        Ok(x)
+        Ok((x, captures))
     }
 }
 
@@ -470,7 +622,7 @@ mod tests {
             "rms_norm", // q norm
             "rms_norm", // k norm
             "attention",
-            "proj",     // gate
+            "proj", // gate
             "attn_gate",
             "proj",     // output
             "rms_norm", // post-attention norm (branch, before the add)
@@ -565,6 +717,83 @@ mod tests {
             .forward_block(&[1, 2, 3], &mut cache)
             .expect_err("skeleton compute must refuse");
         assert!(matches!(err, GlimmerError::Unimplemented { step: "embed" }));
+        assert_eq!(cache.position(), 0);
+    }
+
+    #[test]
+    fn capturing_forward_makes_the_identical_step_sequence() {
+        // Plain forward on one recording stub...
+        let plain_calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (model, _cfg) = tiny_model(Box::new(RecordingCompute {
+            calls: plain_calls.clone(),
+        }));
+        let mut cache = PositionCache::new();
+        let plain_logits = model.forward(&[1, 2], &mut cache).expect("plain forward");
+        assert_eq!(cache.position(), 2);
+
+        // ...and the capturing variant on a second one. Capture may
+        // clone residuals; it may not add, drop, or reorder a single
+        // compute step, and its logits and cache advance must match.
+        let cap_calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (model, cfg) = tiny_model(Box::new(RecordingCompute {
+            calls: cap_calls.clone(),
+        }));
+        let mut cache = PositionCache::new();
+        let (logits, captures) = model
+            .forward_capturing(&[1, 2], &mut cache, &[1, 0])
+            .expect("capturing forward");
+        assert_eq!(logits, plain_logits);
+        assert_eq!(cache.position(), 2);
+        assert_eq!(
+            cap_calls.borrow().as_slice(),
+            plain_calls.borrow().as_slice()
+        );
+        // Captures come back in ascending layer order regardless of
+        // request order, one per requested layer, each holding the
+        // full [tokens][hidden] residual block.
+        assert_eq!(captures.len(), 2);
+        assert_eq!(captures[0].layer, 0);
+        assert_eq!(captures[1].layer, 1);
+        for cap in &captures {
+            assert_eq!(cap.rows.len(), 2 * cfg.hidden as usize);
+        }
+    }
+
+    #[test]
+    fn capturing_block_forward_captures_and_heads_every_row() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (model, _cfg) = tiny_model(Box::new(RecordingCompute {
+            calls: calls.clone(),
+        }));
+        let mut cache = PositionCache::new();
+        let (logits, captures) = model
+            .forward_block_capturing(&[1, 2], &mut cache, &[0])
+            .expect("capturing block forward");
+        assert_eq!(logits.len(), 2 * 128);
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].layer, 0);
+        assert_eq!(cache.position(), 2);
+    }
+
+    #[test]
+    fn capture_out_of_range_refuses_before_any_compute() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (model, _cfg) = tiny_model(Box::new(RecordingCompute {
+            calls: calls.clone(),
+        }));
+        let mut cache = PositionCache::new();
+        // The tiny model has 2 layers; layer 2 does not exist.
+        let err = model
+            .forward_capturing(&[1], &mut cache, &[2])
+            .expect_err("layer 2 of 2 must refuse");
+        assert!(matches!(
+            err,
+            GlimmerError::CaptureLayerOutOfRange {
+                layer: 2,
+                block_count: 2
+            }
+        ));
+        assert!(calls.borrow().is_empty(), "no compute step may run");
         assert_eq!(cache.position(), 0);
     }
 

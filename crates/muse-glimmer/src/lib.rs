@@ -20,7 +20,12 @@
 //!   through the [`TensorSource`] seam.
 //! - The structured forward in [`GlimmerModel::forward`]: validated
 //!   input, the complete per-layer loop, final norm, untied head, and
-//!   the real softcap-and-scale finishing math.
+//!   the real softcap-and-scale finishing math. The capturing
+//!   variants ([`GlimmerModel::forward_capturing`],
+//!   [`GlimmerModel::forward_block_capturing`]) additionally return
+//!   the residual rows entering named layers, the conditioning
+//!   input the DFlash draft consumes (SPEC-itak-spec Q1); capture
+//!   is additive and changes no step of the verified pass.
 //! - Fail-loud errors everywhere: a missing key, a missing tensor, or
 //!   an unimplemented step is a named [`GlimmerError`], never a
 //!   substituted value. That is the audit's central lesson, applied.
@@ -60,5 +65,5 @@ pub use diag::{Diag, NullDiag, StderrDiag};
 pub use error::{GlimmerError, Result};
 pub use layer::{LayerKind, PatternSource};
 pub use metadata::{MapMetadata, Metadata};
-pub use model::{softcap_scale, GlimmerModel};
+pub use model::{softcap_scale, GlimmerModel, LayerInputCapture};
 pub use weights::{expected_tensor_names, Dtype, LayerWeights, TensorSource, TensorView, Weights};

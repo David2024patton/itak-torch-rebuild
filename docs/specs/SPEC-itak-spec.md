@@ -49,10 +49,11 @@ Assumed, flagged wherever used below:
   llama.cpp internals; the 88.6 is a performance anchor, not a design
   input.
 - Whether the `dflash` arch consumes target hidden states as a
-  conditioning input is NOT settled by our dissection (the census gives
-  shapes, not wiring). See open question Q1; the trait design in
-  Section 6 carries an optional conditioning handle so the answer does
-  not change the trait when it lands.
+  conditioning input was settled 2026-10-30: it consumes target
+  layer-input hidden states at the layers its own metadata names,
+  plus a token noise block (Section 10, Q1, with source citations).
+  The trait design in Section 6 already carries the conditioning
+  handle, so the answer did not change the trait.
 
 ## 2. The interfaces this design is built against (code that exists)
 
@@ -156,6 +157,22 @@ with its config read from its own file's metadata under the same
 no-silent-default rule as `GlimmerConfig`. itak-spec defines the
 contract it needs from that module (Section 6.2, the `Speculator`
 implementation for DFlash); the module itself is a Phase 9 item.
+LANDED 2026-10-30: the `dflash` crate (crates/dflash) with
+`DflashConfig` from the file's `dflash.*` metadata, the 58-tensor
+inventory loaded through `itak-loader` (`load_dflash_config`,
+`coverage_dflash`, `load_dflash_weights`) behind the full coverage
+gate, `DflashModel::inject` (conditioning fusion into the draft's
+own KV cache) and `DflashModel::forward_block` (per-position draft
+logits for a noise block, target embedding and head borrowed). Q1
+and Q2 are settled in Section 10 from the file census and the
+llama.cpp source. The target side exposes the conditioning rows
+through the additive `GlimmerModel::forward_capturing` /
+`forward_block_capturing` variants (crates/muse-glimmer), proven
+not to change the verified forward's steps or logits. Arithmetic
+proofs: closed-form and naive-reference tests in the dflash crate,
+chunked/overwrite injection consistency, and a real-file run on
+the server (coverage 58/58, one block forward, finite logits,
+recorded in bench/dflash-e3-2026-10-30.md).
 
 ## 4. The DFlash verify round
 
@@ -669,16 +686,64 @@ lands (that run is T-9.7, and its output is the config default).
 
 ## 10. Open questions (explicit, with owners of the answer)
 
-- Q1. DFlash conditioning. Does the `dflash` arch consume target
-  hidden states, token ids only, or both? Our census gives shapes,
-  not wiring. Settled by: the draft file's full tensor census plus
-  the llama.cpp draft-dflash source, read before the E3 arch module
-  is written. The `ProposeContext.target_hidden` handle exists so
-  either answer fits the trait.
-- Q2. DFlash cache geometry. The draft's own layer pattern, window,
-  and KV geometry under its `dflash.*` metadata keys are unmeasured.
-  Settled by: reading the draft file's metadata through the loader
-  when E3 lands, under the same no-silent-default rule as the target.
+- Q1. DFlash conditioning. SETTLED 2026-10-30 (E3 research pass: the
+  draft file's full census read with this repo's `gguf` crate, plus
+  llama.cpp source on the server: `src/models/dflash.cpp`,
+  `common/speculative.cpp` `common_speculative_impl_draft_dflash`,
+  `src/models/muse-glimmer.cpp`, `src/llama-model.cpp`). The draft
+  consumes BOTH, through two distinct inputs:
+  - Conditioning features are TARGET LAYER-INPUT hidden states. The
+    draft file's `dflash.target_layers` metadata names the target
+    layers `[2, 14, 26, 38, 50]`; for every committed target
+    position, the target graph exposes the residual stream ENTERING
+    each named layer (`res->t_layer_inp[il] = inpL` in
+    muse-glimmer.cpp: the pre-attention-norm residual; layer 0's is
+    the embedding output after its weightless RMSNorm). The driver
+    concatenates the named layers' rows per position, in
+    `target_layers` order (width `5 * 6656 = 33280`, matching
+    `fc.weight`'s stored input width), and submits them to the draft
+    as an embedding batch at the target positions. The draft fuses
+    them (`fc` projection, then RMSNorm with
+    `enc.output_norm.weight`) and, per draft layer, projects the
+    fused rows to K and V (per-head K RMSNorm, RoPE on K) and writes
+    them into the DRAFT'S OWN KV cache at those positions. Q is not
+    computed and the FFN does not run in this injection pass.
+  - Drafting consumes token ids: one noise block per round whose
+    position 0 is the anchor (the last committed token,
+    `id_last`), positions 1.. are the file's
+    `tokenizer.ggml.mask_token_id` (201818), at consecutive
+    positions starting at the committed length. Token embeddings
+    and the output head are the TARGET model's `token_embd.weight`
+    and `output.weight`, borrowed because this draft file carries
+    neither. Draft-layer attention over the block is NON-CAUSAL
+    (the file carries no `dflash.attention.causal` key, so the
+    llama.cpp default applies); committed history is visible
+    through the injected KV. The block forward returns per-position
+    logits for the whole block; position 0 is the anchor and is not
+    itself a draft, so ordinary DFlash yields at most
+    `block_size - 1 = 15` drafts per block. DFlash applies no logit
+    scale or softcap of its own in this path. RoPE pairing is NEOX
+    (half-split) for this file: `llama_model_rope_type` maps
+    `LLM_ARCH_DFLASH` to NEOX unless rope sections (M-RoPE) or
+    DeepSeek-V4 metadata are present, and this file has neither.
+    This file is plain DFlash: no DFlash2 selector tensors or
+    metadata, no DSpark Markov/conv tensors, no `d2t` tensor.
+  Consequences for the trait: `ProposeContext.target_hidden` is not
+  optional for this proposer; it carries the captured layer-input
+  rows for the layers the DRAFT file names (read from the draft's
+  own metadata, never hardcoded in the spec layer), and the target
+  side exposes them through the captured-states forward variant
+  landed with E3 (additive; the verified forward is unchanged).
+- Q2. DFlash cache geometry. SETTLED 2026-10-30 with Q1, from the
+  draft file's own metadata: 5 layers, all sliding-window
+  (`dflash.attention.sliding_window_pattern` = [true x 5]) with the
+  shared window 2048 (`dflash.attention.sliding_window`); 8 KV
+  heads, key and value length 128 each; one shared RoPE base
+  500000 for the whole draft (llama.cpp: "DFlash has a single rope,
+  so the SWA rope == main rope"). The draft KV is the draft
+  context's own cache, filled by the injection pass at target
+  positions and read by the drafting pass; it is not the target's
+  cache and is not checkpointed by the target-side E2 machinery.
 - Q3. Where E1 lives in the phase order. T-2.4 scopes the forward as
   incremental single-token steps; per-position block logits were an
   addition nobody's TODO item owned. Settled: adopted as T-2.10 in

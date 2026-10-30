@@ -3,8 +3,10 @@
 //! Owns one loaded model and serves the platform's socket protocol
 //! (see protocol.rs, the one definition of the wire format): hello,
 //! ping, debug, and generate with streamed token events. The model
-//! runs on a dedicated worker thread because the CPU compute backend
-//! serves one sequence at a time; generations queue.
+//! runs on a configured number of worker threads (slots) because the
+//! CPU compute backend serves one sequence per instance; jobs queue
+//! in a bounded channel and submissions past its capacity are
+//! refused with the `engine_busy` code (TODO T-9.14).
 //!
 //! Configuration is flags, each with an environment fallback, and
 //! nothing is compiled in:
@@ -16,6 +18,11 @@
 //!   requests must address; default is the file's own metadata name.
 //! - `--default-max-tokens N` / `ITAK_ENGINE_DEFAULT_MAX_TOKENS`:
 //!   generation cap when a request omits max_tokens (default 128).
+//! - `--slots N` / `ITAK_ENGINE_SLOTS`: concurrent generations
+//!   (default 1).
+//! - `--max-queued N` / `ITAK_ENGINE_MAX_QUEUED`: generations that
+//!   may wait for a slot before submissions refuse as engine_busy
+//!   (default 8).
 //!
 //! A model that fails to load (including the tensor coverage gate)
 //! exits the process non-zero with the named error: a partial model
@@ -30,7 +37,7 @@ mod streamer;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -87,12 +94,22 @@ fn run() -> i32 {
     ));
 
     let stats = Arc::new(Mutex::new(Stats::default()));
-    let (job_tx, job_rx) = channel::<Job>();
+    // The queue capacity is the concurrency contract (TODO T-9.14):
+    // `slots` jobs run at once, up to `max_queued` more wait, and a
+    // submission past that is refused with the engine_busy code.
+    let capacity = config.slots + config.max_queued;
+    let (job_tx, job_rx) = sync_channel::<Job>(capacity);
+    let job_rx = Arc::new(Mutex::new(job_rx));
     let default_max_tokens = config.default_max_tokens;
-    let worker_stats = Arc::clone(&stats);
-    std::thread::spawn(move || {
-        engine::run_worker(loaded, worker_stats, default_max_tokens, job_rx);
-    });
+    for slot in 0..config.slots {
+        let worker_stats = Arc::clone(&stats);
+        let worker_jobs = Arc::clone(&job_rx);
+        let worker_loaded = loaded.clone();
+        std::thread::spawn(move || {
+            engine::run_worker(worker_loaded, worker_stats, default_max_tokens, worker_jobs);
+        });
+        let _ = slot;
+    }
 
     if socket_path.exists() {
         log_line(&format!(
@@ -117,6 +134,10 @@ fn run() -> i32 {
         protocol::PROTO_VERSION
     ));
 
+    log_line(&format!(
+        "concurrency: slots={} max_queued={} (submissions past capacity refuse as engine_busy)",
+        config.slots, config.max_queued
+    ));
     let started = Instant::now();
     for conn in listener.incoming() {
         match conn {
@@ -124,7 +145,11 @@ fn run() -> i32 {
                 let tx = job_tx.clone();
                 let info = Arc::clone(&info);
                 let stats = Arc::clone(&stats);
-                std::thread::spawn(move || handle_conn(stream, tx, info, stats, started));
+                let limits = Limits {
+                    slots: config.slots,
+                    max_queued: config.max_queued,
+                };
+                std::thread::spawn(move || handle_conn(stream, tx, info, stats, started, limits));
             }
             Err(e) => log_line(&format!("accept failed: {e}")),
         }
@@ -132,11 +157,21 @@ fn run() -> i32 {
     0
 }
 
+/// The engine's concurrency contract, carried to connection threads
+/// so refusals can name the state that refused.
+#[derive(Clone, Copy)]
+struct Limits {
+    slots: usize,
+    max_queued: usize,
+}
+
 struct CliConfig {
     model_path: PathBuf,
     socket_path: PathBuf,
     model_name: Option<String>,
     default_max_tokens: usize,
+    slots: usize,
+    max_queued: usize,
 }
 
 fn parse_args() -> Result<CliConfig, i32> {
@@ -144,6 +179,8 @@ fn parse_args() -> Result<CliConfig, i32> {
     let mut socket: Option<String> = std::env::var("ITAK_ENGINE_SOCKET").ok();
     let mut name: Option<String> = std::env::var("ITAK_ENGINE_MODEL_NAME").ok();
     let mut default_max: Option<String> = std::env::var("ITAK_ENGINE_DEFAULT_MAX_TOKENS").ok();
+    let mut slots: Option<String> = std::env::var("ITAK_ENGINE_SLOTS").ok();
+    let mut max_queued: Option<String> = std::env::var("ITAK_ENGINE_MAX_QUEUED").ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -152,9 +189,11 @@ fn parse_args() -> Result<CliConfig, i32> {
             "--socket" => (&mut socket, "--socket"),
             "--model-name" => (&mut name, "--model-name"),
             "--default-max-tokens" => (&mut default_max, "--default-max-tokens"),
+            "--slots" => (&mut slots, "--slots"),
+            "--max-queued" => (&mut max_queued, "--max-queued"),
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N]"
+                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N]"
                 );
                 return Err(0);
             }
@@ -180,30 +219,38 @@ fn parse_args() -> Result<CliConfig, i32> {
             return Err(2);
         }
     };
-    let default_max_tokens = match default_max {
-        Some(text) => match text.parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                eprintln!("itak-engine: --default-max-tokens must be a positive integer");
-                return Err(2);
-            }
-        },
-        None => 128,
+    let parse_count = |text: Option<String>, label: &str, default: usize, min: usize| -> Result<usize, i32> {
+        match text {
+            Some(text) => match text.parse::<usize>() {
+                Ok(n) if n >= min => Ok(n),
+                _ => {
+                    eprintln!("itak-engine: {label} must be an integer >= {min}");
+                    Err(2)
+                }
+            },
+            None => Ok(default),
+        }
     };
+    let default_max_tokens = parse_count(default_max, "--default-max-tokens", 128, 1)?;
+    let slots = parse_count(slots, "--slots", 1, 1)?;
+    let max_queued = parse_count(max_queued, "--max-queued", 8, 0)?;
     Ok(CliConfig {
         model_path: PathBuf::from(model),
         socket_path: PathBuf::from(socket.unwrap_or_else(|| "/tmp/itak-engine.sock".to_string())),
         model_name: name,
         default_max_tokens,
+        slots,
+        max_queued,
     })
 }
 
 fn handle_conn(
     stream: UnixStream,
-    jobs: Sender<Job>,
+    jobs: SyncSender<Job>,
     info: Arc<ModelInfo>,
     stats: Arc<Mutex<Stats>>,
     started: Instant,
+    limits: Limits,
 ) {
     let mut writer = match stream.try_clone() {
         Ok(writer) => writer,
@@ -273,13 +320,13 @@ fn handle_conn(
                 }
             }
             "debug" => {
-                let frame = debug_info(&info, &stats, started.elapsed().as_secs());
+                let frame = debug_info(&info, &stats, started.elapsed().as_secs(), limits);
                 if !send(&mut writer, &frame) {
                     return;
                 }
             }
             "generate" => {
-                if !handle_generate(&frame, &mut writer, &jobs, &info) {
+                if !handle_generate(&frame, &mut writer, &jobs, &info, &stats, limits) {
                     return;
                 }
             }
@@ -298,8 +345,10 @@ fn handle_conn(
 fn handle_generate(
     frame: &Value,
     writer: &mut UnixStream,
-    jobs: &Sender<Job>,
+    jobs: &SyncSender<Job>,
     info: &Arc<ModelInfo>,
+    stats: &Arc<Mutex<Stats>>,
+    limits: Limits,
 ) -> bool {
     let req = match protocol::parse_generate(frame) {
         Ok(req) => req,
@@ -335,11 +384,27 @@ fn handle_generate(
         frequency_penalty: req.frequency_penalty,
         reply: reply_tx,
     };
-    if jobs.send(job).is_err() {
-        return send(
-            writer,
-            &protocol::error_frame("engine_died", "the engine worker is gone"),
-        );
+    // The bounded queue is the concurrency contract: a submission
+    // past capacity refuses by name instead of queueing without
+    // limit, and the refusal names the state that refused it.
+    match jobs.try_send(job) {
+        Ok(()) => {
+            let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+            st.queued += 1;
+        }
+        Err(TrySendError::Full(_)) => {
+            let msg = format!(
+                "engine busy: {} slot(s) running and the queue is full (max_queued {})",
+                limits.slots, limits.max_queued
+            );
+            return send(writer, &protocol::error_frame("engine_busy", &msg));
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            return send(
+                writer,
+                &protocol::error_frame("engine_died", "the engine worker is gone"),
+            );
+        }
     }
     loop {
         match reply_rx.recv() {
@@ -374,13 +439,15 @@ fn handle_generate(
 }
 
 fn stats_busy(stats: &Arc<Mutex<Stats>>) -> bool {
-    stats.lock().map(|st| st.busy).unwrap_or(false)
+    stats.lock().map(|st| st.active > 0).unwrap_or(false)
 }
 
 /// The debug self-report: what is loaded, how its coverage gate
 /// went, and what it has served. This is the engine's half of the
-/// platform's /debug view.
-fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64) -> Value {
+/// platform's /debug view. The concurrency fields (slots, active,
+/// queued, max_queued) are how an operator sees the T-9.14 contract
+/// and which jobs hold it.
+fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64, limits: Limits) -> Value {
     let st = stats.lock().unwrap_or_else(|p| p.into_inner());
     json::obj(vec![
         ("op", Value::Str("debug_info".into())),
@@ -401,7 +468,11 @@ fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64) -> 
             Value::Num(info.coverage_expected as f64),
         ),
         ("coverage_found", Value::Num(info.coverage_found as f64)),
-        ("busy", Value::Bool(st.busy)),
+        ("busy", Value::Bool(st.active > 0)),
+        ("slots", Value::Num(limits.slots as f64)),
+        ("active", Value::Num(st.active as f64)),
+        ("queued", Value::Num(st.queued as f64)),
+        ("max_queued", Value::Num(limits.max_queued as f64)),
         ("generations", Value::Num(st.generations as f64)),
         ("tokens_generated", Value::Num(st.tokens_generated as f64)),
         (
@@ -426,4 +497,71 @@ fn send(writer: &mut UnixStream, frame: &Value) -> bool {
     let mut line = json::stringify(frame);
     line.push('\n');
     writer.write_all(line.as_bytes()).is_ok() && writer.flush().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    fn test_info() -> Arc<ModelInfo> {
+        Arc::new(ModelInfo {
+            name: "fake".to_string(),
+            path: "fake.gguf".to_string(),
+            architecture: "muse-glimmer".to_string(),
+            layers: 1,
+            hidden: 8,
+            vocab: 16,
+            context_length: 128,
+            coverage_expected: 1,
+            coverage_found: 1,
+        })
+    }
+
+    fn dummy_job() -> Job {
+        // Nobody ever runs this job; it only occupies queue space.
+        let (reply_tx, _reply_rx) = channel::<GenEvent>();
+        Job {
+            prompt: "x".to_string(),
+            max_tokens: None,
+            temperature: 0.0,
+            top_p: 0.0,
+            stop: Vec::new(),
+            seed: 1,
+            top_k: None,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            reply: reply_tx,
+        }
+    }
+
+    #[test]
+    fn full_queue_refuses_engine_busy_by_name() {
+        // Capacity 1 and it is already full: the next submission is
+        // refused with the engine_busy code, not queued, not run.
+        let (tx, _rx) = sync_channel::<Job>(1);
+        tx.try_send(dummy_job()).expect("fill the queue");
+        let (mut a, mut b) = UnixStream::pair().expect("stream pair");
+        let frame = crate::json::parse(r#"{"op":"generate","prompt":"hello"}"#).expect("frame");
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let ok = handle_generate(
+            &frame,
+            &mut a,
+            &tx,
+            &test_info(),
+            &stats,
+            Limits {
+                slots: 1,
+                max_queued: 0,
+            },
+        );
+        assert!(ok, "the connection survives a busy refusal");
+        drop(a);
+        let mut text = String::new();
+        b.read_to_string(&mut text).expect("read reply");
+        assert!(text.contains("\"engine_busy\""), "reply: {text}");
+        // The refused job was not counted as queued.
+        let st = stats.lock().expect("stats");
+        assert_eq!(st.queued, 0);
+    }
 }

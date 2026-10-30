@@ -275,6 +275,21 @@ func TestChatWithoutEngineIsNamedUnavailable(t *testing.T) {
 	}
 }
 
+// busyEngine refuses the way a full engine queue does (T-9.14).
+type busyEngine struct{ *fakeEngine }
+
+func (busyEngine) Generate(context.Context, engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+	return nil, engine.ErrEngineBusy
+}
+
+func TestChatEngineBusyMapping(t *testing.T) {
+	ts := newServer(t, busyEngine{&fakeEngine{}})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusServiceUnavailable || errorCode(t, body) != "engine_busy" {
+		t.Fatalf("status = %d, body = %s; want 503 engine_busy", code, body)
+	}
+}
+
 func TestChatNotImplementedMapping(t *testing.T) {
 	ts := newServer(t, notImplEngine{&fakeEngine{}})
 	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)

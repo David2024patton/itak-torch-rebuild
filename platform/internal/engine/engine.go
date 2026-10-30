@@ -41,6 +41,11 @@ var (
 	// failure at a decode step). It arrives as the terminal
 	// TokenEvent's Err, not as Generate's return value.
 	ErrGenerationFailed = errors.New("engine: generation failed")
+	// ErrEngineBusy means the engine refused the job before it
+	// started: every serving slot is running and the bounded job
+	// queue is full (TODO T-9.14). The refusal is explicit and the
+	// caller may retry; nothing was queued silently.
+	ErrEngineBusy = errors.New("engine: busy")
 )
 
 // GenerateRequest is one completion job handed to the engine. The

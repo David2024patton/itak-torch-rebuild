@@ -17,6 +17,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -40,6 +41,8 @@ func run() int {
 	engineName := flag.String("engine-name", "", "model name the supervised engine serves (--model-name); empty = the file's own name")
 	engineMaxRestarts := flag.Int("engine-max-restarts", 5, "supervised engine: restarts allowed inside -engine-restart-window before the engine stays down")
 	engineRestartWindow := flag.Duration("engine-restart-window", 5*time.Minute, "supervised engine: restart budget window")
+	engineSlots := flag.Int("engine-slots", 1, "supervised engine: concurrent generations (--slots)")
+	engineMaxQueued := flag.Int("engine-max-queued", 8, "supervised engine: generations that may wait for a slot before refusing as engine_busy (--max-queued)")
 	models := flag.String("models", "glimmer", "comma-separated model ids advertised on /v1/models")
 	maxConcurrent := flag.Int("max-concurrent", 4, "maximum simultaneous engine jobs")
 	cacheTTL := flag.Duration("cache-ttl", 5*time.Minute, "response cache TTL; 0 disables caching")
@@ -61,7 +64,7 @@ func run() int {
 	var closeEngine func()
 	if *engineBin != "" {
 		eng, closeEngine = superviseEngine(*engineBin, *engineModel, *engineName, *socket,
-			*engineMaxRestarts, *engineRestartWindow, log)
+			*engineMaxRestarts, *engineRestartWindow, *engineSlots, *engineMaxQueued, log)
 	} else {
 		eng, closeEngine = dialEngine(*socket, log)
 	}
@@ -127,7 +130,7 @@ func dialEngine(socketPath string, log *slog.Logger) (engine.Client, func()) {
 // (TODO T-9.11). A failed initial start is not fatal and is not
 // hidden, matching dialEngine's behavior: the platform runs with
 // the engine marked unavailable and /healthz says so.
-func superviseEngine(bin, model, name, socketPath string, maxRestarts int, window time.Duration, log *slog.Logger) (engine.Client, func()) {
+func superviseEngine(bin, model, name, socketPath string, maxRestarts int, window time.Duration, slots, maxQueued int, log *slog.Logger) (engine.Client, func()) {
 	if model == "" {
 		log.Error("engine-bin set without engine-model; starting with engine unavailable")
 		return engine.Unavailable{}, nil
@@ -135,7 +138,10 @@ func superviseEngine(bin, model, name, socketPath string, maxRestarts int, windo
 	if socketPath == "" {
 		socketPath = "/tmp/itak-engine.sock"
 	}
-	args := []string{"--model", model, "--socket", socketPath}
+	args := []string{
+		"--model", model, "--socket", socketPath,
+		"--slots", fmt.Sprint(slots), "--max-queued", fmt.Sprint(maxQueued),
+	}
 	if name != "" {
 		args = append(args, "--model-name", name)
 	}

@@ -1,14 +1,18 @@
-//! The engine worker: one loaded model, one generation at a time.
+//! The engine workers: one loaded model, a configured number of
+//! serving slots (TODO T-9.14).
 //!
-//! The model lives on a dedicated worker thread because the CPU
-//! compute backend serves exactly one sequence (its KV state is
-//! per-sequence and not Sync). Connection threads hand jobs over an
-//! mpsc channel and forward the streamed events; a second generate
-//! job queues behind the running one. Each job builds a fresh
+//! Each slot is a worker thread because the CPU compute backend
+//! serves exactly one sequence (its KV state is per-sequence and
+//! not Sync). Connection threads hand jobs over a bounded mpsc
+//! channel and forward the streamed events; jobs beyond the slots
+//! queue in the channel up to its configured capacity, and a
+//! submission past capacity is refused by name (`engine_busy`)
+//! instead of queueing without limit. Each job builds a fresh
 //! [`GlimmerModel`] from the shared, already-loaded weights (a clone
 //! of Arc-backed tensor views, so it is cheap) with a fresh
 //! [`CpuCompute`] and a fresh [`PositionCache`], which is the
-//! per-sequence isolation the backend contract requires.
+//! per-sequence isolation the backend contract requires: slots
+//! share the weights and nothing mutable.
 //!
 //! Every failure inside a job is a named [`GenEvent::Error`], never
 //! a panic and never a fabricated token: a bad prompt, a context
@@ -75,8 +79,10 @@ pub struct Stats {
     /// Cache position reached by the most recent job (prompt plus
     /// generated tokens processed into the KV cache).
     pub last_cache_position: usize,
-    /// A generation is running right now.
-    pub busy: bool,
+    /// Generations running right now (one per busy slot).
+    pub active: usize,
+    /// Jobs accepted and waiting for a slot.
+    pub queued: usize,
 }
 
 /// One event on a job's reply channel.
@@ -130,13 +136,16 @@ pub struct Job {
     pub reply: Sender<GenEvent>,
 }
 
-/// The loaded model, owned by the worker thread. Passed from
+/// The loaded model, shared by the worker threads. Passed from
 /// [`load`] to [`run_worker`]; its fields stay private because the
-/// worker is the only consumer.
+/// workers are the only consumers. Cloning is cheap: the weights
+/// are Arc-backed tensor views and the tokenizer is shared behind
+/// an Arc, so each slot clones the handle set, not the model.
+#[derive(Clone)]
 pub struct Loaded {
     cfg: GlimmerConfig,
     weights: Weights,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     add_bos: bool,
 }
 
@@ -227,22 +236,37 @@ pub fn load(config: &EngineConfig) -> Result<(Arc<ModelInfo>, Loaded), String> {
         Loaded {
             cfg,
             weights,
-            tokenizer,
+            tokenizer: Arc::new(tokenizer),
             add_bos,
         },
     ))
 }
 
-/// The worker loop: receive jobs, run them one at a time, until every
-/// sender is gone (the process is shutting down).
+/// The worker loop: receive jobs and run them, until every sender
+/// is gone (the process is shutting down). One worker thread is one
+/// serving slot (TODO T-9.14): `slots` workers share the job queue
+/// behind a mutex, and each job builds its own model instance,
+/// compute backend, and position cache from the shared weights, so
+/// concurrent jobs share nothing mutable. The queue in front of the
+/// slots is bounded by the channel capacity the caller chose; a
+/// submission past it is refused by the connection thread with the
+/// `engine_busy` code, never queued without limit and never run
+/// concurrently inside another job's state.
 pub fn run_worker(
     loaded: Loaded,
     stats: Arc<Mutex<Stats>>,
     default_max_tokens: usize,
-    jobs: Receiver<Job>,
+    jobs: Arc<Mutex<Receiver<Job>>>,
 ) {
-    for job in jobs {
-        run_job(&loaded, &stats, default_max_tokens, job);
+    loop {
+        let job = {
+            let rx = jobs.lock().unwrap_or_else(|p| p.into_inner());
+            rx.recv()
+        };
+        match job {
+            Ok(job) => run_job(&loaded, &stats, default_max_tokens, job),
+            Err(_) => return,
+        }
     }
 }
 
@@ -259,6 +283,12 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         frequency_penalty,
         reply,
     } = job;
+    // The job leaves the queue the moment a slot takes it, however
+    // it ends from here (including the early named failures below).
+    {
+        let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
+        st.queued = st.queued.saturating_sub(1);
+    }
     let fail = |code: &str, message: String| {
         let _ = reply.send(GenEvent::Error {
             code: code.to_string(),
@@ -307,7 +337,7 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
 
     {
         let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
-        st.busy = true;
+        st.active += 1;
         st.last_prompt_tokens = ids.len();
         st.last_generated_tokens = 0;
         st.last_cache_position = ids.len();
@@ -329,7 +359,7 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         &reply,
     );
     let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
-    st.busy = false;
+    st.active = st.active.saturating_sub(1);
     match outcome {
         JobOutcome::Done {
             finish_reason,

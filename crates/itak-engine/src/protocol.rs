@@ -43,7 +43,9 @@
 //!   `bad_request`, `context_overflow`, `model_not_found`,
 //!   `protocol_mismatch`. Codes it maps to a gateway error (502):
 //!   `forward_failed`, `detokenize_failed`, `engine_died`,
-//!   `unknown_op`, `bad_frame`, `internal`.
+//!   `unknown_op`, `bad_frame`, `internal`. And `engine_busy` maps
+//!   to 503: every slot is running and the bounded job queue is
+//!   full (TODO T-9.14).
 
 use crate::json::{obj, Value};
 

@@ -159,6 +159,8 @@ func engineErrorStatus(err error) (status int, code string) {
 		return http.StatusBadRequest, "invalid_request"
 	case errors.Is(err, engine.ErrEngineDied):
 		return http.StatusBadGateway, "engine_died"
+	case errors.Is(err, engine.ErrEngineBusy):
+		return http.StatusServiceUnavailable, "engine_busy"
 	case errors.Is(err, engine.ErrGenerationFailed):
 		return http.StatusBadGateway, "generation_failed"
 	default:

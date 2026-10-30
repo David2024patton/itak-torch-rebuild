@@ -106,6 +106,11 @@ func serveGenerate(write func(map[string]any) bool, prompt string) bool {
 			"op": "error", "code": "context_overflow",
 			"message": "prompt of 9 tokens plus max_tokens 4 exceeds the context length 8",
 		})
+	case strings.Contains(prompt, "err-busy"):
+		return write(map[string]any{
+			"op": "error", "code": "engine_busy",
+			"message": "engine busy: 1 slot(s) running and the queue is full (max_queued 0)",
+		})
 	case strings.Contains(prompt, "err-mid"):
 		if !write(map[string]any{"op": "token", "text": " Paris", "token_id": 13796}) {
 			return false
@@ -176,6 +181,16 @@ func TestUnixGenerateStreamsTokens(t *testing.T) {
 	}
 	if !events[2].Done || events[2].FinishReason != "stop" {
 		t.Fatalf("event 2 = %+v, want done with finish_reason stop", events[2])
+	}
+}
+
+func TestUnixGenerateBusyIsEngineBusy(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Generate(ctx, engine.GenerateRequest{Prompt: "err-busy please"})
+	if !errors.Is(err, engine.ErrEngineBusy) {
+		t.Fatalf("Generate err = %v, want ErrEngineBusy", err)
 	}
 }
 

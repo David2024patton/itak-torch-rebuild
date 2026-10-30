@@ -59,10 +59,11 @@ type genFrame struct {
 // streams token events from the engine. Generate runs on a fresh
 // connection per call (handshake included), so a generation that
 // runs for minutes never blocks Health or DebugInfo on the control
-// connection; the engine serves one generation at a time and queues
-// the rest. Embed refuses with ErrNotImplemented: the protocol has
-// no embedding operation yet, and that is stated in the error, not
-// papered over.
+// connection; the engine runs a configured number of slots and
+// queues a bounded number of jobs behind them, refusing the rest
+// with ErrEngineBusy. Embed refuses with ErrNotImplemented: the
+// protocol has no embedding operation yet, and that is stated in
+// the error, not papered over.
 type UnixClient struct {
 	conn       net.Conn
 	r          *bufio.Reader
@@ -354,6 +355,8 @@ func mapEngineError(f genFrame) error {
 		return fmt.Errorf("%w: %s", ErrNotImplemented, msg)
 	case "engine_died":
 		return fmt.Errorf("%w: %s", ErrEngineDied, msg)
+	case "engine_busy":
+		return fmt.Errorf("%w: %s", ErrEngineBusy, msg)
 	case "forward_failed", "detokenize_failed":
 		return fmt.Errorf("%w: %s: %s", ErrGenerationFailed, f.Code, msg)
 	default:

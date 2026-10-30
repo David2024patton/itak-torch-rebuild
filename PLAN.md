@@ -43,7 +43,7 @@ The grid. Two programs, one seam, a research lab beside them.
 
 - itak-types: the shared contracts (inference request/response, chat messages, token usage, latency stats, model info and parameters). Versioned data with version fields.
 - itak-diag: structured logging, health state, event emission. The debugging law as a shared crate.
-- itak-loader: GGUF parsing and memory-mapped weight access; .itf support lands in S11.
+- itak-loader: the arch-trait adapter over the gguf crate (GGUF parsing and memory-mapped weight access live in gguf); .itf support lands in S11.
 - itak-kernels: quantized tensor math. Q4_K, Q6_K, Q8_0 dequant and matmul first; FP8, AWQ, and ternary (BitNet-style) after. RoPE, RMSNorm, softmax, SiLU.
 - itak-kv: KV cache family as preallocated pools: paged, ring, INT8-quantized, compressed, and offloaded tiers; radix prefix sharing; attention-sink eviction; context freezing.
 - itak-ssm: the state space module. One scan implementing the general three-term recurrence (alpha, beta, gamma), so Mamba-1 and Mamba-2 are the beta = 0 special case and Mamba-3 is the full form; data-dependent rotation applied to B and C; MIMO rank R as config (R = 1 is SISO); BCNorm and B, C biases in the block.
@@ -79,7 +79,7 @@ Rebuild Core first, because everything imports it and its loss is what killed th
 
 ## S5: Rust engine core (TODO Phase 2)
 
-Skeleton first: workspace, crate boundaries, the backend trait, config loading with every limit as config. Then itak-loader (GGUF, mmap), itak-kernels (Q4_K matmul first), a real BPE tokenizer, the KV-cached transformer forward for the Llama and Qwen families, sampling (temperature, top-p, top-k, penalties as config), and the OpenAI-compatible minimal serve path through the seam. Verification is against llama.cpp on the same models (the Qwen2.5 test set from the benchmark work): same prompts, compared outputs, published speed table. Shelf check before building: candle and mistral.rs (MIT/Apache) are the reference Rust implementations to learn from; the kernels here are written from the project's own Mojo and Go reference code, not copied.
+Skeleton first: workspace, crate boundaries, the backend trait, config loading with every limit as config. Then the gguf crate (GGUF parsing, mmap) with itak-loader as the arch-trait adapter over it, itak-kernels (Q4_K matmul first), a real BPE tokenizer, the KV-cached transformer forward for the Llama and Qwen families, sampling (temperature, top-p, top-k, penalties as config), and the OpenAI-compatible minimal serve path through the seam. Verification is against llama.cpp on the same models (the Qwen2.5 test set from the benchmark work): same prompts, compared outputs, published speed table. Shelf check before building: candle and mistral.rs (MIT/Apache) are the reference Rust implementations to learn from; the kernels here are written from the project's own Mojo and Go reference code, not copied.
 
 ## S6: Speculation and advanced inference (TODO Phase 3)
 

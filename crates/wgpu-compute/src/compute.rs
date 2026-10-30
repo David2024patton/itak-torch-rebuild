@@ -35,7 +35,9 @@ use muse_glimmer::{
 
 use crate::detect::{detect, DetectPolicy};
 use crate::device::GpuContext;
-use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_SWIGLU};
+use crate::kernels::k10_q4k_gemm::K10Pipeline;
+use crate::kernels::k11_q6k_gemm::K11Pipeline;
+use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -133,6 +135,11 @@ pub struct WgpuCompute {
     k7: K7Pipeline,
     k8: K8Pipeline,
     k9: K9Pipeline,
+    k10: Option<K10Pipeline>,
+    k10_gated: Option<K10Pipeline>,
+    k10_swiglu: Option<K10Pipeline>,
+    k11: Option<K11Pipeline>,
+    k11_swiglu: Option<K11Pipeline>,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -186,6 +193,16 @@ impl WgpuCompute {
         let k7 = K7Pipeline::new(&ctx.device)?;
         let k8 = K8Pipeline::new(&ctx.device)?;
         let k9 = K9Pipeline::new(&ctx.device)?;
+        // The prefill GEMMs are the one optional pipeline set:
+        // a device granting too little workgroup storage for
+        // the smallest staged tile gets `None` here, and the
+        // resident session keeps its GEMV chunk plans on it
+        // (the K10 module docs own the fallback contract).
+        let k10 = K10Pipeline::for_device(&ctx.device, ACT_NONE)?;
+        let k10_gated = K10Pipeline::for_device(&ctx.device, ACT_GATED)?;
+        let k10_swiglu = K10Pipeline::for_device(&ctx.device, ACT_SWIGLU)?;
+        let k11 = K11Pipeline::for_device(&ctx.device, ACT_NONE)?;
+        let k11_swiglu = K11Pipeline::for_device(&ctx.device, ACT_SWIGLU)?;
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -201,6 +218,11 @@ impl WgpuCompute {
             k7,
             k8,
             k9,
+            k10,
+            k10_gated,
+            k10_swiglu,
+            k11,
+            k11_swiglu,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -281,6 +303,40 @@ impl WgpuCompute {
     /// [`WgpuCompute::k1`].
     pub(crate) fn k9(&self) -> &K9Pipeline {
         &self.k9
+    }
+
+    /// The K10 (Q4_K GEMM) pipeline, when this device grants
+    /// the workgroup storage its smallest tile needs. Only
+    /// the device-resident session prepares its calls, for
+    /// chunk plans at or past the GEMM row threshold; `None`
+    /// is the session's signal to keep the GEMV form. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k10(&self) -> Option<&K10Pipeline> {
+        self.k10.as_ref()
+    }
+
+    /// The K10 pipeline with the attention-gate activation
+    /// fused in. See [`WgpuCompute::k10`].
+    pub(crate) fn k10_gated(&self) -> Option<&K10Pipeline> {
+        self.k10_gated.as_ref()
+    }
+
+    /// The K10 pipeline with the SwiGLU activation fused in.
+    /// See [`WgpuCompute::k10`].
+    pub(crate) fn k10_swiglu(&self) -> Option<&K10Pipeline> {
+        self.k10_swiglu.as_ref()
+    }
+
+    /// The K11 (Q6_K GEMM) pipeline, when this device grants
+    /// the workgroup storage. See [`WgpuCompute::k10`].
+    pub(crate) fn k11(&self) -> Option<&K11Pipeline> {
+        self.k11.as_ref()
+    }
+
+    /// The K11 pipeline with the SwiGLU activation fused in.
+    /// See [`WgpuCompute::k10`].
+    pub(crate) fn k11_swiglu(&self) -> Option<&K11Pipeline> {
+        self.k11_swiglu.as_ref()
     }
 
     /// Drop all stored KV state, device buffers and host mirror.

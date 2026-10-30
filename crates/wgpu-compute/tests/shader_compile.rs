@@ -196,3 +196,49 @@ fn k4_to_k8_pipelines_compile_on_any_available_adapter() {
         info.name, info.backend
     );
 }
+
+#[test]
+fn k10_k11_gemm_shaders_compile_on_any_available_adapter() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping K10/K11 shader compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute K10/K11 shader compile test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("device for K10/K11 shader compile test");
+    use wgpu_compute::kernels::k10_q4k_gemm::{GemmShape, K10Pipeline};
+    use wgpu_compute::kernels::k11_q6k_gemm::K11Pipeline;
+    use wgpu_compute::kernels::k1_q4k_gemv::{ACT_GATED, ACT_NONE, ACT_SWIGLU};
+    // The narrow tile fits the default limits' 16 KiB of
+    // workgroup storage, so it must build everywhere; the
+    // device-selected shapes go through for_device, which
+    // steps down or reports absence by the same limits.
+    let narrow = GemmShape::new(32, 128);
+    for act in [ACT_NONE, ACT_GATED, ACT_SWIGLU] {
+        K10Pipeline::with_shape_act(&device, narrow, act)
+            .unwrap_or_else(|e| panic!("K10 narrow act {act} must build on {}: {e}", info.name));
+    }
+    for act in [ACT_NONE, ACT_SWIGLU] {
+        K11Pipeline::with_shape_act(&device, narrow, act)
+            .unwrap_or_else(|e| panic!("K11 narrow act {act} must build on {}: {e}", info.name));
+    }
+    let _k10 = K10Pipeline::for_device(&device, ACT_NONE)
+        .unwrap_or_else(|e| panic!("K10 for_device must not fail on {}: {e}", info.name));
+    let _k11 = K11Pipeline::for_device(&device, ACT_NONE)
+        .unwrap_or_else(|e| panic!("K11 for_device must not fail on {}: {e}", info.name));
+    eprintln!(
+        "K10 and K11 GEMM shaders compiled on {} ({:?})",
+        info.name, info.backend
+    );
+}

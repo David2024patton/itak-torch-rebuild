@@ -506,6 +506,18 @@ pub struct K2Weights {
     buffer: wgpu::Buffer,
 }
 
+impl K2Weights {
+    /// The resident device buffer holding the tensor's blocks
+    /// in the padded device layout, for the sibling kernel
+    /// that consumes the same upload through its own pipelines
+    /// (K11, the Q6_K GEMM; see
+    /// [`crate::kernels::k1_q4k_gemv::K1Weights::buffer`] for
+    /// the one-upload rule).
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
 /// One prepared K2 dispatch set: a bind group plus grid
 /// dimensions, built once for a (weights, input, output, batch)
 /// combination and encodable any number of times. The bench

@@ -18,8 +18,15 @@
 //! for the device-resident forward: the attention preparation
 //! (the Q/K norms, the sliding layers' rotations, and the KV
 //! append) as one dispatch, proven against the K4/K5
-//! composition it replaces in that path only.
+//! composition it replaces in that path only. K10 and K11 are
+//! the prefill GEMMs (Q4_K and Q6_K): tiled matrix-matrix
+//! forms of K1 and K2 that stage dequantized weight tiles in
+//! workgroup memory so a chunk's weights stream once instead
+//! of once per row, proven against the GEMV composition they
+//! replace in the resident session's chunk plans only.
 
+pub mod k10_q4k_gemm;
+pub mod k11_q6k_gemm;
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;

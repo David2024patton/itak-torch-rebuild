@@ -838,6 +838,18 @@ pub struct K1Weights {
     buffer: wgpu::Buffer,
 }
 
+impl K1Weights {
+    /// The resident device buffer holding the tensor's raw
+    /// bytes, for the sibling kernel that consumes the same
+    /// upload through its own pipelines (K10, the Q4_K GEMM:
+    /// a model's weights live on the device exactly once, in
+    /// whichever form the session uploaded them, and both the
+    /// GEMV and the GEMM bind that one buffer).
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
 /// Stream geometry for an activation dispatch (see
 /// [`K1Pipeline::prepare_act`]): element strides and the
 /// second stream's segment offset, all in elements and all

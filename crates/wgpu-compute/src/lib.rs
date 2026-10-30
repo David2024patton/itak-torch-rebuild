@@ -90,4 +90,6 @@ pub use kernels::k6_attention::{
 pub use kernels::k7_swiglu::{K7Call, K7Pipeline};
 pub use kernels::k8_head::{K8FinishCall, K8GatherRowsCall, K8Pipeline};
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
+pub use kernels::k10_q4k_gemm::{GemmShape, K10Call, K10Pipeline, GEMM_MAX_BATCH};
+pub use kernels::k11_q6k_gemm::{K11Call, K11Pipeline};
 pub use session::{ResidentSession, SessionStats};

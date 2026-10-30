@@ -17,6 +17,12 @@ RULES:
 -->
 # CHANGELOG: iTaK Torch Rebuild
 
+## 2026-10-29: Twenty-lane wave merged into one wired engine tree (integration-2026-10-29)
+- Nineteen lane branches (forward-diff trace tooling, norm audit, RoPE and attention audit, KV decode sensitivity tests, logits head audit, Go core types, debug and event, health and registry, the IPC contract, Q4_K kernels, reference ops kernels, sampling, loader type table, arch dispatch, engine binary, AMD detection, CPU backend, gates and CI, golden harness audit) merged in dependency order into branch integration-2026-10-29 at 0f322f3, since pushed to GitHub with remote hashes verified equal to local.
+- The wave fixed three forward defects: RoPE pairing corrected to the NEOX split-half convention (it was interleaved, in all 52 layers), the post norms moved onto each sub-layer output before the residual add, and the missing scaleless embedding norm added (proof: crates/torch-math/ROPE-AUDIT.md; crates/muse-glimmer/NORM-AUDIT-2026-10-29.md).
+- New crates landed and the workspace is wired: itak-kernels, itak-types, itak-engine (the binary that assembles the crates), and itak-backend (backend trait, CPU backend, and sysfs AMD detection unified from two lanes); twelve crates in total, joined by path dependencies. The Go core module (pkg/types, pkg/debug, pkg/event, pkg/health, pkg/registry) and the platform IPC package landed in the same wave.
+- Proof: cargo test --workspace 374 passed, 0 failed; core/ Go 48 passed; platform/ Go 40 passed; cargo clippy and cargo fmt clean; tools/gates.sh ALL GATES GREEN.
+
 ## 2026-10-29: Tokenizer proven token-for-token on Glimmer's real vocabulary (TODO T-2.3)
 - The Rust BPE tokenizer matches the production llama-server token for token on the 16-prompt bench set (16/16 identical, 16/16 decode round-trips exact), using Glimmer's own 202,048-token vocabulary and 439,802 merges extracted from the production GGUF by the new gguf `tokenizer_extract` example.
 - The first run failed one case, contractions: the pre-tokenizer had implemented the llama-3 split (contraction as its own piece), while llama.cpp routes `pre = llama4` to the GPT-4o pattern, where the contraction is a suffix of the word piece. `pretokenize.rs` and the crate docs now implement and document the GPT-4o pattern, with regression tests.

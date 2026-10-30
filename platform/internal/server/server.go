@@ -515,11 +515,24 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 	if herr != nil {
 		h = engine.HealthStatus{OK: false, Detail: herr.Error()}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"diag":      s.diag.Snapshot(),
 		"scheduler": s.sched.Stats(),
 		"cache":     s.cache.Stats(),
 		"engine":    map[string]any{"ok": h.OK, "detail": h.Detail},
 		"models":    s.cfg.Models,
-	})
+	}
+	// When the wired engine client can report on itself (the socket
+	// client can), its self-report rides along: loaded model,
+	// coverage result, serving counters.
+	if d, ok := s.eng.(interface {
+		DebugInfo(context.Context) (map[string]any, error)
+	}); ok {
+		if info, err := d.DebugInfo(ctx); err == nil {
+			out["engine_debug"] = info
+		} else {
+			out["engine_debug"] = map[string]any{"error": err.Error()}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }

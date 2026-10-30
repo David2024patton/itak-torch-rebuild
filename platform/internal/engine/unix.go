@@ -11,9 +11,12 @@ import (
 	"time"
 )
 
-// Protocol frames for the platform-to-engine socket. The wire format is
-// newline-delimited JSON; tensors move over shared memory later, control
-// stays here where it is easy to debug.
+// Protocol frames for the platform-to-engine socket. The wire format
+// is newline-delimited JSON; tensors move over shared memory later,
+// control stays here where it is easy to debug. The protocol is
+// defined once, in the Rust engine crate (crates/itak-engine/src/
+// protocol.rs); this file implements the same shapes and nothing
+// else.
 const protoVersion = 1
 
 type frame struct {
@@ -24,30 +27,55 @@ type frame struct {
 	Message string `json:"message,omitempty"`
 }
 
-// UnixClient is the skeleton Client speaking to the Rust engine process
-// over a Unix socket.
+// genFrame is the generate request the client sends and the streamed
+// frames the engine answers with: token events (op "token"), one
+// terminal token frame with Done set, or a named refusal (op
+// "error" with a Code the client maps onto its error vocabulary).
+type genFrame struct {
+	Op           string   `json:"op"`
+	Model        string   `json:"model,omitempty"`
+	Prompt       string   `json:"prompt,omitempty"`
+	MaxTokens    int      `json:"max_tokens,omitempty"`
+	Temperature  float64  `json:"temperature,omitempty"`
+	TopP         float64  `json:"top_p,omitempty"`
+	Stop         []string `json:"stop,omitempty"`
+	Text         string   `json:"text,omitempty"`
+	TokenID      int32    `json:"token_id,omitempty"`
+	Done         bool     `json:"done,omitempty"`
+	FinishReason string   `json:"finish_reason,omitempty"`
+	Code         string   `json:"code,omitempty"`
+	Message      string   `json:"message,omitempty"`
+}
+
+// UnixClient is the Client speaking to the Rust engine process over
+// a Unix socket.
 //
-// What is real today: dialing and the protocol handshake, and a ping
-// round trip behind Health. Generate and Embed refuse with
-// ErrNotImplemented until the Rust side of the protocol lands; that is
-// the honest skeleton state, stated in the error, not papered over.
+// What is real: dialing and the protocol handshake, the ping round
+// trip behind Health, the debug self-report, and Generate, which
+// streams token events from the engine. Generate runs on a fresh
+// connection per call (handshake included), so a generation that
+// runs for minutes never blocks Health or DebugInfo on the control
+// connection; the engine serves one generation at a time and queues
+// the rest. Embed refuses with ErrNotImplemented: the protocol has
+// no embedding operation yet, and that is stated in the error, not
+// papered over.
 type UnixClient struct {
-	conn   net.Conn
-	r      *bufio.Reader
-	mu     sync.Mutex // serializes request/response frames on the conn
-	closed bool
+	conn       net.Conn
+	r          *bufio.Reader
+	socketPath string
+	mu         sync.Mutex // serializes request/response frames on the control conn
+	closed     bool
 }
 
 // DialUnix connects to the engine socket and performs the handshake.
 // A peer that does not answer hello_ack for our protocol version is
 // rejected with ErrHandshake; a missing socket wraps ErrUnavailable.
 func DialUnix(ctx context.Context, socketPath string) (*UnixClient, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", socketPath)
+	conn, err := dialRaw(ctx, socketPath)
 	if err != nil {
-		return nil, fmt.Errorf("%w: dial %s: %w", ErrUnavailable, socketPath, err)
+		return nil, err
 	}
-	c := &UnixClient{conn: conn, r: bufio.NewReader(conn)}
+	c := &UnixClient{conn: conn, r: bufio.NewReader(conn), socketPath: socketPath}
 	if err := c.handshake(ctx); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -55,42 +83,59 @@ func DialUnix(ctx context.Context, socketPath string) (*UnixClient, error) {
 	return c, nil
 }
 
-func (c *UnixClient) handshake(ctx context.Context) error {
-	if err := c.roundTripLocked(ctx,
-		frame{Op: "hello", Proto: protoVersion, Client: "torch-platform"},
-		"hello_ack"); err != nil {
-		return err
+func dialRaw(ctx context.Context, socketPath string) (net.Conn, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("%w: dial %s: %w", ErrUnavailable, socketPath, err)
 	}
-	return nil
+	return conn, nil
 }
 
-// roundTripLocked sends one frame and validates the op of the reply.
-// Callers hold no lock; the method takes it.
-func (c *UnixClient) roundTripLocked(ctx context.Context, send frame, wantOp string) error {
+func (c *UnixClient) handshake(ctx context.Context) error {
+	return c.roundTripLocked(ctx,
+		frame{Op: "hello", Proto: protoVersion, Client: "torch-platform"},
+		"hello_ack")
+}
+
+// exchangeLocked sends one frame on the control connection and
+// returns the raw reply line. Callers hold no lock; the method takes
+// it.
+func (c *UnixClient) exchangeLocked(ctx context.Context, send frame) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return ErrClosed
+		return nil, ErrClosed
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(5 * time.Second)
 	}
 	if err := c.conn.SetDeadline(deadline); err != nil {
-		return fmt.Errorf("engine: set deadline: %w", err)
+		return nil, fmt.Errorf("engine: set deadline: %w", err)
 	}
 	defer func() { _ = c.conn.SetDeadline(time.Time{}) }()
 
 	line, err := json.Marshal(send)
 	if err != nil {
-		return fmt.Errorf("engine: marshal frame: %w", err)
+		return nil, fmt.Errorf("engine: marshal frame: %w", err)
 	}
 	if _, err := c.conn.Write(append(line, '\n')); err != nil {
-		return fmt.Errorf("%w: write frame: %w", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: write frame: %w", ErrHandshake, err)
 	}
 	raw, err := c.r.ReadBytes('\n')
 	if err != nil {
-		return fmt.Errorf("%w: read reply: %w", ErrHandshake, err)
+		return nil, fmt.Errorf("%w: read reply: %w", ErrHandshake, err)
+	}
+	return raw, nil
+}
+
+// roundTripLocked sends one frame and validates the op of the reply.
+// Callers hold no lock; the method takes it.
+func (c *UnixClient) roundTripLocked(ctx context.Context, send frame, wantOp string) error {
+	raw, err := c.exchangeLocked(ctx, send)
+	if err != nil {
+		return err
 	}
 	var reply frame
 	if err := json.Unmarshal(raw, &reply); err != nil {
@@ -116,18 +161,173 @@ func (c *UnixClient) Health(ctx context.Context) (HealthStatus, error) {
 	return HealthStatus{OK: true, Detail: "socket handshake + ping ok"}, nil
 }
 
-// Generate is not built yet: the Rust token loop does not speak the
-// socket protocol. Named refusal, never a fabricated stream.
-func (c *UnixClient) Generate(context.Context, GenerateRequest) (<-chan TokenEvent, error) {
-	return nil, fmt.Errorf("%w: generate over socket", ErrNotImplemented)
+// DebugInfo returns the engine's self-report: the loaded model, its
+// coverage-gate result, and its serving counters, as the engine
+// reported them. The platform's /debug route includes it when the
+// wired client offers it.
+func (c *UnixClient) DebugInfo(ctx context.Context) (map[string]any, error) {
+	raw, err := c.exchangeLocked(ctx, frame{Op: "debug"})
+	if err != nil {
+		return nil, err
+	}
+	var info map[string]any
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return nil, fmt.Errorf("%w: debug reply is not JSON: %w", ErrHandshake, err)
+	}
+	if op, _ := info["op"].(string); op != "debug_info" {
+		return nil, fmt.Errorf("%w: got op %q, want %q", ErrHandshake, op, "debug_info")
+	}
+	return info, nil
 }
 
-// Embed is not built yet, same as Generate.
+// Generate runs one completion on the engine and streams its token
+// events. The call blocks until the engine produces its first frame:
+// a refusal that arrives before any token (a bad prompt, a context
+// overflow, a model mismatch) is returned as the call's error, mapped
+// onto the named vocabulary, instead of surfacing as an empty stream.
+// An engine error after streaming has begun closes the channel
+// without a done event, which is how mid-generation failure shows up
+// under the Client contract today.
+func (c *UnixClient) Generate(ctx context.Context, req GenerateRequest) (<-chan TokenEvent, error) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		return nil, ErrClosed
+	}
+	conn, err := dialRaw(ctx, c.socketPath)
+	if err != nil {
+		return nil, err
+	}
+	gc := &UnixClient{conn: conn, r: bufio.NewReader(conn), socketPath: c.socketPath}
+	if err := gc.handshake(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	wire := genFrame{
+		Op:          "generate",
+		Model:       req.Model,
+		Prompt:      req.Prompt,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		Stop:        req.Stop,
+	}
+	line, err := json.Marshal(wire)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("engine: marshal generate frame: %w", err)
+	}
+	if _, err := conn.Write(append(line, '\n')); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: write generate frame: %w", ErrUnavailable, err)
+	}
+
+	out := make(chan TokenEvent, 16)
+	started := make(chan error, 1)
+	go gc.streamGenerate(ctx, out, started)
+	select {
+	case err := <-started:
+		if err != nil {
+			return nil, err
+		}
+		return out, nil
+	case <-ctx.Done():
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
+}
+
+// streamGenerate is the read loop behind Generate. It owns the
+// per-generation connection, closes the event channel exactly once,
+// and reports how the stream began on started (nil once the first
+// token frame has been accepted, the refusal otherwise), exactly
+// once.
+func (c *UnixClient) streamGenerate(ctx context.Context, out chan<- TokenEvent, started chan<- error) {
+	defer close(out)
+	defer func() { _ = c.conn.Close() }()
+	// A caller that goes away mid-generation unblocks the read.
+	go func() {
+		<-ctx.Done()
+		_ = c.conn.Close()
+	}()
+
+	signaled := false
+	signal := func(err error) {
+		if !signaled {
+			signaled = true
+			started <- err
+		}
+	}
+	for {
+		raw, err := c.r.ReadBytes('\n')
+		if err != nil {
+			if ctx.Err() != nil {
+				signal(ctx.Err())
+			} else {
+				signal(fmt.Errorf("%w: generate stream closed early: %w", ErrUnavailable, err))
+			}
+			return
+		}
+		var f genFrame
+		if err := json.Unmarshal(raw, &f); err != nil {
+			signal(fmt.Errorf("%w: generate reply is not JSON: %w", ErrHandshake, err))
+			return
+		}
+		switch f.Op {
+		case "token":
+			signal(nil)
+			ev := TokenEvent{
+				Text:         f.Text,
+				TokenID:      f.TokenID,
+				Done:         f.Done,
+				FinishReason: f.FinishReason,
+			}
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return
+			}
+			if f.Done {
+				return
+			}
+		case "error":
+			// Before the first token, the refusal is Generate's
+			// error return. After it, the error ends the stream: the
+			// channel closes without a done event.
+			signal(mapEngineError(f))
+			return
+		default:
+			signal(fmt.Errorf("%w: unexpected op %q in generate stream", ErrHandshake, f.Op))
+			return
+		}
+	}
+}
+
+func mapEngineError(f genFrame) error {
+	msg := f.Message
+	if msg == "" {
+		msg = f.Code
+	}
+	switch f.Code {
+	case "bad_request", "context_overflow", "model_not_found", "protocol_mismatch":
+		return fmt.Errorf("%w: %s", ErrBadRequest, msg)
+	case "not_implemented":
+		return fmt.Errorf("%w: %s", ErrNotImplemented, msg)
+	default:
+		return fmt.Errorf("engine: %s: %s", f.Code, msg)
+	}
+}
+
+// Embed is not built yet: the socket protocol has no embedding
+// operation. Named refusal, never a fabricated vector.
 func (c *UnixClient) Embed(context.Context, EmbedRequest) (EmbedResponse, error) {
 	return EmbedResponse{}, fmt.Errorf("%w: embed over socket", ErrNotImplemented)
 }
 
-// Close shuts the socket down. Later calls refuse with ErrClosed.
+// Close shuts the control connection down. Later calls refuse with
+// ErrClosed; generations already streaming on their own connections
+// are governed by their request contexts.
 func (c *UnixClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

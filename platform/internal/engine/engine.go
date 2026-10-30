@@ -1,10 +1,12 @@
 // Package engine defines the seam between the Go platform and the Rust
 // hot loop.
 //
-// The platform never generates a token itself. It calls a Client; today
-// the only implementations are Unavailable (wired when no engine is
-// configured) and the Unix-socket skeleton that will talk to the Rust
-// engine process. Every failure mode is a named error so handlers can map
+// The platform never generates a token itself. It calls a Client; the
+// implementations are Unavailable (wired when no engine is configured)
+// and UnixClient, which speaks the socket protocol to the Rust engine
+// process: handshake, ping, the debug self-report, and streamed
+// generation. Embed still refuses by name on both, because the
+// protocol has no embedding operation yet. Every failure mode is a named error so handlers can map
 // it to an honest HTTP status instead of inventing a success response,
 // the failure pattern the old platform kept falling into (fake LoRA
 // loads, an itak-quant that printed SUCCESS and wrote nothing).

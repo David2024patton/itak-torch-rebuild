@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,30 +54,74 @@ func fakeEngine(t *testing.T, ackProto int, ackOp string) string {
 func serveConn(conn net.Conn, ackProto int, ackOp string) {
 	defer func() { _ = conn.Close() }()
 	r := bufio.NewReader(conn)
+	write := func(reply map[string]any) bool {
+		out, _ := json.Marshal(reply)
+		_, err := conn.Write(append(out, '\n'))
+		return err == nil
+	}
 	for {
 		line, err := r.ReadBytes('\n')
 		if err != nil {
 			return
 		}
 		var f struct {
-			Op string `json:"op"`
+			Op     string `json:"op"`
+			Prompt string `json:"prompt"`
 		}
 		if err := json.Unmarshal(line, &f); err != nil {
 			return
 		}
-		var reply map[string]any
 		switch f.Op {
 		case "hello":
-			reply = map[string]any{"op": ackOp, "proto": ackProto}
+			if !write(map[string]any{"op": ackOp, "proto": ackProto}) {
+				return
+			}
 		case "ping":
-			reply = map[string]any{"op": "pong"}
+			if !write(map[string]any{"op": "pong"}) {
+				return
+			}
+		case "debug":
+			if !write(map[string]any{"op": "debug_info", "model": "fake-1b", "generations": 3}) {
+				return
+			}
+		case "generate":
+			if !serveGenerate(write, f.Prompt) {
+				return
+			}
 		default:
-			reply = map[string]any{"op": "error", "message": "unknown op"}
+			if !write(map[string]any{"op": "error", "message": "unknown op"}) {
+				return
+			}
 		}
-		out, _ := json.Marshal(reply)
-		if _, err := conn.Write(append(out, '\n')); err != nil {
-			return
+	}
+}
+
+// serveGenerate scripts the generate stream off the prompt text, so
+// one fake covers the success path and both error placements.
+func serveGenerate(write func(map[string]any) bool, prompt string) bool {
+	switch {
+	case strings.Contains(prompt, "err-overflow"):
+		return write(map[string]any{
+			"op": "error", "code": "context_overflow",
+			"message": "prompt of 9 tokens plus max_tokens 4 exceeds the context length 8",
+		})
+	case strings.Contains(prompt, "err-mid"):
+		if !write(map[string]any{"op": "token", "text": " Paris", "token_id": 13796}) {
+			return false
 		}
+		return write(map[string]any{
+			"op": "error", "code": "forward_failed", "message": "decode step 2: boom",
+		})
+	default:
+		if !write(map[string]any{"op": "token", "text": " Paris", "token_id": 13796}) {
+			return false
+		}
+		if !write(map[string]any{"op": "token", "text": ". It", "token_id": 26}) {
+			return false
+		}
+		return write(map[string]any{
+			"op": "token", "text": "", "token_id": 0, "done": true, "finish_reason": "stop",
+		})
 	}
 }
 
@@ -100,13 +145,74 @@ func TestUnixHandshakeAndHealth(t *testing.T) {
 	}
 }
 
-func TestUnixGenerateIsNamedNotImplemented(t *testing.T) {
+func TestUnixGenerateStreamsTokens(t *testing.T) {
 	c := dial(t, fakeEngine(t, 1, "hello_ack"))
-	if _, err := c.Generate(context.Background(), engine.GenerateRequest{}); !errors.Is(err, engine.ErrNotImplemented) {
-		t.Fatalf("Generate err = %v, want ErrNotImplemented", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := c.Generate(ctx, engine.GenerateRequest{Model: "fake-1b", Prompt: "The capital of France is"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
+	var events []engine.TokenEvent
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 3 {
+		t.Fatalf("got %d events, want 3: %+v", len(events), events)
+	}
+	if events[0].Text != " Paris" || events[0].TokenID != 13796 || events[0].Done {
+		t.Fatalf("event 0 = %+v, want the Paris token event", events[0])
+	}
+	if events[1].Text != ". It" || events[1].TokenID != 26 {
+		t.Fatalf("event 1 = %+v", events[1])
+	}
+	if !events[2].Done || events[2].FinishReason != "stop" {
+		t.Fatalf("event 2 = %+v, want done with finish_reason stop", events[2])
+	}
+}
+
+func TestUnixGenerateStartErrorIsBadRequest(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.Generate(ctx, engine.GenerateRequest{Prompt: "err-overflow please"})
+	if !errors.Is(err, engine.ErrBadRequest) {
+		t.Fatalf("Generate err = %v, want ErrBadRequest", err)
+	}
+}
+
+func TestUnixGenerateMidStreamErrorClosesWithoutDone(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ch, err := c.Generate(ctx, engine.GenerateRequest{Prompt: "err-mid please"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	var events []engine.TokenEvent
+	for ev := range ch {
+		events = append(events, ev)
+	}
+	if len(events) != 1 || events[0].Text != " Paris" || events[0].Done {
+		t.Fatalf("events = %+v, want one token event and a close with no done", events)
+	}
+}
+
+func TestUnixEmbedStillNotImplemented(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
 	if _, err := c.Embed(context.Background(), engine.EmbedRequest{}); !errors.Is(err, engine.ErrNotImplemented) {
 		t.Fatalf("Embed err = %v, want ErrNotImplemented", err)
+	}
+}
+
+func TestUnixDebugInfo(t *testing.T) {
+	c := dial(t, fakeEngine(t, 1, "hello_ack"))
+	info, err := c.DebugInfo(context.Background())
+	if err != nil {
+		t.Fatalf("DebugInfo: %v", err)
+	}
+	if info["model"] != "fake-1b" {
+		t.Fatalf("debug info = %v, want model fake-1b", info)
 	}
 }
 

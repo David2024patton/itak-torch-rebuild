@@ -16,6 +16,7 @@ members = [
     "crates/attention",
     "crates/cpu-compute",
     "crates/gguf",
+    "crates/itak-engine",
     "crates/itak-kernels",
     "crates/itak-loader",
     "crates/itak-types",

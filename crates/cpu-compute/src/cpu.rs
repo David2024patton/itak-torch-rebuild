@@ -316,6 +316,13 @@ impl CpuCompute {
     }
 
     /// Apply RoPE to every head of one position's projection row.
+    /// The pairing is llama.cpp's NORM mode (adjacent channels):
+    /// `llama_model_rope_type` selects LLAMA_ROPE_TYPE_NORM for
+    /// muse-glimmer, and the converter unpermuted Q/K into that
+    /// layout, so the half-split form torch-math's `rope` implements
+    /// for the llama/qwen2 families would pair the wrong channels
+    /// here (a Run B follow-up find; the two pairings disagree
+    /// numerically from the first rotated position).
     fn rope_row(
         row: &[f32],
         heads: usize,
@@ -326,7 +333,7 @@ impl CpuCompute {
     ) -> Result<Vec<f32>> {
         let mut out = Vec::with_capacity(row.len());
         for h in 0..heads {
-            let rotated = torch_math::rope(
+            let rotated = torch_math::rope_interleaved(
                 &row[h * head_dim..(h + 1) * head_dim],
                 position,
                 base,
@@ -389,6 +396,31 @@ impl Compute for CpuCompute {
         let mut out = Vec::with_capacity(x.len());
         for r in 0..rows {
             let row = torch_math::rms_norm(&x[r * width..(r + 1) * width], &w, eps)
+                .map_err(|e| step_failed(step, e.to_string()))?;
+            out.extend_from_slice(&row);
+        }
+        Ok(out)
+    }
+
+    fn rms_norm_plain(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>> {
+        let step = "rms_norm_plain";
+        if rows == 0 || x.len() % rows != 0 {
+            return Err(step_failed(
+                step,
+                format!(
+                    "input holds {} elements, not a whole number of {rows} rows",
+                    x.len()
+                ),
+            ));
+        }
+        let width = x.len() / rows;
+        // Weightless: normalize by RMS only. torch_math::rms_norm
+        // wants a weight slice, so hand it ones rather than growing
+        // a second kernel for the same arithmetic.
+        let ones = vec![1.0f32; width];
+        let mut out = Vec::with_capacity(x.len());
+        for r in 0..rows {
+            let row = torch_math::rms_norm(&x[r * width..(r + 1) * width], &ones, eps)
                 .map_err(|e| step_failed(step, e.to_string()))?;
             out.extend_from_slice(&row);
         }
@@ -479,30 +511,43 @@ impl Compute for CpuCompute {
         let head_dim = cfg.key_length as usize;
         let params = AttentionParams::new();
         let mut out = Vec::with_capacity(rows * q_width);
-        // One position at a time: rotate, append, attend. Prefill
-        // and decode share this exact path (decode is the rows == 1
-        // case), and the causal and window masks inside
-        // gqa_attention are stated over absolute positions, so a
-        // query never sees a later position even though the whole
-        // call's keys end up stored.
+        // One position at a time: rotate (sliding layers only),
+        // append, attend. Prefill and decode share this exact path
+        // (decode is the rows == 1 case), and the causal and window
+        // masks inside gqa_attention are stated over absolute
+        // positions, so a query never sees a later position even
+        // though the whole call's keys end up stored.
         for i in 0..rows {
             let position = start + i;
-            let q_rot = Self::rope_row(
-                &req.q[i * q_width..(i + 1) * q_width],
-                cfg.q_heads as usize,
-                head_dim,
-                position,
-                cfg.rope_freq_base,
-                step,
-            )?;
-            let k_rot = Self::rope_row(
-                &req.k[i * k_width..(i + 1) * k_width],
-                cfg.kv_heads as usize,
-                head_dim,
-                position,
-                cfg.rope_freq_base,
-                step,
-            )?;
+            // RoPE runs on the sliding-window layers only, at the
+            // SWA base; global layers are NoPE and their Q/K pass
+            // through unrotated (src/models/muse-glimmer.cpp:
+            // "RoPE runs on the SWA layers, NoPE on full ones").
+            let (q_rot, k_rot) = if req.kind == LayerKind::SlidingWindow {
+                (
+                    Self::rope_row(
+                        &req.q[i * q_width..(i + 1) * q_width],
+                        cfg.q_heads as usize,
+                        head_dim,
+                        position,
+                        cfg.rope_freq_base_swa,
+                        step,
+                    )?,
+                    Self::rope_row(
+                        &req.k[i * k_width..(i + 1) * k_width],
+                        cfg.kv_heads as usize,
+                        head_dim,
+                        position,
+                        cfg.rope_freq_base_swa,
+                        step,
+                    )?,
+                )
+            } else {
+                (
+                    req.q[i * q_width..(i + 1) * q_width].to_vec(),
+                    req.k[i * k_width..(i + 1) * k_width].to_vec(),
+                )
+            };
             state
                 .cache
                 .append(
@@ -638,6 +683,7 @@ mod tests {
             key_length: 2,
             value_length: 2,
             rope_freq_base: 10_000.0,
+            rope_freq_base_swa: 10_000.0,
             rms_eps: 1e-6,
             sliding_window: 8,
             logit_softcap: 20.0,

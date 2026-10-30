@@ -327,6 +327,7 @@ fn test_config_kv(
         key_length,
         value_length,
         rope_freq_base: 10_000.0,
+        rope_freq_base_swa: 10_000.0,
         rms_eps: 1e-6,
         sliding_window,
         logit_softcap: 20.0,
@@ -360,17 +361,21 @@ fn max_diff(a: &[f32], b: &[f32]) -> f32 {
 
 #[test]
 fn zero_attention_and_ffn_match_hand_computed_logits() {
-    // ASSUMPTION PINNED, one of the two placements muse-glimmer's
-    // model docs flag for verification: the post norms are applied
-    // AFTER each residual add (the Gemma-style pre/post pattern).
-    // With the attention output projection and the FFN down
-    // projection zeroed, neither sub-block can change the residual
-    // stream, so under that reading each layer maps the stream x to
-    // rms(rms(x)): one post-attention norm, one post-FFN norm. The
-    // expected logits below are computed by exactly that reading
-    // with test-local math. If the post norms ever move ahead of the
-    // adds, the count changes and this test fails visibly, which is
-    // what pinning an assumption means.
+    // CONVENTIONS PINNED, settled from llama.cpp source in the Run B
+    // follow-up (src/models/muse-glimmer.cpp): (1) the embedding
+    // output passes a weightless RMSNorm before layer 0; (2) each
+    // post norm normalizes the sub-block's OUTPUT and the result is
+    // added to the untouched residual, so the residual stream itself
+    // is never renormalized; (3) the head scales first, then
+    // softcaps. With the attention output projection and the FFN
+    // down projection zeroed, both branch outputs are the zero
+    // vector, their post norms are zero too, and each layer leaves
+    // the stream exactly as it found it. The expected logits below
+    // are computed by exactly that reading with test-local math:
+    // the embedding row passes TWO norms in total (embedding norm,
+    // final norm). The pre-fix conventions (post norms after the
+    // adds, no embedding norm, cap before scale) would give five
+    // norms and a different finishing curve, and fail here.
     let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::SlidingWindow], 16);
     let model = make_model(&cfg, Style::Analytic);
     let mut cache = PositionCache::new();
@@ -380,18 +385,18 @@ fn zero_attention_and_ffn_match_hand_computed_logits() {
     assert_eq!(cache.position(), 3);
     assert_eq!(logits.len(), VOCAB);
 
-    // Last token is 3; its embedding row passes 2 norms per layer
-    // (4 total) plus the final norm, then the repeat-identity head,
-    // then the file's softcap and scale (cap 20, scale 0.5).
+    // Last token is 3; its embedding row passes the embedding norm
+    // and the final norm, then the repeat-identity head, then the
+    // file's scale and softcap (scale 0.5, cap 20, in that order).
     let mut x: Vec<f64> = (0..HIDDEN)
         .map(|i| f64::from(emb_pattern_a(3, i)))
         .collect();
-    for _ in 0..5 {
+    for _ in 0..2 {
         x = rms64(&x, 1e-6);
     }
     for (j, got) in logits.iter().enumerate() {
         let z = x[j % HIDDEN];
-        let want = 0.5 * 20.0 * (z / 20.0).tanh();
+        let want = 20.0 * (0.5 * z / 20.0).tanh();
         assert!(
             (f64::from(*got) - want).abs() < 1e-4,
             "logit {j}: got {got}, want {want}"
@@ -400,8 +405,10 @@ fn zero_attention_and_ffn_match_hand_computed_logits() {
 }
 
 /// Test-local RoPE in f64: adjacent pairs, pair i turning by
-/// position * base^(-2i / dim), the convention `torch-math`
-/// documents and llama.cpp uses.
+/// position * base^(-2i / dim). This is ggml's NORM pairing, the
+/// one llama.cpp selects for muse-glimmer; torch-math's default
+/// `rope` is the half-split NEOX pairing the llama/qwen2 families
+/// use, and the Glimmer backend must not call that one.
 fn rope64(v: &[f64], position: usize, base: f64) -> Vec<f64> {
     let mut out = v.to_vec();
     let dim = v.len() as f64;
@@ -417,22 +424,154 @@ fn rope64(v: &[f64], position: usize, base: f64) -> Vec<f64> {
 
 #[test]
 fn attention_mixing_matches_a_naive_reference() {
-    // ASSUMPTIONS PINNED, both flagged in muse-glimmer's model docs:
-    // (1) the attention gate projection reads the same normed input
-    // as the Q/K/V projections. Here attn_gate is 0.25 * identity,
-    // so the gate values are 0.25 * h and the naive route below uses
-    // h (the normed input), never the raw residual; the opposite
-    // reading produces different numbers and would fail. (2) The
-    // post norms sit after the residual adds, as in the sibling
-    // test. Everything else (QK norms per head, RoPE at absolute
-    // positions, GQA grouping 2:1, causal masking, the gate's
-    // sigmoid, the final norm, the softcap) is computed here from
-    // the formulas, in f64, sharing no code with the backend.
+    // CONVENTIONS PINNED, settled from llama.cpp source in the Run B
+    // follow-up (src/models/muse-glimmer.cpp): (1) the attention
+    // gate projection reads the same normed input as the Q/K/V
+    // projections. Here attn_gate is 0.25 * identity, so the gate
+    // values are 0.25 * h and the naive route below uses h (the
+    // normed input), never the raw stream; the opposite reading
+    // produces different numbers and would fail. (2) The embedding
+    // output is RMS-normed (weightless) before the layer, and that
+    // normed stream, not the raw embedding, is the residual base.
+    // (3) The post-attention norm normalizes the branch output
+    // (with the reference graph's hardcoded eps 1e-8) before the
+    // residual add; the FFN output is zero in this style, so its
+    // post norm contributes nothing. (4) RoPE runs on the sliding
+    // layer and NOT on the global layer (NoPE), so the naive route
+    // runs twice, once per kind, rotating only for the sliding one:
+    // a backend that rotates the global layer, or fails to rotate
+    // the sliding one, disagrees with one of the two runs.
+    // Everything else (QK norms per head, GQA grouping 2:1, causal
+    // masking, the gate's sigmoid, the final norm, scale-then-cap)
+    // is computed here from the formulas, in f64, sharing no code
+    // with the backend.
+    let eps = 1e-6f64;
+    let post_eps = 1e-8f64; // the reference graph's hardcoded post-norm eps
+    let toks = [5usize, 9usize];
+    let emb: Vec<Vec<f64>> = toks
+        .iter()
+        .map(|&t| {
+            (0..HIDDEN)
+                .map(|i| f64::from(emb_pattern_b(t, i)))
+                .collect()
+        })
+        .collect();
+    // The stream entering the layer: embedding rows after the
+    // weightless embedding norm.
+    let stream: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
+    let h: Vec<Vec<f64>> = stream.iter().map(|x| rms64(x, eps)).collect();
+
+    for (kind, rotate) in [
+        (LayerKind::Global, false),
+        (LayerKind::SlidingWindow, true),
+    ] {
+        let cfg = test_config(vec![kind], 16);
+        let model = make_model(&cfg, Style::Attention);
+        let mut cache = PositionCache::new();
+        let logits = model.forward(&[5, 9], &mut cache).expect("forward runs");
+        assert_eq!(cache.position(), 2);
+
+        let q_of = |p: usize, head: usize| -> Vec<f64> {
+            let q = rms64(&h[p][head * HEAD_DIM..(head + 1) * HEAD_DIM], eps);
+            if rotate {
+                rope64(&q, p, 10_000.0)
+            } else {
+                q
+            }
+        };
+        let k_of = |p: usize, kv: usize| -> Vec<f64> {
+            let k = rms64(&h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM], eps);
+            if rotate {
+                rope64(&k, p, 10_000.0)
+            } else {
+                k
+            }
+        };
+        let v_of = |p: usize, kv: usize| -> Vec<f64> {
+            h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec()
+        };
+
+        // Attention for the last position (p = 1) only; its output
+        // is what the returned logits are computed from.
+        let p = 1;
+        let mut attn = vec![0.0f64; HIDDEN];
+        for head in 0..4 {
+            let kv = head / 2; // GQA: heads pair up over 2 KV heads.
+            let q = q_of(p, head);
+            let mut scores = Vec::new();
+            for j in 0..=p {
+                let k = k_of(j, kv);
+                let s: f64 =
+                    q.iter().zip(&k).map(|(a, b)| a * b).sum::<f64>() / (HEAD_DIM as f64).sqrt();
+                scores.push(s);
+            }
+            let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+            let sum: f64 = exps.iter().sum();
+            for d in 0..HEAD_DIM {
+                let mut acc = 0.0;
+                for (j, e) in exps.iter().enumerate() {
+                    acc += (e / sum) * v_of(j, kv)[d];
+                }
+                attn[head * HEAD_DIM + d] = acc;
+            }
+        }
+        // Gate: attn_gate = 0.25 * identity over the normed input h.
+        let gated: Vec<f64> = attn
+            .iter()
+            .zip(&h[p])
+            .map(|(a, hv)| a / (1.0 + (-(0.25 * hv)).exp()))
+            .collect();
+        // Output projection is identity. Post norm on the branch,
+        // then the residual add against the embedding-normed stream.
+        // The FFN branch is zero, so the stream passes it unchanged.
+        let post = rms64(&gated, post_eps);
+        let after: Vec<f64> = stream[p]
+            .iter()
+            .zip(&post)
+            .map(|(x, g)| x + g)
+            .collect();
+        let n = rms64(&after, eps); // final norm
+        for (j, got) in logits.iter().enumerate() {
+            let z = n[j % HIDDEN];
+            let want = 20.0 * (0.5 * z / 20.0).tanh();
+            assert!(
+                (f64::from(*got) - want).abs() < 1e-3,
+                "{kind:?} logit {j}: got {got}, want {want}"
+            );
+        }
+    }
+}
+
+#[test]
+fn post_norm_eps_and_placement_are_pinned_by_a_tiny_branch() {
+    // The post-norm convention has two halves, both settled from
+    // src/models/muse-glimmer.cpp: the norm applies to the branch
+    // output BEFORE the residual add, with eps hardcoded to 1e-8
+    // (not the file's 1e-5). With an ordinary-size branch the eps
+    // half is numerically invisible, so this test shrinks the
+    // attention output projection to 1e-4 * identity: the branch RMS
+    // lands near sqrt(1e-8), where eps 1e-8 vs eps 1e-6 changes the
+    // normalized branch by more than an order of magnitude, and the
+    // placement half matters just as much (normalizing the branch
+    // rescales it to unit RMS; normalizing the sum would leave it a
+    // 1e-4 ripple on the stream). The naive route below computes
+    // the expected logits under both eps readings and asserts the
+    // backend lands on the 1e-8 one decisively.
     let cfg = test_config(vec![LayerKind::Global], 16);
-    let model = make_model(&cfg, Style::Attention);
+    let mut source = build_source(&cfg, Style::Attention);
+    source.tensors.insert(
+        "blk.0.attn_output.weight".to_string(),
+        f32_tensor(
+            "blk.0.attn_output.weight",
+            &[HIDDEN as u64, HIDDEN as u64],
+            scaled_identity(HIDDEN, 1e-4),
+        ),
+    );
+    let weights = Weights::load(&source, &cfg).expect("weights load");
+    let model = GlimmerModel::new(cfg, weights, Box::new(CpuCompute::new()));
     let mut cache = PositionCache::new();
     let logits = model.forward(&[5, 9], &mut cache).expect("forward runs");
-    assert_eq!(cache.position(), 2);
 
     let eps = 1e-6f64;
     let toks = [5usize, 9usize];
@@ -444,34 +583,16 @@ fn attention_mixing_matches_a_naive_reference() {
                 .collect()
         })
         .collect();
-    let h: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
-    let q_of = |p: usize, head: usize| -> Vec<f64> {
-        rope64(
-            &rms64(&h[p][head * HEAD_DIM..(head + 1) * HEAD_DIM], eps),
-            p,
-            10_000.0,
-        )
-    };
-    let k_of = |p: usize, kv: usize| -> Vec<f64> {
-        rope64(
-            &rms64(&h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM], eps),
-            p,
-            10_000.0,
-        )
-    };
-    let v_of =
-        |p: usize, kv: usize| -> Vec<f64> { h[p][kv * HEAD_DIM..(kv + 1) * HEAD_DIM].to_vec() };
-
-    // Attention for the last position (p = 1) only; its output is
-    // what the returned logits are computed from.
+    let stream: Vec<Vec<f64>> = emb.iter().map(|x| rms64(x, eps)).collect();
+    let h: Vec<Vec<f64>> = stream.iter().map(|x| rms64(x, eps)).collect();
     let p = 1;
     let mut attn = vec![0.0f64; HIDDEN];
     for head in 0..4 {
-        let kv = head / 2; // GQA: heads pair up over 2 KV heads.
-        let q = q_of(p, head);
+        let kv = head / 2;
+        let q = rms64(&h[p][head * HEAD_DIM..(head + 1) * HEAD_DIM], eps);
         let mut scores = Vec::new();
-        for j in 0..=p {
-            let k = k_of(j, kv);
+        for hj in h.iter().take(p + 1) {
+            let k = rms64(&hj[kv * HEAD_DIM..(kv + 1) * HEAD_DIM], eps);
             let s: f64 =
                 q.iter().zip(&k).map(|(a, b)| a * b).sum::<f64>() / (HEAD_DIM as f64).sqrt();
             scores.push(s);
@@ -482,30 +603,32 @@ fn attention_mixing_matches_a_naive_reference() {
         for d in 0..HEAD_DIM {
             let mut acc = 0.0;
             for (j, e) in exps.iter().enumerate() {
-                acc += (e / sum) * v_of(j, kv)[d];
+                acc += (e / sum) * h[j][kv * HEAD_DIM + d];
             }
             attn[head * HEAD_DIM + d] = acc;
         }
     }
-    // Gate: attn_gate = 0.25 * identity over the normed input h.
-    let gated: Vec<f64> = attn
+    let branch: Vec<f64> = attn
         .iter()
         .zip(&h[p])
-        .map(|(a, hv)| a / (1.0 + (-(0.25 * hv)).exp()))
+        .map(|(a, hv)| 1e-4 * a / (1.0 + (-(0.25 * hv)).exp()))
         .collect();
-    // Output projection is identity; residual add; post norms.
-    let after: Vec<f64> = emb[p].iter().zip(&gated).map(|(x, g)| x + g).collect();
-    let a = rms64(&after, eps); // post-attention norm
-    let b = rms64(&a, eps); // post-FFN norm (FFN output is zero)
-    let n = rms64(&b, eps); // final norm
-    for (j, got) in logits.iter().enumerate() {
-        let z = n[j % HIDDEN];
-        let want = 0.5 * 20.0 * (z / 20.0).tanh();
-        assert!(
-            (f64::from(*got) - want).abs() < 1e-3,
-            "logit {j}: got {got}, want {want}"
-        );
-    }
+    let expected = |post_eps: f64| -> Vec<f64> {
+        let post = rms64(&branch, post_eps);
+        let after: Vec<f64> = stream[p].iter().zip(&post).map(|(x, g)| x + g).collect();
+        let n = rms64(&after, eps);
+        (0..VOCAB)
+            .map(|j| 20.0 * (0.5 * n[j % HIDDEN] / 20.0).tanh())
+            .collect()
+    };
+    let to_f32 = |v: &[f64]| v.iter().map(|x| *x as f32).collect::<Vec<f32>>();
+    let d_right = max_diff(&logits, &to_f32(&expected(1e-8)));
+    let d_wrong = max_diff(&logits, &to_f32(&expected(1e-6)));
+    assert!(
+        d_right < 2e-3 && d_right * 10.0 < d_wrong,
+        "post-norm eps/placement not decisive: distance to the eps-1e-8 reading \
+         is {d_right}, to the eps-1e-6 reading is {d_wrong}"
+    );
 }
 
 #[test]
@@ -590,6 +713,96 @@ fn incremental_matches_prefill_across_window_eviction() {
     assert!(
         d <= 1e-6,
         "incremental logits differ from one-shot prefill by {d} across window eviction"
+    );
+}
+
+/// Intermediate-scale config for the decode-sensitivity test: the
+/// real model's head geometry (32 Q heads over 2 KV heads, a 16 to
+/// 1 grouping), its eps and RoPE base, an every-fourth global layer
+/// pattern like the real 52, but only 8 layers and hidden 512 so
+/// the test stays inside a debug-build time budget (the reference
+/// backend dequantizes per call; at hidden 1024 this test took
+/// ~300 s in debug). The existing proofs are 2 layers, 4 heads,
+/// head dim 8; run B's freeze appeared at real scale, so this test
+/// exists to find which scale axis, if any, kills decode
+/// sensitivity in isolation.
+fn intermediate_config() -> GlimmerConfig {
+    let layers: Vec<LayerKind> = (0..8)
+        .map(|i| {
+            if i % 4 == 3 {
+                LayerKind::Global
+            } else {
+                LayerKind::SlidingWindow
+            }
+        })
+        .collect();
+    GlimmerConfig {
+        name: Some("intermediate synthetic".to_string()),
+        block_count: 8,
+        context_length: 4096,
+        hidden: 512,
+        ffn_hidden: 1024,
+        q_heads: 32,
+        kv_heads: 2,
+        key_length: 16,
+        value_length: 16,
+        rope_freq_base: 500_000.0,
+        rope_freq_base_swa: 500_000.0,
+        rms_eps: 1e-5,
+        sliding_window: 2048,
+        logit_softcap: 20.0,
+        logit_scale: 0.196_116_13,
+        vocab_size: 96,
+        layers,
+        pattern_source: PatternSource::MeasuredFallback,
+    }
+}
+
+#[test]
+fn decode_step_tracks_the_fed_token_at_intermediate_scale() {
+    // Run B's second symptom: at decode time the returned top-5 was
+    // identical to about 1e-6 regardless of the token fed. This test
+    // measures exactly that sensitivity at intermediate scale: same
+    // prompt, two different decode tokens, and the max logit
+    // difference between the two resulting distributions must be
+    // orders of magnitude above the freeze signature. The one-shot
+    // cross-check separates "the decode path is broken" from "the
+    // model's dynamics are insensitive": a correct decode step must
+    // also reproduce the one-shot logits for prompt + token.
+    let cfg = intermediate_config();
+    let prompt: [u32; 5] = [1, 2, 3, 4, 5];
+
+    let decode_after = |token: u32| -> Vec<f32> {
+        let model = make_model(&cfg, Style::Random);
+        let mut cache = PositionCache::new();
+        model.forward(&prompt, &mut cache).expect("prefill");
+        model.forward(&[token], &mut cache).expect("decode step")
+    };
+    let logits_a = decode_after(7);
+    let logits_b = decode_after(42);
+
+    let sensitivity = max_diff(&logits_a, &logits_b);
+    eprintln!("intermediate-scale decode sensitivity (7 vs 42): {sensitivity}");
+    assert!(
+        sensitivity > 1e-3,
+        "decode sensitivity collapsed: feeding token 7 vs token 42 after the \
+         same prompt changed the logits by only {sensitivity} (freeze signature \
+         in run B was ~1e-6)"
+    );
+
+    // The decode step must equal a one-shot run over prompt + token.
+    let one_shot = {
+        let model = make_model(&cfg, Style::Random);
+        let mut cache = PositionCache::new();
+        let mut seq = prompt.to_vec();
+        seq.push(7);
+        model.forward(&seq, &mut cache).expect("one-shot")
+    };
+    let lag = max_diff(&logits_a, &one_shot);
+    assert!(
+        lag <= 1e-5,
+        "decode step disagrees with one-shot prompt+token by {lag}: the decode \
+         path is not computing the distribution for the position it claims"
     );
 }
 

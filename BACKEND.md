@@ -267,6 +267,75 @@ it removes hand-rolled synchronization and descriptor management
 from a one-card product, and the measured limits say it is not the
 bottleneck standing between us and 708 GB/s.
 
+## BACKEND-RESULTS: K1 first landing (2026-10-29, crate `wgpu-compute`)
+
+The wgpu member of the itak-backend family landed as its own
+crate beside `cpu-compute` (the way the CPU member landed for
+T-4.1): `crates/wgpu-compute`, implementing `muse_glimmer::Compute`
+with device selection per Section 2 and kernel K1 real. K2 to K8
+sit in their own modules under the crate's `kernels` map, and
+every step that needs one refuses through that module with a
+named `StepFailed`; nothing falls back silently inside a step
+(Section 6's L2 composition stays a caller decision).
+
+**Correctness.** Synthetic full-row tests compare the GPU result
+against the `gguf` crate's dequantizer plus `torch-math` within
+reassociation noise, and the `k1_check` example ran the real
+file's `blk.0.ffn_gate.weight` ([6656 x 19968], 74,760,192 bytes)
+through `proj` on the server: max relative error 2.98e-7, cosine
+1.000000000 against the CPU reference. The Q6_K refusal through
+K2 and the cached-name geometry refusal are pinned by tests.
+
+**Bench method.** Server, RX 7900 XTX via RADV Mesa 26.0.8, wgpu
+27.0.1. The bench (`k1_bench` example) holds real Q4_K tensors
+resident and dispatches the GEMV over all of them per iteration:
+6 tensors, 167,731,200 bytes streamed per iteration, 2,000 timed
+iterations after 50 warmup, median of 3 runs. Short windows
+mislead on this card: an early 25-iteration run (a 68 ms window)
+read 61.4 GB/s before clocks ramped, so no number below comes
+from a short window; the single-tensor probe's timed window is
+about 0.2 s at its speed, the resident-set runs about 1.5 to
+2.3 s.
+
+| Measurement | GB/s | Note |
+| :--- | :--- | :--- |
+| Stream probe (this grid and access pattern, no dequant math; `stream_probe` example) | 746.9 | The wgpu stack's streaming level on this card |
+| K1 v1: scalar byte loads, one row per workgroup | 148.6 | First version |
+| K1 v2: vec4 traffic, one lane per super-block (SHIPPED) | 216.5 | The kernel in the crate |
+| K1 v3: Section 4 tile (4 rows per workgroup, activations staged in workgroup memory) | 147.6 | Built, measured, rejected: staging cost more than shared activation loads saved at these shapes |
+
+**Ash verdict (Section 8 rule, computed).** The shipped K1 lands
+at 216.5 GB/s, which is 30.6 percent of llama.cpp's 708 GB/s and
+below the 637 GB/s trigger: by the rule as written, the ash
+evaluation trigger FIRES for K1 after tuning. The evidence
+complicates the trigger's premise, and the complication is
+recorded rather than smoothed over: the stream probe through
+the same wgpu stack, same grid, reached 746.9 GB/s (105 percent
+of llama.cpp's number), so the gap is not the abstraction's
+streaming cost; it is the dequant instruction mix inside the
+kernel (nibble extraction, per-element conversion, and the
+factored scale/min sums). Section 8's prescribed prototype (K1
+in ash at Glimmer shapes) remains one valid next experiment; a
+llama.cpp-style kernel restructure in WGSL (shared-memory
+dequant staging, per-thread K slices) is the other, and the
+probe says the stack would not be its ceiling. No ash work was
+started under this landing; the trigger state is the record.
+
+**Residency notes.** Nothing hit the 2 GiB buffer cap: the
+largest K1 tensor is 74.8 MB, and the cap first matters at K3's
+0.86 GiB head, which fits. The bench window itself was
+constrained: the production llama-server held 25.35 GB of the
+card's 25.75 GB VRAM (about 384 MiB free), so the bench ran with
+a 160 MiB resident subset (still roughly twice the 96 MiB
+Infinity Cache, so the stream is VRAM traffic) instead of the
+full 14.89 GiB model stream. A full-residency Tier 1 run needs
+the card to itself and is a scheduled measurement, not a bench
+beside production. Coexistence is a first-order effect on this
+host: later the same evening, with a second llama-server and
+engine processes from parallel work on the card, the identical
+bench binary read about 17 GB/s. Bench reports on this host
+must state their window, as this one does.
+
 ## Appendix: the adapter probe
 
 Lives in scratch (/tmp/wgpu-probe), not in this repo: it is a

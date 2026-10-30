@@ -8,6 +8,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -239,6 +240,110 @@ func TestUnixEmbedStillNotImplemented(t *testing.T) {
 	c := dial(t, fakeEngine(t, 1, "hello_ack"))
 	if _, err := c.Embed(context.Background(), engine.EmbedRequest{}); !errors.Is(err, engine.ErrNotImplemented) {
 		t.Fatalf("Embed err = %v, want ErrNotImplemented", err)
+	}
+}
+
+// capturingEngine is a fake that records the raw generate frame it
+// receives, so a test can assert exactly what crossed the wire.
+func capturingEngine(t *testing.T) (string, func() map[string]any) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "engine.sock")
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	var mu sync.Mutex
+	var lastGen map[string]any
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				r := bufio.NewReader(conn)
+				for {
+					line, err := r.ReadBytes('\n')
+					if err != nil {
+						return
+					}
+					var f map[string]any
+					if json.Unmarshal(line, &f) != nil {
+						return
+					}
+					var reply map[string]any
+					switch f["op"] {
+					case "hello":
+						reply = map[string]any{"op": "hello_ack", "proto": 1}
+					case "generate":
+						mu.Lock()
+						lastGen = f
+						mu.Unlock()
+						serveGenerate(func(m map[string]any) bool {
+							out, _ := json.Marshal(m)
+							_, err := conn.Write(append(out, '\n'))
+							return err == nil
+						}, "")
+						return
+					default:
+						reply = map[string]any{"op": "pong"}
+					}
+					out, _ := json.Marshal(reply)
+					if _, err := conn.Write(append(out, '\n')); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return path, func() map[string]any {
+		mu.Lock()
+		defer mu.Unlock()
+		return lastGen
+	}
+}
+
+func TestUnixGenerateSamplingFieldsCrossTheWire(t *testing.T) {
+	path, lastGen := capturingEngine(t)
+	c := dial(t, path)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	seed, topK := uint64(42), 40
+	pres, freq := 0.5, -0.25
+	ch, err := c.Generate(ctx, engine.GenerateRequest{
+		Prompt: "x", Seed: &seed, TopK: &topK,
+		PresencePenalty: &pres, FrequencyPenalty: &freq,
+	})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for range ch {
+	}
+	frame := lastGen()
+	if frame == nil {
+		t.Fatal("fake engine captured no generate frame")
+	}
+	if frame["seed"] != float64(42) || frame["top_k"] != float64(40) ||
+		frame["presence_penalty"] != 0.5 || frame["frequency_penalty"] != -0.25 {
+		t.Fatalf("generate frame sampling fields = %v, want seed 42, top_k 40, penalties 0.5/-0.25", frame)
+	}
+
+	// Absent fields stay absent: an unset seed must not become a
+	// wire 0 the engine would mistake for an explicit seed.
+	ch, err = c.Generate(ctx, engine.GenerateRequest{Prompt: "x"})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for range ch {
+	}
+	frame = lastGen()
+	for _, key := range []string{"seed", "top_k", "presence_penalty", "frequency_penalty"} {
+		if _, present := frame[key]; present {
+			t.Fatalf("unset %s leaked onto the wire: %v", key, frame)
+		}
 	}
 }
 

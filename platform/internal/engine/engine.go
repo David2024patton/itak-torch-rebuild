@@ -43,7 +43,10 @@ var (
 	ErrGenerationFailed = errors.New("engine: generation failed")
 )
 
-// GenerateRequest is one completion job handed to the engine.
+// GenerateRequest is one completion job handed to the engine. The
+// sampling parity fields (TODO T-9.13) are pointers so an explicit
+// zero (a seed of 0, a penalty of 0) is distinguishable from an
+// absent field all the way to the wire.
 type GenerateRequest struct {
 	Model       string   `json:"model"`
 	Prompt      string   `json:"prompt"`
@@ -51,6 +54,15 @@ type GenerateRequest struct {
 	Temperature float64  `json:"temperature,omitempty"`
 	TopP        float64  `json:"top_p,omitempty"`
 	Stop        []string `json:"stop,omitempty"`
+	// Seed makes a sampled run reproducible; nil lets the engine
+	// seed from its clock.
+	Seed *uint64 `json:"seed,omitempty"`
+	// TopK caps the sampler's candidate set; nil or 0 disables it.
+	TopK *int `json:"top_k,omitempty"`
+	// PresencePenalty and FrequencyPenalty are the OpenAI-form
+	// repetition penalties; nil or 0 disables each.
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
 }
 
 // TokenEvent is one streamed piece of a generation. Done marks the final

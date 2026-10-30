@@ -253,6 +253,11 @@ type chatRequest struct {
 	Temperature *float64      `json:"temperature"`
 	TopP        *float64      `json:"top_p"`
 	Stop        []string      `json:"stop"`
+	// Sampling parity fields (TODO T-9.13), OpenAI-shaped.
+	Seed             *uint64  `json:"seed"`
+	TopK             *int     `json:"top_k"`
+	PresencePenalty  *float64 `json:"presence_penalty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty"`
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -267,10 +272,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	greq := engine.GenerateRequest{
-		Model:     req.Model,
-		Prompt:    flattenMessages(req.Messages),
-		MaxTokens: req.MaxTokens,
-		Stop:      req.Stop,
+		Model:            req.Model,
+		Prompt:           flattenMessages(req.Messages),
+		MaxTokens:        req.MaxTokens,
+		Stop:             req.Stop,
+		Seed:             req.Seed,
+		TopK:             req.TopK,
+		PresencePenalty:  req.PresencePenalty,
+		FrequencyPenalty: req.FrequencyPenalty,
 	}
 	if req.Temperature != nil {
 		greq.Temperature = *req.Temperature
@@ -454,6 +463,15 @@ func validateChat(req *chatRequest) *fieldError {
 	}
 	if req.TopP != nil && (*req.TopP < 0 || *req.TopP > 1) {
 		return &fieldError{"top_p must be between 0 and 1", "top_p"}
+	}
+	if req.TopK != nil && *req.TopK < 0 {
+		return &fieldError{"top_k must be >= 0", "top_k"}
+	}
+	if req.PresencePenalty != nil && (*req.PresencePenalty < -2 || *req.PresencePenalty > 2) {
+		return &fieldError{"presence_penalty must be between -2 and 2", "presence_penalty"}
+	}
+	if req.FrequencyPenalty != nil && (*req.FrequencyPenalty < -2 || *req.FrequencyPenalty > 2) {
+		return &fieldError{"frequency_penalty must be between -2 and 2", "frequency_penalty"}
 	}
 	return nil
 }

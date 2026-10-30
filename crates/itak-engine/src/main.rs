@@ -315,10 +315,14 @@ fn handle_generate(
         return send(writer, &protocol::error_frame("model_not_found", &msg));
     }
     let (reply_tx, reply_rx) = channel::<GenEvent>();
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x2545_f491);
+    // A request seed makes the sampled run reproducible; only a
+    // request without one is seeded from the clock (TODO T-9.13).
+    let seed = req.seed.unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x2545_f491)
+    });
     let job = Job {
         prompt: req.prompt,
         max_tokens: req.max_tokens,
@@ -326,6 +330,9 @@ fn handle_generate(
         top_p: req.top_p,
         stop: req.stop,
         seed,
+        top_k: req.top_k,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
         reply: reply_tx,
     };
     if jobs.send(job).is_err() {

@@ -18,10 +18,14 @@ import (
 const testKey = "test-key"
 
 // fakeEngine is a deterministic stand-in at the platform's engine seam.
-type fakeEngine struct{ generateCalls atomic.Int64 }
+type fakeEngine struct {
+	generateCalls atomic.Int64
+	lastRequest   atomic.Value // engine.GenerateRequest
+}
 
-func (f *fakeEngine) Generate(_ context.Context, _ engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+func (f *fakeEngine) Generate(_ context.Context, req engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
 	f.generateCalls.Add(1)
+	f.lastRequest.Store(req)
 	ch := make(chan engine.TokenEvent, 3)
 	ch <- engine.TokenEvent{Text: "Hello", TokenID: 1}
 	ch <- engine.TokenEvent{Text: " world", TokenID: 2}
@@ -223,14 +227,37 @@ func TestChatMidStreamFailureStreamingIsErrorFrame(t *testing.T) {
 	}
 }
 
+func TestChatSamplingFieldsReachTheEngine(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServer(t, fake)
+	body := `{"model":"glimmer","seed":42,"top_k":40,"presence_penalty":0.5,"frequency_penalty":-0.25,` +
+		`"messages":[{"role":"user","content":"hi"}]}`
+	code, _, respBody := do(t, ts, http.MethodPost, "/v1/chat/completions", body, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d (%s)", code, respBody)
+	}
+	got, ok := fake.lastRequest.Load().(engine.GenerateRequest)
+	if !ok {
+		t.Fatal("engine saw no generate request")
+	}
+	if got.Seed == nil || *got.Seed != 42 || got.TopK == nil || *got.TopK != 40 ||
+		got.PresencePenalty == nil || *got.PresencePenalty != 0.5 ||
+		got.FrequencyPenalty == nil || *got.FrequencyPenalty != -0.25 {
+		t.Fatalf("engine request = %+v, want seed 42, top_k 40, penalties 0.5/-0.25", got)
+	}
+}
+
 func TestChatValidation(t *testing.T) {
 	ts := newServer(t, &fakeEngine{})
 	cases := map[string]string{
-		"no model":    `{"messages":[{"role":"user","content":"x"}]}`,
-		"no messages": `{"model":"glimmer"}`,
-		"empty role":  `{"model":"glimmer","messages":[{"role":"","content":"x"}]}`,
-		"bad temp":    `{"model":"glimmer","temperature":9,"messages":[{"role":"user","content":"x"}]}`,
-		"not json":    `{oops`,
+		"no model":      `{"messages":[{"role":"user","content":"x"}]}`,
+		"no messages":   `{"model":"glimmer"}`,
+		"empty role":    `{"model":"glimmer","messages":[{"role":"","content":"x"}]}`,
+		"bad temp":      `{"model":"glimmer","temperature":9,"messages":[{"role":"user","content":"x"}]}`,
+		"bad top_k":     `{"model":"glimmer","top_k":-1,"messages":[{"role":"user","content":"x"}]}`,
+		"bad presence":  `{"model":"glimmer","presence_penalty":3,"messages":[{"role":"user","content":"x"}]}`,
+		"bad frequency": `{"model":"glimmer","frequency_penalty":-3,"messages":[{"role":"user","content":"x"}]}`,
+		"not json":      `{oops`,
 	}
 	for name, body := range cases {
 		code, _, respBody := do(t, ts, http.MethodPost, "/v1/chat/completions", body, testKey)

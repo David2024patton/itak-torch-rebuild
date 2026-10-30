@@ -1,57 +1,151 @@
 //! Sampling over the forward's finished logits.
 //!
-//! The protocol carries temperature and top-p from the platform's
-//! request; this module is where they are honored. Temperature at or
-//! below zero is greedy (argmax, lowest id on ties), which is the
-//! temperature-0 behavior the golden-output proofs rely on. Above
-//! zero, logits are scaled, softened with a numerically stable
-//! softmax in f64, truncated to the smallest nucleus whose mass
-//! reaches top-p (top-p outside (0, 1) disables truncation), and one
-//! token is drawn from the renormalized nucleus with a seeded
-//! xorshift64* generator. The seed is an explicit input so tests are
-//! deterministic; the server seeds it from the clock and a job
-//! counter.
+//! The protocol carries temperature, top-p, top-k, a seed, and the
+//! presence/frequency penalties from the platform's request; this
+//! module is where they are honored. Temperature at or below zero
+//! is greedy (argmax, lowest id on ties), which is the temperature-0
+//! behavior the golden-output proofs rely on. Penalties are applied
+//! first, in the OpenAI form: a token's logit drops by
+//! `frequency_penalty * count + presence_penalty * (count > 0)`,
+//! where the count covers the prompt tokens (fed via
+//! [`Sampler::observe`]) and every token this sampler has already
+//! picked. Above zero temperature, the penalized logits are
+//! truncated to the top-k set when top-k is set, softened with a
+//! numerically stable softmax in f64, truncated again to the
+//! smallest nucleus whose mass reaches top-p (top-p outside (0, 1)
+//! disables truncation), and one token is drawn from the
+//! renormalized nucleus with a seeded xorshift64* generator. The
+//! seed is an explicit input so a sampled run is reproducible end
+//! to end (TODO T-9.13); the server seeds from the clock only when
+//! the request carries no seed.
 
-/// Greedy and stochastic token selection over one logits row.
+use std::collections::HashMap;
+
+/// One generation's sampling parameters, all from the request.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerConfig {
+    /// Sampling temperature; at or below 0 the sampler is greedy.
+    pub temperature: f64,
+    /// Nucleus mass cap; outside (0, 1) disables truncation.
+    pub top_p: f64,
+    /// Candidate set cap; 0 disables top-k truncation.
+    pub top_k: usize,
+    /// Per-occurrence logit penalty (OpenAI form).
+    pub presence_penalty: f64,
+    /// Flat logit penalty for any prior occurrence (OpenAI form).
+    pub frequency_penalty: f64,
+    /// Generator seed; any value is accepted (zero is remapped,
+    /// xorshift has no zero state). Ignored when greedy.
+    pub seed: u64,
+}
+
+impl Default for SamplerConfig {
+    fn default() -> Self {
+        SamplerConfig {
+            temperature: 0.0,
+            top_p: 0.0,
+            top_k: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            seed: 0,
+        }
+    }
+}
+
+/// Greedy and stochastic token selection over one logits row, with
+/// repetition state for the penalties.
 pub struct Sampler {
-    temperature: f64,
-    top_p: f64,
+    cfg: SamplerConfig,
     state: u64,
+    counts: HashMap<u32, u32>,
 }
 
 impl Sampler {
-    /// A sampler for one generation. `seed` only matters when
-    /// `temperature > 0`; any value is accepted (zero is remapped,
-    /// xorshift has no zero state).
-    pub fn new(temperature: f64, top_p: f64, seed: u64) -> Self {
+    /// A sampler for one generation.
+    pub fn new(cfg: SamplerConfig) -> Self {
         Sampler {
-            temperature,
-            top_p,
-            state: if seed == 0 {
+            cfg,
+            state: if cfg.seed == 0 {
                 0x9e37_79b9_7f4a_7c15
             } else {
-                seed
+                cfg.seed
             },
+            counts: HashMap::new(),
         }
     }
 
     /// Whether this sampler ignores its generator and takes argmax.
     pub fn is_greedy(&self) -> bool {
-        self.temperature <= 0.0
+        self.cfg.temperature <= 0.0
     }
 
-    /// Pick the next token id from a finished logits row.
-    pub fn pick(&mut self, logits: &[f32]) -> u32 {
-        if self.is_greedy() || logits.len() <= 1 {
-            return argmax(logits);
+    /// Feed tokens into the penalty counts without sampling them:
+    /// the prompt, so a penalty request counts prompt repetitions
+    /// the way OpenAI's form specifies.
+    pub fn observe(&mut self, tokens: &[u32]) {
+        for &t in tokens {
+            *self.counts.entry(t).or_insert(0) += 1;
         }
-        let temp = self.temperature;
-        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        // (id, probability) in id order, stable softmax in f64.
-        let mut probs: Vec<(u32, f64)> = logits
+    }
+
+    /// The penalized logit for one token id.
+    fn adjusted(&self, id: u32, logit: f32) -> f64 {
+        let count = self.counts.get(&id).copied().unwrap_or(0);
+        if count == 0 || (self.cfg.presence_penalty == 0.0 && self.cfg.frequency_penalty == 0.0) {
+            return f64::from(logit);
+        }
+        let mut z = f64::from(logit);
+        z -= self.cfg.frequency_penalty * f64::from(count);
+        if count > 0 {
+            z -= self.cfg.presence_penalty;
+        }
+        z
+    }
+
+    /// Pick the next token id from a finished logits row. The pick
+    /// joins the penalty counts, so a repeated pick costs more
+    /// under the penalties than the first one did.
+    pub fn pick(&mut self, logits: &[f32]) -> u32 {
+        let token = self.select(logits);
+        *self.counts.entry(token).or_insert(0) += 1;
+        token
+    }
+
+    fn select(&mut self, logits: &[f32]) -> u32 {
+        if logits.is_empty() {
+            return 0;
+        }
+        // Penalized logits, in id order.
+        let adjusted: Vec<f64> = logits
             .iter()
             .enumerate()
-            .map(|(i, &z)| (i as u32, (f64::from(z - max) / temp).exp()))
+            .map(|(i, &z)| self.adjusted(i as u32, z))
+            .collect();
+        if self.is_greedy() || logits.len() <= 1 {
+            return argmax(&adjusted);
+        }
+        // Candidate set: top-k by penalized logit when top-k is
+        // set and smaller than the row, else the whole row.
+        let mut candidates: Vec<u32> = (0..logits.len() as u32).collect();
+        if self.cfg.top_k > 0 && self.cfg.top_k < candidates.len() {
+            candidates.sort_by(|&a, &b| {
+                adjusted[b as usize]
+                    .partial_cmp(&adjusted[a as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            candidates.truncate(self.cfg.top_k);
+            candidates.sort_unstable();
+        }
+        // Stable softmax in f64 over the candidates.
+        let temp = self.cfg.temperature;
+        let max = candidates
+            .iter()
+            .map(|&id| adjusted[id as usize])
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mut probs: Vec<(u32, f64)> = candidates
+            .iter()
+            .map(|&id| (id, ((adjusted[id as usize] - max) / temp).exp()))
             .collect();
         let total: f64 = probs.iter().map(|(_, p)| p).sum();
         for (_, p) in probs.iter_mut() {
@@ -64,14 +158,14 @@ impl Sampler {
                 .1
                 .partial_cmp(&probs[a].1)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
+                .then(probs[a].0.cmp(&probs[b].0))
         });
         let mut keep = probs.len();
-        if self.top_p > 0.0 && self.top_p < 1.0 {
+        if self.cfg.top_p > 0.0 && self.cfg.top_p < 1.0 {
             let mut cumulative = 0.0;
             for (rank, &idx) in order.iter().enumerate() {
                 cumulative += probs[idx].1;
-                if cumulative >= self.top_p {
+                if cumulative >= self.cfg.top_p {
                     keep = rank + 1;
                     break;
                 }
@@ -108,9 +202,9 @@ impl Sampler {
 
 /// The lowest id holding the maximum logit (llama.cpp's greedy tie
 /// behavior, and what the reference harness's top-1 records show).
-pub fn argmax(logits: &[f32]) -> u32 {
+fn argmax(logits: &[f64]) -> u32 {
     let mut best = 0u32;
-    let mut best_val = f32::NEG_INFINITY;
+    let mut best_val = f64::NEG_INFINITY;
     for (i, &z) in logits.iter().enumerate() {
         if z > best_val {
             best_val = z;
@@ -124,9 +218,18 @@ pub fn argmax(logits: &[f32]) -> u32 {
 mod tests {
     use super::*;
 
+    fn cfg(temperature: f64, top_p: f64, seed: u64) -> SamplerConfig {
+        SamplerConfig {
+            temperature,
+            top_p,
+            seed,
+            ..SamplerConfig::default()
+        }
+    }
+
     #[test]
     fn greedy_picks_argmax_with_lowest_id_ties() {
-        let mut s = Sampler::new(0.0, 0.0, 42);
+        let mut s = Sampler::new(cfg(0.0, 0.0, 42));
         assert_eq!(s.pick(&[1.0, 3.0, 3.0, 2.0]), 1);
         assert_eq!(s.pick(&[-5.0, -9.0]), 0);
     }
@@ -136,7 +239,7 @@ mod tests {
         // The first token's mass alone exceeds a tiny top-p for any
         // seed, so the nucleus is a single token.
         for seed in 0..16 {
-            let mut s = Sampler::new(1.0, 1e-9, seed);
+            let mut s = Sampler::new(cfg(1.0, 1e-9, seed));
             assert_eq!(s.pick(&[0.0, 10.0, 0.0, 0.0]), 1, "seed {seed}");
         }
     }
@@ -144,11 +247,49 @@ mod tests {
     #[test]
     fn seeded_sampling_is_deterministic() {
         let logits = [0.3, 1.2, -0.5, 2.0, 0.0, 0.7];
-        let mut a = Sampler::new(0.8, 0.9, 1234);
-        let mut b = Sampler::new(0.8, 0.9, 1234);
+        let mut a = Sampler::new(cfg(0.8, 0.9, 1234));
+        let mut b = Sampler::new(cfg(0.8, 0.9, 1234));
         for _ in 0..32 {
             assert_eq!(a.pick(&logits), b.pick(&logits));
         }
+    }
+
+    #[test]
+    fn seeded_runs_match_across_a_whole_sequence() {
+        // The T-9.13 determinism shape: two samplers with the same
+        // full option set (seed, top-k, top-p, both penalties) fed
+        // the same sequence of logits rows produce identical token
+        // streams, penalty state included.
+        let rows: Vec<Vec<f32>> = (0..24)
+            .map(|i| {
+                vec![
+                    (i % 7) as f32 * 0.3,
+                    1.1 - (i % 3) as f32 * 0.2,
+                    0.4,
+                    2.0 - (i % 5) as f32 * 0.35,
+                    -0.6,
+                ]
+            })
+            .collect();
+        let full = SamplerConfig {
+            temperature: 0.9,
+            top_p: 0.95,
+            top_k: 4,
+            presence_penalty: 0.3,
+            frequency_penalty: 0.2,
+            seed: 777,
+        };
+        let run = |c: SamplerConfig| -> Vec<u32> {
+            let mut s = Sampler::new(c);
+            s.observe(&[3, 3, 1]);
+            rows.iter().map(|row| s.pick(row)).collect()
+        };
+        assert_eq!(run(full), run(full));
+        // A different seed diverges somewhere in the sequence with
+        // overwhelming probability; if it ever does not, the seed
+        // is not actually reaching the generator.
+        let other = SamplerConfig { seed: 778, ..full };
+        assert_ne!(run(full), run(other));
     }
 
     #[test]
@@ -158,7 +299,7 @@ mod tests {
         let logits = [0.0, 0.1, -0.1, 0.05];
         let mut seen = std::collections::BTreeSet::new();
         for seed in 0..200u64 {
-            let mut s = Sampler::new(1.0e6, 1.0, seed.wrapping_mul(7919) + 1);
+            let mut s = Sampler::new(cfg(1.0e6, 1.0, seed.wrapping_mul(7919) + 1));
             seen.insert(s.pick(&logits));
         }
         assert!(seen.len() >= 3, "only saw {seen:?}");
@@ -168,8 +309,74 @@ mod tests {
     fn peaked_distribution_dominates_at_moderate_temperature() {
         let logits = [0.0, 20.0, 0.0];
         for seed in 0..16 {
-            let mut s = Sampler::new(1.0, 1.0, seed * 31 + 7);
+            let mut s = Sampler::new(cfg(1.0, 1.0, seed * 31 + 7));
             assert_eq!(s.pick(&logits), 1, "seed {seed}");
         }
+    }
+
+    #[test]
+    fn top_k_one_is_greedy_even_sampled() {
+        let logits = [0.3, 1.2, -0.5, 2.0, 0.0];
+        for seed in 0..16 {
+            let mut c = cfg(1.3, 1.0, seed);
+            c.top_k = 1;
+            let mut s = Sampler::new(c);
+            assert_eq!(s.pick(&logits), 3, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn frequency_penalty_pushes_the_pick_off_a_repeated_token() {
+        // Token 0 leads by 0.1; after 5 observations under a 0.5
+        // frequency penalty its adjusted logit drops by 2.5, so the
+        // greedy pick moves to token 1. Without the penalty the
+        // same history changes nothing.
+        let logits = [2.0, 1.9, 0.0];
+        let mut plain = Sampler::new(cfg(0.0, 0.0, 1));
+        plain.observe(&[0, 0, 0, 0, 0]);
+        assert_eq!(plain.pick(&logits), 0);
+
+        let mut c = cfg(0.0, 0.0, 1);
+        c.frequency_penalty = 0.5;
+        let mut penalized = Sampler::new(c);
+        penalized.observe(&[0, 0, 0, 0, 0]);
+        assert_eq!(penalized.pick(&logits), 1);
+    }
+
+    #[test]
+    fn presence_penalty_costs_a_token_once_regardless_of_count() {
+        // Token 0 leads by 0.4. A presence penalty of 0.5 moves the
+        // pick after a single observation, and further observations
+        // do not move it more (contrast with frequency above).
+        let logits = [2.0, 1.6, 0.0];
+        let mut c = cfg(0.0, 0.0, 1);
+        c.presence_penalty = 0.5;
+        let mut once = Sampler::new(c);
+        once.observe(&[0]);
+        assert_eq!(once.pick(&logits), 1);
+        let mut many = Sampler::new(c);
+        many.observe(&[0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(many.pick(&logits), 1);
+        // And with the weaker penalty the single hit is not enough.
+        let mut weak = Sampler::new(SamplerConfig {
+            presence_penalty: 0.3,
+            ..c
+        });
+        weak.observe(&[0, 0, 0]);
+        assert_eq!(weak.pick(&logits), 0);
+    }
+
+    #[test]
+    fn picked_tokens_join_the_penalty_counts() {
+        // Greedy with a frequency penalty over a constant row must
+        // rotate: each pick makes its token costlier until another
+        // token wins. Without the penalty the same row repeats.
+        let logits = [1.0, 0.95, 0.9];
+        let mut c = cfg(0.0, 0.0, 1);
+        c.frequency_penalty = 0.2;
+        let mut s = Sampler::new(c);
+        assert_eq!(s.pick(&logits), 0);
+        assert_eq!(s.pick(&logits), 1); // 0 now costs 0.2, sits at 0.8
+        assert_eq!(s.pick(&logits), 2); // then 1 also sits at 0.75
     }
 }

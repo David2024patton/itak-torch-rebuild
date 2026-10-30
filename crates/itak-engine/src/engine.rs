@@ -24,7 +24,7 @@ use cpu_compute::CpuCompute;
 use muse_glimmer::{GlimmerConfig, GlimmerModel, PositionCache, StderrDiag, Weights};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
 
-use crate::sampler::Sampler;
+use crate::sampler::{Sampler, SamplerConfig};
 use crate::streamer::Streamer;
 
 /// Operator configuration for the engine process. Every value comes
@@ -116,8 +116,16 @@ pub struct Job {
     pub top_p: f64,
     /// Stop strings.
     pub stop: Vec<String>,
-    /// Sampling seed for this job (ignored when greedy).
+    /// Sampling seed for this job (ignored when greedy). The
+    /// connection thread resolves the request's optional seed
+    /// against the clock before the job is queued.
     pub seed: u64,
+    /// Top-k candidate cap; None or 0 disables truncation.
+    pub top_k: Option<usize>,
+    /// Presence penalty (OpenAI form); 0 disables.
+    pub presence_penalty: f64,
+    /// Frequency penalty (OpenAI form); 0 disables.
+    pub frequency_penalty: f64,
     /// Where events go.
     pub reply: Sender<GenEvent>,
 }
@@ -246,6 +254,9 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         top_p,
         stop,
         seed,
+        top_k,
+        presence_penalty,
+        frequency_penalty,
         reply,
     } = job;
     let fail = |code: &str, message: String| {
@@ -306,10 +317,15 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         loaded,
         &ids,
         max_tokens,
-        temperature,
-        top_p,
+        SamplerConfig {
+            temperature,
+            top_p,
+            top_k: top_k.unwrap_or(0),
+            presence_penalty,
+            frequency_penalty,
+            seed,
+        },
         stop,
-        seed,
         &reply,
     );
     let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
@@ -368,15 +384,12 @@ enum JobOutcome {
 /// The token loop itself: prefill once, then one forward per sampled
 /// token against the position cache (the incremental decode the
 /// blueprint requires; there is no full re-forward anywhere here).
-#[allow(clippy::too_many_arguments)]
 fn generate_inner(
     loaded: &Loaded,
     ids: &[u32],
     max_tokens: usize,
-    temperature: f64,
-    top_p: f64,
+    sampler_cfg: SamplerConfig,
     stop: Vec<String>,
-    seed: u64,
     reply: &Sender<GenEvent>,
 ) -> JobOutcome {
     let model = GlimmerModel::with_diag(
@@ -386,7 +399,10 @@ fn generate_inner(
         Arc::new(StderrDiag),
     );
     let mut cache = PositionCache::new();
-    let mut sampler = Sampler::new(temperature, top_p, seed);
+    let mut sampler = Sampler::new(sampler_cfg);
+    // The prompt counts toward the penalties (the OpenAI form), so
+    // it is observed before the first pick.
+    sampler.observe(ids);
     let mut streamer = Streamer::new(stop);
     let eos = loaded.tokenizer.eos_id();
 

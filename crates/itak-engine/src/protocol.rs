@@ -16,7 +16,12 @@
 //!   "temperature":F,"top_p":F,"stop":["..."]}`: one generation.
 //!   `max_tokens` absent or 0 means the engine's configured default;
 //!   `temperature` absent or 0 is greedy; `top_p` absent, 0, or 1
-//!   disables nucleus truncation.
+//!   disables nucleus truncation. Optional sampling parity fields
+//!   (TODO T-9.13): `seed` (integer; a seeded sampled run is
+//!   reproducible, absent means the engine seeds from the clock),
+//!   `top_k` (integer; absent or 0 disables top-k truncation), and
+//!   `presence_penalty` / `frequency_penalty` (numbers; absent or 0
+//!   disables the penalty).
 //!
 //! Frames from the engine:
 //!
@@ -61,6 +66,15 @@ pub struct GenerateRequest {
     pub top_p: f64,
     /// Stop strings.
     pub stop: Vec<String>,
+    /// Request seed for reproducible sampled runs; None means the
+    /// engine seeds from the clock.
+    pub seed: Option<u64>,
+    /// Top-k candidate cap; None or 0 disables truncation.
+    pub top_k: Option<usize>,
+    /// Presence penalty (OpenAI form); 0 disables.
+    pub presence_penalty: f64,
+    /// Frequency penalty (OpenAI form); 0 disables.
+    pub frequency_penalty: f64,
 }
 
 /// Parse a generate frame. A missing or mistyped prompt is the only
@@ -94,6 +108,16 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let seed = frame.get("seed").and_then(Value::as_usize).map(|n| n as u64);
+    let top_k = frame.get("top_k").and_then(Value::as_usize);
+    let presence_penalty = frame
+        .get("presence_penalty")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let frequency_penalty = frame
+        .get("frequency_penalty")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     Ok(GenerateRequest {
         model,
         prompt,
@@ -101,6 +125,10 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
         temperature,
         top_p,
         stop,
+        seed,
+        top_k,
+        presence_penalty,
+        frequency_penalty,
     })
 }
 
@@ -163,7 +191,7 @@ mod tests {
     #[test]
     fn generate_frame_full_shape() {
         let frame = parse(
-            r#"{"op":"generate","model":"glimmer","prompt":"x","max_tokens":4,"temperature":0.7,"top_p":0.9,"stop":["\n","END"]}"#,
+            r#"{"op":"generate","model":"glimmer","prompt":"x","max_tokens":4,"temperature":0.7,"top_p":0.9,"stop":["\n","END"],"seed":42,"top_k":40,"presence_penalty":0.5,"frequency_penalty":-0.25}"#,
         )
         .expect("frame");
         let req = parse_generate(&frame).expect("request");
@@ -172,6 +200,20 @@ mod tests {
         assert_eq!(req.temperature, 0.7);
         assert_eq!(req.top_p, 0.9);
         assert_eq!(req.stop, vec!["\n".to_string(), "END".to_string()]);
+        assert_eq!(req.seed, Some(42));
+        assert_eq!(req.top_k, Some(40));
+        assert_eq!(req.presence_penalty, 0.5);
+        assert_eq!(req.frequency_penalty, -0.25);
+    }
+
+    #[test]
+    fn generate_frame_sampling_fields_default_off() {
+        let frame = parse(r#"{"op":"generate","prompt":"x"}"#).expect("frame");
+        let req = parse_generate(&frame).expect("request");
+        assert_eq!(req.seed, None);
+        assert_eq!(req.top_k, None);
+        assert_eq!(req.presence_penalty, 0.0);
+        assert_eq!(req.frequency_penalty, 0.0);
     }
 
     #[test]

@@ -32,19 +32,23 @@ type frame struct {
 // terminal token frame with Done set, or a named refusal (op
 // "error" with a Code the client maps onto its error vocabulary).
 type genFrame struct {
-	Op           string   `json:"op"`
-	Model        string   `json:"model,omitempty"`
-	Prompt       string   `json:"prompt,omitempty"`
-	MaxTokens    int      `json:"max_tokens,omitempty"`
-	Temperature  float64  `json:"temperature,omitempty"`
-	TopP         float64  `json:"top_p,omitempty"`
-	Stop         []string `json:"stop,omitempty"`
-	Text         string   `json:"text,omitempty"`
-	TokenID      int32    `json:"token_id,omitempty"`
-	Done         bool     `json:"done,omitempty"`
-	FinishReason string   `json:"finish_reason,omitempty"`
-	Code         string   `json:"code,omitempty"`
-	Message      string   `json:"message,omitempty"`
+	Op               string   `json:"op"`
+	Model            string   `json:"model,omitempty"`
+	Prompt           string   `json:"prompt,omitempty"`
+	MaxTokens        int      `json:"max_tokens,omitempty"`
+	Temperature      float64  `json:"temperature,omitempty"`
+	TopP             float64  `json:"top_p,omitempty"`
+	Stop             []string `json:"stop,omitempty"`
+	Seed             *uint64  `json:"seed,omitempty"`
+	TopK             *int     `json:"top_k,omitempty"`
+	PresencePenalty  *float64 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequency_penalty,omitempty"`
+	Text             string   `json:"text,omitempty"`
+	TokenID          int32    `json:"token_id,omitempty"`
+	Done             bool     `json:"done,omitempty"`
+	FinishReason     string   `json:"finish_reason,omitempty"`
+	Code             string   `json:"code,omitempty"`
+	Message          string   `json:"message,omitempty"`
 }
 
 // UnixClient is the Client speaking to the Rust engine process over
@@ -207,13 +211,17 @@ func (c *UnixClient) Generate(ctx context.Context, req GenerateRequest) (<-chan 
 		return nil, err
 	}
 	wire := genFrame{
-		Op:          "generate",
-		Model:       req.Model,
-		Prompt:      req.Prompt,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stop:        req.Stop,
+		Op:               "generate",
+		Model:            req.Model,
+		Prompt:           req.Prompt,
+		MaxTokens:        req.MaxTokens,
+		Temperature:      req.Temperature,
+		TopP:             req.TopP,
+		Stop:             req.Stop,
+		Seed:             req.Seed,
+		TopK:             req.TopK,
+		PresencePenalty:  req.PresencePenalty,
+		FrequencyPenalty: req.FrequencyPenalty,
 	}
 	line, err := json.Marshal(wire)
 	if err != nil {

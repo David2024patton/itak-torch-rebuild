@@ -341,3 +341,128 @@ winning logit against the host scan, engineered ties, tail
 and all-negative cases, empty-input refusal) and the
 resident argmax-tail test (two-chunk prompt plus a 12-step
 greedy generation against forward plus the host pick).
+
+## MMQ prefill path (2026-10-30, later still): the integer-dot kernels
+
+The GEMM section above named the next lever: true MMQ,
+llama.cpp's design. It is built. K12 quantizes activation
+rows on the fly into Q8_1 form (per 32 elements: packed
+int8 words plus the (d, s) pair ggml's MMQ layout wants,
+with the two 16-element half sums Q6_K's fold needs added;
+scales stay f32 in this device-only format). The
+activation transforms live in the quantizer, in the same
+K1ActGeom addressing the GEMM act forms use, so the gated
+output and SwiGLU-fused down projections run through the
+new path unchanged in shape: one quantize dispatch
+(ACT_NONE / ACT_GATED / ACT_SWIGLU) feeds one product
+dispatch. K13 (Q4_K) and K14 (Q6_K) run the products as
+DP4A integer dots (`dot4I8Packed`, the WGSL spelling of
+the instruction ggml-vulkan reaches through
+`dotPacked4x8EXT`) against the weights' staged integer
+payloads, folding per-sub-block scales in f32 at the
+store, in super-block order, term for term with
+`vec_dot_q4_K_q8_1` / `vec_dot_q6_K_q8_1`. The session
+prefers MMQ past the same 16-row threshold, keeps the
+f32 GEMM as the fallback for devices and shapes MMQ
+refuses by name, and leaves single-row decode on the
+fused GEMV chain untouched.
+
+**Is the integer path real?** A probe kernel
+(examples/dp4a_probe.rs) runs three register loops at
+identical geometry: `dot4I8Packed` measures 9.79 TOPS of
+int8 MACs, the unpack-into-vec4<i32> emulation 2.84 TOPS,
+an FP32 FMA chain 6.57 TFLOPS. The unpack path scalarizes
+on this backend (3.4x slower), so the fallback the task
+allowed for would have capped the design near GEMM
+rates; the packed intrinsic reaches the hardware dot.
+(The probe's per-step LCG update dilutes all three
+numbers alike; they are comparative, not peaks.)
+
+**Per-tensor, batch 64, real file** (mmq_bench, same
+discipline as k10_bench; product time, quantize is
+0.02-0.06 ms and composes to within noise of the product
+alone):
+
+| tensor | GEMV replay | GEMM t32x128 | MMQ m32 | MMQ m64 |
+|---|---|---|---|---|
+| blk.0 ffn_down (Q6_K, 109 MB) | 6.73 ms | 3.02-3.09 ms | 4.02 ms | 2.52-2.55 ms |
+| blk.0 ffn_gate (Q4_K, 74.8 MB) | 4.57 ms | 2.05-2.09 ms | 1.88 ms | 1.49-1.51 ms |
+
+**The bank-conflict find.** The first MMQ build measured
+at or below the GEMM (Q4_K m64 2.26 ms, Q6_K m32
+3.42 ms). The cause was not the dots: the staged
+activation tile's 64-word row stride puts all sixteen
+batch lanes of a wavefront on the same LDS bank for
+every activation load (their addresses differ by whole
+rows), a 16-way conflict on the kernel's most frequent
+load. Skewing the tile to a 65-word row stride, one word
+of padding per row, moved Q4_K m32 2.41 -> 1.88 ms and
+m64 2.26 -> 1.49 ms, and Q6_K m64 3.63 -> 2.52 ms.
+Q6_K m32 regressed 3.42 -> 4.02 ms under the same change
+(recorded, not explained away; its fold does twice the
+f32 work per dot and its resident set is one 128-thread
+workgroup per CU). The wide tile wins both families, so
+m64 is the shipped shape and m32 remains for devices
+whose workgroup-storage grant fits it but not m64. An
+earlier experiment, unrolling the sub-block loop at
+generation time so staged offsets are literals, changed
+nothing measurable; the compiler had already
+strength-reduced the addresses. Recorded as a negative
+result so nobody re-pays for it.
+
+**Session prefill, real file, same prompts both
+builds** (the pre-MMQ resident build is the A/B control):
+
+| prompt | GEMM build | MMQ build |
+|---|---|---|
+| 254 tokens | 3,130 ms | 2,760 / 2,941 ms |
+| 1,024 tokens | 11,446 ms | 7,541 / 7,558 ms |
+| marginal rate | 92.6 tok/s | 161 tok/s |
+
+Gross at 1,024 tokens: 89.5 -> 135.8 tok/s. The MMQ
+path is 1.74x the GEMM on the marginal rate.
+
+**Correctness.** Synthetic gates (tests/k12_k14_mmq.rs):
+the products match a host reference running the same
+quantized math (exact integer dots, same fold) at ~2e-7
+relative across batches 1-64, both tile shapes, and the
+plain/gated/SwiGLU forms; against the exact f32 product
+the activation-quantization band measures 0.36% (Q4_K)
+and 0.42% (Q6_K) of the result scale, which is the Q8_1
+design's error, gated separately from kernel correctness.
+The quantizer itself matches its host reference
+bit-exactly on the test data (scales within 1 ulp: RADV's
+division is not correctly rounded, measured). Real file:
+the Stage 1 first-token probability prints 0.403462 (all
+digits), the 8/8 stream is exact, the 254- and
+1,024-token continuations are token-identical to the
+GEMM build's, and the 64-token argmax-mode stream is
+byte-identical to logits mode on this build.
+
+**Where it lands against 998, honestly.** The marginal
+rate is 161 tok/s, 1.74x the GEMM and still 6x short of
+llama.cpp's Vulkan number. What binds, with the
+measurements: the Q4_K product runs at 5.7 T int8
+MACs/s and the Q6_K product at 3.4 T, against the
+probe's diluted 9.8 TOPS and a much higher architectural
+ceiling. Three named causes. (1) Occupancy: the m64
+tiles stage 41-45 KB of workgroup memory, so one
+workgroup is resident per CU; the tile is one
+super-block deep with a barrier per super-block (78
+barriers across an ffn_down workgroup), so latency
+hiding rests on in-thread ILP alone. (2) Fold issue:
+the per-sub-block f32 fold competes for the same VALU
+issue as the dots, and Q6_K folds twice per 32 elements
+(two 16-element halves), which is most of why its
+product trails Q4_K's despite identical dot counts.
+(3) The session ceiling: the non-projection chunk chain
+was 28% of the marginal at GEMM time and this pass did
+not touch it; infinitely fast projections would still
+bound the marginal near 330 tok/s under the current
+chain. Closing the rest of the gap is the wide-tile
+(128x128-class) double-buffered MMQ plus a profile of
+that chain, a kernel project of its own, not a tuning
+knob on this tile. The 4x8 f32 GEMM sub-tile noted as
+the secondary option in the GEMM section was not built:
+the MMQ proved possible on this backend, which was its
+condition.

@@ -30,6 +30,7 @@ use crate::compute::{AttentionRequest, Compute};
 use crate::config::GlimmerConfig;
 use crate::diag::{Diag, NullDiag};
 use crate::error::{GlimmerError, Result};
+use crate::trace::{NullTrace, TraceSink};
 use crate::weights::Weights;
 
 /// A Muse Glimmer model ready (structurally) to run.
@@ -80,6 +81,47 @@ impl GlimmerModel {
     /// the cache is untouched and the error names the step or input
     /// that failed.
     pub fn forward(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
+        self.forward_impl(tokens, cache, &mut NullTrace)
+    }
+
+    /// The same forward as [`forward`](Self::forward), additionally
+    /// reporting the residual stream at every stage boundary to
+    /// `sink` (see the [`trace`](crate::trace) module for the stage
+    /// list and line format). This is the per-layer diff path: run
+    /// both engines over the same prompt ids, reduce both to the
+    /// same statistics, and the first stage whose statistics
+    /// disagree names the layer that broke. The logits returned are
+    /// the ordinary forward's, through the same code.
+    pub fn forward_traced(
+        &self,
+        tokens: &[u32],
+        cache: &mut dyn Cache,
+        sink: &mut dyn TraceSink,
+    ) -> Result<Vec<f32>> {
+        self.forward_impl(tokens, cache, sink)
+    }
+
+    /// One trace capture: hand the stage to the sink and note it on
+    /// the diagnostic channel, so a traced run's stages are visible
+    /// in the diag stream as well as in the dump.
+    fn capture(
+        &self,
+        sink: &mut dyn TraceSink,
+        stage: &str,
+        tensor: &[f32],
+        rows: usize,
+        cols: usize,
+    ) {
+        sink.capture(stage, tensor, rows, cols);
+        self.diag.event("trace.capture", stage);
+    }
+
+    fn forward_impl(
+        &self,
+        tokens: &[u32],
+        cache: &mut dyn Cache,
+        sink: &mut dyn TraceSink,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(GlimmerError::EmptyInput);
         }
@@ -106,6 +148,7 @@ impl GlimmerModel {
         let c = &*self.compute;
 
         let mut x = c.embed(&self.weights.embedding, tokens, cfg)?;
+        self.capture(sink, "embed", &x, rows, cfg.hidden as usize);
 
         for (index, (kind, w)) in cfg
             .layers
@@ -142,19 +185,35 @@ impl GlimmerModel {
             let out = c.proj(&attn, &w.attn_output, rows)?;
             let after_attn = c.add(&residual, &out)?;
             let after_attn = c.rms_norm(&after_attn, &w.post_attention_norm, rows, cfg.rms_eps)?;
+            self.capture(
+                sink,
+                &format!("layer.{index}.mid"),
+                &after_attn,
+                rows,
+                cfg.hidden as usize,
+            );
 
             let residual = after_attn;
             let h = c.rms_norm(&residual, &w.ffn_norm, rows, cfg.rms_eps)?;
             let ffn = c.swiglu_ffn(&h, w, rows, cfg)?;
             let after_ffn = c.add(&residual, &ffn)?;
             x = c.rms_norm(&after_ffn, &w.post_ffw_norm, rows, cfg.rms_eps)?;
+            self.capture(
+                sink,
+                &format!("layer.{index}.out"),
+                &x,
+                rows,
+                cfg.hidden as usize,
+            );
         }
 
         let hidden = cfg.hidden as usize;
         let last = &x[(rows - 1) * hidden..rows * hidden];
         let normed = c.rms_norm(last, &self.weights.final_norm, 1, cfg.rms_eps)?;
+        self.capture(sink, "final_norm", &normed, 1, hidden);
         let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
         softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
+        self.capture(sink, "logits", &logits, 1, logits.len());
 
         cache.advance(tokens.len());
         self.diag.event(
@@ -374,6 +433,58 @@ mod tests {
         expected.extend(one_layer);
         expected.extend(["rms_norm", "lm_head"]);
         assert_eq!(calls.borrow().as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn forward_traced_captures_every_stage_in_order() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let compute = Box::new(RecordingCompute {
+            calls: calls.clone(),
+        });
+        let (model, _cfg) = tiny_model(compute);
+        let mut cache = PositionCache::new();
+        let mut log = crate::trace::TraceLog::new(4);
+        let logits = model
+            .forward_traced(&[1, 2], &mut cache, &mut log)
+            .expect("traced forward completes the walk");
+        assert_eq!(logits.len(), 128);
+        assert_eq!(cache.position(), 2);
+
+        let stages: Vec<&str> = log
+            .records()
+            .iter()
+            .map(|r| r.stage.as_str())
+            .collect();
+        assert_eq!(
+            stages,
+            [
+                "embed",
+                "layer.0.mid",
+                "layer.0.out",
+                "layer.1.mid",
+                "layer.1.out",
+                "final_norm",
+                "logits",
+            ]
+        );
+        // The recording compute returns zeros, so every captured
+        // statistic is zero and the shapes track the tiny config:
+        // 2 rows of hidden 32 in the stream, 1 row at the finish.
+        let embed = &log.records()[0];
+        assert_eq!((embed.rows, embed.cols, embed.full.n), (2, 32, 64));
+        assert_eq!(embed.full.mean, 0.0);
+        let head = &log.records()[6];
+        assert_eq!((head.rows, head.cols, head.full.n), (1, 128, 128));
+
+        // The traced and untraced paths are the same code: a plain
+        // forward over the same stub gives the same logits.
+        let calls2 = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let (model2, _cfg2) = tiny_model(Box::new(RecordingCompute { calls: calls2 }));
+        let mut cache2 = PositionCache::new();
+        let plain = model2
+            .forward(&[1, 2], &mut cache2)
+            .expect("plain forward completes the walk");
+        assert_eq!(logits, plain);
     }
 
     #[test]

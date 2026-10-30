@@ -48,6 +48,7 @@ pub mod error;
 pub mod layer;
 pub mod metadata;
 pub mod model;
+pub mod trace;
 pub mod weights;
 
 #[cfg(test)]
@@ -61,4 +62,5 @@ pub use error::{GlimmerError, Result};
 pub use layer::{LayerKind, PatternSource};
 pub use metadata::{MapMetadata, Metadata};
 pub use model::{softcap_scale, GlimmerModel};
+pub use trace::{stats_of, NullTrace, TraceLog, TraceRecord, TraceSink, VecStats};
 pub use weights::{expected_tensor_names, Dtype, LayerWeights, TensorSource, TensorView, Weights};

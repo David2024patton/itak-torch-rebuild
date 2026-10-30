@@ -247,9 +247,11 @@ fn missing_tensor_is_named_missing() {
 
 #[test]
 fn unsupported_type_is_unreadable_not_missing() {
-    // Q3_K (mainline id 11): present in the directory, but the gguf
-    // crate cannot size or read it. The seam must say unreadable, with
-    // the type named, never missing and never placeholder bytes.
+    // Q3_K (mainline id 11): present in the directory. The gguf crate
+    // can size and dequantize it since the lane 13 type table landed,
+    // but muse-glimmer's Dtype vocabulary has no Q3_K, so this seam
+    // cannot deliver it. The seam must say unreadable, with the type
+    // named, never missing and never placeholder bytes.
     let mut tensors = tiny_tensors();
     for t in &mut tensors {
         if t.name == "blk.0.attn_q.weight" {

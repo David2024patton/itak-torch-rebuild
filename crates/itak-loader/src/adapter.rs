@@ -13,8 +13,13 @@
 //!
 //! [`TensorSource`] returns the arch module's `Result`: absent tensors
 //! map to [`GlimmerError::MissingTensor`], and present-but-undeliverable
-//! tensors (a ggml type the `gguf` crate cannot size or read) map to
-//! [`GlimmerError::TensorUnreadable`] with the loader's reason attached.
+//! tensors map to [`GlimmerError::TensorUnreadable`] with the loader's
+//! reason attached. Undeliverable means either the `gguf` crate cannot
+//! size or read the type, or the type has no representation in the arch
+//! module's [`Dtype`] vocabulary (integration 2026-10-29: the `gguf`
+//! type table now sizes and dequantizes Q3_K, but muse-glimmer's
+//! `Dtype` does not carry it, so the seam refuses it by name instead of
+//! serving a view the arch layer cannot interpret).
 //! Neither adapter ever invents a value: no default metadata, no
 //! placeholder bytes.
 
@@ -130,6 +135,23 @@ impl TensorSource for GgufTensorSource<'_> {
             .file
             .tensor_info(name)
             .map_err(|e| map_tensor_error(name, e))?;
+        let dtype = Dtype::from_ggml_id(info.type_id());
+        if let Dtype::Unknown(id) = dtype {
+            diag::debug(
+                "tensor_refused",
+                &format!(
+                    "name={name} type={} id={id} reason=type has no Dtype representation in the arch seam",
+                    info.type_name()
+                ),
+            );
+            return Err(GlimmerError::TensorUnreadable {
+                name: name.to_string(),
+                detail: format!(
+                    "type {} (ggml id {id}) is not readable through the muse-glimmer seam: no Dtype representation",
+                    info.type_name()
+                ),
+            });
+        }
         let bytes = self
             .file
             .tensor_bytes(name)
@@ -145,7 +167,7 @@ impl TensorSource for GgufTensorSource<'_> {
         );
         Ok(TensorView {
             name: name.to_string(),
-            dtype: Dtype::from_ggml_id(info.type_id()),
+            dtype,
             shape: info.dims().to_vec(),
             data: Arc::from(bytes),
         })

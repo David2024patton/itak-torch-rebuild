@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 
-use attention::{AttentionParams, KvCache, LayerKind as AttnLayerKind};
+use attention::{AttentionParams, Checkpoint, KvCache, LayerKind as AttnLayerKind};
 use gguf::dequant::dequantize;
 use gguf::ggml::type_name;
 use gguf::GgmlType;
@@ -264,6 +264,78 @@ impl CpuCompute {
     pub fn reset(&self) {
         dbg_log!("kv state reset");
         *self.kv.borrow_mut() = None;
+    }
+
+    /// Checkpoint the backend's KV cache before a speculative round
+    /// (SPEC-itak-spec Section 5, dependency E2): the round may
+    /// append up to `max_round_tokens` positions per layer, and
+    /// [`CpuCompute::cache_rewind`] can then restore the exact
+    /// pre-round state, ring evictions included.
+    ///
+    /// The KV state must already exist, which it does after the
+    /// first forward (a speculative session checkpoints after
+    /// prefill, per the spec's round structure); checkpointing a
+    /// backend that has served nothing yet is refused by name
+    /// rather than silently binding the checkpoint to an unbuilt
+    /// cache.
+    pub fn cache_checkpoint(&self, max_round_tokens: usize) -> Result<Checkpoint> {
+        let step = "cache_checkpoint";
+        let mut guard = self.kv.borrow_mut();
+        let state = guard.as_mut().ok_or_else(|| {
+            step_failed(
+                step,
+                "no KV state exists yet: a speculative round checkpoints after a first \
+                 forward has built the cache (the spec's prefill), not before",
+            )
+        })?;
+        state
+            .cache
+            .checkpoint(max_round_tokens)
+            .map_err(|e| step_failed(step, e.to_string()))
+    }
+
+    /// Rewind the backend's KV cache to `target` positions against a
+    /// live checkpoint from [`CpuCompute::cache_checkpoint`]:
+    /// committing a round is a rewind to `base + 1 + accepted`,
+    /// aborting it is a rewind to `base`.
+    ///
+    /// Pair this with [`muse_glimmer::Cache::rewind_to`] on the
+    /// model's position cache, with the same target, in the same
+    /// step (SPEC-itak-spec Section 5.4: position and storage move
+    /// together). Rewinding only one of the two is caught by the
+    /// attention step's position cross-check on the next forward,
+    /// which refuses by name rather than attending to a history the
+    /// two sides disagree about.
+    pub fn cache_rewind(&self, checkpoint: &Checkpoint, target: usize) -> Result<()> {
+        let step = "cache_rewind";
+        let mut guard = self.kv.borrow_mut();
+        let state = guard.as_mut().ok_or_else(|| {
+            step_failed(
+                step,
+                "no KV state exists: the sequence was reset after the checkpoint was taken",
+            )
+        })?;
+        state
+            .cache
+            .rewind_to(checkpoint, target)
+            .map_err(|e| step_failed(step, e.to_string()))
+    }
+
+    /// Release a checkpoint taken with
+    /// [`CpuCompute::cache_checkpoint`] once its round is resolved.
+    pub fn cache_release(&self, checkpoint: &Checkpoint) -> Result<()> {
+        let step = "cache_release";
+        let mut guard = self.kv.borrow_mut();
+        let state = guard.as_mut().ok_or_else(|| {
+            step_failed(
+                step,
+                "no KV state exists: the sequence was reset after the checkpoint was taken",
+            )
+        })?;
+        state
+            .cache
+            .release(checkpoint)
+            .map_err(|e| step_failed(step, e.to_string()))
     }
 
     /// Shared projection body: `proj` calls it under its own step
@@ -702,6 +774,44 @@ mod tests {
             shape: shape.to_vec(),
             data: Arc::from(data.into_boxed_slice()),
         }
+    }
+
+    #[test]
+    fn cache_checkpoint_before_any_forward_refuses_by_name() {
+        // No forward has run, so no KV state exists to snapshot; the
+        // refusal names that instead of building an empty cache the
+        // caller never asked for.
+        let c = CpuCompute::new();
+        let err = c.cache_checkpoint(4).expect_err("no KV state yet");
+        match err {
+            GlimmerError::StepFailed { step, detail } => {
+                assert_eq!(step, "cache_checkpoint");
+                assert!(detail.contains("no KV state"), "{detail}");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+        // Rewind and release against the same empty backend refuse
+        // the same way.
+        let other = CpuCompute::new();
+        let mut cache = KvCache::new(&[AttnLayerKind::Global], 1, 2).expect("cache builds");
+        let handle = cache.checkpoint(1).expect("checkpoint");
+        let err = other.cache_rewind(&handle, 0).expect_err("no KV state");
+        assert!(matches!(
+            err,
+            GlimmerError::StepFailed {
+                step: "cache_rewind",
+                ..
+            }
+        ));
+        let err = other.cache_release(&handle).expect_err("no KV state");
+        assert!(matches!(
+            err,
+            GlimmerError::StepFailed {
+                step: "cache_release",
+                ..
+            }
+        ));
+        cache.release(&handle).expect("release");
     }
 
     #[test]

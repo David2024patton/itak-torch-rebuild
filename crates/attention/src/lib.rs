@@ -21,5 +21,5 @@ pub mod diag;
 pub mod error;
 
 pub use attention::{gqa_attention, kv_head_for_query_head, AttentionParams};
-pub use cache::{glimmer_layer_pattern, CacheView, KvCache, LayerKind, LayerStats};
+pub use cache::{glimmer_layer_pattern, CacheView, Checkpoint, KvCache, LayerKind, LayerStats};
 pub use error::AttentionError;

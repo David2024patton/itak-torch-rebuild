@@ -122,12 +122,33 @@ L of them (Section 4). Owned by the forward layer (itak-forward and the
 arch forward), not by itak-spec: speculation is a caller of the forward,
 never a special case inside it (ARCHITECTURE.md Section 3.1 gives
 itak-spec `itak-forward` as a dependency, not the reverse).
+LANDED 2026-10-30 (TODO T-2.10): `GlimmerModel::forward_block` in
+crates/muse-glimmer/src/model.rs, sharing `forward`'s layer loop
+(`forward_rows`), so the single-token path is the block-of-one case.
+Per-position logits are proven against sequential single-token
+forwards on a synthetic config, across a sliding-window boundary,
+and at the convention tests' intermediate scale
+(crates/cpu-compute/tests/forward_tests.rs, `block_and_spec`).
 
 E2. **KvCache checkpoint and rewind.** A transactional API on the
 attention crate's `KvCache`: `checkpoint()`, `rewind_to(checkpoint,
 position)`, `release(checkpoint)`. Semantics in Section 5. Owned by the
 attention crate (later itak-kv), used by itak-spec and by n-gram
 rollback (T-3.1 names rollback in its proof for the same reason).
+LANDED 2026-10-30 (TODO T-2.10): `KvCache::checkpoint(max_round_tokens)`,
+`rewind_to`, and `release` in crates/attention/src/cache.rs, with the
+Section 5 semantics as written (windowed layers save the round's
+touched ring slots, global layers truncate, one live checkpoint,
+appends past the saved range refused by name, a round bound past the
+smallest window refused as `CheckpointTooDeep`). The position half is
+`Cache::rewind_to` in crates/muse-glimmer/src/cache.rs, and the
+backend surface is `CpuCompute::cache_checkpoint` / `cache_rewind` /
+`cache_release`. Measured bound at Glimmer geometry (52 layers,
+2 KV heads, head dim 128, window 2048, round bound 17): 1,357,824
+bytes of saved rows, proven by
+`checkpoint_memory_bound_at_glimmer_geometry` in
+crates/attention/tests/checkpoint_tests.rs; the model-level round
+trip is proven by `speculative_round_trip_rewind_restores_exact_continuation`.
 
 E3. **A dflash arch module.** The draft is a model: it loads through the
 same loader and arch seam as the target (ARCHITECTURE.md Section 6),
@@ -275,9 +296,9 @@ append:
 
 One checkpoint may be outstanding per cache at a time. A second
 `checkpoint()` while one is live is refused with
-`SpecError`-adjacent cache error `CheckpointBusy` (named in the
-attention crate's error set when E2 lands; listed here so the refusal
-has a name from birth). Stack discipline matches the caller: rounds
+`SpecError`-adjacent cache error `CheckpointBusy` (in the attention
+crate's error set since E2 landed, exactly as named here). Stack
+discipline matches the caller: rounds
 are sequential per sequence, and batching (Section 10, Q5) does not
 nest checkpoints inside one sequence's cache.
 
@@ -659,10 +680,10 @@ lands (that run is T-9.7, and its output is the config default).
   Settled by: reading the draft file's metadata through the loader
   when E3 lands, under the same no-silent-default rule as the target.
 - Q3. Where E1 lives in the phase order. T-2.4 scopes the forward as
-  incremental single-token steps; per-position block logits are an
-  addition nobody's TODO item currently owns. Proposed as T-2.10 in
-  Section 11. Until it lands, T-3.x and T-9.6 are blocked on it in
-  fact, whatever the phase numbers say.
+  incremental single-token steps; per-position block logits were an
+  addition nobody's TODO item owned. Settled: adopted as T-2.10 in
+  Section 11 and landed 2026-10-30 (Section 3), so T-3.x and T-9.6
+  are unblocked on this dependency.
 - Q4. Grammar and speculation. v1 refuses the combination
   (`GrammarConflict`). The alternative, applying the grammar mask to
   both distributions before the correction walk, is mathematically
@@ -688,12 +709,13 @@ decompose existing items; they do not renumber or replace any.
 
 Phase 2 (PLAN S5):
 
-- [ ] T-2.10 Block forward with per-position finished logits, plus
+- [x] T-2.10 Block forward with per-position finished logits, plus
   KvCache checkpoint and rewind (SPEC-itak-spec E1 and E2) (proof: a
   unit test rewinds a windowed ring to a mid-block position and the
   cache view is byte-identical to a cache fed only the kept prefix;
   per-position logits match sequential single-token forwards on the
-  same prompt at temperature 0) (PLAN S5)
+  same prompt at temperature 0) (PLAN S5) (landed 2026-10-30: both
+  halves of the proof exist as named in Section 3's LANDED notes)
 
 Phase 3 (PLAN S6):
 

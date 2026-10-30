@@ -890,3 +890,298 @@ fn mismatched_key_value_length_refuses() {
         other => panic!("expected StepFailed, got {other:?}"),
     }
 }
+
+/// Block forward (E1) and the speculative round trip (E1 + E2),
+/// appended as their own module so the convention proofs above stay
+/// untouched. These tests reuse the fixtures above: same weight
+/// builder, same configs, same max-diff helper.
+mod block_and_spec {
+    use super::*;
+    use std::rc::Rc;
+
+    use muse_glimmer::{AttentionRequest, Compute, LayerWeights};
+
+    #[test]
+    fn block_forward_matches_sequential_single_token_forwards() {
+        // E1's core proof: teacher-forcing a block yields, at every
+        // row, the distribution a sequential decode produces at that
+        // position. Causality is what makes this exact rather than
+        // approximate: row i may only depend on tokens 0..=i, and
+        // both routes compute it that way.
+        let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 16);
+        let vocab = cfg.vocab_size as usize;
+        let seq = [3u32, 17, 42, 90, 5];
+
+        let model = make_model(&cfg, Style::Random);
+        let mut cache = PositionCache::new();
+        let block = model
+            .forward_block(&seq, &mut cache)
+            .expect("block forward runs");
+        assert_eq!(block.len(), seq.len() * vocab);
+        assert_eq!(cache.position(), seq.len());
+
+        let stepped = make_model(&cfg, Style::Random);
+        let mut stepped_cache = PositionCache::new();
+        for (i, &token) in seq.iter().enumerate() {
+            let logits = stepped
+                .forward(&[token], &mut stepped_cache)
+                .expect("sequential step runs");
+            let row = &block[i * vocab..(i + 1) * vocab];
+            let d = max_diff(row, &logits);
+            assert!(
+                d <= 1e-6,
+                "position {i}: block row differs from the sequential forward by {d}"
+            );
+        }
+
+        // forward is the block's last row: one implementation, two
+        // entry points.
+        let whole = make_model(&cfg, Style::Random);
+        let mut whole_cache = PositionCache::new();
+        let last = whole
+            .forward(&seq, &mut whole_cache)
+            .expect("one-shot forward runs");
+        let d = max_diff(&block[(seq.len() - 1) * vocab..], &last);
+        assert!(d <= 1e-6, "forward disagrees with forward_block's last row by {d}");
+    }
+
+    #[test]
+    fn block_forward_crossing_a_sliding_window_boundary_matches_sequential() {
+        // Window 3, sequence 6: the block crosses the ring boundary
+        // mid-block, and rows after the crossing were computed
+        // against a window the earlier rows never saw. The per-row
+        // agreement with the sequential route must survive that.
+        let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 3);
+        let vocab = cfg.vocab_size as usize;
+        let seq = [9u32, 8, 7, 6, 5, 4];
+
+        let model = make_model(&cfg, Style::Random);
+        let mut cache = PositionCache::new();
+        let block = model
+            .forward_block(&seq, &mut cache)
+            .expect("block forward runs");
+
+        let stepped = make_model(&cfg, Style::Random);
+        let mut stepped_cache = PositionCache::new();
+        for (i, &token) in seq.iter().enumerate() {
+            let logits = stepped
+                .forward(&[token], &mut stepped_cache)
+                .expect("sequential step runs");
+            let row = &block[i * vocab..(i + 1) * vocab];
+            let d = max_diff(row, &logits);
+            assert!(
+                d <= 1e-6,
+                "position {i}: block row differs across the window boundary by {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn block_forward_matches_sequential_at_intermediate_scale() {
+        // Same proof at the convention tests' intermediate scale:
+        // 8 layers in the real every-fourth pattern, 32 Q heads over
+        // 2 KV heads, the real eps and softcap/scale finishing.
+        let cfg = intermediate_config();
+        let vocab = cfg.vocab_size as usize;
+        let seq = [3u32, 17, 42, 90, 5, 23];
+
+        let model = make_model(&cfg, Style::Random);
+        let mut cache = PositionCache::new();
+        let block = model
+            .forward_block(&seq, &mut cache)
+            .expect("block forward runs");
+        assert_eq!(block.len(), seq.len() * vocab);
+
+        let stepped = make_model(&cfg, Style::Random);
+        let mut stepped_cache = PositionCache::new();
+        for (i, &token) in seq.iter().enumerate() {
+            let logits = stepped
+                .forward(&[token], &mut stepped_cache)
+                .expect("sequential step runs");
+            let row = &block[i * vocab..(i + 1) * vocab];
+            let d = max_diff(row, &logits);
+            assert!(
+                d <= 1e-5,
+                "position {i}: block row differs from the sequential forward by {d} at intermediate scale"
+            );
+        }
+    }
+
+    /// A `Compute` that delegates to a shared `CpuCompute`, so a
+    /// test can hold the backend next to the model that owns it and
+    /// drive the checkpoint API the model cannot see. Test
+    /// scaffolding only: every method is a one-line forward.
+    struct SharedCompute(Rc<CpuCompute>);
+
+    impl Compute for SharedCompute {
+        fn embed(
+            &self,
+            table: &TensorView,
+            tokens: &[u32],
+            cfg: &GlimmerConfig,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.embed(table, tokens, cfg)
+        }
+
+        fn rms_norm(
+            &self,
+            x: &[f32],
+            weight: &TensorView,
+            rows: usize,
+            eps: f32,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.rms_norm(x, weight, rows, eps)
+        }
+
+        fn rms_norm_plain(
+            &self,
+            x: &[f32],
+            rows: usize,
+            eps: f32,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.rms_norm_plain(x, rows, eps)
+        }
+
+        fn proj(
+            &self,
+            x: &[f32],
+            weight: &TensorView,
+            rows: usize,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.proj(x, weight, rows)
+        }
+
+        fn attention(
+            &self,
+            req: &AttentionRequest<'_>,
+            cache: &mut dyn Cache,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.attention(req, cache)
+        }
+
+        fn attn_gate(&self, attn_out: &[f32], gate: &[f32]) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.attn_gate(attn_out, gate)
+        }
+
+        fn add(&self, a: &[f32], b: &[f32]) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.add(a, b)
+        }
+
+        fn swiglu_ffn(
+            &self,
+            x: &[f32],
+            w: &LayerWeights,
+            rows: usize,
+            cfg: &GlimmerConfig,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.swiglu_ffn(x, w, rows, cfg)
+        }
+
+        fn lm_head(
+            &self,
+            x: &[f32],
+            head: &TensorView,
+            cfg: &GlimmerConfig,
+        ) -> muse_glimmer::Result<Vec<f32>> {
+            self.0.lm_head(x, head, cfg)
+        }
+    }
+
+    fn make_shared_model(cfg: &GlimmerConfig) -> (GlimmerModel, Rc<CpuCompute>) {
+        let compute = Rc::new(CpuCompute::new());
+        let source = build_source(cfg, Style::Random);
+        let weights = Weights::load(&source, cfg).expect("synthetic weights load");
+        let model = GlimmerModel::new(
+            cfg.clone(),
+            weights,
+            Box::new(SharedCompute(compute.clone())),
+        );
+        (model, compute)
+    }
+
+    #[test]
+    fn speculative_round_trip_rewind_restores_exact_continuation() {
+        // The whole E1 + E2 loop at model scale, on a window-3
+        // config: the prompt alone overflows the ring, and the
+        // block's appends evict rows held for the committed prefix
+        // (SPEC Section 5.1's corruption case, proven byte-exact at
+        // the cache level in the attention crate's tests). The round
+        // bound equals the window here, the largest round the ring
+        // admits exactly. Checkpoint, block forward over three
+        // drafted tokens, rewind to keep the first two, release,
+        // then continue: the continuation logits must match a route
+        // that never speculated, because the rewind restored the
+        // cache exactly, kept speculative rows included.
+        let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 3);
+        let prompt = [3u32, 17, 42, 90];
+        let block_tokens = [5u32, 23, 8];
+        let continuation = [11u32];
+
+        let reference = {
+            let model = make_model(&cfg, Style::Random);
+            let mut cache = PositionCache::new();
+            model.forward(&prompt, &mut cache).expect("prefill");
+            model
+                .forward(&block_tokens[..2], &mut cache)
+                .expect("kept tokens");
+            model
+                .forward(&continuation, &mut cache)
+                .expect("continuation")
+        };
+
+        let (model, compute) = make_shared_model(&cfg);
+        let mut cache = PositionCache::new();
+        model.forward(&prompt, &mut cache).expect("prefill");
+        assert_eq!(cache.position(), 4);
+        let checkpoint = compute.cache_checkpoint(3).expect("checkpoint");
+        let block = model
+            .forward_block(&block_tokens, &mut cache)
+            .expect("verify forward");
+        assert_eq!(block.len(), block_tokens.len() * VOCAB);
+        assert_eq!(cache.position(), 7);
+        // Commit: base 4, pending + 1 accepted = keep 2 of the block.
+        compute.cache_rewind(&checkpoint, 6).expect("kv rewind");
+        cache.rewind_to(6);
+        compute.cache_release(&checkpoint).expect("release");
+        let got = model
+            .forward(&continuation, &mut cache)
+            .expect("continuation");
+        assert_eq!(cache.position(), 7);
+
+        let d = max_diff(&got, &reference);
+        assert!(
+            d <= 1e-6,
+            "post-rewind continuation differs from the never-speculated route by {d}"
+        );
+    }
+
+    #[test]
+    fn rewound_kv_with_unrewound_position_cache_refuses() {
+        // The two-truths hazard of SPEC Section 5.4: the KV store is
+        // rewound but the position cache is not, so they disagree
+        // (2 vs 4). The next forward must refuse by name at the
+        // attention step's cross-check, not attend across the gap.
+        let cfg = test_config(vec![LayerKind::SlidingWindow, LayerKind::Global], 16);
+        let (model, compute) = make_shared_model(&cfg);
+        let mut cache = PositionCache::new();
+        model.forward(&[3, 17], &mut cache).expect("prefill");
+        let checkpoint = compute.cache_checkpoint(2).expect("checkpoint");
+        model
+            .forward_block(&[42, 90], &mut cache)
+            .expect("block forward");
+        compute.cache_rewind(&checkpoint, 2).expect("kv rewind");
+        compute.cache_release(&checkpoint).expect("release");
+        // Deliberately no cache.rewind_to(2) here.
+        let err = model
+            .forward(&[5], &mut cache)
+            .expect_err("diverged position truths must refuse");
+        match err {
+            GlimmerError::StepFailed { step, detail } => {
+                assert_eq!(step, "attention");
+                assert!(detail.contains("position 2"), "{detail}");
+                assert!(detail.contains("position 4"), "{detail}");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+    }
+}

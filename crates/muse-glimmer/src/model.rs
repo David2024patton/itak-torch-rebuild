@@ -88,14 +88,10 @@ impl GlimmerModel {
         &self.config
     }
 
-    /// Run one forward pass over `tokens` and return the next-token
-    /// logits for the final position, softcapped and scaled per the
-    /// file's own `final_logit_softcapping` and `logit_scale`.
-    ///
-    /// On success the cache advances by `tokens.len()`; on any refusal
-    /// the cache is untouched and the error names the step or input
-    /// that failed.
-    pub fn forward(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
+    /// The input validation both forward entry points share, run
+    /// for real before any compute step: non-empty, every token in
+    /// vocabulary.
+    fn validate_tokens(&self, tokens: &[u32]) -> Result<()> {
         if tokens.is_empty() {
             return Err(GlimmerError::EmptyInput);
         }
@@ -107,6 +103,18 @@ impl GlimmerModel {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Run one forward pass over `tokens` and return the next-token
+    /// logits for the final position, softcapped and scaled per the
+    /// file's own `final_logit_softcapping` and `logit_scale`.
+    ///
+    /// On success the cache advances by `tokens.len()`; on any refusal
+    /// the cache is untouched and the error names the step or input
+    /// that failed.
+    pub fn forward(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
+        self.validate_tokens(tokens)?;
         self.diag.event(
             "forward.begin",
             &format!(
@@ -117,6 +125,91 @@ impl GlimmerModel {
             ),
         );
 
+        let x = self.forward_rows(tokens, cache)?;
+
+        let cfg = &self.config;
+        let rows = tokens.len();
+        let c = &*self.compute;
+        let hidden = cfg.hidden as usize;
+        let last = &x[(rows - 1) * hidden..rows * hidden];
+        let normed = c.rms_norm(last, &self.weights.final_norm, 1, cfg.rms_eps)?;
+        let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
+        softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
+
+        cache.advance(tokens.len());
+        self.diag.event(
+            "forward.end",
+            &format!("logits={} position={}", logits.len(), cache.position()),
+        );
+        Ok(logits)
+    }
+
+    /// Block forward with per-position logits (SPEC-itak-spec
+    /// Section 3, dependency E1): run `tokens` through the same layer
+    /// loop [`GlimmerModel::forward`] runs, and return the finished
+    /// logits for EVERY position in the block, row-major
+    /// `[block][vocab]`, each row softcapped and scaled exactly as
+    /// `forward` finishes its single row. Row `i` is the distribution
+    /// for the token following the prefix extended by
+    /// `tokens[..=i]`, which is what a speculative verify round
+    /// consumes.
+    ///
+    /// This is not a second forward: `forward` is this method's
+    /// block-of-one case read at the last row (plus the positions the
+    /// block already consumed). The cache contract is `forward`'s:
+    /// on success the cache advances by `tokens.len()`; on any
+    /// refusal the cache is untouched and the error names the step
+    /// or input that failed.
+    pub fn forward_block(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
+        self.validate_tokens(tokens)?;
+        self.diag.event(
+            "forward_block.begin",
+            &format!(
+                "tokens={} position={} layers={}",
+                tokens.len(),
+                cache.position(),
+                self.config.block_count
+            ),
+        );
+
+        let x = self.forward_rows(tokens, cache)?;
+
+        let cfg = &self.config;
+        let rows = tokens.len();
+        let c = &*self.compute;
+        let hidden = cfg.hidden as usize;
+        let vocab = cfg.vocab_size as usize;
+        let mut out = Vec::with_capacity(rows * vocab);
+        for r in 0..rows {
+            let row = &x[r * hidden..(r + 1) * hidden];
+            let normed = c.rms_norm(row, &self.weights.final_norm, 1, cfg.rms_eps)?;
+            let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
+            softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
+            out.extend_from_slice(&logits);
+        }
+
+        cache.advance(tokens.len());
+        self.diag.event(
+            "forward_block.end",
+            &format!(
+                "rows={} logits={} position={}",
+                rows,
+                out.len(),
+                cache.position()
+            ),
+        );
+        Ok(out)
+    }
+
+    /// The shared body of both forward entry points: embedding,
+    /// the weightless embedding norm, and the per-layer loop,
+    /// returning the final hidden states `[tokens.len(), hidden]`.
+    /// Reads and appends KV through `cache` (via the compute
+    /// backend's attention step) but does not advance the position
+    /// contract: the entry points advance it once their head
+    /// application has succeeded, so a refused pass leaves the cache
+    /// untouched.
+    fn forward_rows(&self, tokens: &[u32], cache: &mut dyn Cache) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let rows = tokens.len();
         let c = &*self.compute;
@@ -173,18 +266,7 @@ impl GlimmerModel {
             x = c.add(&residual, &ffn)?;
         }
 
-        let hidden = cfg.hidden as usize;
-        let last = &x[(rows - 1) * hidden..rows * hidden];
-        let normed = c.rms_norm(last, &self.weights.final_norm, 1, cfg.rms_eps)?;
-        let mut logits = c.lm_head(&normed, &self.weights.output, cfg)?;
-        softcap_scale(&mut logits, cfg.logit_softcap, cfg.logit_scale);
-
-        cache.advance(tokens.len());
-        self.diag.event(
-            "forward.end",
-            &format!("logits={} position={}", logits.len(), cache.position()),
-        );
-        Ok(logits)
+        Ok(x)
     }
 }
 
@@ -403,6 +485,87 @@ mod tests {
         expected.extend(one_layer);
         expected.extend(["rms_norm", "lm_head"]);
         assert_eq!(calls.borrow().as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn forward_block_heads_every_row_through_the_same_loop() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let compute = Box::new(RecordingCompute {
+            calls: calls.clone(),
+        });
+        let (model, _cfg) = tiny_model(compute);
+        let mut cache = PositionCache::new();
+        let logits = model
+            .forward_block(&[1, 2], &mut cache)
+            .expect("recording compute completes the block walk");
+        // [block][vocab] row-major: 2 rows of 128.
+        assert_eq!(logits.len(), 2 * 128);
+        assert_eq!(cache.position(), 2);
+
+        // The layer walk is forward's, unchanged; what the block
+        // adds is one (final norm, lm_head) pair per row, after it.
+        let recorded = calls.borrow();
+        let walk = &recorded[..recorded.len() - 4];
+        let one_layer: [&str; 16] = [
+            "rms_norm",
+            "proj",
+            "proj",
+            "proj",
+            "rms_norm",
+            "rms_norm",
+            "attention",
+            "proj",
+            "attn_gate",
+            "proj",
+            "rms_norm",
+            "add",
+            "rms_norm",
+            "swiglu_ffn",
+            "rms_norm",
+            "add",
+        ];
+        let mut expected_walk: Vec<&str> = vec!["embed", "rms_norm_plain"];
+        expected_walk.extend(one_layer);
+        expected_walk.extend(one_layer);
+        assert_eq!(walk, expected_walk.as_slice());
+        assert_eq!(
+            &recorded[recorded.len() - 4..],
+            ["rms_norm", "lm_head", "rms_norm", "lm_head"].as_slice()
+        );
+    }
+
+    #[test]
+    fn forward_block_of_one_returns_forward_shape() {
+        let calls = std::rc::Rc::new(RefCell::new(Vec::new()));
+        let compute = Box::new(RecordingCompute {
+            calls: calls.clone(),
+        });
+        let (model, _cfg) = tiny_model(compute);
+        let mut cache = PositionCache::new();
+        let block = model
+            .forward_block(&[7], &mut cache)
+            .expect("block of one runs");
+        assert_eq!(block.len(), 128);
+        assert_eq!(cache.position(), 1);
+    }
+
+    #[test]
+    fn forward_block_refuses_like_forward() {
+        let (model, cfg) = tiny_model(Box::new(UnimplementedCompute));
+        let mut cache = PositionCache::new();
+        assert!(matches!(
+            model.forward_block(&[], &mut cache),
+            Err(GlimmerError::EmptyInput)
+        ));
+        assert!(matches!(
+            model.forward_block(&[cfg.vocab_size], &mut cache),
+            Err(GlimmerError::TokenOutOfRange { .. })
+        ));
+        let err = model
+            .forward_block(&[1, 2, 3], &mut cache)
+            .expect_err("skeleton compute must refuse");
+        assert!(matches!(err, GlimmerError::Unimplemented { step: "embed" }));
+        assert_eq!(cache.position(), 0);
     }
 
     #[test]

@@ -31,6 +31,12 @@
 //!   apart. The integration tests prove the property end to end:
 //!   incremental decode logits match one-shot prefill logits for the
 //!   same sequence.
+//! - **Speculative rollback is exposed, not improvised.**
+//!   [`CpuCompute::cache_checkpoint`], [`CpuCompute::cache_rewind`],
+//!   and [`CpuCompute::cache_release`] pass the `attention` crate's
+//!   checkpoint API through to the one place the KV cache lives, so
+//!   a speculation driver (SPEC-itak-spec Section 5) rolls this
+//!   backend's storage back exactly, ring evictions included.
 //!
 //! The forward's step order, including the two placements the
 //! architecture crate flagged for verification (post norms after
@@ -46,4 +52,5 @@
 pub mod cpu;
 pub mod diag;
 
+pub use attention::Checkpoint;
 pub use cpu::CpuCompute;

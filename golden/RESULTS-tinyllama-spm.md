@@ -70,3 +70,113 @@ layer-by-layer activation diffing follow-up named in
   context and was uninformative about the forward)
 - Diff: `python3 golden/compare.py golden/fixtures/tinyllama-1.1b-chat-v1.0.Q4_K_M.golden.jsonl golden/candidates/tinyllama-1.1b-chat-v1.0.Q4_K_M.candidate.jsonl --strict`
   exits 1 with the summary above.
+
+## Follow-up: re-run after the RoPE pairing fix (13643e0)
+
+The Qwen layer diff (`RESULTS-layer-diff-qwen.md`) found the
+dense forward's RoPE pairing was adjacent where llama.cpp applies
+the half-split NEOX pairing for qwen2, and commit 13643e0 changed
+the shared `torch_math::rope` / `rope_partial` to NEOX. Qwen went
+0/15 to 9/15 on that change. TinyLlama (arch `llama`, the same
+arch-llama forward) was re-run under identical conditions to the
+SPM run above (server, release, RUSTFLAGS target-cpu=x86-64-v3,
+CPU only, 701.3 s; production Glimmer llama-server untouched,
+verified healthy on pid 683675 after the run).
+
+### Headline: a regression for the llama arch, 6/15 to 0/15
+
+| Model | Token-identical | Text-identical | Divergent | Missing |
+| --- | --- | --- | --- | --- |
+| TinyLlama-1.1B Q4_K_M (adjacent pairing, SPM run) | 6 / 15 | 0 / 15 | 9 | 0 |
+| TinyLlama-1.1B Q4_K_M (after 13643e0, NEOX) | 0 / 15 | 0 / 15 | 15 | 0 |
+
+Prompt tokenization is still exact on all 15 prompts; the
+completions are coherent English that leaves the golden trajectory
+immediately (eight forks at index 0). Candidate:
+`golden/candidates/tinyllama-1.1b-chat-v1.0.Q4_K_M.fixed.candidate.jsonl`.
+
+### Fork table with llama.cpp's own margins
+
+Margins were measured by feeding each fork's golden prefix
+(prompt ids + golden completion ids before the fork) to a
+throwaway CPU llama-server (same binary and flags as
+`gen_golden.py`) with `n_probs=5` and reading the winner's
+logprob gap over the best other token at that position
+(`golden/tools/fork_margins.py`). The band column compares
+against the cross-engine noise band the Qwen note measured
+(up to ~0.78 logits); that band was measured on Qwen2.5-1.5B,
+not on this model, so it is a reference scale, not a
+TinyLlama-measured bound.
+
+| Prompt | Fork index | Golden id | Candidate id | llama.cpp winner margin (logits) | vs 0.78 band | Candidate in llama.cpp top-5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| factual_capital | 0 | 3681 | 278 | 0.519 | within | no |
+| factual_science | 1 | 29889 | 29906 | 0.586 | within | yes (gap 1.493) |
+| factual_history | 0 | 29334 | 263 | 2.041 | exceeds | no |
+| arithmetic_add | 1 | 29946 | 29896 | 0.925 | exceeds | no |
+| arithmetic_divide | 2 | 29946 | 29900 | 0.453 | within | no |
+| arithmetic_word | 1 | 29953 | 29896 | 0.416 | within | no |
+| code_python | 0 | 18755 | 302 | 3.137 | exceeds | yes (gap 3.137) |
+| code_go | 7 | 13 | 28956 | 5.190 | exceeds | no |
+| list_colors | 0 | 301 | 322 | 1.212 | exceeds | no |
+| list_days | 1 | 24211 | 278 | 0.466 | within | yes (gap 4.223) |
+| list_counting | 4 | 29947 | 29896 | 7.403 | exceeds | yes (gap 7.403) |
+| accented_french | 0 | 10814 | 454 | 0.532 | within | no |
+| accented_german | 0 | 6209 | 762 | 0.864 | exceeds | no |
+| accented_spanish | 0 | 1208 | 274 | 0.602 | within | no |
+| continuation_classic | 0 | 17366 | 18786 | 4.177 | exceeds | no |
+
+Eight forks exceed the band outright. At the seven within-band
+forks the candidate token still sits outside llama.cpp's top-5
+in six cases, and 1.49 to 4.22 logits behind the winner in the
+rest: the engine did not pick a near-tie runner-up, it picked
+tokens llama.cpp ranks far down. The forks are a systematic
+error, not cross-engine noise, which the root cause below
+confirms directly.
+
+### Root cause: RoPE pairing is per-architecture; 13643e0 generalized qwen2's
+
+llama.cpp's own source settles the pairing per architecture
+(`llama_model_rope_type` in `src/llama-model.cpp`, the build
+that generated the fixtures): `LLM_ARCH_LLAMA` returns
+`LLAMA_ROPE_TYPE_NORM` (adjacent pairs), `LLM_ARCH_QWEN2`
+returns `LLAMA_ROPE_TYPE_NEOX` (half-split), and
+`LLM_ARCH_MUSE_GLIMMER` returns NORM. The 13643e0 commit
+message asserts NEOX for "qwen2/llama"; the llama half of that
+claim is wrong. The commit changed the one shared pairing
+function arch-llama calls for both architectures, so it fixed
+qwen2 and broke llama in the same edit.
+
+Two cross-checks isolate the cause to the pairing, not to this
+re-run's build or staging:
+
+- The layer-diff agent's own post-fix `golden_run` binary,
+  run on TinyLlama for the single prompt factual_capital,
+  produces the identical wrong trajectory head
+  ([278, 4272, 310, 3681, ...], " the city of Paris...") as
+  this re-run's candidate.
+- A discriminator experiment in the server staging copy only
+  (never committed): the arch-llama call site in `rope_rows`
+  was temporarily switched to `torch_math::rope_interleaved`
+  for the full-rotary case (this file's rope_dim equals its
+  head_dim), and factual_capital returned to fully
+  token-identical over all 64 tokens, exactly as in the SPM
+  run above.
+
+The fix this names, not landed here: arch-llama must select
+the pairing from the file's architecture at the call site,
+the same structural rule the Glimmer backend already follows
+(`rope_interleaved`'s module docs): `llama` takes the
+interleaved pairing (a partial-rotary variant is needed for
+llama-arch files whose rope_dim is below the head dim),
+`qwen2` keeps the NEOX `rope_partial` from 13643e0. Until the
+pairing is per-architecture, the two golden fixtures guard
+opposite directions and either arch can regress silently
+behind the other's fix.
+
+### Files (this follow-up)
+
+- Candidate: `golden/candidates/tinyllama-1.1b-chat-v1.0.Q4_K_M.fixed.candidate.jsonl`
+- Margin probe: `golden/tools/fork_margins.py` (one-off
+  analysis; margins above are its output, reproducible from
+  the fixture and candidate)

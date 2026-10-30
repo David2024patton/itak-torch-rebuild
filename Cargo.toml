@@ -16,10 +16,12 @@ members = [
     "crates/attention",
     "crates/cpu-compute",
     "crates/gguf",
+    "crates/itak-engine",
     "crates/itak-loader",
     "crates/muse-glimmer",
     "crates/tokenizer",
     "crates/torch-math",
+    "crates/wgpu-compute",
 ]
 
 [workspace.package]

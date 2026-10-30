@@ -49,21 +49,35 @@ pub trait Compute {
     /// `[tokens.len(), hidden]`.
     fn embed(&self, table: &TensorView, tokens: &[u32], cfg: &GlimmerConfig) -> Result<Vec<f32>>;
 
-    /// RMSNorm over the last dimension of `x`, which holds `rows` rows.
-    /// Used for the pre norms (width hidden or FFN input), the per-head
-    /// Q and K norms (width head dim, rows = positions times heads),
-    /// the post norms, and the final norm.
+    /// RMSNorm over the last dimension of `x`, which holds `rows` rows,
+    /// scaled by the stored weight (plain `x * w`; the Gemma-style
+    /// (1 + w) shift, where a model family uses one, is folded into
+    /// the stored weights at conversion time). Used for the pre norms
+    /// (width hidden or FFN input), the per-head Q and K norms (width
+    /// head dim, rows = positions times heads), the post norms, and
+    /// the final norm.
     fn rms_norm(&self, x: &[f32], weight: &TensorView, rows: usize, eps: f32) -> Result<Vec<f32>>;
+
+    /// Weightless RMSNorm over the last dimension of `x`: normalize
+    /// each row by its RMS, with no weight multiply. The reference
+    /// graph applies exactly this to the embedding output before the
+    /// first layer (src/models/muse-glimmer.cpp: build_norm with a
+    /// null weight), so it is a distinct step, not an `rms_norm` with
+    /// a ones weight a backend would have to invent.
+    fn rms_norm_plain(&self, x: &[f32], rows: usize, eps: f32) -> Result<Vec<f32>>;
 
     /// Linear projection `x` by `weight`, `[rows, in]` to `[rows, out]`,
     /// dequantizing the weight as needed.
     fn proj(&self, x: &[f32], weight: &TensorView, rows: usize) -> Result<Vec<f32>>;
 
-    /// Attention for one layer: applies RoPE to the request's `q` and
-    /// `k` at the cache's current position, attends under the layer's
-    /// kind (sliding-window layers see only the last
-    /// `cfg.sliding_window` positions), reads and writes KV through
-    /// `cache`, and returns the attention output at query width,
+    /// Attention for one layer. On sliding-window layers it applies
+    /// RoPE (base `cfg.rope_freq_base_swa`) to the request's `q` and
+    /// `k` at the cache's current position and restricts attention to
+    /// the last `cfg.sliding_window` positions. Global layers are
+    /// NoPE: no rotation at all, per the reference graph
+    /// (src/models/muse-glimmer.cpp: "RoPE runs on the SWA layers,
+    /// NoPE on full ones"). Reads and writes KV through `cache`, and
+    /// returns the attention output at query width,
     /// `[positions, q_width]`.
     fn attention(&self, req: &AttentionRequest<'_>, cache: &mut dyn Cache) -> Result<Vec<f32>>;
 
@@ -116,6 +130,12 @@ impl Compute for UnimplementedCompute {
         _eps: f32,
     ) -> Result<Vec<f32>> {
         Err(GlimmerError::Unimplemented { step: "rms_norm" })
+    }
+
+    fn rms_norm_plain(&self, _x: &[f32], _rows: usize, _eps: f32) -> Result<Vec<f32>> {
+        Err(GlimmerError::Unimplemented {
+            step: "rms_norm_plain",
+        })
     }
 
     fn proj(&self, _x: &[f32], _weight: &TensorView, _rows: usize) -> Result<Vec<f32>> {

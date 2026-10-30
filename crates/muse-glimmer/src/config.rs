@@ -32,6 +32,7 @@ pub(crate) const KEY_KV_HEADS: &str = "muse-glimmer.attention.head_count_kv";
 pub(crate) const KEY_KEY_LENGTH: &str = "muse-glimmer.attention.key_length";
 pub(crate) const KEY_VALUE_LENGTH: &str = "muse-glimmer.attention.value_length";
 pub(crate) const KEY_ROPE_FREQ_BASE: &str = "muse-glimmer.rope.freq_base";
+pub(crate) const KEY_ROPE_FREQ_BASE_SWA: &str = "muse-glimmer.rope.freq_base_swa";
 pub(crate) const KEY_RMS_EPS: &str = "muse-glimmer.attention.layer_norm_rms_epsilon";
 pub(crate) const KEY_SLIDING_WINDOW: &str = "muse-glimmer.attention.sliding_window";
 pub(crate) const KEY_LOGIT_SOFTCAP: &str = "muse-glimmer.final_logit_softcapping";
@@ -63,14 +64,27 @@ pub struct GlimmerConfig {
     pub value_length: u32,
     /// RoPE frequency base.
     pub rope_freq_base: f32,
+    /// RoPE base for the sliding-window layers, the only layers
+    /// llama.cpp rotates for this arch (global layers are NoPE;
+    /// src/models/muse-glimmer.cpp: "RoPE runs on the SWA layers,
+    /// NoPE on full ones"). llama.cpp resolves it from the optional
+    /// `rope.freq_base_swa` key and falls back to the train base
+    /// when the file does not carry it (src/llama-model.cpp:
+    /// `rope_freq_base_train_swa`). The real file carries no such
+    /// key, so here it equals `rope_freq_base`, 500000.
+    pub rope_freq_base_swa: f32,
     /// RMSNorm epsilon, from the file (1e-5 on the real model; the
     /// original engine hardcoded 1e-6, one of its silent wrong numbers).
     pub rms_eps: f32,
     /// Sliding-window size in tokens for sliding-window layers.
     pub sliding_window: u32,
-    /// Final logit softcap (applied as `cap * tanh(z / cap)`).
+    /// Final logit softcap cap, applied as `cap * tanh(z / cap)`
+    /// AFTER the logit scale (src/models/muse-glimmer.cpp: scale,
+    /// then `build_softcap`).
     pub logit_softcap: f32,
-    /// Logit scale applied after softcapping.
+    /// Logit scale applied to the lm_head output BEFORE the
+    /// softcap (src/models/muse-glimmer.cpp: `ggml_scale` then
+    /// `build_softcap`).
     pub logit_scale: f32,
     /// Vocabulary size, from the tokenizer token array length.
     pub vocab_size: u32,
@@ -122,6 +136,8 @@ impl GlimmerConfig {
                 key: KEY_VOCAB_TOKENS,
             })?;
 
+        let rope_freq_base = required_f32(meta, KEY_ROPE_FREQ_BASE)?;
+
         Ok(GlimmerConfig {
             name: meta.get_string(KEY_NAME),
             block_count,
@@ -132,7 +148,10 @@ impl GlimmerConfig {
             kv_heads,
             key_length: required_u32(meta, KEY_KEY_LENGTH)?,
             value_length: required_u32(meta, KEY_VALUE_LENGTH)?,
-            rope_freq_base: required_f32(meta, KEY_ROPE_FREQ_BASE)?,
+            rope_freq_base,
+            rope_freq_base_swa: meta
+                .get_f32(KEY_ROPE_FREQ_BASE_SWA)
+                .unwrap_or(rope_freq_base),
             rms_eps: required_f32(meta, KEY_RMS_EPS)?,
             sliding_window,
             logit_softcap: required_f32(meta, KEY_LOGIT_SOFTCAP)?,
@@ -233,6 +252,9 @@ mod tests {
         assert_eq!(cfg.q_width(), 4096);
         assert_eq!(cfg.k_width(), 256);
         assert!((cfg.rope_freq_base - 500_000.0).abs() < 0.01);
+        // The real file carries no rope.freq_base_swa key, so the
+        // SWA base falls back to the train base, as in llama.cpp.
+        assert!((cfg.rope_freq_base_swa - 500_000.0).abs() < 0.01);
         assert!((cfg.rms_eps - 1e-5).abs() < 1e-9);
         assert_eq!(cfg.sliding_window, 2048);
         assert!((cfg.logit_softcap - 20.0).abs() < f32::EPSILON);
@@ -264,6 +286,15 @@ mod tests {
         assert_eq!(cfg.global_layer_count(), 0);
         assert_eq!(cfg.sliding_layer_count(), 2);
         assert_eq!(cfg.vocab_size, 128);
+    }
+
+    #[test]
+    fn explicit_swa_rope_base_wins_over_the_train_base() {
+        let mut meta = tiny_metadata();
+        meta.insert_f32(KEY_ROPE_FREQ_BASE_SWA, 1_000.0);
+        let cfg = GlimmerConfig::from_metadata(&meta).expect("tiny metadata parses");
+        assert!((cfg.rope_freq_base_swa - 1_000.0).abs() < f32::EPSILON);
+        assert!((cfg.rope_freq_base - 10_000.0).abs() < f32::EPSILON);
     }
 
     #[test]

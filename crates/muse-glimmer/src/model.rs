@@ -1,22 +1,32 @@
 //! [`GlimmerModel`]: config plus weights plus compute, and the forward
 //! pass that ties them together.
 //!
-//! The forward is structured exactly as the architecture runs, per
-//! layer: pre-attention norm, Q/K/V projections, per-head Q and K
-//! norms, attention of the layer's kind, attention gate, output
-//! projection, residual add, post-attention norm, pre-FFN norm, SwiGLU
-//! FFN, residual add, post-FFN norm. Then the final norm, the untied
-//! head, and the logit softcap and scale, which are real arithmetic
-//! done here (they are a handful of scalar operations on the logit
-//! vector, not kernel work).
+//! The forward follows the reference graph in llama.cpp
+//! (src/models/muse-glimmer.cpp); its conventions were settled from
+//! that source in the Run B follow-up (see
+//! crates/itak-loader/INTEGRATION-RUN-B.md):
 //!
-//! Two placements are marked for verification at the integration stage,
-//! against the reference graph in llama.cpp, before any output of this
-//! forward is trusted numerically: the post norms are applied after
-//! each residual add (the Gemma-style pre/post pattern the tensor set
-//! implies), and the attention gate projection reads the same normed
-//! input as the Q/K/V projections. The structure makes both placements
-//! one-line changes if the reference disagrees.
+//! - Embedding rows pass a WEIGHTLESS RMSNorm (eps = the file's)
+//!   before layer 0; there is no embedding scale factor.
+//! - Per layer: pre-attention norm, Q/K/V projections, per-head Q
+//!   and K norms, attention of the layer's kind, and the sigmoid
+//!   attention gate, whose projection reads the same normed input
+//!   as Q/K/V and which multiplies the attention output before the
+//!   output projection.
+//! - Each sub-block's output passes its POST norm (eps hardcoded
+//!   1e-8 in the reference graph) BEFORE the residual add:
+//!   `x = x + post_norm(branch)`. The residual stream itself is
+//!   never renormalized.
+//! - Every stored-norm multiplication is plain `x * w`. The
+//!   Gemma-style (1 + w) shift was folded into the four per-layer
+//!   norm weights at conversion time (conversion/muse_glimmer.py:
+//!   `norm_shift`); the final norm was deliberately left unshifted,
+//!   which is why its stored weights center on zero.
+//! - RoPE runs on the sliding-window layers only, at the SWA base,
+//!   in ggml's NORM (interleaved, adjacent-pair) mode; the global
+//!   layers are NoPE.
+//! - The head is: final norm, untied lm_head, multiply by
+//!   `logit_scale`, then softcap `cap * tanh(z / cap)`.
 //!
 //! Input validation (non-empty, token range) is done here, for real,
 //! before any compute step runs. Everything else delegates to
@@ -31,6 +41,12 @@ use crate::config::GlimmerConfig;
 use crate::diag::{Diag, NullDiag};
 use crate::error::{GlimmerError, Result};
 use crate::weights::Weights;
+
+/// Epsilon for the two post norms (post-attention, post-FFN). The
+/// reference graph hardcodes 1e-8 for these, independent of the
+/// file's RMS epsilon used by every other norm
+/// (src/models/muse-glimmer.cpp: `post_norm_eps`).
+pub(crate) const POST_NORM_EPS: f32 = 1e-8;
 
 /// A Muse Glimmer model ready (structurally) to run.
 pub struct GlimmerModel {
@@ -106,6 +122,10 @@ impl GlimmerModel {
         let c = &*self.compute;
 
         let mut x = c.embed(&self.weights.embedding, tokens, cfg)?;
+        // The reference graph normalizes the embedding output with a
+        // weightless RMSNorm before the first layer
+        // (src/models/muse-glimmer.cpp: build_norm with no weight).
+        x = c.rms_norm_plain(&x, rows, cfg.rms_eps)?;
 
         for (index, (kind, w)) in cfg
             .layers
@@ -140,14 +160,17 @@ impl GlimmerModel {
             let gate = c.proj(&h, &w.attn_gate, rows)?;
             let attn = c.attn_gate(&attn, &gate)?;
             let out = c.proj(&attn, &w.attn_output, rows)?;
+            // Post norm on the branch output, THEN the residual add:
+            // the reference graph normalizes the sub-block output
+            // (hardcoded eps 1e-8) and adds the untouched residual.
+            let out = c.rms_norm(&out, &w.post_attention_norm, rows, POST_NORM_EPS)?;
             let after_attn = c.add(&residual, &out)?;
-            let after_attn = c.rms_norm(&after_attn, &w.post_attention_norm, rows, cfg.rms_eps)?;
 
             let residual = after_attn;
             let h = c.rms_norm(&residual, &w.ffn_norm, rows, cfg.rms_eps)?;
             let ffn = c.swiglu_ffn(&h, w, rows, cfg)?;
-            let after_ffn = c.add(&residual, &ffn)?;
-            x = c.rms_norm(&after_ffn, &w.post_ffw_norm, rows, cfg.rms_eps)?;
+            let ffn = c.rms_norm(&ffn, &w.post_ffw_norm, rows, POST_NORM_EPS)?;
+            x = c.add(&residual, &ffn)?;
         }
 
         let hidden = cfg.hidden as usize;
@@ -165,18 +188,19 @@ impl GlimmerModel {
     }
 }
 
-/// The file's logit finishing, applied in place: softcap
-/// `cap * tanh(z / cap)` when the cap is positive, then multiply by the
-/// logit scale. Plain scalar math on the logit vector, implemented here
-/// rather than delegated, and unit tested below.
+/// The file's logit finishing, applied in place: multiply by the
+/// logit scale FIRST, then softcap `cap * tanh(z / cap)` when the cap
+/// is positive. The reference graph applies them in exactly this
+/// order (src/models/muse-glimmer.cpp: `ggml_scale`, then
+/// `build_softcap`). The order is invisible to argmax (both maps are
+/// monotone) but changes every probability. Plain scalar math on the
+/// logit vector, implemented here rather than delegated, and unit
+/// tested below.
 pub fn softcap_scale(logits: &mut [f32], cap: f32, scale: f32) {
-    if cap > 0.0 {
-        for z in logits.iter_mut() {
-            *z = scale * cap * (*z / cap).tanh();
-        }
-    } else {
-        for z in logits.iter_mut() {
-            *z *= scale;
+    for z in logits.iter_mut() {
+        *z *= scale;
+        if cap > 0.0 {
+            *z = cap * (*z / cap).tanh();
         }
     }
 }
@@ -260,6 +284,11 @@ mod tests {
             _eps: f32,
         ) -> Result<Vec<f32>> {
             self.record("rms_norm");
+            Ok(vec![0.0; x.len()])
+        }
+
+        fn rms_norm_plain(&self, x: &[f32], _rows: usize, _eps: f32) -> Result<Vec<f32>> {
+            self.record("rms_norm_plain");
             Ok(vec![0.0; x.len()])
         }
 
@@ -359,17 +388,17 @@ mod tests {
             "rms_norm", // q norm
             "rms_norm", // k norm
             "attention",
-            "proj", // gate
+            "proj",     // gate
             "attn_gate",
-            "proj", // output
+            "proj",     // output
+            "rms_norm", // post-attention norm (branch, before the add)
             "add",
-            "rms_norm", // post-attention norm
             "rms_norm", // ffn pre-norm
             "swiglu_ffn",
+            "rms_norm", // post-ffn norm (branch, before the add)
             "add",
-            "rms_norm", // post-ffn norm
         ];
-        let mut expected: Vec<&str> = vec!["embed"];
+        let mut expected: Vec<&str> = vec!["embed", "rms_norm_plain"];
         expected.extend(one_layer);
         expected.extend(one_layer);
         expected.extend(["rms_norm", "lm_head"]);
@@ -381,11 +410,15 @@ mod tests {
         let mut logits = vec![0.0, 20.0, -20.0, 1000.0];
         softcap_scale(&mut logits, 20.0, 0.5);
         assert_eq!(logits[0], 0.0);
-        // 0.5 * 20 * tanh(1) = 7.6159416
-        assert!((logits[1] - 7.615_941_6).abs() < 1e-5);
-        assert!((logits[2] + 7.615_941_6).abs() < 1e-5);
-        // Saturates at scale * cap = 10.
-        assert!((logits[3] - 10.0).abs() < 1e-4);
+        // Scale first, then cap: 20 * tanh(0.5 * 20 / 20)
+        // = 20 * tanh(0.5) = 9.2423431. The opposite order would
+        // give 0.5 * 20 * tanh(1) = 7.6159416, so this value tells
+        // the two conventions apart.
+        assert!((logits[1] - 9.242_343).abs() < 1e-5);
+        assert!((logits[2] + 9.242_343).abs() < 1e-5);
+        // Saturates at the cap itself, 20, because the scale is
+        // applied before the cap, not after it.
+        assert!((logits[3] - 20.0).abs() < 1e-4);
     }
 
     #[test]

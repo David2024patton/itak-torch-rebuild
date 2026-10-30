@@ -13,3 +13,7 @@
 {"id": "accented_german", "category": "accented", "prompt": "Die Hauptstadt von Österreich ist Wien. Die Hauptstadt der Schweiz ist"}
 {"id": "accented_spanish", "category": "accented", "prompt": "El niño come jamón y queso en el café de la"}
 {"id": "continuation_classic", "category": "continuation", "prompt": "The quick brown fox jumps over the"}
+{"id": "factual_planet", "category": "factual", "prompt": "The largest planet in our solar system is", "reference": "pending"}
+{"id": "long_decode_counting", "category": "long-decode", "prompt": "Counting by threes: 3, 6, 9, 12, 15, 18, 21, 24, 27, 30,", "reference": "pending"}
+{"id": "numbers_digits", "category": "numbers", "prompt": "The number three thousand four hundred twelve written in digits is", "reference": "pending"}
+{"id": "punct_contractions", "category": "punctuation", "prompt": "She whispered, \"I can't believe he'd do that, but we're", "reference": "pending"}

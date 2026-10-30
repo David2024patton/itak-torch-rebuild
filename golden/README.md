@@ -12,18 +12,32 @@ is the reference.
 
 ## Layout
 
-- `prompts.jsonl` — the prompt set, version 1.0: 15 short raw
+- `prompts.jsonl` — the prompt set, version 1.1: 19 short raw
   completion prompts (factual, arithmetic, code, list continuation,
-  accented French/German/Spanish text). Raw completions, not chat
-  turns: the engine forward pass is what is being verified, so no
-  chat template is applied anywhere in this harness. (The long-form
-  Glimmer accuracy prompts live separately in
-  `bench/accuracy-prompts.md` and are a different check.)
+  accented French/German/Spanish text, plus four added 2026-10-29
+  for the forward divergence hunt: a strong-factual first-token
+  probe, a forced long decode, a number-formatting prompt, and a
+  contractions prompt). Raw completions, not chat turns: the engine
+  forward pass is what is being verified, so no chat template is
+  applied anywhere in this harness. (The long-form Glimmer accuracy
+  prompts live separately in `bench/accuracy-prompts.md` and are a
+  different check.)
 - `gen_golden.py` — the generator. Runs llama.cpp on the host that
   has the binaries and the model, writes one fixture per model.
-- `fixtures/*.golden.jsonl` — the golden records.
+- `fixtures/*.golden.jsonl` — the golden records. Currently bound
+  to prompt set v1.0 (15 prompts) by SHA-256 in each fixture's
+  meta; the four v1.1 prompts have no reference yet, see
+  `PENDING-REFERENCES.md` for why and for the exact capture
+  procedure.
 - `compare.py` — the differ. Any engine that can emit the record
   shape below can be checked against a fixture.
+- `determinism_check.py` — proves the reference itself is stable:
+  two temperature-0 runs of each prompt against a throwaway
+  llama-server must produce byte-identical token ids. Run it
+  before trusting any fresh capture.
+- `AUDIT-2026-10-29.md` — the v1.1 audit: what the fixtures do and
+  do not contain (notably: no per-step probabilities or top-k
+  anywhere; completions are 64-token budget truncations).
 
 ## Fixture format
 
@@ -72,7 +86,8 @@ temperature 0, seed 42 (recorded for completeness; the greedy sampler
 does not use it), 64 predicted tokens, context 512, 8 threads, no
 chat template. Fixtures contain no timestamps; regenerating with the
 same llama.cpp build reproduces a fixture byte for byte (verified
-for TinyLlama).
+for TinyLlama; `determinism_check.py` makes the underlying run-to-run
+claim checkable on any model).
 
 ## Tooling choice
 

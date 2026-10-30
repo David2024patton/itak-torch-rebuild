@@ -53,8 +53,13 @@ fn main() -> ExitCode {
 /// Adapts the gguf crate's parsed tokenizer info into the tokenizer
 /// crate's input data. Same thin adapter as the conformance harness
 /// (TODO T-2.3); it lives in harness code, not in either library.
-fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> TokenizerData {
+fn data_from_info(
+    info: &gguf::TokenizerInfo,
+    model: Option<String>,
+    unknown: Option<u32>,
+) -> TokenizerData {
     TokenizerData {
+        model,
         tokens: info.tokens.clone(),
         token_types: info
             .token_types
@@ -62,6 +67,7 @@ fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> Tokenizer
             .map(|types| types.iter().map(|&t| TokenType::from_gguf(t)).collect())
             .unwrap_or_default(),
         merges: info.merges.clone().unwrap_or_default(),
+        scores: info.scores.clone(),
         bos_token_id: info.bos_token_id,
         eos_token_id: info.eos_token_id,
         unknown_token_id: unknown,
@@ -130,7 +136,13 @@ fn run(path: &str, prompt: &str, n_tokens: usize, ids_only: bool) -> Result<(), 
     // Tokenize before any weight work: the printed id sequence is
     // the exact input both engines are compared on.
     let info = file.tokenizer().map_err(|e| e.to_string())?;
-    let tokenizer = Tokenizer::new(data_from_info(&info, None)).map_err(|e| e.to_string())?;
+    let tok_model = file
+        .metadata()
+        .opt_string("tokenizer.ggml.model")
+        .map_err(|e| e.to_string())?
+        .map(str::to_string);
+    let tokenizer =
+        Tokenizer::new(data_from_info(&info, tok_model, None)).map_err(|e| e.to_string())?;
     let body = tokenizer.encode(prompt).map_err(|e| e.to_string())?;
     let add_bos = file
         .metadata()

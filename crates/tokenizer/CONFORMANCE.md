@@ -1,11 +1,17 @@
 # Tokenizer conformance: TODO T-2.3 proof
 
-**Result: 16 of 16 bench prompts token-identical to the reference
-tokenizer on Glimmer's real vocabulary; 16 of 16 decode round-trips
-exact.** Run 2026-10-29 against David's production Glimmer
-llama-server. The first run was 14/16 and caught a real
-pre-tokenizer defect, documented below; the fix is part of the same
-landing.
+**Byte-level family result: 16 of 16 bench prompts token-identical
+to the reference tokenizer on Glimmer's real vocabulary; 16 of 16
+decode round-trips exact.** Run 2026-10-29 against David's
+production Glimmer llama-server. The first run was 14/16 and caught
+a real pre-tokenizer defect, documented below; the fix is part of
+the same landing.
+
+**SentencePiece family result: 15 of 15 golden prompts
+token-identical to llama.cpp on TinyLlama's real vocabulary, and
+decode reproduces all 15 fixture completion texts exactly.** That
+proof is `tests/spm_golden.rs` against the golden fixture; see the
+SentencePiece section at the end of this file.
 
 ## Inputs
 
@@ -102,3 +108,60 @@ tests still pass.
   newlines and spaces can split at a different point than a true
   regex engine in rare multi-newline cases. No case in this set
   exercised either gap into a divergence.
+
+## SentencePiece family: TinyLlama proof
+
+Integration Run A (`golden/RESULTS-integration-a.md`) found the
+byte-level family tokenizing TinyLlama-1.1B into near-byte pieces:
+that file's vocabulary is SentencePiece BPE, a different family.
+The family is now implemented in `src/spm.rs` as a direct port of
+llama.cpp's SPM path, with every rule cited to `llama-vocab.cpp` in
+the llama.cpp checkout the fixtures were generated with (0.7.0-dev,
+build 137, commit a7af149):
+
+- Spaces escape to `▁` (`llama_escape_whitespace`) and one space is
+  prefixed at the start of the text and after every special token
+  (the SPM case of `llama_vocab::impl::tokenize`; the SPM type
+  defaults set `add_space_prefix = true`). The file's
+  `tokenizer.ggml.add_space_prefix` key can override that default
+  in llama.cpp; the crate does not plumb the key yet, and TinyLlama
+  does not carry it.
+- Symbols start as single codepoints, lengths from the
+  `unicode_len_utf8` high-nibble table (`src/unicode.cpp`).
+- Adjacent pairs merge one at a time from a priority queue keyed by
+  the combined token's score from `tokenizer.ggml.scores`
+  (`llm_bigram_spm::comparator`: highest score, ties to the
+  smallest left index). TinyLlama carries the scores array (32,000
+  entries); a file without it gets all-zero scores in llama.cpp,
+  which reduces the queue to leftmost-first merging, and the crate
+  mirrors that too. The merges array in the file does not drive
+  this family and is not parsed for it.
+- Leftover symbols re-segment down to `<0xXX>` byte tokens
+  (`byte_to_token`), the byte-fallback path the accented and code
+  prompts exercise through pieces like the newline byte token.
+- Decode is the SPM case of `token_to_piece`: unescape `▁`, byte
+  tokens contribute their byte, specials render literally. The
+  encoder's space prefix returns as one leading space on decode;
+  llama.cpp removes it only in its whole-sequence detokenizer, not
+  in per-token pieces, so this crate keeps it and the tests assert
+  it explicitly.
+
+Proof, `tests/spm_golden.rs`, against data extracted from the real
+GGUF on the server (`conformance/tinyllama.tokdata`, format version
+2, which adds the scores section): the golden fixture's
+`llama-tokenize` prompt ids are reproduced exactly for all 15
+prompts (`[bos] + encode(prompt)`), decode of the prompt ids
+reproduces each prompt with exactly the one leading space, and
+decode of the fixture completion ids reproduces all 15 completion
+texts. The `examples/conformance.rs` harness, fed the same tokdata
+and a fixture-derived `.tokref`, also reports 15/15 prompts
+token-identical; its decode round-trip line differs by exactly
+that leading space, because the harness's identity expectation was
+written for the byte-level family.
+
+One rule the source did not fully settle: llama.cpp partitions
+text around special tokens with its own special-token table, while
+this crate matches control / user-defined token texts (shared with
+the byte-level family). No golden prompt contains a special token
+as prose, so the fixture cannot distinguish the two; the synthetic
+tests in `tests/spm_family.rs` pin the crate's behavior.

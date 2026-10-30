@@ -47,14 +47,39 @@ impl TokenType {
     }
 }
 
-/// Everything a byte-level BPE tokenizer needs, already parsed.
+/// Which tokenizer family a vocabulary belongs to, decided by the
+/// file's `tokenizer.ggml.model` string. The two families share the
+/// vocabulary arrays but tokenize by different rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizerFamily {
+    /// GPT-2 style byte-level BPE: text is byte-mapped (`Ġ` for a
+    /// space), split by a regex pre-tokenizer, and merged by rank.
+    /// GGUF model values `"gpt2"` (and an absent model key, the
+    /// crate's original behavior).
+    ByteLevelBpe,
+    /// SentencePiece BPE: pieces are stored with `▁` (U+2581) where
+    /// words begin, encoding escapes spaces to `▁`, prefixes one
+    /// space at the start of the text, and merges adjacent symbols
+    /// by the combined token's score. GGUF model value `"llama"`.
+    SentencePiece,
+}
+
+/// Everything a tokenizer needs, already parsed.
 ///
-/// `tokens` and `merges` are the GGUF arrays verbatim: token strings
-/// are byte-mapped text (a leading space inside a token shows as `Ġ`),
-/// and each merge is two token strings separated by one space, in
-/// rank order (earlier merges win).
+/// `tokens` and `merges` are the GGUF arrays verbatim. For the
+/// byte-level family the token strings are byte-mapped text (a
+/// leading space inside a token shows as `Ġ`) and each merge is two
+/// token strings separated by one space, in rank order (earlier
+/// merges win). For the SentencePiece family the token strings are
+/// raw pieces (`▁` marks a word-initial space) and the merges array,
+/// while present in these files, is not what drives encoding: the
+/// per-token `scores` do.
 #[derive(Debug, Clone, Default)]
 pub struct TokenizerData {
+    /// `tokenizer.ggml.model`: the tokenizer family name recorded in
+    /// the file (`"gpt2"`, `"llama"`, ...). `None` selects the
+    /// byte-level BPE family, matching this crate's original callers.
+    pub model: Option<String>,
     /// `tokenizer.ggml.tokens`: the vocabulary, indexed by token id.
     pub tokens: Vec<String>,
     /// `tokenizer.ggml.token_type`: parallel to `tokens`. May be empty,
@@ -63,6 +88,13 @@ pub struct TokenizerData {
     pub token_types: Vec<TokenType>,
     /// `tokenizer.ggml.merges`: merge rules in rank order.
     pub merges: Vec<String>,
+    /// `tokenizer.ggml.scores`: per-token scores, parallel to
+    /// `tokens`. The SentencePiece family merges by the combined
+    /// token's score, so these are load-bearing there; the byte-level
+    /// family ignores them. `None` means the file recorded no scores
+    /// array, in which case llama.cpp uses 0.0 for every token and
+    /// so does this crate.
+    pub scores: Option<Vec<f32>>,
     /// `tokenizer.ggml.bos_token_id`.
     pub bos_token_id: Option<u32>,
     /// `tokenizer.ggml.eos_token_id`.

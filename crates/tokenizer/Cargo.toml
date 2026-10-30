@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Byte-level BPE tokenizer for the iTaK Torch rebuild: GGUF vocab/merges in, correct encode and decode out."
+description = "Tokenizer for the iTaK Torch rebuild: byte-level BPE and SentencePiece BPE families over GGUF vocab/merges/scores, correct encode and decode out."
 
 [features]
 default = []

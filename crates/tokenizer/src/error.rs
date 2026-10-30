@@ -48,6 +48,22 @@ pub enum Error {
         /// [`std::str::Utf8Error::valid_up_to`].
         valid_up_to: usize,
     },
+    /// `tokenizer.ggml.model` named a family this crate does not
+    /// implement (it implements `"gpt2"` byte-level BPE and `"llama"`
+    /// SentencePiece BPE). Refused loudly instead of silently applying
+    /// the wrong family's rules.
+    UnsupportedTokenizerModel(String),
+    /// `scores` was supplied but its length differed from `tokens`.
+    ScoresLengthMismatch {
+        /// Length of the `scores` vector.
+        scores: usize,
+        /// Length of the `tokens` vector.
+        tokens: usize,
+    },
+    /// SentencePiece re-segmentation needed the byte token for a byte
+    /// the vocabulary does not carry (llama.cpp's `byte_to_token`
+    /// throws in the same situation; there is no fallback token).
+    MissingByteToken(u8),
 }
 
 impl fmt::Display for Error {
@@ -83,6 +99,16 @@ impl fmt::Display for Error {
                     f,
                     "decoded bytes are not valid UTF-8 (valid up to byte {valid_up_to})"
                 )
+            }
+            Error::UnsupportedTokenizerModel(model) => {
+                write!(f, "unsupported tokenizer.ggml.model family: {model:?}")
+            }
+            Error::ScoresLengthMismatch { scores, tokens } => write!(
+                f,
+                "scores length {scores} does not match tokens length {tokens}"
+            ),
+            Error::MissingByteToken(byte) => {
+                write!(f, "vocabulary has no byte token for byte {byte:#04x}")
             }
         }
     }

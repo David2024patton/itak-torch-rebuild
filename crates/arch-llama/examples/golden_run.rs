@@ -260,6 +260,13 @@ fn run() -> Result<(), String> {
         .opt_u32("tokenizer.ggml.unknown_token_id")
         .map_err(|e| e.to_string())?;
     let tok_data = TokenizerData {
+        // The family comes from the file's own model string, never
+        // from the model file's name: "llama" selects SentencePiece,
+        // "gpt2" byte-level BPE (see the tokenizer crate).
+        model: md
+            .opt_string("tokenizer.ggml.model")
+            .map_err(|e| e.to_string())?
+            .map(str::to_string),
         tokens: info.tokens.clone(),
         token_types: info
             .token_types
@@ -267,6 +274,7 @@ fn run() -> Result<(), String> {
             .map(|types| types.iter().map(|&t| TokenType::from_gguf(t)).collect())
             .unwrap_or_default(),
         merges: info.merges.clone().unwrap_or_default(),
+        scores: info.scores.clone(),
         bos_token_id: info.bos_token_id,
         eos_token_id: info.eos_token_id,
         unknown_token_id: unknown,

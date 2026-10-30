@@ -1,4 +1,5 @@
-//! Byte-level BPE tokenizer for the iTaK Torch rebuild (TODO T-2.3).
+//! Tokenizers for the iTaK Torch rebuild (TODO T-2.3): byte-level
+//! BPE and SentencePiece BPE, selected by the model's own metadata.
 //!
 //! This crate exists because of two audited defects in the original Torch,
 //! which it is built to never repeat:
@@ -17,10 +18,33 @@
 //! # Input
 //!
 //! The tokenizer is built from already-parsed GGUF metadata, passed in as
-//! plain vectors via [`TokenizerData`]: `tokenizer.ggml.tokens`,
-//! `tokenizer.ggml.token_type`, `tokenizer.ggml.merges`, and the special
+//! plain vectors via [`TokenizerData`]: `tokenizer.ggml.model`,
+//! `tokenizer.ggml.tokens`, `tokenizer.ggml.token_type`,
+//! `tokenizer.ggml.merges`, `tokenizer.ggml.scores`, and the special
 //! token ids (`bos`, `eos`, `unknown`, `padding`). The crate deliberately
 //! does not depend on the GGUF parser crate, so the two stay decoupled.
+//!
+//! # Families
+//!
+//! `tokenizer.ggml.model` selects the family. `"gpt2"` (or an absent
+//! model key) is the byte-level BPE described below. `"llama"` is
+//! SentencePiece BPE, implemented in `src/spm.rs` as a direct port of
+//! llama.cpp's SPM path: spaces escape to `▁` (U+2581), one space is
+//! prefixed at the start of the text and after every special token,
+//! symbols start as single codepoints, and adjacent pairs merge one
+//! at a time by the COMBINED token's score from
+//! `tokenizer.ggml.scores` (highest first, ties to the leftmost pair;
+//! no scores array means every score is 0.0, as in llama.cpp's vocab
+//! load). The merges array, present in these files too, does not
+//! drive SentencePiece encoding and is not even parsed for that
+//! family. Anything that forms no token is re-segmented, down to
+//! `<0xXX>` byte tokens for codepoints outside the vocabulary.
+//! Decode unescapes `▁` back to a space; because encoding adds the
+//! leading space, `decode` of an encoded string carries one leading
+//! space the input did not have, which is the reference behavior
+//! (llama.cpp strips it only in its whole-sequence detokenizer, one
+//! level above per-token pieces). Any other model value is refused
+//! by name at construction.
 //!
 //! # Pre-tokenizer
 //!
@@ -100,10 +124,11 @@ mod data;
 mod diag;
 mod error;
 mod pretokenize;
+mod spm;
 mod tokenizer;
 
 pub use byte_level::{byte_to_char, char_to_byte};
-pub use data::{TokenType, TokenizerData};
+pub use data::{TokenType, TokenizerData, TokenizerFamily};
 pub use error::Error;
 pub use pretokenize::pretokenize;
 pub use tokenizer::Tokenizer;

@@ -36,9 +36,11 @@ fn synthetic() -> Tokenizer {
     types.push(TokenType::Control);
 
     Tokenizer::new(TokenizerData {
+        model: None,
         tokens,
         token_types: types,
         merges: merges.iter().map(ToString::to_string).collect(),
+        scores: None,
         bos_token_id: Some(EOS_ID),
         eos_token_id: Some(EOS_ID),
         unknown_token_id: Some(UNK_ID),

@@ -9,13 +9,13 @@
 //!
 //! Usage: `cargo run --release --example tokenizer_extract -- <model.gguf> <out.tokdata>`
 //!
-//! # The `.tokdata` format (version 1)
+//! # The `.tokdata` format (version 2)
 //!
 //! Line-oriented ASCII framing; string payloads are length-prefixed raw
 //! UTF-8 bytes so any token text survives verbatim:
 //!
 //! ```text
-//! ITAK-TOKDATA-1
+//! ITAK-TOKDATA-2
 //! model <tokenizer.ggml.model, or ->
 //! pre <tokenizer.ggml.pre, or ->
 //! bos <id, or ->
@@ -28,7 +28,15 @@
 //! <one signed decimal per line>  (repeated count times)
 //! merges <count>
 //! <byte length>\n<raw bytes>\n   (repeated count times)
+//! scores <count, 0 when the file records none>
+//! <one decimal float per line>  (repeated count times)
 //! ```
+//!
+//! Version 1 (written by the first cut of this tool) is identical
+//! except for the header line and the missing scores section;
+//! readers accept both. Scores ride along because SentencePiece
+//! family tokenizers merge by per-token score, and the scores live
+//! in `tokenizer.ggml.scores`, a separate array from the merges.
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -63,7 +71,7 @@ fn run(model_path: &str, out_path: &str) -> Result<(), String> {
 
     let mut out = BufWriter::new(File::create(out_path).map_err(|e| e.to_string())?);
     let write = |out: &mut BufWriter<File>| -> std::io::Result<()> {
-        writeln!(out, "ITAK-TOKDATA-1")?;
+        writeln!(out, "ITAK-TOKDATA-2")?;
         writeln!(out, "model {}", model.unwrap_or("-"))?;
         writeln!(out, "pre {}", pre.unwrap_or("-"))?;
         writeln!(out, "bos {}", opt_id(info.bos_token_id))?;
@@ -88,15 +96,23 @@ fn run(model_path: &str, out_path: &str) -> Result<(), String> {
         for merge in merges {
             write_framed(out, merge)?;
         }
+        let scores: &[f32] = info.scores.as_deref().unwrap_or(&[]);
+        writeln!(out, "scores {}", scores.len())?;
+        for score in scores {
+            // f32 Display is the shortest decimal that parses back to
+            // the identical value, so the scores survive verbatim.
+            writeln!(out, "{score}")?;
+        }
         Ok(())
     };
     write(&mut out).map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
 
     println!(
-        "extracted {} tokens, {} merges -> {out_path}",
+        "extracted {} tokens, {} merges, {} scores -> {out_path}",
         info.tokens.len(),
-        info.merges.as_deref().unwrap_or(&[]).len()
+        info.merges.as_deref().unwrap_or(&[]).len(),
+        info.scores.as_deref().unwrap_or(&[]).len()
     );
     Ok(())
 }

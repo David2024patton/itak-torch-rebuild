@@ -93,8 +93,13 @@ fn parse_id(value: &str) -> Option<u32> {
 /// Adapts the gguf crate's parsed tokenizer info into this crate's
 /// input data. This is the thin adapter the crate split calls for: it
 /// lives in harness code, not in either library.
-fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> TokenizerData {
+fn data_from_info(
+    info: &gguf::TokenizerInfo,
+    model: Option<String>,
+    unknown: Option<u32>,
+) -> TokenizerData {
     TokenizerData {
+        model,
         tokens: info.tokens.clone(),
         token_types: info
             .token_types
@@ -102,6 +107,7 @@ fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> Tokenizer
             .map(|types| types.iter().map(|&t| TokenType::from_gguf(t)).collect())
             .unwrap_or_default(),
         merges: info.merges.clone().unwrap_or_default(),
+        scores: info.scores.clone(),
         bos_token_id: info.bos_token_id,
         eos_token_id: info.eos_token_id,
         unknown_token_id: unknown,
@@ -112,7 +118,14 @@ fn data_from_info(info: &gguf::TokenizerInfo, unknown: Option<u32>) -> Tokenizer
 fn load_vocab(path: &Path) -> Result<(TokenizerData, String), String> {
     if path.extension().is_some_and(|e| e == "tokdata") {
         let mut frame = Frame::open(path)?;
-        frame.expect("ITAK-TOKDATA-1")?;
+        // Version 2 appends a scores section after the merges;
+        // version 1 files (the Glimmer extraction) end at the merges.
+        let header = frame.line()?;
+        let has_scores = match header.as_str() {
+            "ITAK-TOKDATA-1" => false,
+            "ITAK-TOKDATA-2" => true,
+            other => return Err(format!("bad tokdata header {other:?}")),
+        };
         let model = frame.field("model")?;
         let pre = frame.field("pre")?;
         let bos = parse_id(&frame.field("bos")?);
@@ -147,16 +160,43 @@ fn load_vocab(path: &Path) -> Result<(TokenizerData, String), String> {
         for _ in 0..n_merges {
             merges.push(frame.framed_string()?);
         }
+        let scores = if has_scores {
+            let n_scores: usize = frame
+                .field("scores")?
+                .parse()
+                .map_err(|_| "bad scores count".to_string())?;
+            let mut scores = Vec::with_capacity(n_scores);
+            for _ in 0..n_scores {
+                let raw: f32 = frame
+                    .line()?
+                    .parse()
+                    .map_err(|_| "bad score value".to_string())?;
+                scores.push(raw);
+            }
+            if scores.is_empty() {
+                None
+            } else {
+                Some(scores)
+            }
+        } else {
+            None
+        };
         let data = TokenizerData {
+            model: if model == "-" { None } else { Some(model) },
             tokens,
             token_types,
             merges,
+            scores,
             bos_token_id: bos,
             eos_token_id: eos,
             unknown_token_id: unk,
             padding_token_id: pad,
         };
-        Ok((data, format!("tokdata model={model} pre={pre}")))
+        let desc = format!(
+            "tokdata model={} pre={pre}",
+            data.model.as_deref().unwrap_or("-")
+        );
+        Ok((data, desc))
     } else {
         let file = gguf::GgufFile::open(path).map_err(|e| e.to_string())?;
         let info = file.tokenizer().map_err(|e| e.to_string())?;
@@ -164,8 +204,13 @@ fn load_vocab(path: &Path) -> Result<(TokenizerData, String), String> {
             .metadata()
             .opt_u32("tokenizer.ggml.unknown_token_id")
             .map_err(|e| e.to_string())?;
+        let model = file
+            .metadata()
+            .opt_string("tokenizer.ggml.model")
+            .map_err(|e| e.to_string())?
+            .map(str::to_string);
         let desc = format!("gguf {}", path.display());
-        Ok((data_from_info(&info, unk), desc))
+        Ok((data_from_info(&info, model, unk), desc))
     }
 }
 

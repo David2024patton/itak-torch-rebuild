@@ -138,6 +138,12 @@ pub struct TokenizerInfo {
     pub token_types: Option<Vec<i32>>,
     /// Byte-pair merge rules (`tokenizer.ggml.merges`), when present.
     pub merges: Option<Vec<String>>,
+    /// Per-token scores (`tokenizer.ggml.scores`), when present.
+    /// SentencePiece-family tokenizers merge by these scores, so the
+    /// tokenizer crate needs them verbatim; files that were converted
+    /// without the array leave this `None` and llama.cpp falls back
+    /// to a score of 0.0 for every token.
+    pub scores: Option<Vec<f32>>,
     /// Beginning-of-sequence token id (`tokenizer.ggml.bos_token_id`).
     pub bos_token_id: Option<u32>,
     /// End-of-sequence token id (`tokenizer.ggml.eos_token_id`).
@@ -163,10 +169,15 @@ impl TokenizerInfo {
             Some(_) => Some(md.get_string_array("tokenizer.ggml.merges")?),
             None => None,
         };
+        let scores = match md.get("tokenizer.ggml.scores") {
+            Some(_) => Some(md.get_f32_array("tokenizer.ggml.scores")?),
+            None => None,
+        };
         Ok(Self {
             tokens,
             token_types,
             merges,
+            scores,
             bos_token_id: md.opt_u32("tokenizer.ggml.bos_token_id")?,
             eos_token_id: md.opt_u32("tokenizer.ggml.eos_token_id")?,
             padding_token_id: md.opt_u32("tokenizer.ggml.padding_token_id")?,

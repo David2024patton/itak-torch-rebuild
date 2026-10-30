@@ -4,19 +4,22 @@
 use std::collections::HashMap;
 
 use crate::byte_level::{byte_token_name, parse_byte_token};
-use crate::data::{TokenType, TokenizerData};
+use crate::data::{TokenType, TokenizerData, TokenizerFamily};
 use crate::diag::dbglog;
 use crate::error::Error;
 use crate::pretokenize::pretokenize;
+use crate::spm;
 use crate::Result;
 
-/// A byte-level BPE tokenizer over a fixed vocabulary and merge table.
+/// A tokenizer over a fixed vocabulary, in one of the two families
+/// ([`TokenizerFamily`]) the file's `tokenizer.ggml.model` selects.
 ///
 /// Construct with [`Tokenizer::new`]; construction validates the data
 /// and fails loudly on anything malformed rather than letting a bad
 /// vocabulary produce silent garbage later.
 #[derive(Debug)]
 pub struct Tokenizer {
+    family: TokenizerFamily,
     tokens: Vec<String>,
     token_types: Vec<TokenType>,
     /// Whether token types were supplied at all. When they were not,
@@ -24,6 +27,9 @@ pub struct Tokenizer {
     types_supplied: bool,
     vocab: HashMap<String, u32>,
     merge_ranks: HashMap<(String, String), u32>,
+    /// Per-token scores, parallel to `tokens` (zero-filled when the
+    /// file recorded none). Only the SentencePiece family reads them.
+    scores: Vec<f32>,
     /// Special token (text, id) pairs, longest text first so the
     /// longest match wins at any position.
     specials: Vec<(String, u32)>,
@@ -36,16 +42,46 @@ pub struct Tokenizer {
 impl Tokenizer {
     /// Builds a tokenizer from parsed GGUF tokenizer metadata.
     ///
+    /// The family is selected by `data.model`: `None` or `"gpt2"`
+    /// gives byte-level BPE, `"llama"` gives SentencePiece BPE, and
+    /// anything else is refused with
+    /// [`Error::UnsupportedTokenizerModel`] rather than silently
+    /// tokenized by the wrong family's rules.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::EmptyVocab`], [`Error::DuplicateToken`],
-    /// [`Error::TokenTypeLengthMismatch`], [`Error::InvalidMerge`], or
-    /// [`Error::SpecialTokenOutOfRange`] when the data is malformed.
+    /// [`Error::TokenTypeLengthMismatch`], [`Error::InvalidMerge`],
+    /// [`Error::SpecialTokenOutOfRange`],
+    /// [`Error::UnsupportedTokenizerModel`], or
+    /// [`Error::ScoresLengthMismatch`] when the data is malformed.
     pub fn new(data: TokenizerData) -> Result<Tokenizer> {
+        let family = match data.model.as_deref() {
+            None | Some("gpt2") => TokenizerFamily::ByteLevelBpe,
+            Some("llama") => TokenizerFamily::SentencePiece,
+            Some(other) => {
+                dbglog!("refusing unsupported tokenizer model {other:?}");
+                return Err(Error::UnsupportedTokenizerModel(other.to_string()));
+            }
+        };
         if data.tokens.is_empty() {
             dbglog!("refusing empty vocabulary");
             return Err(Error::EmptyVocab);
         }
+        let scores: Vec<f32> = match &data.scores {
+            Some(scores) => {
+                if scores.len() != data.tokens.len() {
+                    return Err(Error::ScoresLengthMismatch {
+                        scores: scores.len(),
+                        tokens: data.tokens.len(),
+                    });
+                }
+                scores.clone()
+            }
+            // llama.cpp's vocab load: no scores array means every
+            // token scores 0.0.
+            None => vec![0.0; data.tokens.len()],
+        };
         if !data.token_types.is_empty() && data.token_types.len() != data.tokens.len() {
             return Err(Error::TokenTypeLengthMismatch {
                 tokens: data.tokens.len(),
@@ -66,23 +102,29 @@ impl Tokenizer {
             }
         }
 
-        let mut merge_ranks: HashMap<(String, String), u32> =
-            HashMap::with_capacity(data.merges.len());
-        for (index, merge) in data.merges.iter().enumerate() {
-            let parsed = merge.split_once(' ').and_then(|(a, b)| {
-                if a.is_empty() || b.is_empty() || b.contains(' ') {
-                    None
-                } else {
-                    Some((a.to_string(), b.to_string()))
-                }
-            });
-            let Some(pair) = parsed else {
-                return Err(Error::InvalidMerge {
-                    index,
-                    value: merge.clone(),
+        // Merge ranks drive only the byte-level family. The
+        // SentencePiece family merges by token score and llama.cpp
+        // does not read the merges array for it at all, so the array
+        // is neither parsed nor validated there.
+        let mut merge_ranks: HashMap<(String, String), u32> = HashMap::new();
+        if family == TokenizerFamily::ByteLevelBpe {
+            merge_ranks.reserve(data.merges.len());
+            for (index, merge) in data.merges.iter().enumerate() {
+                let parsed = merge.split_once(' ').and_then(|(a, b)| {
+                    if a.is_empty() || b.is_empty() || b.contains(' ') {
+                        None
+                    } else {
+                        Some((a.to_string(), b.to_string()))
+                    }
                 });
-            };
-            merge_ranks.insert(pair, index as u32);
+                let Some(pair) = parsed else {
+                    return Err(Error::InvalidMerge {
+                        index,
+                        value: merge.clone(),
+                    });
+                };
+                merge_ranks.insert(pair, index as u32);
+            }
         }
 
         let vocab_size = data.tokens.len();
@@ -113,23 +155,31 @@ impl Tokenizer {
         specials.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         dbglog!(
-            "loaded vocab={} merges={} specials={}",
+            "loaded family={family:?} vocab={} merges={} specials={}",
             vocab_size,
             data.merges.len(),
             specials.len()
         );
         Ok(Tokenizer {
+            family,
             tokens: data.tokens,
             token_types,
             types_supplied,
             vocab,
             merge_ranks,
+            scores,
             specials,
             bos: data.bos_token_id,
             eos: data.eos_token_id,
             unk: data.unknown_token_id,
             pad: data.padding_token_id,
         })
+    }
+
+    /// The tokenizer family this instance tokenizes with, as selected
+    /// from `tokenizer.ggml.model` at construction.
+    pub fn family(&self) -> TokenizerFamily {
+        self.family
     }
 
     /// The number of tokens in the vocabulary.
@@ -183,7 +233,10 @@ impl Tokenizer {
         while !rest.is_empty() {
             match self.find_special(rest) {
                 Some((byte_pos, id, byte_len)) => {
-                    self.encode_plain(&rest[..byte_pos], &mut out)?;
+                    let segment = &rest[..byte_pos];
+                    if !segment.is_empty() {
+                        self.encode_plain(segment, &mut out)?;
+                    }
                     out.push(id);
                     rest = &rest[byte_pos + byte_len..];
                 }
@@ -215,12 +268,28 @@ impl Tokenizer {
         best
     }
 
-    /// Encodes text known to contain no special tokens.
+    /// Encodes text known to contain no special tokens, by family.
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) -> Result<()> {
-        for piece in pretokenize(text) {
-            self.encode_piece(piece, out)?;
+        match self.family {
+            TokenizerFamily::ByteLevelBpe => {
+                for piece in pretokenize(text) {
+                    self.encode_piece(piece, out)?;
+                }
+                Ok(())
+            }
+            TokenizerFamily::SentencePiece => {
+                // The space prefix is unconditional here: llama.cpp
+                // prefixes a fragment when the previous fragment was
+                // special (`is_prev_special`, initially true), and in
+                // this segmentation a plain segment only ever occurs
+                // at the start or right after a special token. The
+                // reference source notes the same net effect:
+                // "add_space_prefix currently behaves like always".
+                let ids = spm::encode_segment(&self.vocab, &self.scores, text, true)?;
+                out.extend_from_slice(&ids);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Byte-maps one pre-tokenizer piece and runs BPE over it.
@@ -289,11 +358,14 @@ impl Tokenizer {
 
     /// Decodes token ids into the raw byte stream they represent.
     ///
-    /// Byte-mapped token text runs through the inverse byte map (so
-    /// `Ġ` becomes a real space byte), `<0xXX>` byte tokens contribute
-    /// their single byte, and control / user-defined tokens contribute
-    /// their literal text. A multibyte UTF-8 character split across
-    /// several tokens reassembles in this stream.
+    /// Byte-level family: byte-mapped token text runs through the
+    /// inverse byte map (so `Ġ` becomes a real space byte), `<0xXX>`
+    /// byte tokens contribute their single byte, and control /
+    /// user-defined tokens contribute their literal text.
+    /// SentencePiece family: token text is unescaped (`▁` becomes a
+    /// space byte) instead, with the same byte-token and literal
+    /// rules. A multibyte UTF-8 character split across several
+    /// tokens reassembles in this stream either way.
     ///
     /// # Errors
     ///
@@ -314,6 +386,9 @@ impl Tokenizer {
             .get(id as usize)
             .ok_or(Error::InvalidTokenId(id))?;
         let ty = self.token_types[id as usize];
+        if self.family == TokenizerFamily::SentencePiece {
+            return self.append_token_bytes_spm(text, ty, out);
+        }
         match ty {
             TokenType::Byte => {
                 let byte = parse_byte_token(text)
@@ -341,6 +416,41 @@ impl Tokenizer {
                             out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
                         }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// SentencePiece decode, the `LLAMA_VOCAB_TYPE_SPM` case of
+    /// llama.cpp's `token_to_piece`: byte tokens contribute their
+    /// byte, control / user-defined / unknown tokens render
+    /// literally, normal tokens are unescaped (`▁` becomes a space),
+    /// and tokens typed unused or undefined contribute nothing. With
+    /// no type array, llama.cpp treats every token as normal, so a
+    /// `<0xXX>`-shaped token is the only byte signal available; that
+    /// is the one case handled by shape here.
+    fn append_token_bytes_spm(&self, text: &str, ty: TokenType, out: &mut Vec<u8>) -> Result<()> {
+        match ty {
+            TokenType::Byte => {
+                let byte = parse_byte_token(text)
+                    .ok_or_else(|| Error::MalformedByteToken(text.to_string()))?;
+                out.push(byte);
+            }
+            TokenType::Control | TokenType::UserDefined | TokenType::Unknown => {
+                out.extend_from_slice(text.as_bytes());
+            }
+            TokenType::Normal => {
+                out.extend_from_slice(spm::unescape_whitespace(text).as_bytes());
+            }
+            TokenType::Unused => {}
+            TokenType::Undefined => {
+                if !self.types_supplied {
+                    if let Some(byte) = parse_byte_token(text) {
+                        out.push(byte);
+                        return Ok(());
+                    }
+                    out.extend_from_slice(spm::unescape_whitespace(text).as_bytes());
                 }
             }
         }

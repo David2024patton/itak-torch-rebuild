@@ -161,3 +161,63 @@ Same prefix, same harness, arch-llama rebuilt with the fix:
   that cleared the tensor-source question),
   `LlamaModel::forward_traced` in `crates/arch-llama/src/model.rs`.
 - Fix: `crates/torch-math/src/rope.rs`.
+
+## Follow-up: pairing is per-architecture (the llama half of the claim above was wrong)
+
+The root-cause section above says llama.cpp rotates "qwen2 (and
+llama)" with NEOX. The qwen2 half is proven by the layer diff;
+the llama half was asserted, not measured, and it is wrong.
+llama.cpp's own table (`llama_model_rope_type` in
+src/llama-model.cpp) maps `LLM_ARCH_LLAMA` to
+`LLAMA_ROPE_TYPE_NORM` (adjacent), `LLM_ARCH_QWEN2` to
+`LLAMA_ROPE_TYPE_NEOX` (half-split), `LLM_ARCH_MUSE_GLIMMER` to
+NORM. Because 13643e0 flipped the one shared function
+arch-llama calls for both architectures, it fixed qwen2 and
+regressed TinyLlama from 6/15 to 0/15 token-identical in the
+same edit; the TinyLlama re-run note
+(`RESULTS-tinyllama-spm.md`, regression follow-up) caught it.
+
+The structural fix has now landed: `LlamaConfig::rope_pairing`
+(`crates/arch-llama/src/config.rs`) is the one place the mapping
+lives, selecting `RopePairing::Interleaved` for llama and
+`RopePairing::HalfSplit` for qwen2 from the file's own
+architecture string, and refusing an unmapped architecture with
+the named error `LlamaError::RopePairingUnknown`. `rope_rows`
+dispatches on it; the interleaved partial-rotary form it needs
+is `torch_math::rope_interleaved_partial`. The doc comment in
+`crates/torch-math/src/rope.rs` that carried the wrong "llama
+and qwen2" claim has been corrected to match.
+
+### Re-run (this file's model)
+
+Same conditions as the verification above: David's
+ubuntu-server, release build, RUSTFLAGS target-cpu=x86-64-v3,
+CPU only, runner `crates/arch-llama/examples/golden_run.rs`,
+greedy, 64 tokens max. Production Glimmer llama-server
+untouched (health check after both re-runs: `{"status":"ok"}`,
+still on its original pid). Wall time 971.7 s.
+
+| Model | Token-identical | Text-identical | Divergent | Missing |
+| --- | --- | --- | --- | --- |
+| Qwen2.5-1.5B Q4_K_M | 9 / 15 | 0 / 15 | 6 | 0 |
+
+**9/15 holds exactly.** Stronger: the per-arch candidate is
+token-for-token identical to this note's `.fixed` candidate on
+all 15 prompts: same nine token-identical prompts, same six
+fork points (factual_history 4, code_python 2, list_colors 8,
+accented_french 12, accented_german 20, accented_spanish 0).
+The dispatch is a pure no-op on the qwen2 path, as designed: it
+routes to the same `rope_partial` with the same arguments, and
+the paired TinyLlama re-run proves the other branch restores
+that model's pre-regression trajectories exactly. Neither
+model is below its best-known state, so the fix ships with
+both fixtures guarding their own direction again.
+
+### Files (per-arch fix)
+
+- Candidate: `golden/candidates/qwen2.5-1.5b-q4km.perarch.candidate.jsonl`
+- Fix: `crates/arch-llama/src/config.rs`, `crates/arch-llama/src/model.rs`,
+  `crates/arch-llama/src/error.rs`, `crates/arch-llama/src/lib.rs`,
+  `crates/torch-math/src/rope_interleaved.rs`,
+  `crates/torch-math/src/lib.rs`, `crates/torch-math/src/rope.rs`
+  (doc correction only)

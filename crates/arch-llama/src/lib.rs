@@ -44,7 +44,7 @@ pub mod weights;
 #[cfg(test)]
 mod testkit;
 
-pub use config::{LlamaConfig, ARCHITECTURES};
+pub use config::{LlamaConfig, RopePairing, ARCHITECTURES};
 pub use diag::{Diag, NullDiag, StderrDiag};
 pub use error::{LlamaError, Result};
 pub use model::{ForwardTrace, LayerTrace, LlamaModel};

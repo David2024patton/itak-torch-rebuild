@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use attention::{gqa_attention, AttentionParams, KvCache, LayerKind};
 
-use crate::config::LlamaConfig;
+use crate::config::{LlamaConfig, RopePairing};
 use crate::diag::{Diag, NullDiag};
 use crate::error::{LlamaError, Result};
 use crate::weights::{TensorData, Weights};
@@ -352,20 +352,37 @@ fn linear(
 }
 
 /// RoPE applied in place to a `[rows, heads * head_dim]` buffer,
-/// one position per row.
+/// one position per row. The channel pairing comes from the file's
+/// architecture via [`LlamaConfig::rope_pairing`]: llama-family
+/// files rotate adjacent pairs, qwen2 files rotate half-split
+/// pairs. Naming one pairing function here for both families is
+/// the mistake this dispatch replaces (13643e0 fixed qwen2 by
+/// flipping the shared function and regressed llama with it).
 fn rope_rows(x: &mut [f32], heads: usize, cfg: &LlamaConfig, positions: &[usize]) -> Result<()> {
     let head_dim = cfg.head_dim as usize;
+    let rotary_dim = cfg.rope_dim as usize;
     let width = heads * head_dim;
+    let pairing = cfg.rope_pairing()?;
     for (r, &position) in positions.iter().enumerate() {
         for h in 0..heads {
             let start = (r * heads + h) * head_dim;
-            let rotated = torch_math::rope_partial(
-                &x[start..start + head_dim],
-                position,
-                cfg.rope_freq_base,
-                head_dim,
-                cfg.rope_dim as usize,
-            )?;
+            let head = &x[start..start + head_dim];
+            let rotated = match pairing {
+                RopePairing::Interleaved => torch_math::rope_interleaved_partial(
+                    head,
+                    position,
+                    cfg.rope_freq_base,
+                    head_dim,
+                    rotary_dim,
+                )?,
+                RopePairing::HalfSplit => torch_math::rope_partial(
+                    head,
+                    position,
+                    cfg.rope_freq_base,
+                    head_dim,
+                    rotary_dim,
+                )?,
+            };
             x[start..start + head_dim].copy_from_slice(&rotated);
         }
     }
@@ -385,7 +402,9 @@ fn add_in_place(a: &mut [f32], b: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{build_gguf, refs, tiny_config, tiny_metadata, BiasMode, FakeSource};
+    use crate::testkit::{
+        build_gguf, deterministic_values, refs, tiny_config, tiny_metadata, BiasMode, FakeSource,
+    };
     use gguf::GgufFile;
 
     fn tiny_model(arch: &str, tied: bool, biases: BiasMode) -> LlamaModel {
@@ -417,6 +436,127 @@ mod tests {
             assert_eq!(stats.appended, 4);
             assert_eq!(stats.stored, 4);
         }
+    }
+
+    /// Apply one torch-math pairing function head by head, the
+    /// manual reference `rope_rows` is checked against.
+    fn rotate_manually(
+        input: &[f32],
+        heads: usize,
+        head_dim: usize,
+        positions: &[usize],
+        f: impl Fn(&[f32], usize) -> Vec<f32>,
+    ) -> Vec<f32> {
+        let mut out = input.to_vec();
+        for (r, &position) in positions.iter().enumerate() {
+            for h in 0..heads {
+                let start = (r * heads + h) * head_dim;
+                let rotated = f(&input[start..start + head_dim], position);
+                out[start..start + head_dim].copy_from_slice(&rotated);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn rope_rows_dispatches_on_the_config_architecture() {
+        // Same buffer, same positions, two configs differing only
+        // in the architecture string: llama must come out as the
+        // interleaved rotation and qwen2 as the half-split one,
+        // each exactly the torch-math function the mapping names.
+        // This is the per-arch selection test for the 13643e0
+        // regression, which flipped both families with one edit.
+        let heads = 2;
+        let positions = [1usize, 3];
+        let input = deterministic_values(2 * heads * 8, 42);
+        let llama_cfg = tiny_config("llama");
+        let qwen2_cfg = tiny_config("qwen2");
+
+        let mut llama_out = input.clone();
+        rope_rows(&mut llama_out, heads, &llama_cfg, &positions).expect("llama rotates");
+        let llama_expected = rotate_manually(&input, heads, 8, &positions, |head, pos| {
+            torch_math::rope_interleaved_partial(head, pos, 10_000.0, 8, 8)
+                .expect("interleaved rotates")
+        });
+        assert_eq!(llama_out, llama_expected);
+
+        let mut qwen2_out = input.clone();
+        rope_rows(&mut qwen2_out, heads, &qwen2_cfg, &positions).expect("qwen2 rotates");
+        let qwen2_expected = rotate_manually(&input, heads, 8, &positions, |head, pos| {
+            torch_math::rope_partial(head, pos, 10_000.0, 8, 8).expect("half-split rotates")
+        });
+        assert_eq!(qwen2_out, qwen2_expected);
+
+        // The two pairings genuinely differ on this input (at
+        // positions past 0 rotation is not the identity, and the
+        // pairings join different channels), so the equality checks
+        // above cannot both pass under a single shared pairing.
+        assert!(
+            max_abs_diff(&llama_out, &qwen2_out) > 1e-3,
+            "pairings must differ: diff {}",
+            max_abs_diff(&llama_out, &qwen2_out)
+        );
+    }
+
+    #[test]
+    fn rope_rows_partial_rotary_uses_the_interleaved_subrange_for_llama() {
+        // A llama-arch config whose rope_dim is below the head dim:
+        // the interleaved pairing applied over the first rope_dim
+        // channels, the tail passed through unrotated.
+        let heads = 2;
+        let positions = [2usize];
+        let input = deterministic_values(heads * 8, 7);
+        let mut cfg = tiny_config("llama");
+        cfg.rope_dim = 4;
+
+        let mut out = input.clone();
+        rope_rows(&mut out, heads, &cfg, &positions).expect("partial rotates");
+        let expected = rotate_manually(&input, heads, 8, &positions, |head, pos| {
+            torch_math::rope_interleaved_partial(head, pos, 10_000.0, 8, 4)
+                .expect("interleaved partial rotates")
+        });
+        assert_eq!(out, expected);
+        // Tail channels of every head are the input's, exactly.
+        for h in 0..heads {
+            assert_eq!(out[h * 8 + 4..h * 8 + 8], input[h * 8 + 4..h * 8 + 8]);
+        }
+        // And it is not the full-rotary result: channels 4..8 stay
+        // put here, where the full form rotates them.
+        let mut full_cfg = tiny_config("llama");
+        full_cfg.rope_dim = 8;
+        let mut full_out = input.clone();
+        rope_rows(&mut full_out, heads, &full_cfg, &positions).expect("full rotates");
+        assert!(max_abs_diff(&out, &full_out) > 1e-3);
+    }
+
+    #[test]
+    fn partial_rotary_llama_forward_agrees_prefill_and_incremental() {
+        // The whole forward over the partial interleaved path:
+        // prefill and one-token steps must still agree, the KV
+        // proof restated for the subrange rotation.
+        let mut cfg = tiny_config("llama");
+        cfg.rope_dim = 4;
+        let source = FakeSource::full(&cfg, false, BiasMode::None);
+        let weights = Weights::load(&source, &cfg).expect("weights load");
+        let model = LlamaModel::new(cfg, weights);
+        let prompt = [5u32, 9, 2, 7];
+
+        let mut prefill_cache = model.new_cache().expect("cache");
+        let prefill_logits = model
+            .forward(&prompt, &mut prefill_cache)
+            .expect("prefill runs");
+        assert!(prefill_logits.iter().all(|z| z.is_finite()));
+
+        let mut decode_cache = model.new_cache().expect("cache");
+        let mut decode_logits = Vec::new();
+        for &token in &prompt {
+            decode_logits = model.step(token, &mut decode_cache).expect("step runs");
+        }
+        assert!(
+            max_abs_diff(&prefill_logits, &decode_logits) <= 1e-4,
+            "prefill vs incremental diff {}",
+            max_abs_diff(&prefill_logits, &decode_logits)
+        );
     }
 
     #[test]

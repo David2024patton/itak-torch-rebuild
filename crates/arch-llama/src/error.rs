@@ -38,6 +38,17 @@ pub enum LlamaError {
         /// The architecture string found in the file.
         found: String,
     },
+    /// The config's architecture string has no RoPE pairing mapped.
+    /// Pairing is per-architecture in llama.cpp's table (see
+    /// [`crate::config::RopePairing`]); an unmapped architecture is
+    /// refused by name rather than assigned a guessed pairing.
+    /// `LlamaConfig::from_file` already refuses architectures
+    /// outside the served set, so this fires only for a config
+    /// assembled by hand with an unmapped string.
+    RopePairingUnknown {
+        /// The architecture string with no mapped pairing.
+        architecture: String,
+    },
     /// A tensor the forward needs is not in the weight source. The old
     /// engine kept random placeholder weights in this situation; here
     /// it is an error, always.
@@ -113,6 +124,10 @@ impl fmt::Display for LlamaError {
             Self::WrongArchitecture { found } => write!(
                 f,
                 "this module serves architectures \"llama\" and \"qwen2\" only, file declares \"{found}\""
+            ),
+            Self::RopePairingUnknown { architecture } => write!(
+                f,
+                "no RoPE pairing is mapped for architecture \"{architecture}\"; pairing is per-architecture in llama.cpp and is never guessed"
             ),
             Self::MissingTensor { name } => {
                 write!(

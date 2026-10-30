@@ -35,6 +35,38 @@ use crate::error::{LlamaError, Result};
 /// The architecture strings this module serves.
 pub const ARCHITECTURES: [&str; 2] = ["llama", "qwen2"];
 
+/// Which channels RoPE pairs when it rotates a head vector.
+///
+/// Pairing is a per-architecture convention, not a property of the
+/// math. llama.cpp's authority is `llama_model_rope_type` in
+/// src/llama-model.cpp (the build that generated this project's
+/// golden fixtures): `LLM_ARCH_LLAMA` returns
+/// `LLAMA_ROPE_TYPE_NORM` (adjacent pairs) and `LLM_ARCH_QWEN2`
+/// returns `LLAMA_ROPE_TYPE_NEOX` (half-split pairs).
+/// (`LLM_ARCH_MUSE_GLIMMER` also returns NORM; that architecture
+/// is served by the muse-glimmer crate, whose backend calls
+/// `torch_math::rope_interleaved` directly.)
+///
+/// The pairings rotate different channels at the same rates, so a
+/// file converted for one is garbage under the other. That is not
+/// theory here: commit 13643e0 flipped the one shared pairing
+/// function to NEOX to fix Qwen2.5 and regressed TinyLlama (arch
+/// llama) from 6/15 to 0/15 token-identical in the same edit,
+/// because arch-llama called the shared function for both
+/// architectures. This enum and [`LlamaConfig::rope_pairing`] exist
+/// so the choice is made once, by name, from the file's own
+/// architecture string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RopePairing {
+    /// Adjacent pairs `(2i, 2i + 1)`: ggml's NORM pairing, applied
+    /// by `torch_math::rope_interleaved_partial`. The llama family.
+    Interleaved,
+    /// Half-split pairs `(i, i + rotary_dim / 2)`: ggml's NEOX
+    /// pairing, applied by `torch_math::rope_partial`. The qwen2
+    /// family.
+    HalfSplit,
+}
+
 // Metadata key suffixes, appended to the file's own architecture
 // string. Spelled exactly as the real files carry them.
 pub(crate) const SUFFIX_BLOCK_COUNT: &str = "block_count";
@@ -206,6 +238,33 @@ impl LlamaConfig {
         self.architecture == "qwen2"
     }
 
+    /// The RoPE channel pairing this file's architecture uses, from
+    /// llama.cpp's per-architecture table (see [`RopePairing`] for
+    /// the source citation and the regression that made this a
+    /// named choice). This is the one place the mapping lives; the
+    /// forward dispatches on it and never names a pairing function
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// [`LlamaError::RopePairingUnknown`] when the architecture
+    /// string is not one this mapping covers. [`from_file`] already
+    /// refuses any architecture outside [`ARCHITECTURES`], so this
+    /// can only fire for a config assembled by hand; it refuses
+    /// rather than guessing, because a guessed pairing runs
+    /// silently and produces plausible garbage.
+    ///
+    /// [`from_file`]: LlamaConfig::from_file
+    pub fn rope_pairing(&self) -> Result<RopePairing> {
+        match self.architecture.as_str() {
+            "llama" => Ok(RopePairing::Interleaved),
+            "qwen2" => Ok(RopePairing::HalfSplit),
+            other => Err(LlamaError::RopePairingUnknown {
+                architecture: other.to_string(),
+            }),
+        }
+    }
+
     /// Width of the query projection per position: Q heads times head dim.
     pub fn q_width(&self) -> u32 {
         self.q_heads * self.head_dim
@@ -280,7 +339,7 @@ fn invalid(key: &str, detail: &str) -> LlamaError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testkit::{build_gguf, qwen2_metadata, refs, tinyllama_metadata};
+    use crate::testkit::{build_gguf, qwen2_metadata, refs, tiny_config, tinyllama_metadata};
     use gguf::MetadataValue;
 
     fn parse(metadata: &[(String, MetadataValue)]) -> Result<LlamaConfig> {
@@ -355,6 +414,43 @@ mod tests {
         assert!((cfg.rms_eps - 1e-6).abs() < 1e-10);
         assert_eq!(cfg.vocab_size, 151_936);
         assert!(cfg.attention_biases_required());
+    }
+
+    #[test]
+    fn llama_config_selects_the_interleaved_pairing() {
+        // From the file's own metadata through the real parser: the
+        // llama architecture string alone decides the pairing
+        // (llama.cpp maps LLM_ARCH_LLAMA to NORM).
+        let cfg = parse(&tinyllama_metadata()).expect("real metadata parses");
+        assert_eq!(
+            cfg.rope_pairing().expect("llama maps"),
+            RopePairing::Interleaved
+        );
+    }
+
+    #[test]
+    fn qwen2_config_selects_the_half_split_pairing() {
+        let cfg = parse(&qwen2_metadata()).expect("real metadata parses");
+        assert_eq!(
+            cfg.rope_pairing().expect("qwen2 maps"),
+            RopePairing::HalfSplit
+        );
+    }
+
+    #[test]
+    fn unmapped_architecture_is_refused_a_pairing_by_name() {
+        // A hand-assembled config for an architecture the mapping
+        // does not cover (from_file would refuse it earlier, at the
+        // arch check): the pairing lookup must refuse by name, not
+        // default to either pairing.
+        let cfg = tiny_config("phi3");
+        let err = cfg.rope_pairing().expect_err("phi3 has no mapped pairing");
+        match err {
+            LlamaError::RopePairingUnknown { architecture } => {
+                assert_eq!(architecture, "phi3")
+            }
+            other => panic!("expected RopePairingUnknown, got {other:?}"),
+        }
     }
 
     #[test]

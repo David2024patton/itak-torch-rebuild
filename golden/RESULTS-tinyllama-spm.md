@@ -180,3 +180,67 @@ behind the other's fix.
 - Margin probe: `golden/tools/fork_margins.py` (one-off
   analysis; margins above are its output, reproducible from
   the fixture and candidate)
+
+## Per-architecture pairing fix: regression closed
+
+The fix the section above named has landed. Pairing is now
+selected in exactly one place from the file's own architecture
+string: `LlamaConfig::rope_pairing` in
+`crates/arch-llama/src/config.rs`, which maps `llama` to
+`RopePairing::Interleaved` and `qwen2` to `RopePairing::HalfSplit`
+(citing `llama_model_rope_type` in llama.cpp's
+src/llama-model.cpp) and refuses any other architecture with the
+named error `LlamaError::RopePairingUnknown` instead of guessing.
+`rope_rows` in `crates/arch-llama/src/model.rs` dispatches on it;
+the interleaved side needed a partial-rotary form, added as
+`torch_math::rope_interleaved_partial` (adjacent pairs over the
+first `rope_dim` channels, tail passed through, frequency
+denominator `rotary_dim`, the same partial convention as
+`rope_partial`). The muse-glimmer path is untouched: it already
+called `rope_interleaved` by name. Selection is pinned by tests:
+config-level (llama parses to Interleaved, qwen2 to HalfSplit, an
+unmapped architecture is refused by name), call-site level
+(`rope_rows` output equals the named torch-math function per
+architecture, including a partial-rotary llama config), and a
+full-forward KV proof over the partial interleaved path.
+torch-math 44 passed, arch-llama 29 passed, clippy clean.
+
+### Re-run
+
+Same conditions as before: David's ubuntu-server, release build,
+RUSTFLAGS target-cpu=x86-64-v3, CPU only, runner
+`crates/arch-llama/examples/golden_run.rs`, greedy, 64 tokens max.
+Production Glimmer llama-server untouched (health check after
+the runs: ok; see the Qwen follow-up in
+`RESULTS-layer-diff-qwen.md` for the paired re-run). Wall time
+705.3 s for the full 15 prompts. Prompt tokenization exact on
+all 15, as in the SPM run.
+
+| Model | Token-identical | Text-identical | Divergent | Missing |
+| --- | --- | --- | --- | --- |
+| TinyLlama-1.1B Q4_K_M | 6 / 15 | 0 / 15 | 9 | 0 |
+
+Back to the pre-regression headline, and stronger than the
+headline: the candidate is token-for-token identical to the SPM
+run's candidate on all 15 prompts, fork for fork (factual_science
+29, factual_history 31, arithmetic_add 4, arithmetic_divide 39,
+arithmetic_word 23, code_go 0, accented_french 34,
+accented_spanish 17, continuation_classic 23), with the same six
+prompts fully token-identical (factual_capital, code_python,
+list_colors, list_days, list_counting, accented_german). The
+pre-regression trajectories are reproduced exactly, this time by
+explicit per-architecture selection rather than by the shared
+function happening to hold llama's pairing. The nine remaining
+forks are the forward's known state after the SPM run (coherent,
+late forks; the Qwen half of the same story is in
+`RESULTS-layer-diff-qwen.md`), not pairing damage: the regressed
+run's fork-at-0/1 pattern is gone entirely.
+
+### Files (per-arch fix)
+
+- Candidate: `golden/candidates/tinyllama-1.1b-chat-v1.0.Q4_K_M.perarch.candidate.jsonl`
+- Fix: `crates/arch-llama/src/config.rs` (`RopePairing`,
+  `LlamaConfig::rope_pairing`), `crates/arch-llama/src/model.rs`
+  (`rope_rows` dispatch), `crates/arch-llama/src/error.rs`
+  (`RopePairingUnknown`), `crates/torch-math/src/rope_interleaved.rs`
+  (`rope_interleaved_partial`)

@@ -6,14 +6,23 @@
 //! - The head vector is treated as `rotary_dim / 2` half-split pairs
 //!   `(x[i], x[i + rotary_dim / 2])`: the GPT-NeoX pairing, which is
 //!   ggml's `GGML_ROPE_TYPE_NEOX`, the mode llama.cpp applies for
-//!   the llama and qwen2 families. (An earlier version of this
-//!   module paired adjacent channels `(x[2i], x[2i + 1])` while
-//!   claiming the same name; the layer-by-layer activation diff
-//!   against llama.cpp on Qwen2.5-1.5B, 2026-10-29, proved that
-//!   pairing wrong and this one right: with the input to layer 0
-//!   identical, half-split rotation of the pre-RoPE projections
-//!   reproduces the reference Qcur/Kcur to the quant noise floor,
-//!   adjacent pairing diverges by two orders of magnitude more.)
+//!   the qwen2 family (`llama_model_rope_type` in
+//!   src/llama-model.cpp). It is NOT the llama family's mode: llama
+//!   (and muse-glimmer) map to the adjacent NORM pairing in
+//!   [`crate::rope_interleaved`]. Pairing is per-architecture, and
+//!   arch modules select it from the file, never from this
+//!   function's name. (An earlier version of this module paired
+//!   adjacent channels `(x[2i], x[2i + 1])` while claiming the same
+//!   name; the layer-by-layer activation diff against llama.cpp on
+//!   Qwen2.5-1.5B, 2026-10-29, proved that pairing wrong for qwen2
+//!   and this one right: with the input to layer 0 identical,
+//!   half-split rotation of the pre-RoPE projections reproduces the
+//!   reference Qcur/Kcur to the quant noise floor, adjacent pairing
+//!   diverges by two orders of magnitude more. The same fix
+//!   generalized to llama files regressed TinyLlama's golden run
+//!   from 6/15 to 0/15, because llama's pairing was the adjacent
+//!   one all along; see `crates/arch-llama/src/config.rs` for the
+//!   per-architecture mapping.)
 //! - Pair `i` rotates by `position * base^(-2i / rotary_dim)`.
 //! - `base` is a parameter: the classic value is `10000`, long-context
 //!   models use more (Glimmer and Qwen2.5 use `500000`, Llama 3 uses
@@ -150,7 +159,7 @@ mod tests {
             &out,
             &[
                 0.0,
-                0.999_950_000_416_665_3,   // cos(0.01)
+                0.999_950_000_416_665_3, // cos(0.01)
                 0.0,
                 0.009_999_833_334_166_664, // sin(0.01)
             ],

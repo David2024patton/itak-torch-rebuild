@@ -18,12 +18,23 @@
 //!   form; giving each pairing its own named function is the
 //!   structural fix, so a backend states its architecture's
 //!   pairing at the call site.
+//!
+//! Partial rotary (only the first `rotary_dim` channels rotate, as
+//! in llama-architecture files whose `rope.dimension_count` is
+//! below the head dimension) is supported by
+//! [`rope_interleaved_partial`]; the remaining channels pass
+//! through unchanged. The frequency denominator is `rotary_dim`,
+//! the same partial-rotary convention [`crate::rope_partial`]
+//! documents for the half-split form; for the full form
+//! [`rope_interleaved`] the two are equal anyway.
 
 use crate::{dbg_log, MathError, Result};
 
 /// Apply RoPE with interleaved (adjacent) pairing to one head vector
 /// of length `head_dim` at `position`: pair `i` joins channels
 /// `(2i, 2i + 1)` and rotates by `position * base^(-2i / head_dim)`.
+/// Equivalent to [`rope_interleaved_partial`] with
+/// `rotary_dim == head_dim`.
 ///
 /// # Errors
 ///
@@ -35,6 +46,28 @@ pub fn rope_interleaved(
     position: usize,
     base: f32,
     head_dim: usize,
+) -> Result<Vec<f32>> {
+    rope_interleaved_partial(input, position, base, head_dim, head_dim)
+}
+
+/// Apply RoPE with interleaved (adjacent) pairing to the first
+/// `rotary_dim` channels of one head vector of length `head_dim` at
+/// `position`; channels at or beyond `rotary_dim` are copied through
+/// unchanged. Pair `i` joins channels `(2i, 2i + 1)` and rotates by
+/// `position * base^(-2i / rotary_dim)`.
+///
+/// # Errors
+///
+/// - [`MathError::LengthMismatch`] if `input.len() != head_dim`.
+/// - [`MathError::InvalidConfig`] if `head_dim` or `rotary_dim` is
+///   odd or less than 2, if `rotary_dim > head_dim`, or if `base`
+///   is not finite and greater than 1.
+pub fn rope_interleaved_partial(
+    input: &[f32],
+    position: usize,
+    base: f32,
+    head_dim: usize,
+    rotary_dim: usize,
 ) -> Result<Vec<f32>> {
     if head_dim < 2 || head_dim % 2 != 0 {
         return Err(MathError::InvalidConfig {
@@ -50,6 +83,13 @@ pub fn rope_interleaved(
             actual: input.len(),
         });
     }
+    if rotary_dim < 2 || rotary_dim % 2 != 0 || rotary_dim > head_dim {
+        return Err(MathError::InvalidConfig {
+            op: "rope_interleaved",
+            param: "rotary_dim",
+            reason: "rotary_dim must be even, >= 2, and <= head_dim",
+        });
+    }
     if !base.is_finite() || base <= 1.0 {
         return Err(MathError::InvalidConfig {
             op: "rope_interleaved",
@@ -57,14 +97,16 @@ pub fn rope_interleaved(
             reason: "base must be finite and > 1",
         });
     }
-    dbg_log!("rope_interleaved position={position} base={base} head_dim={head_dim}");
+    dbg_log!(
+        "rope_interleaved_partial position={position} base={base} head_dim={head_dim} rotary_dim={rotary_dim}"
+    );
     let mut out = input.to_vec();
     // Angles in f64, as in the half-split form: at long contexts the
     // product position * base^(-2i/d) loses real precision in f32.
     let pos = position as f64;
     let base64 = f64::from(base);
-    for i in 0..head_dim / 2 {
-        let exponent = -((2 * i) as f64) / (head_dim as f64);
+    for i in 0..rotary_dim / 2 {
+        let exponent = -((2 * i) as f64) / (rotary_dim as f64);
         let angle = pos * base64.powf(exponent);
         let (sin, cos) = angle.sin_cos();
         let (x, y) = (f64::from(input[2 * i]), f64::from(input[2 * i + 1]));
@@ -116,6 +158,49 @@ mod tests {
     }
 
     #[test]
+    fn partial_rotary_rotates_adjacent_pairs_and_passes_the_tail() {
+        // head_dim 8, rotary_dim 4, base 10000, position 1: adjacent
+        // pair 0 joins channels (0, 1) at rate 1, pair 1 joins
+        // (2, 3) at rate 10000^(-2/4) = 0.01, and channels 4..8 are
+        // beyond rotary_dim and pass through. The half-split
+        // partial on the same input pairs (0, 2) and (1, 3)
+        // instead, turning channel 0 with (cos 1 - sin 1), so
+        // these values tell the pairings apart in the partial case
+        // as well.
+        let input = [1.0, 0.0, 1.0, 0.0, 9.0, -4.0, 7.0, 3.0];
+        let out = rope_interleaved_partial(&input, 1, 10_000.0, 8, 4).unwrap();
+        assert_vec_close(
+            &out,
+            &[
+                0.540_302_305_868_139_8,   // cos(1), channel 0
+                0.841_470_984_807_896_5,   // sin(1), channel 1
+                0.999_950_000_416_665_3,   // cos(0.01), channel 2
+                0.009_999_833_334_166_664, // sin(0.01), channel 3
+                9.0,                       // tail, untouched
+                -4.0,
+                7.0,
+                3.0,
+            ],
+            1e-5,
+        );
+        // The half-split partial form on the same input must NOT
+        // produce this: pairings differ, not just names.
+        let neox = crate::rope_partial(&input, 1, 10_000.0, 8, 4).unwrap();
+        assert!(
+            out.iter().zip(&neox).any(|(a, b)| (a - b).abs() > 0.1),
+            "interleaved and half-split partials must differ on this input"
+        );
+    }
+
+    #[test]
+    fn partial_with_full_rotary_dim_equals_the_full_form() {
+        let input = [0.3, -1.2, 2.5, 0.7, 1.1, -0.4, 0.9, 2.2];
+        let partial = rope_interleaved_partial(&input, 5, 500_000.0, 8, 8).unwrap();
+        let full = rope_interleaved(&input, 5, 500_000.0, 8).unwrap();
+        assert_eq!(partial, full);
+    }
+
+    #[test]
     fn bad_config_is_an_error() {
         assert_eq!(
             rope_interleaved(&[1.0, 0.0], 0, 10_000.0, 4),
@@ -125,6 +210,21 @@ mod tests {
                 actual: 2
             })
         );
+        // Partial form refuses an impossible rotary_dim by name.
+        assert!(matches!(
+            rope_interleaved_partial(&[1.0, 0.0, 1.0, 0.0], 0, 10_000.0, 4, 8),
+            Err(MathError::InvalidConfig {
+                param: "rotary_dim",
+                ..
+            })
+        ));
+        assert!(matches!(
+            rope_interleaved_partial(&[1.0, 0.0, 1.0, 0.0], 0, 10_000.0, 4, 3),
+            Err(MathError::InvalidConfig {
+                param: "rotary_dim",
+                ..
+            })
+        ));
         assert!(matches!(
             rope_interleaved(&[1.0, 0.0, 1.0], 0, 10_000.0, 3),
             Err(MathError::InvalidConfig {

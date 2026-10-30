@@ -47,7 +47,7 @@ pub use linalg::{matmul, matvec};
 pub use logits::{logit_scale, logit_softcap};
 pub use norm::rms_norm;
 pub use rope::{rope, rope_partial};
-pub use rope_interleaved::rope_interleaved;
+pub use rope_interleaved::{rope_interleaved, rope_interleaved_partial};
 
 /// Result type for `torch-math` operations.
 pub type Result<T> = std::result::Result<T, MathError>;

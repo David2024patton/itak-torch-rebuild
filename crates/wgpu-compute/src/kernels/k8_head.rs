@@ -76,6 +76,109 @@ fn dtype_id(dtype: Dtype) -> u32 {
 /// Threads per workgroup for the gather and finish kernels.
 const WORKGROUP: u32 = 256;
 
+/// Workgroups in the argmax reduction's first stage: each
+/// reduces its strided share of the logits to one (value,
+/// index) pair in the partials buffer, and the finish stage
+/// reduces those pairs to the single winner. 128 groups x
+/// 256 threads keeps the per-thread stride short at the real
+/// vocabulary (202,048 logits: about seven elements per
+/// thread) while the finish stage stays one workgroup.
+pub const ARGMAX_GROUPS: usize = 128;
+
+/// The argmax shader: two entry points sharing the combine
+/// rule and the workgroup reduction arrays. The rule is the
+/// host sampler's (`itak-engine`'s greedy pick): the maximum
+/// value wins, and an exact tie goes to the LOWEST index. The
+/// rule is a total order (value descending, index ascending),
+/// so the staged reduction returns exactly what a sequential
+/// scan returns on any finite input. A thread that visits no
+/// element (and a group whose partial is empty) carries
+/// (-inf, u32::MAX), which can never win a tie against a real
+/// element; NaN logits would poison the comparisons the same
+/// way they poison the host scan's, and the head's finishing
+/// guarantees finite logits for the models this backend
+/// serves (the softcap bounds them outright).
+const ARGMAX_SHADER: &str = r#"
+struct Params {
+    n: u32,
+}
+
+@group(0) @binding(0) var<storage, read> logits: array<f32>;
+@group(0) @binding(1) var<storage, read_write> partials: array<u32>;
+@group(0) @binding(2) var<uniform> params: Params;
+@group(0) @binding(3) var<storage, read_write> result: array<u32>;
+
+var<workgroup> red_v: array<f32, 256>;
+var<workgroup> red_i: array<u32, 256>;
+
+// The greedy combine: (ov, oi) replaces (v, i) when it is
+// strictly greater, or equal with a lower index.
+fn better(v: f32, i: u32, ov: f32, oi: u32) -> bool {
+    return ov > v || (ov == v && oi < i);
+}
+
+// Reduce this workgroup's per-thread pairs (already in the
+// reduction arrays) to lane 0's pair.
+fn reduce(lane: u32) {
+    var stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            if (better(red_v[lane], red_i[lane], red_v[lane + stride], red_i[lane + stride])) {
+                red_v[lane] = red_v[lane + stride];
+                red_i[lane] = red_i[lane + stride];
+            }
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+}
+
+@compute @workgroup_size(256)
+fn argmax_stage_main(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {
+    let lane = lid.x;
+    let tid = wid.x * 256u + lane;
+    var bv = bitcast<f32>(0xff800000u);
+    var bi = 0xffffffffu;
+    for (var i = tid; i < params.n; i += 32768u) {
+        let v = logits[i];
+        if (better(bv, bi, v, i)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    red_v[lane] = bv;
+    red_i[lane] = bi;
+    workgroupBarrier();
+    reduce(lane);
+    if (lane == 0u) {
+        partials[wid.x * 2u] = bitcast<u32>(red_v[0]);
+        partials[wid.x * 2u + 1u] = red_i[0];
+    }
+}
+
+@compute @workgroup_size(256)
+fn argmax_finish_main(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let lane = lid.x;
+    var bv = bitcast<f32>(0xff800000u);
+    var bi = 0xffffffffu;
+    if (lane < 128u) {
+        bv = bitcast<f32>(partials[lane * 2u]);
+        bi = partials[lane * 2u + 1u];
+    }
+    red_v[lane] = bv;
+    red_i[lane] = bi;
+    workgroupBarrier();
+    reduce(lane);
+    if (lane == 0u) {
+        // The result buffer is the caller's: word 0 the
+        // winning index, word 1 the winning logit's bits.
+        result[0] = red_i[0];
+        result[1] = bitcast<u32>(red_v[0]);
+    }
+}
+"#;
+
 /// The F32 gather shader: one thread per output channel.
 const GATHER_F32_SHADER: &str = r#"
 struct GatherParams {
@@ -640,6 +743,50 @@ impl K8FinishCall {
     }
 }
 
+/// One prepared argmax reduction over a device logits
+/// buffer: the stage dispatch (one workgroup per
+/// [`ARGMAX_GROUPS`] slice, writing (value, index) pairs to
+/// the caller's partials buffer) and the finish dispatch
+/// (one workgroup reducing the pairs into the caller's
+/// two-word result buffer: winning index, then the winning
+/// logit's bits). Encodable any number of times against the
+/// same buffers; the logits buffer's contents are the
+/// caller's to rewrite between forwards. See
+/// [`K8Pipeline::prepare_argmax`].
+#[derive(Debug)]
+pub struct K8ArgmaxCall {
+    stage_pipeline: wgpu::ComputePipeline,
+    stage_bind_group: wgpu::BindGroup,
+    finish_pipeline: wgpu::ComputePipeline,
+    finish_bind_group: wgpu::BindGroup,
+}
+
+impl K8ArgmaxCall {
+    /// Record both dispatches into `encoder` (the stage, then
+    /// the finish; wgpu's hazard tracking orders the second
+    /// after the first's writes).
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k8 argmax"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record both dispatches into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to append the reduction to the head
+    /// segment of a forward chunk.
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.stage_pipeline);
+        pass.set_bind_group(0, &self.stage_bind_group, &[]);
+        pass.dispatch_workgroups(ARGMAX_GROUPS as u32, 1, 1);
+        pass.set_pipeline(&self.finish_pipeline);
+        pass.set_bind_group(0, &self.finish_bind_group, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+}
+
 /// The compiled K8 pipelines (F32 gather, two-byte gather,
 /// quantized gather, their multi-row forms, head finish, and
 /// the scale-only finish).
@@ -656,6 +803,8 @@ pub struct K8Pipeline {
     gather_norm_quant: wgpu::ComputePipeline,
     finish: wgpu::ComputePipeline,
     scale: wgpu::ComputePipeline,
+    argmax_stage: wgpu::ComputePipeline,
+    argmax_finish: wgpu::ComputePipeline,
 }
 
 impl K8Pipeline {
@@ -714,6 +863,8 @@ impl K8Pipeline {
         );
         let finish = build(FINISH_SHADER, "finish_main", "k8 head finish");
         let scale = build(SCALE_SHADER, "scale_main", "k8 head scale");
+        let argmax_stage = build(ARGMAX_SHADER, "argmax_stage_main", "k8 argmax stage");
+        let argmax_finish = build(ARGMAX_SHADER, "argmax_finish_main", "k8 argmax finish");
         dbg_log!("k8 pipelines built");
         Ok(K8Pipeline {
             gather_f32,
@@ -727,6 +878,8 @@ impl K8Pipeline {
             gather_norm_quant,
             finish,
             scale,
+            argmax_stage,
+            argmax_finish,
         })
     }
 
@@ -986,6 +1139,129 @@ impl K8Pipeline {
             bind_group,
             grid,
         }
+    }
+
+    /// Prepare an on-device argmax over a logits buffer of
+    /// `n` elements: the two-stage reduction whose winner is
+    /// the host sampler's greedy pick (maximum value, lowest
+    /// index on an exact tie; see the shader's docs).
+    /// `partials` must hold at least [`ARGMAX_GROUPS`] (value
+    /// bits, index) u32 pairs and `result` at least two u32
+    /// words; both are caller-owned scratch the call writes
+    /// and the caller reads after submission.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when `n` is zero or a
+    /// scratch buffer is undersized.
+    pub fn prepare_argmax(
+        &self,
+        ctx: &GpuContext,
+        logits: &wgpu::Buffer,
+        n: usize,
+        partials: &wgpu::Buffer,
+        result: &wgpu::Buffer,
+    ) -> Result<K8ArgmaxCall> {
+        if n == 0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k8 argmax".to_string(),
+                detail: "argmax over zero logits".to_string(),
+            });
+        }
+        if partials.size() < (ARGMAX_GROUPS * 2 * 4) as u64 || result.size() < 8 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k8 argmax".to_string(),
+                detail: format!(
+                    "partials ({} bytes) or result ({} bytes) undersized for the reduction \
+                     ({} pairs and 2 words needed)",
+                    partials.size(),
+                    result.size(),
+                    ARGMAX_GROUPS
+                ),
+            });
+        }
+        let params: [u32; 4] = [n as u32, 0, 0, 0];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k8 argmax params", &param_bytes);
+        let stage_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k8 argmax stage bind group"),
+            layout: &self.argmax_stage.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: logits.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: partials.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let finish_bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k8 argmax finish bind group"),
+            layout: &self.argmax_finish.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: partials.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: result.as_entire_binding(),
+                },
+            ],
+        });
+        dbg_log!("k8 argmax prepared: n={n}");
+        Ok(K8ArgmaxCall {
+            stage_pipeline: self.argmax_stage.clone(),
+            stage_bind_group,
+            finish_pipeline: self.argmax_finish.clone(),
+            finish_bind_group,
+        })
+    }
+
+    /// One-shot argmax over host logits: upload, reduce on
+    /// the device, read back the eight result bytes. Returns
+    /// the winning index and the winning logit. The check and
+    /// bench data path; the resident session prepares its
+    /// reduction against its own buffers instead.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on empty input;
+    /// [`WgpuError::Readback`] when the result cannot be
+    /// mapped back.
+    pub fn argmax(&self, ctx: &GpuContext, logits: &[f32]) -> Result<(u32, f32)> {
+        if logits.is_empty() {
+            return Err(WgpuError::InvalidTensor {
+                name: "k8 argmax".to_string(),
+                detail: "argmax over zero logits".to_string(),
+            });
+        }
+        let logits_buf = ctx.upload_f32("k8 argmax logits", logits);
+        let partials = ctx.scratch_buffer("k8 argmax partials", (ARGMAX_GROUPS * 2 * 4) as u64);
+        let result = ctx.scratch_buffer("k8 argmax result", 8);
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k8 argmax staging"),
+            size: 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let call = self.prepare_argmax(ctx, &logits_buf, logits.len(), &partials, &result)?;
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("k8 argmax run"),
+            });
+        call.encode(&mut encoder);
+        encoder.copy_buffer_to_buffer(&result, 0, &staging, 0, 8);
+        ctx.queue.submit([encoder.finish()]);
+        let words = ctx.map_staging(&staging, 2)?;
+        Ok((words[0].to_bits(), words[1]))
     }
 
     /// Dispatch one gather pipeline for one token row and read

@@ -75,6 +75,8 @@ pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
 pub use device::GpuContext;
 pub use error::{Result, WgpuError};
+pub use kernels::k10_q4k_gemm::{GemmShape, K10Call, K10Pipeline, GEMM_MAX_BATCH};
+pub use kernels::k11_q6k_gemm::{K11Call, K11Pipeline};
 pub use kernels::k1_q4k_gemv::{
     K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
 };
@@ -88,8 +90,8 @@ pub use kernels::k6_attention::{
     AttendGeom, DeviceKv, GpuKvState, K6FlashCall, K6Pipeline, K6ReduceCall, K6ScoresCall, LayerKv,
 };
 pub use kernels::k7_swiglu::{K7Call, K7Pipeline};
-pub use kernels::k8_head::{K8FinishCall, K8GatherRowsCall, K8Pipeline};
+pub use kernels::k8_head::{
+    K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, K8Pipeline, ARGMAX_GROUPS,
+};
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
-pub use kernels::k10_q4k_gemm::{GemmShape, K10Call, K10Pipeline, GEMM_MAX_BATCH};
-pub use kernels::k11_q6k_gemm::{K11Call, K11Pipeline};
 pub use session::{ResidentSession, SessionStats};

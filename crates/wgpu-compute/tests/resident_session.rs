@@ -401,3 +401,87 @@ fn resident_session_matches_trait_and_cpu() {
     assert_step_agrees(71, &cpu_logits, &gpu_logits, &resident_logits);
     assert_eq!(session.position(), 71);
 }
+
+/// The host greedy pick with the engine sampler's convention:
+/// a strictly-greater scan, so the LOWEST index wins an exact
+/// tie. (The file's `argmax` helper above uses `max_by`,
+/// which keeps the last maximum; the sampler and the device
+/// reduction both keep the first.)
+fn host_greedy(logits: &[f32]) -> (u32, f32) {
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best = i;
+        }
+    }
+    (best as u32, best_val)
+}
+
+/// The argmax tail: `forward_argmax` must return the same
+/// winner (and the same winning logit) as `forward` plus the
+/// host greedy pick, on a multi-chunk prompt and across a
+/// greedy generation, while reading back eight bytes per
+/// chunk instead of the logits vector.
+#[test]
+fn resident_session_argmax_tail_matches_logits() {
+    let logits_backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping resident argmax test: no suitable adapter (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    let argmax_backend = WgpuCompute::new().expect("argmax backend instance builds");
+    let cfg = cross_cfg();
+    let weights = cross_weights(&cfg);
+    let mut logits_session =
+        ResidentSession::new(&logits_backend, &cfg, &weights).expect("logits session builds");
+    let mut argmax_session =
+        ResidentSession::new(&argmax_backend, &cfg, &weights).expect("argmax session builds");
+
+    // A 70-token prompt: two chunks through both readback
+    // shapes, so the reduction is proven on the chunked
+    // prefill path as well as on decode rows.
+    let prompt: Vec<u32> = (0..70).map(|i| (i * 37 % 1024) as u32).collect();
+    let logits = logits_session.forward(&prompt).expect("logits forward");
+    let (id, logit) = argmax_session
+        .forward_argmax(&prompt)
+        .expect("argmax forward");
+    let (want_id, want_logit) = host_greedy(&logits);
+    assert_eq!(id, want_id, "argmax winner disagrees after the prompt");
+    assert!(
+        (logit - want_logit).abs() <= 1e-6 + 1e-5 * want_logit.abs(),
+        "argmax winning logit {logit} vs host {want_logit}"
+    );
+    assert_eq!(logits_session.position(), argmax_session.position());
+    let a_stats = argmax_session.stats();
+    assert_eq!(a_stats.argmax_readbacks, 2, "one argmax readback per chunk");
+    assert_eq!(a_stats.readbacks, 0, "the argmax tail never reads logits");
+    assert_eq!(logits_session.stats().readbacks, 2);
+
+    // Greedy generation: each session feeds its own winner;
+    // the streams must stay identical step by step.
+    let mut next = vec![id];
+    for step in 0..12 {
+        let logits = logits_session.forward(&next).expect("logits decode");
+        let (step_id, step_logit) = argmax_session.forward_argmax(&next).expect("argmax decode");
+        let (want_id, want_logit) = host_greedy(&logits);
+        assert_eq!(
+            step_id, want_id,
+            "argmax winner disagrees at decode step {step}"
+        );
+        assert!(
+            (step_logit - want_logit).abs() <= 1e-6 + 1e-5 * want_logit.abs(),
+            "argmax winning logit {step_logit} vs host {want_logit} at step {step}"
+        );
+        next = vec![step_id];
+    }
+    assert_eq!(argmax_session.stats().argmax_readbacks, 14);
+    assert_eq!(argmax_session.position(), logits_session.position());
+}

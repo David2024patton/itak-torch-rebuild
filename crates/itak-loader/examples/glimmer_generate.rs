@@ -4,17 +4,22 @@
 //! and weights behind the coverage gate, the `tokenizer` crate
 //! tokenizes, and `muse-glimmer`'s forward runs on `cpu-compute`.
 //!
-//! Usage: `glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only] [--gpu|--gpu-trait]`
+//! Usage: `glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only] [--gpu|--gpu-trait|--gpu-argmax]`
 //!
 //! `--gpu` runs the device-resident session in `wgpu-compute`:
 //! weights upload once, activations and KV never leave the
 //! card, and each forward chunk is one command-buffer chain
 //! with only the finished logits read back (the fast path; see
-//! `wgpu-compute`'s session module). `--gpu-trait` selects the
-//! older trait path over the same backend (per-step host round
-//! trips through `GlimmerModel`), kept as the reference and for
-//! comparison runs. The default is the `cpu-compute` reference.
-//! Same model, same output contract on all three paths.
+//! `wgpu-compute`'s session module). `--gpu-argmax` runs the
+//! same resident session with the on-device argmax tail: each
+//! chunk reads back eight bytes (the winning index and its
+//! logit, reduced on the GPU) instead of the logits vector,
+//! so its per-step lines carry the winner and its raw logit
+//! rather than a top-5. `--gpu-trait` selects the older trait
+//! path over the same backend (per-step host round trips
+//! through `GlimmerModel`), kept as the reference and for
+//! comparison runs. The default is the `cpu-compute`
+//! reference. Same model, same output contract on all paths.
 //!
 //! The prompt ids are printed before any weight work happens, so the
 //! identical id sequence can be handed to a reference engine (the
@@ -45,18 +50,19 @@ fn main() -> ExitCode {
     let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
         eprintln!(
             "usage: glimmer_generate <path-to-gguf> <prompt> [n_tokens] [--ids-only] \
-             [--gpu|--gpu-trait]"
+             [--gpu|--gpu-trait|--gpu-argmax]"
         );
         return ExitCode::from(2);
     };
     let ids_only = args.iter().any(|a| a == "--ids-only");
     let gpu = args.iter().any(|a| a == "--gpu");
     let gpu_trait = args.iter().any(|a| a == "--gpu-trait");
+    let gpu_argmax = args.iter().any(|a| a == "--gpu-argmax");
     let n_tokens: usize = args
         .get(3)
         .filter(|a| !a.starts_with("--"))
         .map_or(8, |a| a.parse().unwrap_or(8));
-    match run(path, prompt, n_tokens, ids_only, gpu, gpu_trait) {
+    match run(path, prompt, n_tokens, ids_only, gpu, gpu_trait, gpu_argmax) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("FAIL: {msg}");
@@ -140,6 +146,7 @@ fn run(
     ids_only: bool,
     gpu: bool,
     gpu_trait: bool,
+    gpu_argmax: bool,
 ) -> Result<(), String> {
     let t_open = Instant::now();
     let file = gguf::GgufFile::open(Path::new(path)).map_err(|e| e.to_string())?;
@@ -200,8 +207,10 @@ fn run(
     println!("phase=load_weights ms={}", t_load.elapsed().as_millis());
 
     let vocab = info.tokens.clone();
-    if gpu {
-        return run_resident(&cfg, &weights, &ids, n_tokens, &vocab, &tokenizer);
+    if gpu || gpu_argmax {
+        return run_resident(
+            &cfg, &weights, &ids, n_tokens, &vocab, &tokenizer, gpu_argmax,
+        );
     }
     let t_backend = Instant::now();
     let backend: Box<dyn muse_glimmer::Compute> = if gpu_trait {
@@ -271,11 +280,17 @@ fn run_resident(
     n_tokens: usize,
     vocab: &[String],
     tokenizer: &Tokenizer,
+    argmax_tail: bool,
 ) -> Result<(), String> {
     let t_backend = Instant::now();
     let backend = wgpu_compute::WgpuCompute::new().map_err(|e| e.to_string())?;
     println!(
-        "phase=backend_open backend=resident ms={}",
+        "phase=backend_open backend={} ms={}",
+        if argmax_tail {
+            "resident-argmax"
+        } else {
+            "resident"
+        },
         t_backend.elapsed().as_millis()
     );
     let t_session = Instant::now();
@@ -285,12 +300,20 @@ fn run_resident(
 
     let mut generated: Vec<u32> = Vec::new();
     let t_prefill = Instant::now();
-    let logits = session.forward(ids).map_err(|e| e.to_string())?;
-    let prefill_ms = t_prefill.elapsed().as_millis();
-    let top = top_k(&logits, 5);
-    println!("phase=prefill ms={prefill_ms} prompt_tokens={}", ids.len());
-    print_top("prefill_top", &top, vocab);
-    let mut next = top[0].0;
+    let mut next = if argmax_tail {
+        let (top, logit) = session.forward_argmax(ids).map_err(|e| e.to_string())?;
+        let prefill_ms = t_prefill.elapsed().as_millis();
+        println!("phase=prefill ms={prefill_ms} prompt_tokens={}", ids.len());
+        println!("prefill_argmax id={top} logit={logit:.6}");
+        top
+    } else {
+        let logits = session.forward(ids).map_err(|e| e.to_string())?;
+        let prefill_ms = t_prefill.elapsed().as_millis();
+        let top = top_k(&logits, 5);
+        println!("phase=prefill ms={prefill_ms} prompt_tokens={}", ids.len());
+        print_top("prefill_top", &top, vocab);
+        top[0].0
+    };
     generated.push(next);
     println!(
         "gen step=1 id={next} tok={:?} source=prefill",
@@ -300,16 +323,27 @@ fn run_resident(
 
     for step in 2..=n_tokens {
         let t_step = Instant::now();
-        let logits = session.forward(&[next]).map_err(|e| e.to_string())?;
-        let ms = t_step.elapsed().as_millis();
-        let top = top_k(&logits, 5);
-        print_top(&format!("step{step}_top"), &top, vocab);
-        next = top[0].0;
-        generated.push(next);
-        println!(
-            "gen step={step} id={next} tok={:?} ms={ms}",
-            vocab[next as usize]
-        );
+        if argmax_tail {
+            let (top, logit) = session.forward_argmax(&[next]).map_err(|e| e.to_string())?;
+            let ms = t_step.elapsed().as_millis();
+            next = top;
+            generated.push(next);
+            println!(
+                "gen step={step} id={next} tok={:?} ms={ms} argmax_logit={logit:.6}",
+                vocab[next as usize]
+            );
+        } else {
+            let logits = session.forward(&[next]).map_err(|e| e.to_string())?;
+            let ms = t_step.elapsed().as_millis();
+            let top = top_k(&logits, 5);
+            print_top(&format!("step{step}_top"), &top, vocab);
+            next = top[0].0;
+            generated.push(next);
+            println!(
+                "gen step={step} id={next} tok={:?} ms={ms}",
+                vocab[next as usize]
+            );
+        }
         std::io::stdout().flush().ok();
     }
 
@@ -319,12 +353,13 @@ fn run_resident(
     let stats = session.stats();
     println!(
         "phase=session_stats forwards={} chunks={} submissions={} aux_submissions={} \
-         readbacks={} dispatches={} tokens={}",
+         readbacks={} argmax_readbacks={} dispatches={} tokens={}",
         stats.forwards,
         stats.chunks,
         stats.submissions,
         stats.aux_submissions,
         stats.readbacks,
+        stats.argmax_readbacks,
         stats.dispatches,
         stats.tokens
     );

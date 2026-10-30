@@ -40,9 +40,13 @@
 //! normalize the branch at the hardcoded epsilon below and
 //! only then add the untouched residual; RoPE applies to the
 //! sliding-window layers only; the head finishing scales
-//! first, then softcaps. Argmax stays on the host: the
-//! session returns the finished logits, and the caller picks
-//! the token exactly as it does from the trait path.
+//! first, then softcaps. Two readback shapes share the one
+//! chain: `forward` returns the finished logits and the
+//! caller picks the token exactly as it does from the trait
+//! path, while `forward_argmax` appends K8's on-device
+//! reduction to the head segment and reads back eight bytes
+//! (the winning index and logit, the host sampler's greedy
+//! pick) for callers on the greedy path.
 //!
 //! Buffer discipline: activations ping-pong between two
 //! stream buffers, one chunk of rows at a time. The fused
@@ -75,7 +79,9 @@ use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
 use crate::kernels::k6_attention::{AttendGeom, DeviceKv, K6FlashCall, K6ReduceCall, K6ScoresCall};
 use crate::kernels::k7_swiglu::K7Call;
-use crate::kernels::k8_head::{K8FinishCall, K8GatherRowsCall, GATHER_NORM_MAX_WIDTH};
+use crate::kernels::k8_head::{
+    K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, ARGMAX_GROUPS, GATHER_NORM_MAX_WIDTH,
+};
 use crate::kernels::k9_attn_prep::{K9PrepCall, PrepArgs};
 
 /// The post-norm epsilon, hardcoded to match the reference
@@ -150,6 +156,11 @@ pub struct SessionStats {
     pub aux_submissions: u64,
     /// Logits readbacks (one per chunk).
     pub readbacks: u64,
+    /// Argmax readbacks (one per chunk forwarded through
+    /// [`ResidentSession::forward_argmax`]): eight bytes each
+    /// (the winning index and logit) instead of the logits
+    /// vector's 808 KB at the real vocabulary.
+    pub argmax_readbacks: u64,
     /// Compute dispatches recorded (across all chunks).
     pub dispatches: u64,
     /// Tokens forwarded.
@@ -602,7 +613,11 @@ impl ResidentLayer {
             )
         } else if qk_q4k && gate_fusable {
             (
-                Some(upload_batch(backend, &[&w.attn_q, &w.attn_k, &w.attn_gate], "proj")?),
+                Some(upload_batch(
+                    backend,
+                    &[&w.attn_q, &w.attn_k, &w.attn_gate],
+                    "proj",
+                )?),
                 false,
                 true,
             )
@@ -621,7 +636,11 @@ impl ResidentLayer {
             && w.ffn_up.dtype == Dtype::Q4K
             && mat(&w.ffn_up)
         {
-            Some(upload_batch(backend, &[&w.ffn_gate, &w.ffn_up], "swiglu_ffn")?)
+            Some(upload_batch(
+                backend,
+                &[&w.ffn_gate, &w.ffn_up],
+                "swiglu_ffn",
+            )?)
         } else {
             None
         };
@@ -754,6 +773,16 @@ struct Scratch {
     logits: wgpu::Buffer,
     /// Logits readback staging, `[vocab]`, `COPY_DST | MAP_READ`.
     staging: wgpu::Buffer,
+    /// Argmax reduction partials, `[ARGMAX_GROUPS][2]` u32
+    /// (value bits, index) pairs.
+    argmax_partials: wgpu::Buffer,
+    /// Argmax reduction result, `[2]` u32 (winning index,
+    /// winning logit's bits).
+    argmax_result: wgpu::Buffer,
+    /// Argmax readback staging, `[2]` u32, `COPY_DST |
+    /// MAP_READ`: the eight bytes an argmax-tail chunk returns
+    /// instead of the logits vector.
+    argmax_staging: wgpu::Buffer,
 }
 
 impl Scratch {
@@ -800,6 +829,14 @@ impl Scratch {
             staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("session logits staging"),
                 size: (vocab * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            argmax_partials: act("session argmax partials", ARGMAX_GROUPS * 2),
+            argmax_result: act("session argmax result", 2),
+            argmax_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("session argmax staging"),
+                size: 8,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
@@ -1024,6 +1061,11 @@ struct ChunkPlan {
     /// the head is Q5_K: the finishing map is fused into the
     /// head kernel's final store instead).
     finish: Option<K8FinishCall>,
+    /// The on-device argmax reduction over the finished
+    /// logits (an argmax-tail chunk appends its two
+    /// dispatches to the head segment and reads back eight
+    /// bytes instead of the logits vector).
+    argmax: K8ArgmaxCall,
     /// Compute dispatches one chunk of this plan records.
     dispatch_count: u64,
 }
@@ -1710,6 +1752,16 @@ impl ChunkPlan {
             };
             (head, Some(finish))
         };
+        let argmax = backend
+            .k8()
+            .prepare_argmax(
+                ctx,
+                &scratch.logits,
+                cfg.vocab_size as usize,
+                &scratch.argmax_partials,
+                &scratch.argmax_result,
+            )
+            .map_err(|e| we(e, "lm_head"))?;
         let dispatch_count = 1
             + u64::from(embed_norm.is_some())
             + layer_plans
@@ -1730,6 +1782,7 @@ impl ChunkPlan {
             final_norm,
             head,
             finish,
+            argmax,
             dispatch_count,
         })
     }
@@ -1815,6 +1868,26 @@ impl ChunkPlan {
             &self.scratch.staging,
             0,
             u64::from(cfg.vocab_size) * 4,
+        );
+    }
+
+    /// Record the argmax reduction into the open head `pass`,
+    /// after the head segment: the two reduction dispatches
+    /// over the finished logits.
+    fn encode_argmax(&self, pass: &mut wgpu::ComputePass<'_>) {
+        self.argmax.encode_into(pass);
+    }
+
+    /// Copy the argmax result (winning index and logit, two
+    /// words) into its readback staging (an encoder-level
+    /// operation, recorded last on an argmax-tail chunk).
+    fn copy_argmax(&self, encoder: &mut wgpu::CommandEncoder) {
+        encoder.copy_buffer_to_buffer(
+            &self.scratch.argmax_result,
+            0,
+            &self.scratch.argmax_staging,
+            0,
+            8,
         );
     }
 }
@@ -2007,6 +2080,64 @@ impl<'a> ResidentSession<'a> {
     /// validation; kernel refusals surface as
     /// [`GlimmerError::StepFailed`] under the owning step.
     pub fn forward(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.validate_tokens(tokens)?;
+        self.stats.forwards += 1;
+        self.stats.tokens += tokens.len() as u64;
+        let mut rest = tokens;
+        let mut logits = Vec::new();
+        while !rest.is_empty() {
+            let rows = self.chunk_rows(rest.len());
+            match self.forward_chunk(&rest[..rows], ChunkTail::Logits)? {
+                ChunkOutcome::Logits(chunk_logits) => logits = chunk_logits,
+                ChunkOutcome::Argmax(..) => unreachable!("logits tail yields logits"),
+            }
+            rest = &rest[rows..];
+        }
+        Ok(logits)
+    }
+
+    /// Run one forward over `tokens` and return the greedy
+    /// next token and its finished logit, reduced ON THE
+    /// DEVICE: the same forward as [`ResidentSession::forward`]
+    /// (same chunks, same chain, same head), except each
+    /// chunk's head segment appends K8's argmax reduction and
+    /// the readback is the reduction's eight bytes (winning
+    /// index, winning logit) instead of the logits vector.
+    /// The winner is the host sampler's greedy pick (maximum
+    /// logit, lowest index on an exact tie), so a generation
+    /// driven by this method token-matches one driven by
+    /// `forward` plus a host argmax, which is the property
+    /// the resident-session test pins. Callers that need the
+    /// full distribution (sampling, top-k, probabilities)
+    /// keep using `forward`; this method exists for the
+    /// greedy path, where the vector itself is waste.
+    ///
+    /// # Errors
+    ///
+    /// The same validation and step failures as
+    /// [`ResidentSession::forward`].
+    pub fn forward_argmax(&mut self, tokens: &[u32]) -> Result<(u32, f32)> {
+        self.validate_tokens(tokens)?;
+        self.stats.forwards += 1;
+        self.stats.tokens += tokens.len() as u64;
+        let mut rest = tokens;
+        let mut winner = (0, f32::NEG_INFINITY);
+        while !rest.is_empty() {
+            let rows = self.chunk_rows(rest.len());
+            match self.forward_chunk(&rest[..rows], ChunkTail::Argmax)? {
+                ChunkOutcome::Argmax(id, logit) => winner = (id, logit),
+                ChunkOutcome::Logits(_) => unreachable!("argmax tail yields argmax"),
+            }
+            rest = &rest[rows..];
+        }
+        Ok(winner)
+    }
+
+    /// The input validation both forward entry points share,
+    /// matching the model's own: [`GlimmerError::EmptyInput`]
+    /// on an empty slice and [`GlimmerError::TokenOutOfRange`]
+    /// naming the first token past the vocabulary.
+    fn validate_tokens(&self, tokens: &[u32]) -> Result<()> {
         if tokens.is_empty() {
             return Err(GlimmerError::EmptyInput);
         }
@@ -2018,16 +2149,7 @@ impl<'a> ResidentSession<'a> {
                 });
             }
         }
-        self.stats.forwards += 1;
-        self.stats.tokens += tokens.len() as u64;
-        let mut rest = tokens;
-        let mut logits = Vec::new();
-        while !rest.is_empty() {
-            let rows = self.chunk_rows(rest.len());
-            logits = self.forward_chunk(&rest[..rows])?;
-            rest = &rest[rows..];
-        }
-        Ok(logits)
+        Ok(())
     }
 
     /// Rows for the next chunk of an `n`-token remainder: the
@@ -2058,8 +2180,10 @@ impl<'a> ResidentSession<'a> {
 
     /// Run one chunk: ensure KV, refresh the plan's positions,
     /// upload the token ids, encode the whole chain into one
-    /// command buffer, submit once, read back only the logits.
-    fn forward_chunk(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+    /// command buffer, submit once, and read back per `tail`:
+    /// the finished logits, or the on-device argmax reduction
+    /// over them (eight bytes).
+    fn forward_chunk(&mut self, tokens: &[u32], tail: ChunkTail) -> Result<ChunkOutcome> {
         let ctx = self.backend.context();
         let rows = tokens.len();
         let start = self.position;
@@ -2163,24 +2287,66 @@ impl<'a> ResidentSession<'a> {
                 timestamp_writes: None,
             });
             plan.encode_head(&mut pass);
+            if tail == ChunkTail::Argmax {
+                plan.encode_argmax(&mut pass);
+            }
         }
-        plan.copy_logits(&mut encoder, &self.cfg);
-        let dispatches = plan.dispatch_count;
+        match tail {
+            ChunkTail::Logits => plan.copy_logits(&mut encoder, &self.cfg),
+            ChunkTail::Argmax => plan.copy_argmax(&mut encoder),
+        }
+        let dispatches = plan.dispatch_count + u64::from(tail == ChunkTail::Argmax) * 2;
         let staging = plan.scratch.staging.clone();
+        let argmax_staging = plan.scratch.argmax_staging.clone();
         ctx.queue.submit([encoder.finish()]);
         self.stats.submissions += 1;
         self.stats.chunks += 1;
         self.stats.dispatches += dispatches;
-        let logits = ctx
-            .map_staging(&staging, self.cfg.vocab_size as usize)
-            .map_err(|e| we(e, "lm_head"))?;
-        self.stats.readbacks += 1;
+        let outcome = match tail {
+            ChunkTail::Logits => {
+                let logits = ctx
+                    .map_staging(&staging, self.cfg.vocab_size as usize)
+                    .map_err(|e| we(e, "lm_head"))?;
+                self.stats.readbacks += 1;
+                ChunkOutcome::Logits(logits)
+            }
+            ChunkTail::Argmax => {
+                // The staging's two words are the winning
+                // index (as u32 bits in the first word's place)
+                // and the winning logit itself.
+                let words = ctx
+                    .map_staging(&argmax_staging, 2)
+                    .map_err(|e| we(e, "lm_head"))?;
+                self.stats.argmax_readbacks += 1;
+                ChunkOutcome::Argmax(words[0].to_bits(), words[1])
+            }
+        };
         self.position = end;
         dbg_log!(
             "session forward: rows={rows} start={start} end={end} dispatches={dispatches} \
              submissions={}",
             self.stats.submissions
         );
-        Ok(logits)
+        Ok(outcome)
     }
+}
+
+/// What a forward chunk's head segment returns to the host:
+/// the finished logits vector, or the on-device argmax
+/// reduction over it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChunkTail {
+    /// Read back the finished logits (`forward`).
+    Logits,
+    /// Reduce the finished logits on the device and read
+    /// back the winner (`forward_argmax`).
+    Argmax,
+}
+
+/// A forward chunk's result, per its [`ChunkTail`].
+enum ChunkOutcome {
+    /// The finished logits of the chunk's last token.
+    Logits(Vec<f32>),
+    /// The winning token id and its finished logit.
+    Argmax(u32, f32),
 }

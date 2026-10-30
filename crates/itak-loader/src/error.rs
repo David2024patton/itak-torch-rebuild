@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use arch_llama::LlamaError;
 use gguf::GgufError;
 use muse_glimmer::GlimmerError;
 
@@ -26,8 +27,42 @@ pub enum LoaderError {
     /// it could not take). Passed through unwrapped in kind so callers
     /// can match on the arch module's own error variants.
     Glimmer(GlimmerError),
+    /// The llama-family architecture module refused something (bad
+    /// config, a tensor it could not take). Passed through unwrapped
+    /// in kind, same as the Glimmer variant.
+    Llama(LlamaError),
     /// The GGUF loader refused something (parse or read failure).
     Gguf(GgufError),
+    /// The file's own `general.architecture` string names no module
+    /// in the arch registry. Carries the string the file declared and
+    /// the complete supported list, so the refusal itself teaches the
+    /// caller what this engine loads (ARCHITECTURE.md 5.3: an
+    /// unrecognized string is a named refusal listing what is
+    /// supported).
+    UnknownArchitecture {
+        /// The architecture string the file declared.
+        found: String,
+        /// Every architecture string the registry can route, sorted.
+        supported: Vec<String>,
+    },
+    /// A second module tried to register an architecture string that
+    /// already has one. The registry is the only load path, so a
+    /// string must route to exactly one module.
+    DuplicateArchitecture {
+        /// The architecture string that was registered twice.
+        architecture: String,
+    },
+    /// Engine selection found no candidate able to serve an
+    /// architecture by capability (the module provides no forward, no
+    /// available backend lists the architecture). Selection is by
+    /// capability, never by file size; the detail states which
+    /// capability check failed.
+    NoCapableEngine {
+        /// The architecture that could not be served.
+        architecture: String,
+        /// Why every candidate was refused, in plain words.
+        detail: String,
+    },
 }
 
 impl fmt::Display for LoaderError {
@@ -40,7 +75,25 @@ impl fmt::Display for LoaderError {
                 names.join(", ")
             ),
             LoaderError::Glimmer(e) => write!(f, "{e}"),
+            LoaderError::Llama(e) => write!(f, "{e}"),
             LoaderError::Gguf(e) => write!(f, "{e}"),
+            LoaderError::UnknownArchitecture { found, supported } => write!(
+                f,
+                "unsupported architecture \"{found}\": this engine loads [{}]",
+                supported.join(", ")
+            ),
+            LoaderError::DuplicateArchitecture { architecture } => write!(
+                f,
+                "architecture \"{architecture}\" is already registered: \
+                 one architecture string routes to exactly one module"
+            ),
+            LoaderError::NoCapableEngine {
+                architecture,
+                detail,
+            } => write!(
+                f,
+                "no capable engine for architecture \"{architecture}\": {detail}"
+            ),
         }
     }
 }
@@ -50,7 +103,11 @@ impl std::error::Error for LoaderError {
         match self {
             LoaderError::MissingTensors(_) => None,
             LoaderError::Glimmer(e) => Some(e),
+            LoaderError::Llama(e) => Some(e),
             LoaderError::Gguf(e) => Some(e),
+            LoaderError::UnknownArchitecture { .. } => None,
+            LoaderError::DuplicateArchitecture { .. } => None,
+            LoaderError::NoCapableEngine { .. } => None,
         }
     }
 }
@@ -58,6 +115,12 @@ impl std::error::Error for LoaderError {
 impl From<GlimmerError> for LoaderError {
     fn from(e: GlimmerError) -> Self {
         Self::Glimmer(e)
+    }
+}
+
+impl From<LlamaError> for LoaderError {
+    fn from(e: LlamaError) -> Self {
+        Self::Llama(e)
     }
 }
 

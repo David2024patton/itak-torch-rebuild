@@ -20,6 +20,17 @@
 //! - [`load_weights`] runs the coverage gate first, then loads the
 //!   full weight set through the [`TensorSource`] adapter. A partially
 //!   loaded model is never returned.
+//! - [`registry`] is the architecture dispatch (TODO T-2.8): the
+//!   file's own `general.architecture` string routes through
+//!   [`ArchRegistry::standard`] to the module registered for it
+//!   (full modules for muse-glimmer, llama, and qwen2; registered
+//!   stubs proving routing for gemma2, olmo2, and deepseek2), and an
+//!   unknown string is refused by name with the supported list in
+//!   the error. [`select_engine`] then picks a serve engine by
+//!   capability, never by file size. The registry is the only load
+//!   path for multi-family loading; the `load_config` /
+//!   `load_weights` functions above remain the Glimmer module's own
+//!   bridge.
 //!
 //! Diagnostics are built in from birth (David's rule): structured
 //! `key=value` debug lines flow through [`diag`] whenever
@@ -45,10 +56,17 @@ pub mod adapter;
 pub mod coverage;
 pub mod diag;
 pub mod error;
+pub mod registry;
+pub mod stub;
 
 pub use adapter::{GgufMetadata, GgufTensorSource};
 pub use coverage::{coverage, CoverageReport};
 pub use error::{LoaderError, Result};
+pub use registry::{
+    select_engine, ArchEntry, ArchRegistry, Capabilities, DispatchResult, Dispatched,
+    EngineCandidate, EngineSelection, Handler, ModuleKind, REGISTRY_VERSION,
+};
+pub use stub::StubConfig;
 
 use gguf::GgufFile;
 use muse_glimmer::{GlimmerConfig, Weights};

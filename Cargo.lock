@@ -52,6 +52,7 @@ dependencies = [
 name = "itak-loader"
 version = "0.1.0"
 dependencies = [
+ "arch-llama",
  "cpu-compute",
  "gguf",
  "muse-glimmer",

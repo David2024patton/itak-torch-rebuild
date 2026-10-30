@@ -174,6 +174,33 @@ chunked/overwrite injection consistency, and a real-file run on
 the server (coverage 58/58, one block forward, finite logits,
 recorded in bench/dflash-e3-2026-10-30.md).
 
+E4. **The loop itself (this spec's subject).**
+LANDED 2026-10-30 (TODO T-3.6 and T-3.7): the `itak-spec` crate
+(crates/itak-spec) with `SpecSession` implementing the Section 4 round
+structure over E1/E2/E3, the Section 6.2 `Speculator` trait with the
+DFlash implementation, the Section 6.1 error table, the Section 6.3
+config block, the Section 6.4 diag catalogue and cumulative
+`SpecStats`, and the correction walk as pure functions in the crate's
+sampler module. Draft sync follows Q1/Q2 as settled: captures are
+staged by absolute position at the verify forward, and commit injects
+exactly the newly committed positions' concatenated layer-input rows;
+the draft cache is never checkpointed by the target machinery. The
+session owns the seeded RNG (a xorshift64*, the engine sampler's
+generator), settling Q6 in the home Section 6.3 proposed. Proof:
+temperature-0 token identity against plain greedy generation on
+synthetic configs at depths 1, 2, 4, and 6; the verify-refusal refuse
+and latch paths proven with a sabotage compute that fails one
+attention call; creation refusals and the draft commit contract
+covered by named tests; and a real-file identity run on the server
+(16 tokens, depth 6, Stage 1 prompt) recorded in
+bench/spec-loop-2026-10-30.md. Still open against this spec: T-9.6's
+serving half (the loop proves the mechanism on CPU; the tok/s clause
+belongs to the GPU path), T-9.7's depth sweep on this stack, T-3.1
+(n-gram), T-3.3 (Medusa), T-3.2 (its proof names the original FFI
+path's test cases, not in hand; the walk here is proven against
+hand-computed distributions from Section 4), and the grammar-aware
+walk (Q4).
+
 ## 4. The DFlash verify round
 
 One round of speculative decode, for one sequence. Definitions:
@@ -495,7 +522,7 @@ Section 5.1: a flag read only by a log line is a build failure).
 | Knob | Default | Meaning |
 | --- | --- | --- |
 | `spec.mode` | `off` | `off`, `dflash`, `ngram`; `medusa` becomes valid when Section 8's path lands |
-| `spec.dflash.n_max` | 4 | Verify depth for DFlash. 4 is the measured profile's value; the sweep (Section 9 in this spec, TODO T-9.7) may re-default it with its table filed |
+| `spec.dflash.n_max` | 6 | Verify depth for DFlash. 6 is the operating point the llama.cpp sweep measured on 2026-10-30 (bench/gpu-proof-2026-10-30.md: depth 6 at 107.39 tok/s against 41.64 plain, depths 8 and up harmful); the sweep on this stack (Section 9, TODO T-9.7) may re-default it with its table filed |
 | `spec.dflash.draft_path` | none | The draft GGUF; required when mode is `dflash` |
 | `spec.dflash.draft_temperature` | follow target | Draft sampler temperature |
 | `spec.ngram.max_depth` | 8 | Longest n-gram proposal |
@@ -506,7 +533,8 @@ Section 5.1: a flag read only by a log line is a build failure).
 RNG: the correction walk draws from a per-session seeded RNG injected
 into the driver, never a global. Temperature 0 needs no draws (the
 greedy special case), and seeded draws make the sampled arm of the
-sweep reproducible. Which crate owns the RNG implementation is Q6.
+sweep reproducible. Which crate owns the RNG implementation was Q6;
+settled 2026-10-30 (itak-spec's session owns it).
 
 ### 6.4 Diagnostic events, per verify round
 
@@ -761,6 +789,11 @@ lands (that run is T-9.7, and its output is the config default).
 - Q6. RNG ownership. The correction walk needs a per-session seeded
   RNG; no crate in the current tree owns one. Landing spot (sampler
   code beside T-2.5 is the natural home) is proposed, not settled.
+  Settled 2026-10-30 by the itak-spec landing: the session owns a
+  seeded xorshift64* (the same generator the engine sampler uses),
+  injected through the spec config's seed and consumed only by
+  temperature sampling; it lives in itak-spec's rng module beside the
+  walk in its sampler module.
 - Q7. Sweep prompt freeze. Whether the proxy layer's default
   reasoning_strength injection applies to the sweep's prompt set must
   be frozen in the bench note before T-P.1 runs, so the anchor and
@@ -784,15 +817,21 @@ Phase 2 (PLAN S5):
 
 Phase 3 (PLAN S6):
 
-- [ ] T-3.6 itak-spec crate skeleton: Speculator trait, SpecError set,
+- [x] T-3.6 itak-spec crate skeleton: Speculator trait, SpecError set,
   spec config block, diag event catalogue, session validation
   (proof: cargo tests green; a session configured mode=dflash with no
   draft attached refuses creation by name; every config knob has a
-  behavior test) (PLAN S6)
-- [ ] T-3.7 Correction sampler as a pure function: accept rule and
+  behavior test) (PLAN S6) (landed 2026-10-30: crates/itak-spec;
+  creation refuses as DraftNotLoaded; the full loop, not only the
+  skeleton, landed with it, Section 3 note E4)
+- [x] T-3.7 Correction sampler as a pure function: accept rule and
   residual distribution per SPEC-itak-spec Section 4 (proof: the
   distribution test cases T-3.2 names pass against it; greedy walk
   equals argmax comparison on recorded distribution pairs) (PLAN S6)
+  (landed 2026-10-30: crates/itak-spec/src/sampler.rs, proven against
+  hand-computed distributions from Section 4 with scripted draws;
+  T-3.2 itself stays open because its named proof references the
+  original FFI path's test cases, which are not in hand)
 
 Phase 7 (PLAN S10):
 

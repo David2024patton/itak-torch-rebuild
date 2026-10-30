@@ -59,6 +59,8 @@ RULES:
 - [ ] T-3.3 Medusa tree drafting with heads loaded from versioned artifact files (proof: heads trained in Phase 7 load here; measured tok/s gain over baseline published; zero-init heads are not a passing state) (PLAN S6)
 - [ ] T-3.4 MTP decoding and early-exit drafting with auto-discovery calibration wired on (proof: calibration runs and the drafting mode flag demonstrably changes behaviour in a test, unlike the original's dead boolean) (PLAN S6)
 - [ ] T-3.5 Constrained decoding on the platform side: GBNF grammar, JSON mode, JSON schema, token healing (proof: schema conformance test suite from the original handlers) (PLAN S6)
+- [x] T-3.6 itak-spec crate skeleton: Speculator trait, SpecError set, spec config block, diag event catalogue, session validation (proof: cargo tests green; a session configured mode=dflash with no draft attached refuses creation by name; every config knob has a behavior test) (PLAN S6) (landed 2026-10-30: crates/itak-spec, commit dcaf130; the full verify loop landed with the skeleton, SPEC-itak-spec Section 3 note E4)
+- [x] T-3.7 Correction sampler as a pure function: accept rule and residual distribution per SPEC-itak-spec Section 4 (proof: the distribution test cases T-3.2 names pass against it; greedy walk equals argmax comparison on recorded distribution pairs) (PLAN S6) (landed 2026-10-30: crates/itak-spec/src/sampler.rs, proven against hand-computed Section 4 distributions with scripted draws; T-3.2 stays open, its named proof references the original FFI path's test cases, not in hand)
 
 ## Phase 4: GPU backend and hardware (PLAN S7)
 - [ ] T-4.1 itak-backend trait plus CPU SIMD backend (proof: engine serves on CPU only with the GPU backend disabled) (PLAN S7)

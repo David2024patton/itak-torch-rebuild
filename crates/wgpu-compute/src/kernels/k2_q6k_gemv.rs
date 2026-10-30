@@ -811,7 +811,15 @@ impl K2Pipeline {
                 ),
             });
         }
-        self.prepare_inner(ctx, weights, input_a, Some(input_b), output, batch, Some(geom))
+        self.prepare_inner(
+            ctx,
+            weights,
+            input_a,
+            Some(input_b),
+            output,
+            batch,
+            Some(geom),
+        )
     }
 
     /// The shared prepare: bind the weights, the streams, and

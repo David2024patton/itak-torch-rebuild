@@ -73,12 +73,7 @@ struct TensorBench {
     calls: Vec<(String, BenchCall)>,
 }
 
-fn time_calls(
-    ctx: &wgpu_compute::GpuContext,
-    calls: &[BenchCall],
-    warmup: u32,
-    iters: u32,
-) -> f64 {
+fn time_calls(ctx: &wgpu_compute::GpuContext, calls: &[BenchCall], warmup: u32, iters: u32) -> f64 {
     let run_pass = |ctx: &wgpu_compute::GpuContext| {
         let mut encoder = ctx
             .device

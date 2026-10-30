@@ -176,10 +176,16 @@ impl WgpuCompute {
     /// shader fails to compile.
     pub fn from_context(ctx: GpuContext) -> crate::error::Result<Self> {
         let k1 = K1Pipeline::new(&ctx.device)?;
-        let k1_gated =
-            K1Pipeline::with_shape_act(&ctx.device, crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()), ACT_GATED)?;
-        let k1_swiglu =
-            K1Pipeline::with_shape_act(&ctx.device, crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()), ACT_SWIGLU)?;
+        let k1_gated = K1Pipeline::with_shape_act(
+            &ctx.device,
+            crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()),
+            ACT_GATED,
+        )?;
+        let k1_swiglu = K1Pipeline::with_shape_act(
+            &ctx.device,
+            crate::kernels::k1_q4k_gemv::shipped_shape(ctx.device.features()),
+            ACT_SWIGLU,
+        )?;
         let k2 = K2Pipeline::new(&ctx.device)?;
         let k2_swiglu = K2Pipeline::with_shape_act(
             &ctx.device,

@@ -66,10 +66,7 @@ fn run(path: &str, full: bool) -> Result<(), String> {
         cfg.global_layer_count(),
         cfg.sliding_layer_count()
     );
-    println!(
-        "global layer indices: {:?}",
-        cfg.global_layer_indices()
-    );
+    println!("global layer indices: {:?}", cfg.global_layer_indices());
 
     // Cross-check: the gguf crate's own generic config reader must
     // agree with the arch module's parse of the same metadata.

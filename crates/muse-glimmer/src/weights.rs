@@ -363,7 +363,11 @@ mod tests {
         let source = IndexedSource { values };
         let weights = Weights::load(&source, &cfg).expect("indexed source loads");
         let served = |view: &TensorView| {
-            f32::from_le_bytes(view.data.iter().copied().collect::<Vec<u8>>()[..4].try_into().unwrap())
+            f32::from_le_bytes(
+                view.data.iter().copied().collect::<Vec<u8>>()[..4]
+                    .try_into()
+                    .unwrap(),
+            )
         };
         let expect = |name: &str| source.values[name];
         assert_eq!(weights.embedding.name, "token_embd.weight");

@@ -12,8 +12,8 @@
 //! diag channel, per the architecture: a fallback is a fact the
 //! operator can pull out of the module, never a silent default.
 
-use crate::hwdetect::HardwareReport;
 use crate::diag::dbg_log;
+use crate::hwdetect::HardwareReport;
 
 /// Auto-config limits and switches, each with a default.
 ///

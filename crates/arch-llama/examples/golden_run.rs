@@ -182,11 +182,7 @@ fn load_prompts(path: &Path) -> Result<Vec<Prompt>, String> {
         let category = json_string_field(line, "category").unwrap_or_default();
         let text = json_string_field(line, "prompt")
             .ok_or_else(|| format!("prompt {id} lacks prompt text"))?;
-        prompts.push(Prompt {
-            id,
-            category,
-            text,
-        });
+        prompts.push(Prompt { id, category, text });
     }
     if prompts.is_empty() {
         return Err("prompt set is empty".to_string());
@@ -235,8 +231,8 @@ fn run() -> Result<(), String> {
     let prompts = load_prompts(Path::new(&args.prompts))?;
 
     let t0 = Instant::now();
-    let file = GgufFile::open(Path::new(&args.model))
-        .map_err(|e| format!("open {}: {e}", args.model))?;
+    let file =
+        GgufFile::open(Path::new(&args.model)).map_err(|e| format!("open {}: {e}", args.model))?;
     let md = file.metadata();
     let tok_model = md
         .opt_string("tokenizer.ggml.model")

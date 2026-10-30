@@ -81,7 +81,9 @@ pub use config::{BackendConfig, GpuPolicy};
 pub use cpu::CpuBackend;
 pub use detect::{detect, AdapterBackend, AdapterInfo, AdapterProbe, DeviceType, SystemProbe};
 pub use error::BackendError;
-pub use hwdetect::{CommandRunner, DetectSource, Detector, GpuInfo, GpuVendor, SystemCommandRunner};
+pub use hwdetect::{
+    CommandRunner, DetectSource, Detector, GpuInfo, GpuVendor, SystemCommandRunner,
+};
 pub use report::{
     BackendKind, CapabilityReport, CpuInfo, DiagEvent, FallbackLevel, HardwareReport, ImplKind, Op,
     OpStatus, OpSupport, SelectionOutcome, SimdFeatures, ALL_GGML_TYPES,

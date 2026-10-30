@@ -534,12 +534,7 @@ mod tests {
             Ok(vec![0.0; x.len()])
         }
 
-        fn lm_head(
-            &self,
-            _x: &[f32],
-            head: &TensorView,
-            _cfg: &GlimmerConfig,
-        ) -> Result<Vec<f32>> {
+        fn lm_head(&self, _x: &[f32], head: &TensorView, _cfg: &GlimmerConfig) -> Result<Vec<f32>> {
             self.events
                 .borrow_mut()
                 .push(format!("lm_head name={}", head.name));
@@ -636,11 +631,7 @@ mod tests {
         assert_eq!(logits.len(), 128);
         assert_eq!(cache.position(), 2);
 
-        let stages: Vec<&str> = log
-            .records()
-            .iter()
-            .map(|r| r.stage.as_str())
-            .collect();
+        let stages: Vec<&str> = log.records().iter().map(|r| r.stage.as_str()).collect();
         assert_eq!(
             stages,
             [

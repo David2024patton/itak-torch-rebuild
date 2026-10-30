@@ -500,7 +500,6 @@ fn final_norm_weight_is_the_effective_gain_not_an_offset() {
 /// `torch-math`'s `rope_neox` implements. Written from the
 /// definition here so the naive reference shares no code with the
 /// backend.
-
 fn rope64(v: &[f64], position: usize, base: f64) -> Vec<f64> {
     let mut out = v.to_vec();
     let dim = v.len() as f64;
@@ -620,11 +619,7 @@ fn attention_mixing_matches_a_naive_reference() {
 /// * w[i]`, computed from the f32 fixture values. Shares no code
 /// with the backend or with `torch-math`.
 fn rms_w64(v: &[f32], w: &[f32], eps: f64) -> Vec<f64> {
-    let ms = v
-        .iter()
-        .map(|x| f64::from(*x) * f64::from(*x))
-        .sum::<f64>()
-        / v.len() as f64;
+    let ms = v.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>() / v.len() as f64;
     let inv = 1.0 / (ms + eps).sqrt();
     v.iter()
         .zip(w.iter())
@@ -683,14 +678,28 @@ fn tail_discriminates_tensors_eps_and_softcap_order() {
         .map(|i| ((i * 37) % 13) as f32 * 0.3 - 1.2)
         .collect();
     let replace = |source: &mut MapSource, name: &str, shape: &[u64], values: Vec<f32>| {
-        source.tensors.insert(
-            name.to_string(),
-            f32_tensor(name, shape, values),
-        );
+        source
+            .tensors
+            .insert(name.to_string(), f32_tensor(name, shape, values));
     };
-    replace(&mut source, "blk.0.post_attention_norm.weight", &[HIDDEN as u64], pa.clone());
-    replace(&mut source, "blk.0.post_ffw_norm.weight", &[HIDDEN as u64], pf.clone());
-    replace(&mut source, "output_norm.weight", &[HIDDEN as u64], on.clone());
+    replace(
+        &mut source,
+        "blk.0.post_attention_norm.weight",
+        &[HIDDEN as u64],
+        pa.clone(),
+    );
+    replace(
+        &mut source,
+        "blk.0.post_ffw_norm.weight",
+        &[HIDDEN as u64],
+        pf.clone(),
+    );
+    replace(
+        &mut source,
+        "output_norm.weight",
+        &[HIDDEN as u64],
+        on.clone(),
+    );
 
     // Reference final state for token 3, in the test's own math.
     // INTEGRATION NOTE (2026-10-29, lanes 02 + 05): this reference
@@ -732,7 +741,12 @@ fn tail_discriminates_tensors_eps_and_softcap_order() {
         *v = 0.0;
     }
     head[37 * HIDDEN + c_star] = (30.0 / n_max) as f32;
-    replace(&mut source, "output.weight", &[HIDDEN as u64, VOCAB as u64], head.clone());
+    replace(
+        &mut source,
+        "output.weight",
+        &[HIDDEN as u64, VOCAB as u64],
+        head.clone(),
+    );
 
     let weights = Weights::load(&source, &cfg).expect("tail weights load");
     let model = GlimmerModel::new(cfg, weights, Box::new(CpuCompute::new()));

@@ -26,7 +26,9 @@
 use std::sync::Arc;
 
 use gguf::{GgufError, GgufFile, MetadataValue};
-use muse_glimmer::{Dtype, GlimmerError, Metadata, Result as GlimmerResult, TensorSource, TensorView};
+use muse_glimmer::{
+    Dtype, GlimmerError, Metadata, Result as GlimmerResult, TensorSource, TensorView,
+};
 
 use crate::diag;
 
@@ -51,10 +53,7 @@ impl<'a> GgufMetadata<'a> {
     /// is worth a diag line even though the trait answer is `None`.
     fn note_unreadable(&self, key: &str, err: &GgufError) {
         if self.file.metadata().get(key).is_some() {
-            diag::debug(
-                "metadata_unreadable",
-                &format!("key={key} reason={err}"),
-            );
+            diag::debug("metadata_unreadable", &format!("key={key} reason={err}"));
         }
     }
 }

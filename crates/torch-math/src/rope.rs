@@ -81,10 +81,7 @@ fn angle(position: usize, base: f32, rotary_dim: usize, pair_idx: usize) -> f64 
 fn rotate_pair(x: f32, y: f32, angle: f64) -> (f32, f32) {
     let (sin, cos) = angle.sin_cos();
     let (x, y) = (f64::from(x), f64::from(y));
-    (
-        (x * cos - y * sin) as f32,
-        (x * sin + y * cos) as f32,
-    )
+    ((x * cos - y * sin) as f32, (x * sin + y * cos) as f32)
 }
 
 /// Apply NORMAL (interleaved) RoPE to one head vector of length
@@ -368,16 +365,16 @@ mod tests {
         let out = rope_neox(&input, 3, 500_000.0, 128).unwrap();
         assert_close(out[0], -0.141_120_008_059_867_2, 1e-5); // -sin(3)
         assert_close(out[64], -0.989_992_496_600_445_4, 1e-5); // cos(3)
-        //
-        // Pair 63 = (channel 63, channel 127) at rate
-        // 500000^(-126/128) = 2.4551408e-6: e_63 at position 1000
-        // turns by 0.0024551408 rad.
+                                                               //
+                                                               // Pair 63 = (channel 63, channel 127) at rate
+                                                               // 500000^(-126/128) = 2.4551408e-6: e_63 at position 1000
+                                                               // turns by 0.0024551408 rad.
         let mut input = vec![0.0f32; 128];
         input[63] = 1.0;
         let out = rope_neox(&input, 1000, 500_000.0, 128).unwrap();
         assert_close(out[63], 0.999_996_986_143_361_7, 1e-5); // cos(0.0024551408)
         assert_close(out[127], 0.002_455_138_324_650_322_6, 1e-6); // sin(0.0024551408)
-        // Every other channel is exactly zero: no pair leaks.
+                                                                   // Every other channel is exactly zero: no pair leaks.
         let leaked: f32 = out
             .iter()
             .enumerate()

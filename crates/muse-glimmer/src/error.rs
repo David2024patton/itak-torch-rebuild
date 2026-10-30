@@ -83,6 +83,22 @@ pub enum GlimmerError {
         /// The model's vocabulary size.
         vocab_size: u32,
     },
+    /// Sampling was asked to draw from an empty logit slice.
+    EmptyLogits,
+    /// Every logit is negative infinity or NaN, so no probability
+    /// distribution exists to draw from. Named instead of letting a
+    /// softmax produce NaNs and a draw pick an arbitrary token.
+    NoViableToken,
+    /// A sampling parameter is outside the range where it means
+    /// anything (a negative temperature, a top-p above 1, a zero
+    /// repetition penalty). The config is refused whole, never clamped
+    /// silently into a different behavior than the caller asked for.
+    InvalidSampling {
+        /// The config field at fault (for example `temperature`).
+        field: &'static str,
+        /// What is wrong with the value.
+        detail: String,
+    },
 }
 
 impl fmt::Display for GlimmerError {
@@ -126,6 +142,18 @@ impl fmt::Display for GlimmerError {
                     f,
                     "token id {token} is outside the vocabulary of {vocab_size}"
                 )
+            }
+            GlimmerError::EmptyLogits => {
+                write!(f, "sampling called with zero logits")
+            }
+            GlimmerError::NoViableToken => {
+                write!(
+                    f,
+                    "every logit is negative infinity or NaN; no token can be drawn"
+                )
+            }
+            GlimmerError::InvalidSampling { field, detail } => {
+                write!(f, "sampling config field {field} is invalid: {detail}")
             }
         }
     }

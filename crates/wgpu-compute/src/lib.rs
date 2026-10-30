@@ -45,12 +45,20 @@
 //! positions and cross-checks), so attention runs end to end;
 //! and K8 (the embedding gather in every dtype `cpu-compute`
 //! accepts, plus the scale-then-softcap head finishing kernel,
-//! proven against `muse_glimmer::softcap_scale` and held for
-//! the device-resident forward, since the model applies the
-//! finishing itself today). A forward over this backend
+//! proven against `muse_glimmer::softcap_scale`; the trait
+//! path's model applies the finishing itself, the resident
+//! path runs this kernel). A forward over this backend
 //! therefore runs every step on the GPU. Nothing falls back
 //! silently; per-op CPU composition is the caller's load-time
 //! decision (BACKEND.md Section 6, level L2).
+//!
+//! The device-resident forward ([`session`]) composes the same
+//! kernels without the trait's host round trips: weights
+//! upload once, activations and KV stay on the device, and
+//! each forward chunk is one command-buffer chain with only
+//! the finished logits read back. The trait path remains the
+//! executable reference; the resident path is pinned to it by
+//! the cross-path session test.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -61,6 +69,7 @@ pub mod device;
 pub mod diag;
 pub mod error;
 pub mod kernels;
+pub mod session;
 
 pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
@@ -69,8 +78,11 @@ pub use error::{Result, WgpuError};
 pub use kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Shape, K1Weights};
 pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};
 pub use kernels::k3_q5k_gemv::{K3Call, K3Pipeline, K3Shape, K3Weights};
-pub use kernels::k4_rmsnorm::K4Pipeline;
-pub use kernels::k5_rope_kv::K5Pipeline;
-pub use kernels::k6_attention::{AttendGeom, GpuKvState, K6Pipeline, LayerKv};
-pub use kernels::k7_swiglu::K7Pipeline;
-pub use kernels::k8_head::K8Pipeline;
+pub use kernels::k4_rmsnorm::{K4Call, K4Pipeline};
+pub use kernels::k5_rope_kv::{K5AppendCall, K5Pipeline, K5RotateCall};
+pub use kernels::k6_attention::{
+    AttendGeom, DeviceKv, GpuKvState, K6Pipeline, K6ReduceCall, K6ScoresCall, LayerKv,
+};
+pub use kernels::k7_swiglu::{K7Call, K7Pipeline};
+pub use kernels::k8_head::{K8FinishCall, K8GatherRowsCall, K8Pipeline};
+pub use session::{ResidentSession, SessionStats};

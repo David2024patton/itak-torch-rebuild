@@ -157,3 +157,42 @@ fn k2_k3_shaders_compile_on_any_available_adapter() {
         }
     }
 }
+
+#[test]
+fn k4_to_k8_pipelines_compile_on_any_available_adapter() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping K4-K8 compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute K4-K8 compile test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("device for K4-K8 compile test");
+    // K8 in particular: the multi-row gathers and the
+    // scale-only finish landed with the resident session, and
+    // this is their adapter-independent compile gate.
+    let _k4 = wgpu_compute::K4Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K4 pipeline must build on {}: {e}", info.name));
+    let _k5 = wgpu_compute::K5Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K5 pipeline must build on {}: {e}", info.name));
+    let _k6 = wgpu_compute::K6Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K6 pipeline must build on {}: {e}", info.name));
+    let _k7 = wgpu_compute::K7Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K7 pipeline must build on {}: {e}", info.name));
+    let _k8 = wgpu_compute::K8Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K8 pipeline must build on {}: {e}", info.name));
+    eprintln!(
+        "K4-K8 shipped shaders compiled on {} ({:?})",
+        info.name, info.backend
+    );
+}

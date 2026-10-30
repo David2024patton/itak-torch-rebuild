@@ -131,8 +131,21 @@ fn gather_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 /// dequantizing its own element from the block bytes. Block
 /// layouts and decoders restate `gguf`'s reference
 /// implementations; dtype codes: 0 = Q4_K, 1 = Q6_K, 2 = Q5_K,
-/// 3 = Q8_0.
-const GATHER_QUANT_SHADER: &str = r#"
+/// 3 = Q8_0. Composed from the params/bindings head, the shared
+/// dequantizer helpers ([`QUANT_DEQUANT_HELPERS`], which the
+/// multi-row gather below also uses), and the single-row main.
+fn gather_quant_shader() -> String {
+    format!("{GATHER_QUANT_HEAD}{QUANT_DEQUANT_HELPERS}{GATHER_QUANT_MAIN}")
+}
+
+/// The quantized multi-row gather shader, composed the same
+/// way from its own head and main around the shared helpers.
+fn gather_rows_quant_shader() -> String {
+    format!("{GATHER_ROWS_QUANT_HEAD}{QUANT_DEQUANT_HELPERS}{GATHER_ROWS_QUANT_MAIN}")
+}
+
+/// The single-row gather's params and bindings head.
+const GATHER_QUANT_HEAD: &str = r#"
 struct GatherParams {
     width: u32,
     row_start: u32,
@@ -142,7 +155,14 @@ struct GatherParams {
 @group(0) @binding(0) var<storage, read> table: array<u32>;
 @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 @group(0) @binding(2) var<uniform> params: GatherParams;
+"#;
 
+/// The dequantizer helpers shared by both quantized gathers:
+/// byte access over the u32 table view and one dequantizer per
+/// dtype code (0 = Q4_K, 1 = Q6_K, 2 = Q5_K, 3 = Q8_0), each
+/// restating `gguf`'s reference decoder instruction for
+/// instruction.
+const QUANT_DEQUANT_HELPERS: &str = r#"
 // One byte of the table. The u32 view's word and lane are
 // host-endian: the host uploads little-endian bytes and reads
 // them back on the same machine class (see the K1 shader's note
@@ -243,7 +263,11 @@ fn dequant_q8_0(g: u32) -> f32 {
     }
     return d * f32(q);
 }
+"#;
 
+/// The single-row gather's main: one thread per output channel
+/// of the one row `row_start` selects.
+const GATHER_QUANT_MAIN: &str = r#"
 @compute @workgroup_size(256)
 fn gather_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let c = gid.x;
@@ -259,6 +283,111 @@ fn gather_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out[c] = dequant_q5k(g);
     } else {
         out[c] = dequant_q8_0(g);
+    }
+}
+"#;
+
+/// The multi-row gathers for the device-resident forward: one
+/// dispatch gathers a whole chunk of token rows, the token ids
+/// read from a device buffer (the only per-forward upload the
+/// resident path makes, a few bytes per token). One thread per
+/// output element of the `[rows][width]` block; the row's token
+/// comes from `tokens[row]`. Three storage families, mirroring
+/// the single-row gathers above.
+const GATHER_ROWS_F32_SHADER: &str = r#"
+struct GatherRowsParams {
+    width: u32,
+    rows: u32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> table: array<f32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: GatherRowsParams;
+
+@compute @workgroup_size(256)
+fn gather_rows_main(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat = (wid.y * params.grid_x + wid.x) * 256u + lid.x;
+    if (flat >= params.rows * params.width) {
+        return;
+    }
+    let row = flat / params.width;
+    out[flat] = table[tokens[row] * params.width + flat % params.width];
+}
+"#;
+
+/// The two-byte (F16 / BF16) multi-row gather; dtype codes as
+/// in the single-row shader (0 = F16, 1 = BF16).
+const GATHER_ROWS_HALF_SHADER: &str = r#"
+struct GatherRowsParams {
+    width: u32,
+    rows: u32,
+    dtype: u32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> table: array<u32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: GatherRowsParams;
+
+@compute @workgroup_size(256)
+fn gather_rows_main(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat = (wid.y * params.grid_x + wid.x) * 256u + lid.x;
+    if (flat >= params.rows * params.width) {
+        return;
+    }
+    let row = flat / params.width;
+    let g = tokens[row] * params.width + flat % params.width;
+    let bits = (table[g / 2u] >> (16u * (g % 2u))) & 0xFFFFu;
+    if (params.dtype == 0u) {
+        out[flat] = unpack2x16float(bits).x;
+    } else {
+        out[flat] = bitcast<f32>(bits << 16u);
+    }
+}
+"#;
+
+/// The quantized multi-row gather's params and bindings head;
+/// the shader is this head plus [`QUANT_DEQUANT_HELPERS`] plus
+/// [`GATHER_ROWS_QUANT_MAIN`]. Dtype codes as in the single-row
+/// shader (0 = Q4_K, 1 = Q6_K, 2 = Q5_K, 3 = Q8_0).
+const GATHER_ROWS_QUANT_HEAD: &str = r#"
+struct GatherRowsParams {
+    width: u32,
+    rows: u32,
+    dtype: u32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> table: array<u32>;
+@group(0) @binding(1) var<storage, read> tokens: array<u32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+@group(0) @binding(3) var<uniform> params: GatherRowsParams;
+"#;
+
+/// The quantized multi-row gather's main.
+const GATHER_ROWS_QUANT_MAIN: &str = r#"
+@compute @workgroup_size(256)
+fn gather_rows_main(@builtin(workgroup_id) wid: vec3<u32>,
+                    @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat = (wid.y * params.grid_x + wid.x) * 256u + lid.x;
+    if (flat >= params.rows * params.width) {
+        return;
+    }
+    let row = flat / params.width;
+    let g = tokens[row] * params.width + flat % params.width;
+    if (params.dtype == 0u) {
+        out[flat] = dequant_q4k(g);
+    } else if (params.dtype == 1u) {
+        out[flat] = dequant_q6k(g);
+    } else if (params.dtype == 2u) {
+        out[flat] = dequant_q5k(g);
+    } else {
+        out[flat] = dequant_q8_0(g);
     }
 }
 "#;
@@ -286,6 +415,33 @@ fn finish_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// The scale-only finishing shader: `muse_glimmer::softcap_scale`
+/// with no positive cap multiplies by the scale and stops, so
+/// the resident path needs the same half of the finishing
+/// without the tanh (the finish kernel above refuses a
+/// non-positive cap by design, keeping its one job). Same
+/// params layout as the finish shader, `cap` unused.
+const SCALE_SHADER: &str = r#"
+struct FinishParams {
+    n: u32,
+    scale: f32,
+    cap: f32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> logits: array<f32>;
+@group(0) @binding(1) var<uniform> params: FinishParams;
+
+@compute @workgroup_size(256)
+fn scale_main(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = (wid.y * params.grid_x + wid.x) * 256u + lid.x;
+    if (i < params.n) {
+        logits[i] = logits[i] * params.scale;
+    }
+}
+"#;
+
 /// Dtype codes for the quantized gather's uniform.
 const CODE_Q4_K: u32 = 0;
 const CODE_Q6_K: u32 = 1;
@@ -296,18 +452,91 @@ const CODE_Q8_0: u32 = 3;
 const CODE_F16: u32 = 0;
 const CODE_BF16: u32 = 1;
 
+/// One prepared multi-row gather dispatch: token ids from a
+/// device buffer, rows written to a device output. Encodable
+/// any number of times (the token buffer's contents are the
+/// caller's to rewrite between forwards). See
+/// [`K8Pipeline::prepare_gather_rows`].
+#[derive(Debug)]
+pub struct K8GatherRowsCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+impl K8GatherRowsCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k8 embedding gather rows"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+}
+
+/// One prepared head-finishing dispatch (scale-then-softcap,
+/// or scale-only through the sibling pipeline): in place over
+/// a logits buffer, encodable any number of times. See
+/// [`K8Pipeline::prepare_finish`] and
+/// [`K8Pipeline::prepare_scale`].
+#[derive(Debug)]
+pub struct K8FinishCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+impl K8FinishCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k8 head finish"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+}
+
 /// The compiled K8 pipelines (F32 gather, two-byte gather,
-/// quantized gather, head finish).
+/// quantized gather, their multi-row forms, head finish, and
+/// the scale-only finish).
 #[derive(Debug)]
 pub struct K8Pipeline {
     gather_f32: wgpu::ComputePipeline,
     gather_half: wgpu::ComputePipeline,
     gather_quant: wgpu::ComputePipeline,
+    gather_rows_f32: wgpu::ComputePipeline,
+    gather_rows_half: wgpu::ComputePipeline,
+    gather_rows_quant: wgpu::ComputePipeline,
     finish: wgpu::ComputePipeline,
+    scale: wgpu::ComputePipeline,
 }
 
 impl K8Pipeline {
-    /// Compile all four K8 pipelines on `device`.
+    /// Compile all K8 pipelines on `device`.
     ///
     /// # Errors
     ///
@@ -329,15 +558,203 @@ impl K8Pipeline {
         };
         let gather_f32 = build(GATHER_F32_SHADER, "gather_main", "k8 gather f32");
         let gather_half = build(GATHER_HALF_SHADER, "gather_main", "k8 gather half");
-        let gather_quant = build(GATHER_QUANT_SHADER, "gather_main", "k8 gather quant");
+        let gather_quant = build(&gather_quant_shader(), "gather_main", "k8 gather quant");
+        let gather_rows_f32 = build(
+            GATHER_ROWS_F32_SHADER,
+            "gather_rows_main",
+            "k8 gather rows f32",
+        );
+        let gather_rows_half = build(
+            GATHER_ROWS_HALF_SHADER,
+            "gather_rows_main",
+            "k8 gather rows half",
+        );
+        let gather_rows_quant = build(
+            &gather_rows_quant_shader(),
+            "gather_rows_main",
+            "k8 gather rows quant",
+        );
         let finish = build(FINISH_SHADER, "finish_main", "k8 head finish");
+        let scale = build(SCALE_SHADER, "scale_main", "k8 head scale");
         dbg_log!("k8 pipelines built");
         Ok(K8Pipeline {
             gather_f32,
             gather_half,
             gather_quant,
+            gather_rows_f32,
+            gather_rows_half,
+            gather_rows_quant,
             finish,
+            scale,
         })
+    }
+
+    /// Prepare a multi-row embedding gather over device
+    /// buffers: `rows` token ids read from `tokens` (rewritable
+    /// between forwards), rows of the resident `table` written
+    /// to `out` as `[rows][width]`. The table's dtype selects
+    /// the storage family, accepting exactly the set
+    /// [`K8Pipeline::embed`] accepts and refusing the rest by
+    /// name.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `"embed"` on a dtype
+    /// with no gather family or a zero geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_gather_rows(
+        &self,
+        ctx: &GpuContext,
+        table: &wgpu::Buffer,
+        tokens: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        dtype: Dtype,
+    ) -> GlimmerResult<K8GatherRowsCall> {
+        let step = "embed";
+        if rows == 0 || width == 0 {
+            return Err(step_failed(
+                step,
+                format!("gather of {rows} rows of width {width}: nothing to gather"),
+            ));
+        }
+        let (pipeline, code): (&wgpu::ComputePipeline, Option<u32>) = match dtype {
+            Dtype::F32 => (&self.gather_rows_f32, None),
+            Dtype::F16 => (&self.gather_rows_half, Some(CODE_F16)),
+            Dtype::Bf16 => (&self.gather_rows_half, Some(CODE_BF16)),
+            Dtype::Q4K => (&self.gather_rows_quant, Some(CODE_Q4_K)),
+            Dtype::Q6K => (&self.gather_rows_quant, Some(CODE_Q6_K)),
+            Dtype::Q5K => (&self.gather_rows_quant, Some(CODE_Q5_K)),
+            Dtype::Q8_0 => (&self.gather_rows_quant, Some(CODE_Q8_0)),
+            other => {
+                return Err(step_failed(
+                    step,
+                    format!(
+                        "embedding dtype {} (ggml type id {}) has no gather family in this backend",
+                        gguf::ggml::type_name(dtype_id(other)),
+                        dtype_id(other)
+                    ),
+                ))
+            }
+        };
+        let total_wg = ((rows * width) as u64).div_ceil(u64::from(WORKGROUP));
+        let grid = grid_dims(total_wg);
+        let param_bytes: Vec<u8> = match code {
+            Some(code) => [width as u32, rows as u32, code, grid.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            None => [width as u32, rows as u32, grid.0]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        };
+        let params_buf = ctx.uniform_buffer("k8 gather rows params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k8 gather rows bind group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: table.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: tokens.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        dbg_log!("k8 gather rows prepared: rows={rows} width={width} dtype={dtype:?}");
+        Ok(K8GatherRowsCall {
+            pipeline: pipeline.clone(),
+            bind_group,
+            grid,
+        })
+    }
+
+    /// Prepare a head-finishing dispatch over a device logits
+    /// buffer: scale, then tanh softcap, in place. The resident
+    /// form of [`K8Pipeline::finish`].
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when `cap` is not positive
+    /// and finite (the no-cap case is [`K8Pipeline::prepare_scale`]).
+    pub fn prepare_finish(
+        &self,
+        ctx: &GpuContext,
+        logits: &wgpu::Buffer,
+        n: usize,
+        scale: f32,
+        cap: f32,
+    ) -> Result<K8FinishCall> {
+        if !cap.is_finite() || cap <= 0.0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k8 finish".to_string(),
+                detail: format!("softcap {cap} is not positive and finite"),
+            });
+        }
+        Ok(self.prepare_finish_impl(ctx, &self.finish, logits, n, scale, cap))
+    }
+
+    /// Prepare a scale-only finishing dispatch over a device
+    /// logits buffer, for a model whose softcap is not positive
+    /// (`muse_glimmer::softcap_scale` applies the scale and
+    /// stops there in that case).
+    pub fn prepare_scale(
+        &self,
+        ctx: &GpuContext,
+        logits: &wgpu::Buffer,
+        n: usize,
+        scale: f32,
+    ) -> K8FinishCall {
+        self.prepare_finish_impl(ctx, &self.scale, logits, n, scale, 0.0)
+    }
+
+    /// Shared body of the two finishing prepares: the pipelines
+    /// share the params layout and the bind group shape.
+    fn prepare_finish_impl(
+        &self,
+        ctx: &GpuContext,
+        pipeline: &wgpu::ComputePipeline,
+        logits: &wgpu::Buffer,
+        n: usize,
+        scale: f32,
+        cap: f32,
+    ) -> K8FinishCall {
+        let total_wg = (n as u64).div_ceil(u64::from(WORKGROUP));
+        let grid = grid_dims(total_wg);
+        let params: [u32; 4] = [n as u32, scale.to_bits(), cap.to_bits(), grid.0];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k8 finish params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k8 finish bind group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: logits.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        K8FinishCall {
+            pipeline: pipeline.clone(),
+            bind_group,
+            grid,
+        }
     }
 
     /// Dispatch one gather pipeline for one token row and read
@@ -594,39 +1011,13 @@ impl K8Pipeline {
             return Ok(Vec::new());
         }
         let buf = ctx.upload_f32("k8 logits", logits);
-        let total_wg = (logits.len() as u64).div_ceil(u64::from(WORKGROUP));
-        let grid = grid_dims(total_wg);
-        let params: [u32; 4] = [logits.len() as u32, scale.to_bits(), cap.to_bits(), grid.0];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k8 finish params", &param_bytes);
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k8 finish bind group"),
-            layout: &self.finish.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let call = self.prepare_finish(ctx, &buf, logits.len(), scale, cap)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k8 finish run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k8 head finish"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.finish);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!("k8 finish: n={} scale={scale} cap={cap}", logits.len());
         ctx.read_f32(&buf, logits.len())
@@ -641,13 +1032,23 @@ mod tests {
     fn shaders_carry_their_entry_points() {
         assert!(GATHER_F32_SHADER.contains("fn gather_main"));
         assert!(GATHER_HALF_SHADER.contains("fn gather_main"));
-        assert!(GATHER_QUANT_SHADER.contains("fn dequant_q4k"));
-        assert!(GATHER_QUANT_SHADER.contains("fn dequant_q5k"));
-        assert!(GATHER_QUANT_SHADER.contains("fn dequant_q6k"));
-        assert!(GATHER_QUANT_SHADER.contains("fn dequant_q8_0"));
+        assert!(gather_quant_shader().contains("fn dequant_q4k"));
+        assert!(gather_quant_shader().contains("fn dequant_q5k"));
+        assert!(gather_quant_shader().contains("fn dequant_q6k"));
+        assert!(gather_quant_shader().contains("fn dequant_q8_0"));
         assert!(FINISH_SHADER.contains("fn finish_main"));
         // The finish order is pinned: scale first, then the cap.
         assert!(FINISH_SHADER.contains("logits[i] * params.scale"));
         assert!(FINISH_SHADER.contains("params.cap * tanh"));
+        // The multi-row gathers read their token ids from a
+        // device buffer and share the one dequantizer source.
+        assert!(GATHER_ROWS_F32_SHADER.contains("fn gather_rows_main"));
+        assert!(GATHER_ROWS_F32_SHADER.contains("tokens[row]"));
+        assert!(GATHER_ROWS_HALF_SHADER.contains("fn gather_rows_main"));
+        assert!(gather_rows_quant_shader().contains("fn gather_rows_main"));
+        assert!(gather_rows_quant_shader().contains("fn dequant_q4k"));
+        assert!(gather_rows_quant_shader().contains("tokens[row]"));
+        assert!(SCALE_SHADER.contains("fn scale_main"));
+        assert!(!SCALE_SHADER.contains("tanh"));
     }
 }

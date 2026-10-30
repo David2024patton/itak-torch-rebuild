@@ -193,6 +193,54 @@ impl WgpuCompute {
         &self.ctx
     }
 
+    /// The K1 (Q4_K GEMV) pipeline. Crate-internal: the
+    /// device-resident session ([`crate::session`]) composes the
+    /// same pipelines this backend's trait implementation uses,
+    /// so the two paths can never drift onto different kernels.
+    pub(crate) fn k1(&self) -> &K1Pipeline {
+        &self.k1
+    }
+
+    /// The K2 (Q6_K GEMV) pipeline. See [`WgpuCompute::k1`].
+    pub(crate) fn k2(&self) -> &K2Pipeline {
+        &self.k2
+    }
+
+    /// The K3 (Q5_K GEMV) pipeline. See [`WgpuCompute::k1`].
+    pub(crate) fn k3(&self) -> &K3Pipeline {
+        &self.k3
+    }
+
+    /// The K4 (RMSNorm and residual add) pipeline. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k4(&self) -> &K4Pipeline {
+        &self.k4
+    }
+
+    /// The K5 (RoPE and KV append) pipeline. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k5(&self) -> &K5Pipeline {
+        &self.k5
+    }
+
+    /// The K6 (grouped-query attention) pipeline. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k6(&self) -> &K6Pipeline {
+        &self.k6
+    }
+
+    /// The K7 (SwiGLU and attention gate) pipeline. See
+    /// [`WgpuCompute::k1`].
+    pub(crate) fn k7(&self) -> &K7Pipeline {
+        &self.k7
+    }
+
+    /// The K8 (embedding gather and head finishing) pipeline.
+    /// See [`WgpuCompute::k1`].
+    pub(crate) fn k8(&self) -> &K8Pipeline {
+        &self.k8
+    }
+
     /// Drop all stored KV state, device buffers and host mirror.
     /// The next attention call rebuilds the state from its
     /// config and expects the caller's sequence position to be 0
@@ -590,6 +638,9 @@ impl Compute for WgpuCompute {
             first_pos,
             start_pos: start,
             window,
+            // The trait state's ring holds exactly one window,
+            // so its slot modulus is the window itself.
+            ring: window,
         };
         let scores = self
             .k6

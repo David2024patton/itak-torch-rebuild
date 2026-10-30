@@ -84,6 +84,41 @@ fn gate_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// One prepared K7 dispatch: a bind group plus grid dimensions,
+/// built once for a fixed (buffers, length) combination and
+/// encodable any number of times into any command encoder. The
+/// device-resident forward's unit of composition (see
+/// [`crate::session`]); the one-shot entry points below prepare,
+/// encode, submit, and read back.
+#[derive(Debug)]
+pub struct K7Call {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+impl K7Call {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k7 dispatch"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+}
+
 /// The compiled K7 pipelines (SwiGLU and the attention gate).
 #[derive(Debug)]
 pub struct K7Pipeline {
@@ -118,6 +153,79 @@ impl K7Pipeline {
         Ok(K7Pipeline { swiglu, gate })
     }
 
+    /// Prepare an elementwise dispatch over device buffers:
+    /// `out[i] = op(a[i], b[i])` for `n` elements, through
+    /// `pipeline`.
+    fn prepare(
+        &self,
+        ctx: &GpuContext,
+        pipeline: &wgpu::ComputePipeline,
+        a: &wgpu::Buffer,
+        b: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: usize,
+    ) -> K7Call {
+        let total = (n as u64).div_ceil(u64::from(WORKGROUP));
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total);
+        let params: [u32; 2] = [n as u32, grid.0];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k7 params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k7 bind group"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        K7Call {
+            pipeline: pipeline.clone(),
+            bind_group,
+            grid,
+        }
+    }
+
+    /// Prepare a SwiGLU dispatch over device buffers:
+    /// `out = silu(gate) * up` elementwise, `n` elements.
+    pub fn prepare_swiglu(
+        &self,
+        ctx: &GpuContext,
+        gate: &wgpu::Buffer,
+        up: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: usize,
+    ) -> K7Call {
+        self.prepare(ctx, &self.swiglu, gate, up, out, n)
+    }
+
+    /// Prepare an attention-gate dispatch over device buffers:
+    /// `out = attn_out * sigmoid(gate)` elementwise, `n`
+    /// elements.
+    pub fn prepare_gate(
+        &self,
+        ctx: &GpuContext,
+        attn_out: &wgpu::Buffer,
+        gate: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: usize,
+    ) -> K7Call {
+        self.prepare(ctx, &self.gate, attn_out, gate, out, n)
+    }
+
     /// Shared elementwise body: upload both operands, dispatch,
     /// read back.
     fn run(
@@ -140,47 +248,13 @@ impl K7Pipeline {
         let a_buf = ctx.upload_f32("k7 a", a);
         let b_buf = ctx.upload_f32("k7 b", b);
         let out_buf = ctx.scratch_buffer("k7 output", (a.len() * 4) as u64);
-        let total = (a.len() as u64).div_ceil(u64::from(WORKGROUP));
-        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total);
-        let params: [u32; 2] = [a.len() as u32, grid.0];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k7 params", &param_bytes);
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k7 bind group"),
-            layout: &pipeline.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let call = self.prepare(ctx, pipeline, &a_buf, &b_buf, &out_buf, a.len());
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k7 run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some(what),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!("k7 {what}: n={}", a.len());
         ctx.read_f32(&out_buf, a.len())

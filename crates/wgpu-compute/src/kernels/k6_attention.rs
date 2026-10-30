@@ -86,6 +86,7 @@ struct ScoresParams {
     scale: f32,
     total: u32,
     grid_x: u32,
+    ring: u32,
 }
 
 @group(0) @binding(0) var<storage, read> q: array<f32>;
@@ -117,9 +118,15 @@ fn scores_main(@builtin(workgroup_id) wid: vec3<u32>,
         scores[flat] = -1.0e30;
         return;
     }
+    // The slot modulus is the ring capacity, NOT the mask
+    // window: the two are the same for a decode-step ring, but
+    // a chunked prefill ring is larger than the window (it must
+    // hold every position any query in the chunk can see), and
+    // slotting by the window there would alias positions a
+    // chunk apart onto one slot.
     var slot = kp;
-    if (params.window != 0u) {
-        slot = kp % params.window;
+    if (params.ring != 0u) {
+        slot = kp % params.ring;
     }
     let kv_head = head / (params.q_heads / params.kv_heads);
     let q_base = (row * params.q_heads + head) * params.head_dim;
@@ -143,6 +150,7 @@ struct ReduceParams {
     first_pos: u32,
     window: u32,
     grid_x: u32,
+    ring: u32,
 }
 
 @group(0) @binding(0) var<storage, read> scores: array<f32>;
@@ -179,9 +187,11 @@ fn reduce_main(@builtin(workgroup_id) wid: vec3<u32>,
         }
         let w = exp(sc - m);
         let kp = params.first_pos + idx;
+        // Slot modulus is the ring capacity, as in the scores
+        // kernel (see its note): never the mask window.
         var slot = kp;
-        if (params.window != 0u) {
-            slot = kp % params.window;
+        if (params.ring != 0u) {
+            slot = kp % params.ring;
         }
         let v = values[(slot * params.kv_heads + kv_head) * params.head_dim + d];
         acc += w * v;
@@ -227,92 +237,51 @@ pub struct LayerKv {
     pub capacity: usize,
 }
 
-/// The backend-owned KV state: the host mirror cache (the
-/// position contract's other half) plus per-layer device buffers.
+/// The device half of the KV design, factored out of
+/// [`GpuKvState`] so the device-resident session
+/// ([`crate::session`]) can own the same per-layer buffers
+/// without the host mirror: one buffer pair per layer, global
+/// layers addressed by absolute position and grown
+/// geometrically, windowed layers a fixed ring of `window`
+/// slots, exactly the growth and slotting law the trait path
+/// runs. Positions themselves are the owner's business here;
+/// this struct manages storage only.
 #[derive(Debug)]
-pub struct GpuKvState {
-    host: KvCache,
-    shape: CacheShape,
+pub struct DeviceKv {
+    kinds: Vec<AttnLayerKind>,
+    ring: usize,
     layers: Vec<Option<LayerKv>>,
 }
 
-impl GpuKvState {
-    /// Build the state for `cfg`'s shape: the host mirror from
-    /// the config's layer pattern, no device buffers yet (they
-    /// allocate on first append, per layer).
-    ///
-    /// # Errors
-    ///
-    /// [`GlimmerError::StepFailed`] under `step` when the
-    /// `attention` crate refuses the pattern.
-    pub fn build(cfg: &GlimmerConfig, step: &'static str) -> GlimmerResult<Self> {
-        let pattern: Vec<AttnLayerKind> = cfg
-            .layers
-            .iter()
-            .map(|kind| match kind {
-                LayerKind::Global => AttnLayerKind::Global,
-                LayerKind::SlidingWindow => AttnLayerKind::Windowed {
-                    window: cfg.sliding_window as usize,
-                },
-            })
-            .collect();
-        let host = KvCache::new(&pattern, cfg.kv_heads as usize, cfg.key_length as usize)
-            .map_err(|e| step_failed(step, e.to_string()))?;
-        dbg_log!(
-            "gpu kv state built layers={} kv_heads={} head_dim={} window={}",
-            pattern.len(),
-            cfg.kv_heads,
-            cfg.key_length,
-            cfg.sliding_window
-        );
-        Ok(GpuKvState {
-            host,
-            shape: CacheShape::of(cfg),
-            layers: (0..pattern.len()).map(|_| None).collect(),
-        })
-    }
-
-    /// Refuse when `cfg`'s shape differs from the built one.
-    ///
-    /// # Errors
-    ///
-    /// [`GlimmerError::StepFailed`] under `step` on a mismatch,
-    /// with `cpu-compute`'s wording for the same refusal.
-    pub fn check_shape(&self, cfg: &GlimmerConfig, step: &'static str) -> GlimmerResult<()> {
-        if self.shape != CacheShape::of(cfg) {
-            return Err(step_failed(
-                step,
-                "this WgpuCompute already serves a model of a different shape; \
-                 construct a fresh WgpuCompute per model (or reset this one) \
-                 instead of retargeting it mid-sequence",
-            ));
-        }
-        Ok(())
-    }
-
-    /// The host mirror cache (positions and stored rows).
+impl DeviceKv {
+    /// Build the storage for a layer pattern: no buffers yet
+    /// (they allocate on first append, per layer). `ring` is
+    /// the capacity every windowed layer's ring gets: the
+    /// sliding window itself for a step-at-a-time driver (the
+    /// trait state), or the window plus chunk headroom for a
+    /// chunked driver (the resident session; see
+    /// [`AttendGeom::ring`] for why the two differ).
     #[must_use]
-    pub fn host(&self) -> &KvCache {
-        &self.host
+    pub fn new(pattern: &[AttnLayerKind], ring: usize) -> Self {
+        DeviceKv {
+            kinds: pattern.to_vec(),
+            ring,
+            layers: (0..pattern.len()).map(|_| None).collect(),
+        }
     }
 
-    /// The host mirror cache, mutably (appends land here after
-    /// K5 rotates, with the read-back rows, so the mirror holds
-    /// exactly what the device computed).
-    pub fn host_mut(&mut self) -> &mut KvCache {
-        &mut self.host
-    }
-
-    /// The sliding window this state was built with.
-    fn window(&self) -> usize {
-        self.shape.sliding_window as usize
+    /// The windowed layers' ring capacity.
+    #[must_use]
+    pub fn ring(&self) -> usize {
+        self.ring
     }
 
     /// Make sure layer `layer`'s device buffers hold at least
     /// the rows its kind needs after `appended_total` appends:
-    /// exactly `window` rows for a windowed layer (allocated
-    /// once), geometric growth for a global one (old contents
-    /// copied across). Returns the layer's buffers.
+    /// exactly the ring capacity for a windowed layer
+    /// (allocated once), geometric growth for a global one
+    /// (old contents copied across). Returns the layer's
+    /// buffers.
     ///
     /// # Errors
     ///
@@ -326,13 +295,15 @@ impl GpuKvState {
         appended_total: usize,
         step: &'static str,
     ) -> GlimmerResult<&LayerKv> {
-        let kind = self
-            .host
-            .layer_kind(layer)
-            .map_err(|e| step_failed(step, e.to_string()))?;
+        let kind = *self.kinds.get(layer).ok_or_else(|| {
+            step_failed(
+                step,
+                format!("layer {layer} is outside the KV state's layer pattern"),
+            )
+        })?;
         let needed = match kind {
             AttnLayerKind::Global => appended_total,
-            AttnLayerKind::Windowed { .. } => self.window(),
+            AttnLayerKind::Windowed { .. } => self.ring,
         };
         let slot = self.layers.get_mut(layer).ok_or_else(|| {
             step_failed(
@@ -373,6 +344,12 @@ impl GpuKvState {
         Ok(slot.as_ref().expect("the layer was just ensured"))
     }
 
+    /// How many layers the pattern holds.
+    #[must_use]
+    pub fn layer_count(&self) -> usize {
+        self.layers.len()
+    }
+
     /// Layer `layer`'s device buffers, once ensured.
     ///
     /// # Errors
@@ -389,6 +366,117 @@ impl GpuKvState {
                     format!("layer {layer} has no device KV buffers; ensure_layer runs first"),
                 )
             })
+    }
+}
+
+/// The backend-owned KV state: the host mirror cache (the
+/// position contract's other half) plus per-layer device buffers
+/// (in [`DeviceKv`], the storage half).
+#[derive(Debug)]
+pub struct GpuKvState {
+    host: KvCache,
+    shape: CacheShape,
+    kv: DeviceKv,
+}
+
+impl GpuKvState {
+    /// Build the state for `cfg`'s shape: the host mirror from
+    /// the config's layer pattern, no device buffers yet (they
+    /// allocate on first append, per layer).
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `step` when the
+    /// `attention` crate refuses the pattern.
+    pub fn build(cfg: &GlimmerConfig, step: &'static str) -> GlimmerResult<Self> {
+        let pattern: Vec<AttnLayerKind> = cfg
+            .layers
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Global => AttnLayerKind::Global,
+                LayerKind::SlidingWindow => AttnLayerKind::Windowed {
+                    window: cfg.sliding_window as usize,
+                },
+            })
+            .collect();
+        let host = KvCache::new(&pattern, cfg.kv_heads as usize, cfg.key_length as usize)
+            .map_err(|e| step_failed(step, e.to_string()))?;
+        dbg_log!(
+            "gpu kv state built layers={} kv_heads={} head_dim={} window={}",
+            pattern.len(),
+            cfg.kv_heads,
+            cfg.key_length,
+            cfg.sliding_window
+        );
+        let kv = DeviceKv::new(&pattern, cfg.sliding_window as usize);
+        Ok(GpuKvState {
+            host,
+            shape: CacheShape::of(cfg),
+            kv,
+        })
+    }
+
+    /// Refuse when `cfg`'s shape differs from the built one.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `step` on a mismatch,
+    /// with `cpu-compute`'s wording for the same refusal.
+    pub fn check_shape(&self, cfg: &GlimmerConfig, step: &'static str) -> GlimmerResult<()> {
+        if self.shape != CacheShape::of(cfg) {
+            return Err(step_failed(
+                step,
+                "this WgpuCompute already serves a model of a different shape; \
+                 construct a fresh WgpuCompute per model (or reset this one) \
+                 instead of retargeting it mid-sequence",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The host mirror cache (positions and stored rows).
+    #[must_use]
+    pub fn host(&self) -> &KvCache {
+        &self.host
+    }
+
+    /// The host mirror cache, mutably (appends land here after
+    /// K5 rotates, with the read-back rows, so the mirror holds
+    /// exactly what the device computed).
+    pub fn host_mut(&mut self) -> &mut KvCache {
+        &mut self.host
+    }
+
+    /// Make sure layer `layer`'s device buffers hold at least
+    /// the rows its kind needs after `appended_total` appends
+    /// (the storage law lives in [`DeviceKv`]; this is the
+    /// mirror-owning state's delegation to it). Returns the
+    /// layer's buffers.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `step` for an
+    /// out-of-range layer.
+    pub fn ensure_layer(
+        &mut self,
+        ctx: &GpuContext,
+        layer: usize,
+        kv_width: usize,
+        appended_total: usize,
+        step: &'static str,
+    ) -> GlimmerResult<&LayerKv> {
+        self.kv
+            .ensure_layer(ctx, layer, kv_width, appended_total, step)
+    }
+
+    /// Layer `layer`'s device buffers, once ensured.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `step` when the layer
+    /// was never ensured.
+    pub fn layer(&self, layer: usize, step: &'static str) -> GlimmerResult<&LayerKv> {
+        self.kv.layer(layer, step)
     }
 }
 
@@ -412,6 +500,154 @@ pub struct AttendGeom {
     pub start_pos: usize,
     /// The layer's window, or `None` for a global layer.
     pub window: Option<usize>,
+    /// The KV ring's capacity for a windowed layer: positions
+    /// are slotted modulo this in the device buffers. Equal to
+    /// the window when the ring holds exactly one window (the
+    /// trait state's layout); larger for the resident session,
+    /// whose chunked prefill needs every position any query in
+    /// the chunk can see to survive the chunk's appends. The
+    /// mask distance is always `window`, never this. `None`
+    /// for a global layer (absolute addressing).
+    pub ring: Option<usize>,
+}
+
+/// One prepared scores dispatch. The geometry's position part
+/// (stored count, first stored position, query start) changes
+/// every forward, so the call keeps its uniform buffer and
+/// rewrites it wholesale through
+/// [`K6ScoresCall::set_geometry`]; the buffers and the head
+/// geometry are fixed at prepare time. The scores buffer it
+/// writes is the caller's, sized for the largest geometry the
+/// caller will set. This is the device-resident forward's unit
+/// of composition (see [`crate::session`]); the one-shot entry
+/// points prepare, encode, and submit.
+#[derive(Debug)]
+pub struct K6ScoresCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    grid: (u32, u32),
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    ring: Option<usize>,
+}
+
+impl K6ScoresCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k6 attention scores"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+
+    /// Point the scores at a new position window: `stored`
+    /// entries are visible, the oldest at absolute position
+    /// `first_pos`, the query rows starting at `start_pos`.
+    /// Rewrites the uniform and the dispatch grid in one go.
+    /// Same queue-ordering contract as
+    /// [`crate::kernels::k5_rope_kv::K5RotateCall::set_start_position`]:
+    /// call it while no submission using this call is in flight.
+    pub fn set_geometry(
+        &mut self,
+        ctx: &GpuContext,
+        stored: usize,
+        first_pos: usize,
+        start_pos: usize,
+    ) {
+        let total = self.rows * self.q_heads * stored;
+        let total_wg = (total as u64).div_ceil(u64::from(SCORES_WORKGROUP));
+        self.grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let params: [u32; 12] = [
+            self.rows as u32,
+            self.q_heads as u32,
+            self.kv_heads as u32,
+            self.head_dim as u32,
+            stored as u32,
+            first_pos as u32,
+            start_pos as u32,
+            self.window.map_or(0, |w| w as u32),
+            scale.to_bits(),
+            total as u32,
+            self.grid.0,
+            self.ring.map_or(0, |r| r as u32),
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        ctx.queue.write_buffer(&self.params, 0, &param_bytes);
+    }
+}
+
+/// One prepared reduce dispatch, the scores call's sibling: the
+/// position part of its geometry rewrites through
+/// [`K6ReduceCall::set_geometry`]; its grid (one workgroup per
+/// query row and head) is position-independent.
+#[derive(Debug)]
+pub struct K6ReduceCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    grid: (u32, u32),
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    ring: Option<usize>,
+}
+
+impl K6ReduceCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k6 attention reduce"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+
+    /// Point the reduce at a new position window: `stored`
+    /// entries, the oldest at absolute position `first_pos`.
+    /// Same queue-ordering contract as the scores call's setter.
+    pub fn set_geometry(&mut self, ctx: &GpuContext, stored: usize, first_pos: usize) {
+        let params: [u32; 8] = [
+            self.q_heads as u32,
+            self.kv_heads as u32,
+            self.head_dim as u32,
+            stored as u32,
+            first_pos as u32,
+            self.window.map_or(0, |w| w as u32),
+            self.grid.0,
+            self.ring.map_or(0, |r| r as u32),
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        ctx.queue.write_buffer(&self.params, 0, &param_bytes);
+    }
 }
 
 /// The compiled K6 pipelines (scores and reduce).
@@ -482,42 +718,25 @@ impl K6Pipeline {
         Ok(())
     }
 
-    /// Run the scores kernel: `q` (device buffer, `[rows,
-    /// q_width]`) against the layer's resident keys, producing
-    /// the `[rows, q_heads, stored]` score buffer (device-side;
-    /// the reduce kernel consumes it).
+    /// Prepare a scores dispatch: `q` (device buffer, `[rows,
+    /// q_width]`) against the layer's resident keys, writing the
+    /// `[rows, q_heads, stored]` scores into the caller's
+    /// `scores_buf` (sized for the largest geometry the caller
+    /// will set through the returned call).
     ///
     /// # Errors
     ///
     /// [`WgpuError::InvalidTensor`] on an unusable geometry.
-    pub fn scores(
+    pub fn prepare_scores(
         &self,
         ctx: &GpuContext,
         q: &wgpu::Buffer,
         kv: &LayerKv,
+        scores_buf: &wgpu::Buffer,
         geom: &AttendGeom,
-    ) -> Result<wgpu::Buffer> {
+    ) -> Result<K6ScoresCall> {
         Self::check_geom(geom)?;
-        let total = geom.rows * geom.q_heads * geom.stored;
-        let scores_buf = ctx.scratch_buffer("k6 scores", (total * 4) as u64);
-        let total_wg = (total as u64).div_ceil(u64::from(SCORES_WORKGROUP));
-        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
-        let scale = 1.0f32 / (geom.head_dim as f32).sqrt();
-        let params: [u32; 11] = [
-            geom.rows as u32,
-            geom.q_heads as u32,
-            geom.kv_heads as u32,
-            geom.head_dim as u32,
-            geom.stored as u32,
-            geom.first_pos as u32,
-            geom.start_pos as u32,
-            geom.window.map_or(0, |w| w as u32),
-            scale.to_bits(),
-            total as u32,
-            grid.0,
-        ];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k6 scores params", &param_bytes);
+        let params_buf = ctx.uniform_buffer("k6 scores params", &[0u8; 48]);
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k6 scores bind group"),
             layout: &self.scores.get_bind_group_layout(0),
@@ -540,20 +759,47 @@ impl K6Pipeline {
                 },
             ],
         });
+        let mut call = K6ScoresCall {
+            pipeline: self.scores.clone(),
+            bind_group,
+            params: params_buf,
+            grid: (0, 0),
+            rows: geom.rows,
+            q_heads: geom.q_heads,
+            kv_heads: geom.kv_heads,
+            head_dim: geom.head_dim,
+            window: geom.window,
+            ring: geom.ring,
+        };
+        call.set_geometry(ctx, geom.stored, geom.first_pos, geom.start_pos);
+        Ok(call)
+    }
+
+    /// Run the scores kernel: `q` (device buffer, `[rows,
+    /// q_width]`) against the layer's resident keys, producing
+    /// the `[rows, q_heads, stored]` score buffer (device-side;
+    /// the reduce kernel consumes it).
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry.
+    pub fn scores(
+        &self,
+        ctx: &GpuContext,
+        q: &wgpu::Buffer,
+        kv: &LayerKv,
+        geom: &AttendGeom,
+    ) -> Result<wgpu::Buffer> {
+        Self::check_geom(geom)?;
+        let total = geom.rows * geom.q_heads * geom.stored;
+        let scores_buf = ctx.scratch_buffer("k6 scores", (total * 4) as u64);
+        let call = self.prepare_scores(ctx, q, kv, &scores_buf, geom)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k6 scores run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k6 attention scores"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.scores);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!(
             "k6 scores: rows={} q_heads={} stored={} first_pos={}",
@@ -563,6 +809,62 @@ impl K6Pipeline {
             geom.first_pos
         );
         Ok(scores_buf)
+    }
+
+    /// Prepare a reduce dispatch over a scores buffer and the
+    /// layer's resident values, writing the attention output
+    /// `[rows, q_width]` into the caller's `out` buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry.
+    pub fn prepare_reduce(
+        &self,
+        ctx: &GpuContext,
+        scores: &wgpu::Buffer,
+        kv: &LayerKv,
+        out: &wgpu::Buffer,
+        geom: &AttendGeom,
+    ) -> Result<K6ReduceCall> {
+        Self::check_geom(geom)?;
+        let total_wg = (geom.rows * geom.q_heads) as u64;
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
+        let params_buf = ctx.uniform_buffer("k6 reduce params", &[0u8; 32]);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k6 reduce bind group"),
+            layout: &self.reduce.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: scores.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: kv.v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut call = K6ReduceCall {
+            pipeline: self.reduce.clone(),
+            bind_group,
+            params: params_buf,
+            grid,
+            q_heads: geom.q_heads,
+            kv_heads: geom.kv_heads,
+            head_dim: geom.head_dim,
+            window: geom.window,
+            ring: geom.ring,
+        };
+        call.set_geometry(ctx, geom.stored, geom.first_pos);
+        Ok(call)
     }
 
     /// Run the reduce kernel over a scores buffer from
@@ -584,55 +886,13 @@ impl K6Pipeline {
         Self::check_geom(geom)?;
         let out_elems = geom.rows * geom.q_heads * geom.head_dim;
         let out_buf = ctx.scratch_buffer("k6 attention output", (out_elems * 4) as u64);
-        let total_wg = (geom.rows * geom.q_heads) as u64;
-        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
-        let params: [u32; 7] = [
-            geom.q_heads as u32,
-            geom.kv_heads as u32,
-            geom.head_dim as u32,
-            geom.stored as u32,
-            geom.first_pos as u32,
-            geom.window.map_or(0, |w| w as u32),
-            grid.0,
-        ];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k6 reduce params", &param_bytes);
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k6 reduce bind group"),
-            layout: &self.reduce.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: scores.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: kv.v.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let call = self.prepare_reduce(ctx, scores, kv, &out_buf, geom)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k6 reduce run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k6 attention reduce"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.reduce);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!(
             "k6 reduce: rows={} q_heads={} stored={}",
@@ -669,6 +929,7 @@ mod tests {
             first_pos: 0,
             start_pos: 0,
             window: Some(2048),
+            ring: Some(2048),
         };
         assert!(K6Pipeline::check_geom(&geom).is_ok());
         geom.head_dim = 256;

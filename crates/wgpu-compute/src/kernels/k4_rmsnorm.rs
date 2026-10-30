@@ -144,6 +144,43 @@ mod mode {
     pub const WEIGHTED_RESIDUAL: u32 = 2;
 }
 
+/// One prepared K4 dispatch: a bind group plus grid dimensions,
+/// built once for a fixed (buffers, rows, width, mode, eps)
+/// combination and encodable any number of times into any
+/// command encoder. This is the device-resident forward's unit
+/// of composition (see [`crate::session`]): the one-shot entry
+/// points below prepare, encode, submit, and read back; the
+/// resident path prepares once per shape and encodes the whole
+/// forward into a single submission.
+#[derive(Debug)]
+pub struct K4Call {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+}
+
+impl K4Call {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k4 dispatch"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+}
+
 /// The compiled K4 pipelines (norm and add), plus the dummy
 /// buffer the norm shader binds for inputs a mode does not read.
 #[derive(Debug)]
@@ -194,12 +231,181 @@ impl K4Pipeline {
         Ok(K4Pipeline { norm, add, dummy })
     }
 
-    /// Shared norm body: upload, dispatch one workgroup per row,
-    /// read back. `weight` and `residual` are bound only by the
-    /// modes that read them; the caller validates shapes.
+    /// Prepare a norm dispatch over device buffers: `x` read,
+    /// `out` written, `weight` and `residual` bound when the mode
+    /// reads them (a dummy binding otherwise). `rows` rows of
+    /// `width` channels; the caller validates shapes, exactly as
+    /// the one-shot entry points do before they call this.
     // One argument per bound input plus the mode and eps: the
     // parameter list is the bind group's shape, kept flat on
     // purpose for this private helper.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_norm(
+        &self,
+        ctx: &GpuContext,
+        x: &wgpu::Buffer,
+        weight: Option<&wgpu::Buffer>,
+        residual: Option<&wgpu::Buffer>,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        mode_value: u32,
+        eps: f32,
+    ) -> K4Call {
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(rows as u64);
+        let params: [u32; 5] = [width as u32, rows as u32, grid.0, mode_value, eps.to_bits()];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k4 norm params", &param_bytes);
+        let dummy = self.dummy.clone();
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k4 norm bind group"),
+            layout: &self.norm.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: x.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: weight.unwrap_or(&dummy).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: residual.unwrap_or(&dummy).as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        K4Call {
+            pipeline: self.norm.clone(),
+            bind_group,
+            grid,
+        }
+    }
+
+    /// Prepare a weighted RMSNorm over device buffers:
+    /// `x / sqrt(mean(x^2) + eps) * w` per row, `x` holding
+    /// `rows` rows of the weight's width, written to `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_rms_norm(
+        &self,
+        ctx: &GpuContext,
+        x: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> K4Call {
+        self.prepare_norm(
+            ctx,
+            x,
+            Some(weight),
+            None,
+            out,
+            rows,
+            width,
+            mode::WEIGHTED,
+            eps,
+        )
+    }
+
+    /// Prepare a weightless RMSNorm over device buffers (the
+    /// post-embedding form): `x / sqrt(mean(x^2) + eps)` per row.
+    pub fn prepare_rms_norm_plain(
+        &self,
+        ctx: &GpuContext,
+        x: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> K4Call {
+        self.prepare_norm(ctx, x, None, None, out, rows, width, mode::PLAIN, eps)
+    }
+
+    /// Prepare the fused post-norm step over device buffers:
+    /// `residual + rms_norm(branch) * w` per row in one pass,
+    /// written to `out` (which aliases neither input).
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_norm_residual(
+        &self,
+        ctx: &GpuContext,
+        residual: &wgpu::Buffer,
+        branch: &wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> K4Call {
+        self.prepare_norm(
+            ctx,
+            branch,
+            Some(weight),
+            Some(residual),
+            out,
+            rows,
+            width,
+            mode::WEIGHTED_RESIDUAL,
+            eps,
+        )
+    }
+
+    /// Prepare a residual add over device buffers: `a + b`
+    /// elementwise into `out`, `n` elements.
+    pub fn prepare_add(
+        &self,
+        ctx: &GpuContext,
+        a: &wgpu::Buffer,
+        b: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: usize,
+    ) -> K4Call {
+        let total = (n as u64).div_ceil(u64::from(WORKGROUP));
+        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total);
+        let params: [u32; 2] = [n as u32, grid.0];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buf = ctx.uniform_buffer("k4 add params", &param_bytes);
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k4 add bind group"),
+            layout: &self.add.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        K4Call {
+            pipeline: self.add.clone(),
+            bind_group,
+            grid,
+        }
+    }
+
+    /// Shared norm body: upload, dispatch one workgroup per row,
+    /// read back. `weight` and `residual` are bound only by the
+    /// modes that read them; the caller validates shapes.
     #[allow(clippy::too_many_arguments)]
     fn run_norm(
         &self,
@@ -213,59 +419,26 @@ impl K4Pipeline {
         eps: f32,
     ) -> Result<Vec<f32>> {
         let x_buf = ctx.upload_f32("k4 norm input", x);
-        let w_buf = match weight {
-            Some(w) => ctx.upload_f32("k4 norm weight", w),
-            None => self.dummy.clone(),
-        };
-        let r_buf = match residual {
-            Some(r) => ctx.upload_f32("k4 norm residual", r),
-            None => self.dummy.clone(),
-        };
+        let w_buf = weight.map(|w| ctx.upload_f32("k4 norm weight", w));
+        let r_buf = residual.map(|r| ctx.upload_f32("k4 norm residual", r));
         let out_buf = ctx.scratch_buffer("k4 norm output", (x.len() * 4) as u64);
-        let grid = crate::kernels::k1_q4k_gemv::grid_dims(rows as u64);
-        let params: [u32; 5] = [width as u32, rows as u32, grid.0, mode_value, eps.to_bits()];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k4 norm params", &param_bytes);
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k4 norm bind group"),
-            layout: &self.norm.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: x_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: w_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: r_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let call = self.prepare_norm(
+            ctx,
+            &x_buf,
+            w_buf.as_ref(),
+            r_buf.as_ref(),
+            &out_buf,
+            rows,
+            width,
+            mode_value,
+            eps,
+        );
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k4 norm run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k4 rmsnorm"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.norm);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!("k4 norm: rows={rows} width={width} mode={mode_value} eps={eps}");
         ctx.read_f32(&out_buf, x.len())
@@ -380,47 +553,13 @@ impl K4Pipeline {
         let a_buf = ctx.upload_f32("k4 add a", a);
         let b_buf = ctx.upload_f32("k4 add b", b);
         let out_buf = ctx.scratch_buffer("k4 add output", (a.len() * 4) as u64);
-        let total = (a.len() as u64).div_ceil(u64::from(WORKGROUP));
-        let grid = crate::kernels::k1_q4k_gemv::grid_dims(total);
-        let params: [u32; 2] = [a.len() as u32, grid.0];
-        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let params_buf = ctx.uniform_buffer("k4 add params", &param_bytes);
-        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k4 add bind group"),
-            layout: &self.add.get_bind_group_layout(0),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: a_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: b_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: out_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: params_buf.as_entire_binding(),
-                },
-            ],
-        });
+        let call = self.prepare_add(ctx, &a_buf, &b_buf, &out_buf, a.len());
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k4 add run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k4 residual add"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.add);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!("k4 add: n={}", a.len());
         ctx.read_f32(&out_buf, a.len())

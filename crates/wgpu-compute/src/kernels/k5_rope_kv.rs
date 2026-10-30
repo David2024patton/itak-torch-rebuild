@@ -122,6 +122,101 @@ fn append_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// One prepared rotate dispatch, encodable any number of times
+/// into any command encoder. The start position is the one
+/// parameter a sequence changes per forward, so the call keeps
+/// its uniform buffer and rewrites that one word through
+/// [`K5RotateCall::set_start_position`]; everything else (the
+/// buffer, the geometry, the base) is fixed at prepare time.
+/// This is the device-resident forward's unit of composition
+/// (see [`crate::session`]); the one-shot entry points prepare,
+/// encode, and submit.
+#[derive(Debug)]
+pub struct K5RotateCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    grid: (u32, u32),
+}
+
+impl K5RotateCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k5 rope rotate"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+
+    /// Point the rotation at a new absolute start position (the
+    /// prepared call's rows sit at `start_position + row`). The
+    /// rewrite rides the queue, so it lands in submission order:
+    /// call it while no submission using this call is in flight
+    /// (the resident session is synchronous per forward, so this
+    /// is its natural state).
+    pub fn set_start_position(&self, ctx: &GpuContext, start_position: usize) {
+        // RotateParams word 3, after width, head_dim, total_pairs.
+        ctx.queue
+            .write_buffer(&self.params, 12, &(start_position as u32).to_le_bytes());
+    }
+}
+
+/// One prepared append dispatch, the rotate call's sibling: the
+/// start position rewrites through
+/// [`K5AppendCall::set_start_position`], the rest is fixed at
+/// prepare time.
+#[derive(Debug)]
+pub struct K5AppendCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    grid: (u32, u32),
+}
+
+impl K5AppendCall {
+    /// Record this call's dispatch into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k5 kv append"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record this dispatch into an already-open compute
+    /// `pass`: the composition form the device-resident
+    /// session uses to chain a whole forward into one pass
+    /// per segment (wgpu inserts the hazard barriers
+    /// between dispatches inside the pass).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+    }
+
+    /// Point the append at a new absolute start position (the
+    /// prepared rows land at slots for `start_position + row`).
+    /// Same queue-ordering contract as
+    /// [`K5RotateCall::set_start_position`].
+    pub fn set_start_position(&self, ctx: &GpuContext, start_position: usize) {
+        // AppendParams word 2, after kv_width and total.
+        ctx.queue
+            .write_buffer(&self.params, 8, &(start_position as u32).to_le_bytes());
+    }
+}
+
 /// The compiled K5 pipelines (rotate and append).
 #[derive(Debug)]
 pub struct K5Pipeline {
@@ -156,16 +251,17 @@ impl K5Pipeline {
         Ok(K5Pipeline { rotate, append })
     }
 
-    /// Rotate every row of `buffer` in place: `rows` rows of
-    /// `heads * head_dim` channels, row `r` at absolute position
-    /// `start_position + r`, interleaved pairing, the given base.
+    /// Prepare a rotate dispatch over `buffer` in place: `rows`
+    /// rows of `heads * head_dim` channels, row `r` at absolute
+    /// position `start_position + r` (rewritable through the
+    /// returned call), interleaved pairing, the given base.
     ///
     /// # Errors
     ///
     /// [`WgpuError::InvalidTensor`] when the geometry is unusable
     /// (odd or zero head dim, zero rows).
     #[allow(clippy::too_many_arguments)]
-    pub fn rotate(
+    pub fn prepare_rotate(
         &self,
         ctx: &GpuContext,
         buffer: &wgpu::Buffer,
@@ -174,7 +270,7 @@ impl K5Pipeline {
         head_dim: usize,
         start_position: usize,
         base: f32,
-    ) -> Result<()> {
+    ) -> Result<K5RotateCall> {
         if rows == 0 || heads == 0 || head_dim < 2 || head_dim % 2 != 0 {
             return Err(WgpuError::InvalidTensor {
                 name: "k5 rotate".to_string(),
@@ -218,20 +314,40 @@ impl K5Pipeline {
                 },
             ],
         });
+        Ok(K5RotateCall {
+            pipeline: self.rotate.clone(),
+            bind_group,
+            params: params_buf,
+            grid,
+        })
+    }
+
+    /// Rotate every row of `buffer` in place: `rows` rows of
+    /// `heads * head_dim` channels, row `r` at absolute position
+    /// `start_position + r`, interleaved pairing, the given base.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when the geometry is unusable
+    /// (odd or zero head dim, zero rows).
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate(
+        &self,
+        ctx: &GpuContext,
+        buffer: &wgpu::Buffer,
+        rows: usize,
+        heads: usize,
+        head_dim: usize,
+        start_position: usize,
+        base: f32,
+    ) -> Result<()> {
+        let call = self.prepare_rotate(ctx, buffer, rows, heads, head_dim, start_position, base)?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k5 rotate run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k5 rope rotate"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.rotate);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!(
             "k5 rotate: rows={rows} heads={heads} head_dim={head_dim} start={start_position} base={base}"
@@ -239,17 +355,19 @@ impl K5Pipeline {
         Ok(())
     }
 
-    /// Append `rows` rows of K and V from the staging buffers
-    /// into the layer's resident KV buffers, starting at absolute
-    /// position `start_position`. `window` is the layer's ring
-    /// size, or `None` for a global layer (slot = position).
+    /// Prepare an append dispatch: `rows` rows of K and V from
+    /// the staging buffers into the layer's resident KV buffers,
+    /// starting at absolute position `start_position`
+    /// (rewritable through the returned call). `window` is the
+    /// layer's ring size, or `None` for a global layer
+    /// (slot = position).
     ///
     /// # Errors
     ///
     /// [`WgpuError::InvalidTensor`] when `rows` or `kv_width` is
     /// zero.
     #[allow(clippy::too_many_arguments)]
-    pub fn append(
+    pub fn prepare_append(
         &self,
         ctx: &GpuContext,
         k_src: &wgpu::Buffer,
@@ -260,7 +378,7 @@ impl K5Pipeline {
         kv_width: usize,
         start_position: usize,
         window: Option<usize>,
-    ) -> Result<()> {
+    ) -> Result<K5AppendCall> {
         if rows == 0 || kv_width == 0 {
             return Err(WgpuError::InvalidTensor {
                 name: "k5 append".to_string(),
@@ -305,20 +423,53 @@ impl K5Pipeline {
                 },
             ],
         });
+        Ok(K5AppendCall {
+            pipeline: self.append.clone(),
+            bind_group,
+            params: params_buf,
+            grid,
+        })
+    }
+
+    /// Append `rows` rows of K and V from the staging buffers
+    /// into the layer's resident KV buffers, starting at absolute
+    /// position `start_position`. `window` is the layer's ring
+    /// size, or `None` for a global layer (slot = position).
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when `rows` or `kv_width` is
+    /// zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append(
+        &self,
+        ctx: &GpuContext,
+        k_src: &wgpu::Buffer,
+        v_src: &wgpu::Buffer,
+        k_dst: &wgpu::Buffer,
+        v_dst: &wgpu::Buffer,
+        rows: usize,
+        kv_width: usize,
+        start_position: usize,
+        window: Option<usize>,
+    ) -> Result<()> {
+        let call = self.prepare_append(
+            ctx,
+            k_src,
+            v_src,
+            k_dst,
+            v_dst,
+            rows,
+            kv_width,
+            start_position,
+            window,
+        )?;
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("k5 append run"),
             });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("k5 kv append"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.append);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(grid.0, grid.1, 1);
-        }
+        call.encode(&mut encoder);
         ctx.queue.submit([encoder.finish()]);
         dbg_log!(
             "k5 append: rows={rows} kv_width={kv_width} start={start_position} window={window:?}"

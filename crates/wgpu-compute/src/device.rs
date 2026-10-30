@@ -201,6 +201,20 @@ impl GpuContext {
             });
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
         self.queue.submit([encoder.finish()]);
+        self.map_staging(&staging, count)
+    }
+
+    /// Map a staging buffer filled by a copy the CALLER encoded
+    /// and submitted (the device-resident session copies its
+    /// logits into its own staging buffer inside the forward's
+    /// single submission, then maps through here), collecting
+    /// `count` f32 values. The caller owns the staging buffer's
+    /// size and usage (`COPY_DST | MAP_READ`).
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::Readback`] when the map fails or never fires.
+    pub fn map_staging(&self, staging: &wgpu::Buffer, count: usize) -> Result<Vec<f32>> {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {

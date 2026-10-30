@@ -7,6 +7,7 @@ math family:
 | :--- | :--- |
 | `norm` | `rms_norm` with `eps` as a parameter (never a constant) |
 | `rope` | `rope` / `rope_partial`, configurable base (`500000` for Glimmer), llama.cpp pairing and partial-rotary conventions |
+| `softmax` | `softmax` over one row: max-subtracted for stability, `-inf` (mask) entries get exactly `0.0`, an all-masked row is a named error |
 | `activation` | `silu`, `gelu_tanh`, and the gated forms `swiglu` / `geglu` as separate functions |
 | `logits` | `logit_softcap` and `logit_scale`, both parameterized (Glimmer: cap `20.0`, scale `0.1961`) |
 | `linalg` | `matvec` and `matmul` over flat row-major buffers, shapes always validated |

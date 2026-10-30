@@ -151,16 +151,13 @@ impl GemmShape {
 #[must_use]
 pub fn shipped_shape(limits: &wgpu::Limits) -> Option<GemmShape> {
     let storage = limits.max_compute_workgroup_storage_size;
-    for shape in [
+    [
         GemmShape::new(64, 256),
         GemmShape::new(64, 128),
         GemmShape::new(32, 128),
-    ] {
-        if storage >= shape.tile_bytes() {
-            return Some(shape);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|shape| storage >= shape.tile_bytes())
 }
 
 /// The activation-fusion declarations for `act`, textually

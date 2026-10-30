@@ -239,3 +239,105 @@ Prefill spot-check after the pass: warm 64-row chunks run
 at ~78 tok/s or better (258-token prompt, marginal rate),
 at or above the 69 tok/s baseline; chunk plans keep the
 two-pass attention by design.
+
+## GEMM prefill path and on-device argmax (2026-10-30, later still)
+
+**Prefill: K10/K11 tiled GEMM.** Past 16 rows, chunk plans
+no longer replay the GEMV chain per prompt row. K10 (Q4_K)
+and K11 (Q6_K) stage each super-block column's dequantized
+tile in workgroup memory once and apply it to all 64 chunk
+rows from per-thread 4x4 register sub-tiles, carrying K1's
+gated and SwiGLU activation forms with the same K1ActGeom
+addressing, so the plan's fused projections (gated output,
+SwiGLU-fused down) dispatch through the GEMM unchanged.
+Weights bind the K1/K2 uploads' one resident buffer per
+tensor. Single-row decode keeps the fused GEMV chain,
+untouched by construction; a device granting under 16 KiB
+of workgroup storage builds no GEMM pipelines and the
+session keeps its GEMV chunk plans (the fallback is read
+from the backend, never substituted silently).
+
+Per-tensor bench (examples/k10_bench, batch 64, real file,
+two healthy windows; ms per pass over the tensor):
+
+| tensor | GEMV replay | t64x256 | t64x128 | t32x128 (shipped) |
+| --- | ---: | ---: | ---: | ---: |
+| Q6_K ffn_down 19968x6656 (109 MB) | 6.4-6.8 | 5.15 | 3.18 | 2.99 |
+| Q4_K ffn_gate 6656x19968 (74.7 MB) | 4.4-4.5 | 3.50 | 2.04 | 1.95 |
+
+Session prefill (glimmer_generate --gpu, repeated-sentence
+prompts, two runs each; totals include first-chunk plan
+builds):
+
+| prompt | t64x256 | t32x128 (shipped) |
+| --- | ---: | ---: |
+| 254 tokens | 5,062 / 4,957 ms (50 tok/s) | 3,495 / 3,534 ms (72 tok/s) |
+| 1,024 tokens | 17,744 ms (58 tok/s, one run) | 11,773 / 11,810 ms (87 tok/s) |
+
+Marginal rate between the two lengths: 60 tok/s at
+t64x256, **93 tok/s at the shipped t32x128**, against the
+pre-GEMM warm marginal of ~78 tok/s and llama.cpp's 998.
+The GEMM closes only a slice of the gap, and the reason is
+measured: per-tensor effective stream is ~36 GB/s against
+the ~818 GB/s the GEMV achieves at batch 1, so the kernel
+is bound inside the workgroup at ~5.7 TFLOPS effective
+(FP32 peak ~61), not at DRAM. Each staged f32 element is
+re-read from workgroup memory at roughly one FMA per LDS
+byte, staging barriers land every 128 staged columns, and
+256-deep tiles measure worse than 128-deep at both widths
+(more barrier-serial staging per workgroup, less
+occupancy): the narrow tile wins on shape, not capacity.
+Decomposition of the 10.75 ms/token marginal: ~72% the
+GEMM projections at the rates above, ~28% the
+non-projection chunk chain (two-pass K6 attention over the
+chunk's queries and the stored context, prep, norms,
+gather, dispatch boundaries).
+
+Named next lever, with its evidence: an MMQ in
+llama.cpp's actual sense. Quantize each activation block
+to int8 on the fly and run the inner product on DP4A
+integer dot instructions against the weights' integer
+payloads, folding per-block scales back at the store.
+That is the design that reaches 998 tok/s on this card;
+the f32-tile GEMM here is the correctness-first stepping
+stone, and its staging discipline, act forms, and session
+wiring carry over. Secondary: a 4x8 per-thread sub-tile
+halves staged-tile LDS reads per FMA (the register budget
+allows it on RDNA3) for an estimated 1.5-2x on the
+projection share. The 28% non-projection share wants its
+own timestamp profile before anyone optimizes it.
+
+Gate honesty: the first server run of the GEMM tests
+caught a real bug, in the one-shot helpers rather than the
+kernels: K10Pipeline::run and K11Pipeline::run encoded
+their dispatch into a command encoder they never
+submitted, so their readbacks mapped initial zeros (the
+act-form paths and the session, which submit, were correct
+throughout; no session proof ever touched the broken
+helpers). Isolated by driving prepare with manual buffers
+on the device, fixed with the missing submit, and the
+test's tolerance re-based to the result set's magnitude
+scale: the fixture's random f16 headers put outputs at
+~1e3, where summation order alone is worth ~1e-2 absolute.
+
+**Argmax tail.** K8 gains a two-stage reduction (128
+workgroups of (value, index) partials, one finish
+workgroup) under the host sampler's exact greedy rule:
+maximum value, lowest index on an exact tie, a total
+order, so the staged result equals a sequential scan on
+any finite input. ResidentSession::forward_argmax runs
+the identical chunk chain with the reduction appended to
+the head segment; the per-chunk readback is 8 bytes
+(winning index, winning logit) instead of the logits
+vector's 808 KB at the real vocabulary, and SessionStats
+counts argmax readbacks separately. Real-file proof:
+--gpu-argmax's 64-token generated stream is byte-identical
+to the logits-mode stream, the prefill winner's logit
+matches to all printed digits (17.343929, prob 0.403462),
+and the run's stats show 64 argmax readbacks and 0 logits
+readbacks. forward is unchanged for sampling and top-k
+callers. Synthetic gates: tests/k8_argmax.rs (bit-exact
+winning logit against the host scan, engineered ties, tail
+and all-negative cases, empty-input refusal) and the
+resident argmax-tail test (two-chunk prompt plus a 12-step
+greedy generation against forward plus the host pick).

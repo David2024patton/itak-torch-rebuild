@@ -1,0 +1,19 @@
+# Test-skip exceptions for this repo (TODO T-1.7).
+#
+# RULE: a test that skips because an environment piece is missing
+# (a model file, a GPU, a service, a credential) FAILS CI unless the
+# test is listed in this file. No exceptions are granted silently:
+# tools/check-test-skips.sh compares every skipped test it sees
+# against this list, and an unlisted skip is a hard failure.
+#
+# FORMAT: one test name per line, exactly as the runner prints it
+# (Go: the name after "--- SKIP:"; Rust: the test path before
+# "... ignored"). Every entry must carry a comment on the line above
+# it stating: what environment piece is missing, why the test cannot
+# run in CI, and who owns removing the exception.
+#
+# CURRENT STATE: no active exceptions. As of the gates landing
+# (2026-10-29) no test in this repo skips: the Go platform suite has
+# no t.Skip calls and the Rust workspace has no #[ignore] tests.
+# The first real skip gets added here, with its reason, in the same
+# commit that introduces the skip.

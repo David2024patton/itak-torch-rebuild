@@ -1,0 +1,39 @@
+{
+  // Markdown lint for this repo (TODO T-1.5), run by tools/gates.sh
+  // and CI. Rules are ON by default; the exceptions below are the
+  // repo's documented formats, each with its reason. Do not add an
+  // exception to silence a finding in a normal doc: fix the doc.
+  "config": {
+    // MD013: control files (TODO.md, STATUS.md, PLAN.md) are written
+    // as one long line per item on purpose: stable ID, statement, and
+    // proof string stay greppable on a single line.
+    "MD013": false,
+    // MD022/MD032: blank lines around headings and lists are not
+    // enforced while the control files are append-edited by parallel
+    // build lanes; normalizing them churns every lane's diff.
+    // Revisit when the control files are next regenerated.
+    "MD022": false,
+    "MD032": false,
+    // MD033: HTML comments are this repo's file-header mechanism
+    // (see the top of docs/RULES.md) and READMEs use a centered HTML
+    // title block per the repo standard.
+    "MD033": false,
+    // MD034: REFERENCES.md is a link index; bare URLs are the format
+    // (one reference per line, copyable as-is).
+    "MD034": false,
+    // MD041: the repo-standard README opens with a centered HTML
+    // title block, not an H1 on line 1.
+    "MD041": false,
+    // MD060: tables across the repo use the compact pipe style
+    // consistently; they render identically and the padded style is
+    // not worth a tree-wide reformat.
+    "MD060": false
+  },
+  "ignores": [
+    // Prompt data for accuracy runs, not documentation: lines that
+    // look like headings are prompt text and must not be edited.
+    "bench/accuracy-prompts.md",
+    "target/**",
+    "node_modules/**"
+  ]
+}

@@ -18,6 +18,7 @@ Raw logs: `bench-results-2026-10-26/` in this folder. Deep research page: artifa
 - Torch test set: Qwen2.5-7B-Instruct Q4_K_M (bartowski single file) 4,683,074,240 B; Qwen2.5-1.5B-Instruct Q4_K_M 1,117,320,736 B, in `/home/server/models/torch-test/`.
 
 ## Phase A, llama-bench (-ngl 999, pp512 / tg128, 3 reps), Vulkan
+
 | Quant | Model size | pp512 tok/s | tg128 tok/s | Peak VRAM |
 |---|---|---|---|---|
 | Q3_K_XL | 12.43 GiB | 680.06 ± 38.46 | **51.98 ± 0.21** | 11.9 GiB |

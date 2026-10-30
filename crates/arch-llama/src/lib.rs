@@ -47,5 +47,5 @@ mod testkit;
 pub use config::{LlamaConfig, ARCHITECTURES};
 pub use diag::{Diag, NullDiag, StderrDiag};
 pub use error::{LlamaError, Result};
-pub use model::LlamaModel;
+pub use model::{ForwardTrace, LayerTrace, LlamaModel};
 pub use weights::{expected_tensor_names, LayerWeights, TensorData, TensorSource, Weights};

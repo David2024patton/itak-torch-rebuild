@@ -93,6 +93,30 @@ impl LlamaModel {
     /// On any refusal the cache is untouched (all validation happens
     /// before the first append) and the error names what failed.
     pub fn forward(&self, tokens: &[u32], cache: &mut KvCache) -> Result<Vec<f32>> {
+        self.forward_inner(tokens, cache, None)
+    }
+
+    /// [`forward`](Self::forward) with per-layer intermediates
+    /// captured into a [`ForwardTrace`]: the same code path, with
+    /// the sub-step buffers cloned out as they pass. Exists for
+    /// activation diffing against a reference engine (golden layer
+    /// harness); the plain forward pays nothing for it.
+    pub fn forward_traced(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+    ) -> Result<(Vec<f32>, ForwardTrace)> {
+        let mut trace = ForwardTrace::default();
+        let logits = self.forward_inner(tokens, cache, Some(&mut trace))?;
+        Ok((logits, trace))
+    }
+
+    fn forward_inner(
+        &self,
+        tokens: &[u32],
+        cache: &mut KvCache,
+        mut trace: Option<&mut ForwardTrace>,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(LlamaError::EmptyInput);
         }
@@ -140,10 +164,17 @@ impl LlamaModel {
             let row = token as usize * hidden;
             x.extend_from_slice(&self.weights.embedding.data[row..row + hidden]);
         }
+        if let Some(t) = trace.as_deref_mut() {
+            t.embd = x.clone();
+        }
 
         let positions: Vec<usize> = (base..base + rows).collect();
         for (index, w) in self.weights.layers.iter().enumerate() {
+            let mut lt = trace.as_ref().map(|_| LayerTrace::default());
             let h = rms_rows(&x, hidden, &w.attn_norm.data, cfg.rms_eps)?;
+            if let Some(lt) = lt.as_mut() {
+                lt.attn_norm = h.clone();
+            }
             let mut q = linear(
                 &h,
                 hidden,
@@ -165,8 +196,17 @@ impl LlamaModel {
                 cfg.v_width() as usize,
                 w.attn_v_bias.as_ref(),
             )?;
+            if let Some(lt) = lt.as_mut() {
+                lt.q_pre_rope = q.clone();
+                lt.k_pre_rope = k.clone();
+                lt.v = v.clone();
+            }
             rope_rows(&mut q, cfg.q_heads as usize, cfg, &positions)?;
             rope_rows(&mut k, cfg.kv_heads as usize, cfg, &positions)?;
+            if let Some(lt) = lt.as_mut() {
+                lt.q = q.clone();
+                lt.k = k.clone();
+            }
             let k_w = cfg.k_width() as usize;
             let v_w = cfg.v_width() as usize;
             for (r, &position) in positions.iter().enumerate() {
@@ -188,17 +228,33 @@ impl LlamaModel {
             )?;
             let out = linear(&attn, cfg.q_width() as usize, &w.attn_output, hidden, None)?;
             add_in_place(&mut x, &out);
+            if let Some(lt) = lt.as_mut() {
+                lt.ffn_inp = x.clone();
+            }
 
             let h = rms_rows(&x, hidden, &w.ffn_norm.data, cfg.rms_eps)?;
+            if let Some(lt) = lt.as_mut() {
+                lt.ffn_norm = h.clone();
+            }
             let gate = linear(&h, hidden, &w.ffn_gate, cfg.ffn_hidden as usize, None)?;
             let up = linear(&h, hidden, &w.ffn_up, cfg.ffn_hidden as usize, None)?;
             let act = torch_math::swiglu(&gate, &up)?;
             let down = linear(&act, cfg.ffn_hidden as usize, &w.ffn_down, hidden, None)?;
+            if let Some(lt) = lt.as_mut() {
+                lt.ffn_out = down.clone();
+            }
             add_in_place(&mut x, &down);
+            if let (Some(t), Some(lt)) = (trace.as_deref_mut(), lt.as_mut()) {
+                lt.l_out = x.clone();
+                t.layers.push(std::mem::take(lt));
+            }
         }
 
         let last = &x[(rows - 1) * hidden..rows * hidden];
         let normed = torch_math::rms_norm(last, &self.weights.final_norm.data, cfg.rms_eps)?;
+        if let Some(t) = trace {
+            t.result_norm = normed.clone();
+        }
         let head = self.weights.head();
         let logits = torch_math::matvec(&head.data, cfg.vocab_size as usize, hidden, &normed)?;
 
@@ -215,6 +271,51 @@ impl LlamaModel {
     pub fn step(&self, token: u32, cache: &mut KvCache) -> Result<Vec<f32>> {
         self.forward(&[token], cache)
     }
+}
+
+/// Per-layer intermediates captured by
+/// [`LlamaModel::forward_traced`]. Every buffer is in this crate's
+/// row convention: `[rows][width]`, one row per input token, in the
+/// same flat layout the forward itself uses. Field names follow the
+/// reference graph's tensor names (llama.cpp) so a dump of one side
+/// lines up against the other by name.
+#[derive(Debug, Default, Clone)]
+pub struct LayerTrace {
+    /// Output of the pre-attention RMSNorm (`attn_norm`).
+    pub attn_norm: Vec<f32>,
+    /// Query projection before RoPE (no reference-graph counterpart;
+    /// the reference names only the rotated tensor).
+    pub q_pre_rope: Vec<f32>,
+    /// Key projection before RoPE.
+    pub k_pre_rope: Vec<f32>,
+    /// Query projection after RoPE (`Qcur`).
+    pub q: Vec<f32>,
+    /// Key projection after RoPE (`Kcur`).
+    pub k: Vec<f32>,
+    /// Value projection (`Vcur`).
+    pub v: Vec<f32>,
+    /// Hidden state after the attention residual add (`ffn_inp`).
+    pub ffn_inp: Vec<f32>,
+    /// Output of the pre-FFN RMSNorm (`ffn_norm`).
+    pub ffn_norm: Vec<f32>,
+    /// FFN down-projection output, before its residual add
+    /// (`ffn_out`).
+    pub ffn_out: Vec<f32>,
+    /// Hidden state after the FFN residual add: this layer's output
+    /// (`l_out`).
+    pub l_out: Vec<f32>,
+}
+
+/// One traced forward pass: the embedding rows, one [`LayerTrace`]
+/// per layer, and the final norm applied to the last position.
+#[derive(Debug, Default, Clone)]
+pub struct ForwardTrace {
+    /// Embedding output rows (`inp_embd`).
+    pub embd: Vec<f32>,
+    /// Per-layer traces, in layer order.
+    pub layers: Vec<LayerTrace>,
+    /// Final RMSNorm output for the last position (`result_norm`).
+    pub result_norm: Vec<f32>,
 }
 
 /// RMSNorm applied row by row over a `[rows, width]` buffer.

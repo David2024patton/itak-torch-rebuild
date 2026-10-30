@@ -3,8 +3,17 @@
 //! entered the model at all. This module is the correction, written
 //! against the conventions llama.cpp uses (the project's reference):
 //!
-//! - The head vector is treated as `head_dim / 2` adjacent pairs
-//!   `(x[2i], x[2i + 1])` (the GPT-NeoX pairing llama.cpp applies).
+//! - The head vector is treated as `rotary_dim / 2` half-split pairs
+//!   `(x[i], x[i + rotary_dim / 2])`: the GPT-NeoX pairing, which is
+//!   ggml's `GGML_ROPE_TYPE_NEOX`, the mode llama.cpp applies for
+//!   the llama and qwen2 families. (An earlier version of this
+//!   module paired adjacent channels `(x[2i], x[2i + 1])` while
+//!   claiming the same name; the layer-by-layer activation diff
+//!   against llama.cpp on Qwen2.5-1.5B, 2026-10-29, proved that
+//!   pairing wrong and this one right: with the input to layer 0
+//!   identical, half-split rotation of the pre-RoPE projections
+//!   reproduces the reference Qcur/Kcur to the quant noise floor,
+//!   adjacent pairing diverges by two orders of magnitude more.)
 //! - Pair `i` rotates by `position * base^(-2i / rotary_dim)`.
 //! - `base` is a parameter: the classic value is `10000`, long-context
 //!   models use more (Glimmer and Qwen2.5 use `500000`, Llama 3 uses
@@ -82,17 +91,18 @@ pub fn rope_partial(
     // Angles are computed in f64: at long contexts the product
     // position * base^(-2i/d) loses real precision in f32, and the
     // reference implementation is the one that must not drift.
+    // Pairing is half-split (GPT-NeoX / ggml NEOX): pair i joins
+    // channel i with channel i + rotary_dim/2.
     let pos = position as f64;
     let base64 = f64::from(base);
-    for (pair_idx, pair) in out[..rotary_dim].chunks_exact_mut(2).enumerate() {
-        let exponent = -((2 * pair_idx) as f64) / (rotary_dim as f64);
+    let half = rotary_dim / 2;
+    for i in 0..half {
+        let exponent = -((2 * i) as f64) / (rotary_dim as f64);
         let angle = pos * base64.powf(exponent);
         let (sin, cos) = angle.sin_cos();
-        if let [first, second] = pair {
-            let (x, y) = (f64::from(*first), f64::from(*second));
-            *first = (x * cos - y * sin) as f32;
-            *second = (x * sin + y * cos) as f32;
-        }
+        let (x, y) = (f64::from(input[i]), f64::from(input[i + half]));
+        out[i] = (x * cos - y * sin) as f32;
+        out[i + half] = (x * sin + y * cos) as f32;
     }
     Ok(out)
 }
@@ -112,16 +122,36 @@ mod tests {
 
     #[test]
     fn known_rotations() {
-        // head_dim 4, base 10000: pair 0 turns at rate 1, pair 1 at
-        // rate 10000^(-1/2) = 0.01. At position 1 the unit vectors
-        // [1,0] and [1,0] become (cos a, sin a) for their own a.
+        // head_dim 4, base 10000, half-split pairing: pair 0 joins
+        // channels (0, 2) and turns at rate 1, pair 1 joins (1, 3)
+        // at rate 10000^(-1/2) = 0.01. At position 1 the input
+        // [1, 0, 1, 0] puts (1, 1) in pair 0 and (0, 0) in pair 1,
+        // so pair 0 becomes (cos 1 - sin 1, sin 1 + cos 1) written
+        // back to channels 0 and 2, and pair 1 stays zero. (These
+        // values distinguish the half-split pairing from the
+        // adjacent pairing, which would rotate (1, 0) and (1, 0)
+        // separately; the layer diff against llama.cpp settled
+        // which one the reference uses.)
         let out = rope(&[1.0, 0.0, 1.0, 0.0], 1, 10_000.0, 4).unwrap();
         assert_vec_close(
             &out,
             &[
-                0.540_302_305_868_139_8,   // cos(1)
-                0.841_470_984_807_896_5,   // sin(1)
+                -0.301_168_68, // cos(1) - sin(1), channel 0
+                0.0,           // channel 1 (pair 1 was zero)
+                1.381_773_3,   // sin(1) + cos(1), channel 2
+                0.0,           // channel 3 (pair 1 was zero)
+            ],
+            1e-5,
+        );
+        // Pair 1 in isolation: [0, 1, 0, 0] is (1, 0) in pair 1,
+        // which turns at rate 0.01 into channels 1 and 3.
+        let out = rope(&[0.0, 1.0, 0.0, 0.0], 1, 10_000.0, 4).unwrap();
+        assert_vec_close(
+            &out,
+            &[
+                0.0,
                 0.999_950_000_416_665_3,   // cos(0.01)
+                0.0,
                 0.009_999_833_334_166_664, // sin(0.01)
             ],
             1e-5,
@@ -153,10 +183,12 @@ mod tests {
 
     #[test]
     fn base_is_a_parameter() {
-        // With base 500000 and head_dim 4, pair 1 turns at rate
-        // 500000^(-1/2) = 0.00141421..., far slower than base 10000.
-        let out = rope(&[1.0, 0.0, 1.0, 0.0], 1, 500_000.0, 4).unwrap();
+        // With base 500000 and head_dim 4, pair 1 (channels 1 and 3)
+        // turns at rate 500000^(-1/2) = 0.00141421..., far slower
+        // than base 10000.
+        let out = rope(&[0.0, 1.0, 0.0, 0.0], 1, 500_000.0, 4).unwrap();
         assert_close(out[3], 0.001_414_213_5, 1e-6); // sin(500000^-0.5)
+        assert_close(out[1], 0.999_999_0, 1e-6); // cos(500000^-0.5)
     }
 
     #[test]

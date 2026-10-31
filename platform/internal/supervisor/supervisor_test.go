@@ -39,14 +39,17 @@ func runFakeEngine(socketPath string) {
 	// variables survived the supervisor's allowlist, and burst a
 	// single stderr line past the old 64 KiB scanner default
 	// followed by a marker line.
-	if report := os.Getenv("ITAK_ENGINE_ENVREPORT"); report != "" {
+	if reportDir := os.Getenv("ITAK_ENGINE_ENVREPORT"); reportDir != "" {
 		_, keyPresent := os.LookupEnv("TORCH_API_KEY")
 		_, markPresent := os.LookupEnv("ITAK_ENGINE_TESTMARK")
 		_, pathPresent := os.LookupEnv("PATH")
 		content := "TORCH_API_KEY=" + presentWord(keyPresent) +
 			"\nITAK_ENGINE_TESTMARK=" + presentWord(markPresent) +
 			"\nPATH=" + presentWord(pathPresent) + "\n"
-		_ = os.WriteFile(report, []byte(content), 0o600)
+		// The environment names only the directory (the test's own
+		// TempDir); the file name is fixed here, so this process can
+		// only ever write the one report file inside it.
+		_ = os.WriteFile(filepath.Join(reportDir, "env-report.txt"), []byte(content), 0o600) //nolint:gosec // test-only: directory is the parent test's own TempDir, file name fixed above
 	}
 	if os.Getenv("ITAK_ENGINE_STDERRBURST") == "1" {
 		fmt.Fprintf(os.Stderr, "%s\n", strings.Repeat("x", 200_000))
@@ -256,17 +259,18 @@ func TestSupervisorRestartBudgetExhaustion(t *testing.T) {
 // TORCH_API_KEY, set in the supervisor's own environment here, must
 // not reach the child.
 func TestSupervisorChildEnvIsAllowlisted(t *testing.T) {
-	report := filepath.Join(t.TempDir(), "env-report.txt")
+	reportDir := t.TempDir()
+	report := filepath.Join(reportDir, "env-report.txt")
 	t.Setenv("TORCH_API_KEY", "must-not-reach-the-engine")
 	t.Setenv("ITAK_ENGINE_TESTMARK", "1")
-	t.Setenv("ITAK_ENGINE_ENVREPORT", report)
+	t.Setenv("ITAK_ENGINE_ENVREPORT", reportDir)
 	startSupervisor(t, 1)
 
 	waitFor(t, "child env report", func() bool {
 		_, err := os.Stat(report)
 		return err == nil
 	})
-	data, err := os.ReadFile(report)
+	data, err := os.ReadFile(report) //nolint:gosec // test-only: path is this test's own TempDir joined with the fixed report file name
 	if err != nil {
 		t.Fatalf("read env report: %v", err)
 	}

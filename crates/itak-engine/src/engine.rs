@@ -170,6 +170,10 @@ pub struct Job {
     pub presence_penalty: f64,
     /// Frequency penalty (OpenAI form); 0 disables.
     pub frequency_penalty: f64,
+    /// Whether this job's full prompt ids and generated text may
+    /// be written to the engine log (the operator's --log-content).
+    /// Off by default: the log lines carry counts and timings.
+    pub log_content: bool,
     /// Where events go.
     pub reply: Sender<GenEvent>,
 }
@@ -463,6 +467,7 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         top_k,
         presence_penalty,
         frequency_penalty,
+        log_content,
         reply,
     } = job;
     // The job leaves the queue the moment a slot takes it, however
@@ -519,7 +524,15 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         temperature,
         top_p
     ));
-    crate::log_line(&format!("prompt ids: {ids:?}"));
+    // The full id list is content, not diagnostics: token ids are
+    // reversible to prompt text with the model's own tokenizer, so
+    // it is logged only under the operator's --log-content. It is
+    // also one unbounded line per job (a max-context prompt is on
+    // the order of a megabyte on one line), which is half of how
+    // the supervisor's stderr pump wedged (adjudication H-2).
+    if log_content {
+        crate::log_line(&format!("prompt ids: {ids:?}"));
+    }
 
     {
         let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
@@ -557,12 +570,12 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
             st.last_generated_tokens = generated;
             st.last_cache_position = ids.len() + generated;
             drop(st);
-            crate::log_line(&format!(
-                "generate done: finish_reason={} generated={} elapsed_ms={} text={:?}",
-                finish_reason,
+            crate::log_line(&done_log_line(
+                &finish_reason,
                 generated,
                 started.elapsed().as_millis(),
-                text
+                &text,
+                log_content,
             ));
             let _ = reply.send(GenEvent::Done { finish_reason });
         }
@@ -579,6 +592,30 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
             drop(st);
             crate::log_line("generate aborted: client disconnected");
         }
+    }
+}
+
+/// The generate-done log line. The completion text is user
+/// content, so by default the line carries the finish reason, the
+/// count, and the elapsed time only; the full text is included
+/// solely under the operator's --log-content, the same gate as the
+/// prompt id dump in run_job. The stable prefix and field order
+/// are unchanged either way, so log readers see one shape.
+fn done_log_line(
+    finish_reason: &str,
+    generated: usize,
+    elapsed_ms: u128,
+    text: &str,
+    log_content: bool,
+) -> String {
+    if log_content {
+        format!(
+            "generate done: finish_reason={finish_reason} generated={generated} elapsed_ms={elapsed_ms} text={text:?}"
+        )
+    } else {
+        format!(
+            "generate done: finish_reason={finish_reason} generated={generated} elapsed_ms={elapsed_ms}"
+        )
     }
 }
 
@@ -737,6 +774,20 @@ mod tests {
         assert_eq!(assemble_prompt_ids(&[954], true, None), vec![954]);
         // Empty body with BOS asked: the lone BOS is the prompt.
         assert_eq!(assemble_prompt_ids(&[], true, Some(200000)), vec![200000]);
+    }
+
+    #[test]
+    fn done_log_line_carries_content_only_under_the_flag() {
+        let plain = done_log_line("stop", 7, 1234, "the completion text", false);
+        assert!(plain.contains("finish_reason=stop"), "line: {plain}");
+        assert!(plain.contains("generated=7"), "line: {plain}");
+        assert!(plain.contains("elapsed_ms=1234"), "line: {plain}");
+        assert!(
+            !plain.contains("completion text"),
+            "content must not reach the default log line: {plain}"
+        );
+        let full = done_log_line("stop", 7, 1234, "the completion text", true);
+        assert!(full.contains("the completion text"), "line: {full}");
     }
 
     #[test]

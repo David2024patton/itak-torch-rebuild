@@ -32,6 +32,11 @@
 //!   256).
 //! - `--max-embed-tokens N` / `ITAK_ENGINE_MAX_EMBED_TOKENS`: the
 //!   largest single embed input, in tokens (default 8192).
+//! - `--log-content` / `ITAK_ENGINE_LOG_CONTENT` (1 or true): also
+//!   log the full prompt token ids and generated text of every job.
+//!   Default off: job logs carry counts, finish reasons, and
+//!   timings only, because prompts and completions are user content
+//!   and the supervisor forwards this stderr into the platform log.
 //!
 //! A model that fails to load (including the tensor coverage gate)
 //! exits the process non-zero with the named error: a partial model
@@ -152,6 +157,7 @@ fn run() -> i32 {
                     max_frame_bytes: config.max_frame_bytes,
                     max_embed_inputs: config.max_embed_inputs,
                     max_embed_tokens: config.max_embed_tokens,
+                    log_content: config.log_content,
                 };
                 std::thread::spawn(move || handle_conn(stream, tx, info, stats, started, limits));
             }
@@ -207,6 +213,7 @@ struct Limits {
     max_frame_bytes: usize,
     max_embed_inputs: usize,
     max_embed_tokens: usize,
+    log_content: bool,
 }
 
 struct CliConfig {
@@ -219,6 +226,7 @@ struct CliConfig {
     max_frame_bytes: usize,
     max_embed_inputs: usize,
     max_embed_tokens: usize,
+    log_content: bool,
 }
 
 fn parse_args() -> Result<CliConfig, i32> {
@@ -231,9 +239,19 @@ fn parse_args() -> Result<CliConfig, i32> {
     let mut max_frame: Option<String> = std::env::var("ITAK_ENGINE_MAX_FRAME_BYTES").ok();
     let mut max_embed_inputs: Option<String> = std::env::var("ITAK_ENGINE_MAX_EMBED_INPUTS").ok();
     let mut max_embed_tokens: Option<String> = std::env::var("ITAK_ENGINE_MAX_EMBED_TOKENS").ok();
+    // A boolean flag, not a value flag: the presence of
+    // --log-content, or ITAK_ENGINE_LOG_CONTENT=1/true, turns it on.
+    let mut log_content = std::env::var("ITAK_ENGINE_LOG_CONTENT")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--log-content" {
+            log_content = true;
+            i += 1;
+            continue;
+        }
         let (slot, label) = match args[i].as_str() {
             "--model" => (&mut model, "--model"),
             "--socket" => (&mut socket, "--socket"),
@@ -246,7 +264,7 @@ fn parse_args() -> Result<CliConfig, i32> {
             "--max-embed-tokens" => (&mut max_embed_tokens, "--max-embed-tokens"),
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N] [--max-frame-bytes N] [--max-embed-inputs N] [--max-embed-tokens N]"
+                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N] [--max-frame-bytes N] [--max-embed-inputs N] [--max-embed-tokens N] [--log-content]"
                 );
                 return Err(0);
             }
@@ -301,6 +319,7 @@ fn parse_args() -> Result<CliConfig, i32> {
         max_frame_bytes,
         max_embed_inputs,
         max_embed_tokens,
+        log_content,
     })
 }
 
@@ -552,6 +571,7 @@ fn handle_generate(
         top_k: req.top_k,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
+        log_content: limits.log_content,
         reply: reply_tx,
     };
     // The bounded queue is the concurrency contract: a submission
@@ -784,6 +804,7 @@ mod tests {
             top_k: None,
             presence_penalty: 0.0,
             frequency_penalty: 0.0,
+            log_content: false,
             reply: reply_tx,
         }
     }
@@ -867,6 +888,7 @@ mod tests {
             max_frame_bytes,
             max_embed_inputs: 256,
             max_embed_tokens: 8192,
+            log_content: false,
         })
     }
 
@@ -1038,6 +1060,7 @@ mod tests {
             max_frame_bytes: 4_194_304,
             max_embed_inputs: 2,
             max_embed_tokens: 8192,
+            log_content: false,
         });
         write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
         let reply = read_reply(&mut client);
@@ -1072,6 +1095,7 @@ mod tests {
                 max_frame_bytes: 4_194_304,
                 max_embed_inputs: 256,
                 max_embed_tokens: 8192,
+                log_content: false,
             },
         );
         assert!(ok, "the connection survives a busy refusal");

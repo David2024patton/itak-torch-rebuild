@@ -32,7 +32,8 @@ fn main() -> ExitCode {
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    it.next().ok_or_else(|| format!("flag {flag} needs a value"))
+    it.next()
+        .ok_or_else(|| format!("flag {flag} needs a value"))
 }
 
 fn write_bin(dir: &Path, name: &str, data: &[f32]) -> Result<(), String> {
@@ -121,7 +122,9 @@ fn run() -> Result<(), String> {
     let load = |suffix: &str| -> Result<Option<Vec<f32>>, String> {
         let name = format!("{p}.{suffix}");
         if file.has_tensor(&name) {
-            Ok(Some(file.load_f32(&name).map_err(|e| format!("{name}: {e}"))?))
+            Ok(Some(
+                file.load_f32(&name).map_err(|e| format!("{name}: {e}"))?,
+            ))
         } else {
             Ok(None)
         }
@@ -133,8 +136,16 @@ fn run() -> Result<(), String> {
     let q_w = 1536usize;
     let k_w = 256usize;
 
-    write_bin(&out_dir, "q_split", &proj(&h, rows, &wq, q_w, bq.as_deref()))?;
-    write_bin(&out_dir, "k_split", &proj(&h, rows, &wk, k_w, bk.as_deref()))?;
+    write_bin(
+        &out_dir,
+        "q_split",
+        &proj(&h, rows, &wq, q_w, bq.as_deref()),
+    )?;
+    write_bin(
+        &out_dir,
+        "k_split",
+        &proj(&h, rows, &wk, k_w, bk.as_deref()),
+    )?;
 
     if let Some(wqkv) = load("attn_qkv.weight")? {
         let total_w = q_w + 2 * k_w;
@@ -167,8 +178,16 @@ fn run() -> Result<(), String> {
             wk_i[g * k_w * hidden..(g + 1) * k_w * hidden]
                 .copy_from_slice(&wqkv[ks..ks + k_w * hidden]);
         }
-        write_bin(&out_dir, "q_fused_interleaved", &proj(&h, rows, &wq_i, q_w, bias_q))?;
-        write_bin(&out_dir, "k_fused_interleaved", &proj(&h, rows, &wk_i, k_w, bias_k))?;
+        write_bin(
+            &out_dir,
+            "q_fused_interleaved",
+            &proj(&h, rows, &wq_i, q_w, bias_q),
+        )?;
+        write_bin(
+            &out_dir,
+            "k_fused_interleaved",
+            &proj(&h, rows, &wk_i, k_w, bias_k),
+        )?;
         let _ = total_w;
     }
     eprintln!("qkv_probe: wrote candidates to {}", out_dir.display());

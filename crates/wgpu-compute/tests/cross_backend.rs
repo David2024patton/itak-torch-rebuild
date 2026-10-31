@@ -275,9 +275,14 @@ fn cross_backend_greedy_generation_agrees() {
             cpu_top, gpu_top,
             "top-1 disagreement at step {step} (max abs diff {d})"
         );
-        assert!(d < 0.5, "logit drift beyond the stated bound at step {step}: {d}");
+        assert!(
+            d < 0.5,
+            "logit drift beyond the stated bound at step {step}: {d}"
+        );
         assert_eq!(cpu_cache.position(), gpu_cache.position());
         next = vec![cpu_top as u32];
     }
-    eprintln!("cross-backend: 6 forwards agreed on top-1 throughout; worst max abs diff {worst:.4e}");
+    eprintln!(
+        "cross-backend: 6 forwards agreed on top-1 throughout; worst max abs diff {worst:.4e}"
+    );
 }

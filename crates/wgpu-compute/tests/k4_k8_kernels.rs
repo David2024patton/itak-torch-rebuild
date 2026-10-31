@@ -270,8 +270,12 @@ fn k5_rotate_matches_torch_math_and_append_hits_cache_slots() {
         let v_dst = ctx.scratch_buffer("k5 test v dst", (capacity * kv_width * 4) as u64);
         k5.append(ctx, &k_src, &v_src, &k_dst, &v_dst, 2, kv_width, 6, window)
             .expect("append");
-        let got_k = ctx.read_f32(&k_dst, capacity * kv_width).expect("k readback");
-        let got_v = ctx.read_f32(&v_dst, capacity * kv_width).expect("v readback");
+        let got_k = ctx
+            .read_f32(&k_dst, capacity * kv_width)
+            .expect("k readback");
+        let got_v = ctx
+            .read_f32(&v_dst, capacity * kv_width)
+            .expect("v readback");
         for (i, slot) in slots.iter().enumerate() {
             assert_eq!(
                 &got_k[slot * kv_width..(slot + 1) * kv_width],
@@ -338,7 +342,10 @@ fn k6_attention_matches_cpu_step_for_step() {
                 "k6 attention chunk {chunk_idx} layer {layer} ({:?}): max abs diff {d:.3e}",
                 cfg.layers[layer]
             );
-            assert!(d < 2e-3, "attention drifted at chunk {chunk_idx} layer {layer}: {d}");
+            assert!(
+                d < 2e-3,
+                "attention drifted at chunk {chunk_idx} layer {layer}: {d}"
+            );
             step += 1;
         }
         cpu_cache.advance(rows);

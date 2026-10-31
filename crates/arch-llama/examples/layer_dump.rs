@@ -31,7 +31,8 @@ fn main() -> ExitCode {
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    it.next().ok_or_else(|| format!("flag {flag} needs a value"))
+    it.next()
+        .ok_or_else(|| format!("flag {flag} needs a value"))
 }
 
 struct Dumper {
@@ -56,9 +57,8 @@ impl Dumper {
         }
         let path = self.dir.join(format!("{name}.bin"));
         fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        self.manifest.push_str(&format!(
-            "  \"{name}\": [{width}, {rows}],\n"
-        ));
+        self.manifest
+            .push_str(&format!("  \"{name}\": [{width}, {rows}],\n"));
         Ok(())
     }
 
@@ -90,8 +90,16 @@ fn dump_trace(
     for (il, lt) in trace.layers.iter().enumerate() {
         let p = format!("L{il:02}");
         d.tensor(&format!("{p}_attn_norm"), &lt.attn_norm, hidden)?;
-        d.tensor(&format!("{p}_q_pre_rope"), &lt.q_pre_rope, cfg.q_width() as usize)?;
-        d.tensor(&format!("{p}_k_pre_rope"), &lt.k_pre_rope, cfg.k_width() as usize)?;
+        d.tensor(
+            &format!("{p}_q_pre_rope"),
+            &lt.q_pre_rope,
+            cfg.q_width() as usize,
+        )?;
+        d.tensor(
+            &format!("{p}_k_pre_rope"),
+            &lt.k_pre_rope,
+            cfg.k_width() as usize,
+        )?;
         d.tensor(&format!("{p}_q"), &lt.q, cfg.q_width() as usize)?;
         d.tensor(&format!("{p}_k"), &lt.k, cfg.k_width() as usize)?;
         d.tensor(&format!("{p}_v"), &lt.v, cfg.v_width() as usize)?;
@@ -140,8 +148,8 @@ fn run() -> Result<(), String> {
         return Err("missing --ids".to_string());
     }
 
-    let file = GgufFile::open(Path::new(&model_path))
-        .map_err(|e| format!("open {model_path}: {e}"))?;
+    let file =
+        GgufFile::open(Path::new(&model_path)).map_err(|e| format!("open {model_path}: {e}"))?;
     let cfg = LlamaConfig::from_file(&file).map_err(|e| format!("config: {e}"))?;
     let weights = Weights::load(&file, &cfg).map_err(|e| format!("weights: {e}"))?;
     let model = LlamaModel::new(cfg.clone(), weights);

@@ -12,16 +12,16 @@
 //! the other kernel suites. On David's server the 7900 XTX
 //! answers and every test runs for real.
 
+use muse_glimmer::Dtype;
 use wgpu_compute::kernels::k1_q4k_gemv::{
     f32_to_f16_bits, shipped_shape as k1_shipped, K1ActGeom, K1Pipeline, ACT_GATED, ACT_SWIGLU,
 };
 use wgpu_compute::kernels::k2_q6k_gemv::{shipped_shape as k2_shipped, K2Pipeline};
-use muse_glimmer::Dtype;
 use wgpu_compute::kernels::k3_q5k_gemv::{K3Pipeline, FINISH_SCALE, FINISH_SOFTCAP};
-use wgpu_compute::kernels::k8_head::K8Pipeline;
-use wgpu_compute::kernels::k6_attention::{AttendGeom, K6Pipeline, LayerKv};
 use wgpu_compute::kernels::k4_rmsnorm::K4Pipeline;
 use wgpu_compute::kernels::k5_rope_kv::K5Pipeline;
+use wgpu_compute::kernels::k6_attention::{AttendGeom, K6Pipeline, LayerKv};
+use wgpu_compute::kernels::k8_head::K8Pipeline;
 use wgpu_compute::kernels::k9_attn_prep::{K9Pipeline, PrepArgs};
 use wgpu_compute::{WgpuCompute, WgpuError};
 
@@ -449,9 +449,7 @@ fn check_flash(geom: AttendGeom, seed: u64) {
     let k6 = K6Pipeline::new(&ctx.device).expect("k6 pipeline");
     let q_width = geom.q_heads * geom.head_dim;
     let kv_width = geom.kv_heads * geom.head_dim;
-    let capacity = geom
-        .ring
-        .unwrap_or(geom.first_pos + geom.stored);
+    let capacity = geom.ring.unwrap_or(geom.first_pos + geom.stored);
     let q = ctx.upload_f32("flash q", &lcg(seed, geom.rows * q_width));
     let kv = LayerKv {
         k: ctx.upload_f32("flash kv k", &lcg(seed + 1, capacity * kv_width)),
@@ -613,10 +611,18 @@ fn k4_norm_chain_matches_the_two_dispatch_composition() {
             chain.encode_into(&mut pass);
         }
         ctx.queue.submit([encoder.finish()]);
-        let want_s = ctx.read_f32(&stream_ref, rows * width).expect("read stream");
-        let got_s = ctx.read_f32(&stream_new, rows * width).expect("read stream");
-        let want_n = ctx.read_f32(&normed_ref, rows * width).expect("read normed");
-        let got_n = ctx.read_f32(&normed_new, rows * width).expect("read normed");
+        let want_s = ctx
+            .read_f32(&stream_ref, rows * width)
+            .expect("read stream");
+        let got_s = ctx
+            .read_f32(&stream_new, rows * width)
+            .expect("read stream");
+        let want_n = ctx
+            .read_f32(&normed_ref, rows * width)
+            .expect("read normed");
+        let got_n = ctx
+            .read_f32(&normed_new, rows * width)
+            .expect("read normed");
         // The stream is the same operation sequence as the
         // two-dispatch form; the fused kernel's codegen may
         // contract a multiply-add the separate kernel does
@@ -704,8 +710,12 @@ fn k4_norm_close_matches_the_composition_and_emits_the_head_row() {
         fin.encode_into(&mut pass);
     }
     ctx.queue.submit([encoder.finish()]);
-    let want_s = ctx.read_f32(&stream_ref, rows * width).expect("read stream");
-    let got_s = ctx.read_f32(&stream_new, rows * width).expect("read stream");
+    let want_s = ctx
+        .read_f32(&stream_ref, rows * width)
+        .expect("read stream");
+    let got_s = ctx
+        .read_f32(&stream_new, rows * width)
+        .expect("read stream");
     let want_h = ctx.read_f32(&head_ref, width).expect("read head");
     let got_h = ctx.read_f32(&head_new, width).expect("read head");
     let ds = max_abs(&got_s, &want_s);
@@ -822,7 +832,16 @@ fn k3_finish_fused_into_the_head_matches_the_k8_pass() {
         .prepare_finish(ctx, &ref_buf, out, scale, cap)
         .expect("prepare k8 finish");
     let fused = k3
-        .prepare_with_finish(ctx, &weights, &in_buf, &new_buf, 1, FINISH_SOFTCAP, scale, cap)
+        .prepare_with_finish(
+            ctx,
+            &weights,
+            &in_buf,
+            &new_buf,
+            1,
+            FINISH_SOFTCAP,
+            scale,
+            cap,
+        )
         .expect("prepare fused head");
     let mut encoder = ctx
         .device
@@ -846,7 +865,16 @@ fn k3_finish_fused_into_the_head_matches_the_k8_pass() {
     // The scale-only mode against K8's scale pass.
     let finish2 = k8.prepare_scale(ctx, &ref_buf, out, scale);
     let fused2 = k3
-        .prepare_with_finish(ctx, &weights, &in_buf, &new_buf, 1, FINISH_SCALE, scale, 0.0)
+        .prepare_with_finish(
+            ctx,
+            &weights,
+            &in_buf,
+            &new_buf,
+            1,
+            FINISH_SCALE,
+            scale,
+            0.0,
+        )
         .expect("prepare scale head");
     let plain2 = k3
         .prepare(ctx, &weights, &in_buf, &ref_buf, 1)
@@ -892,7 +920,8 @@ fn k8_gather_norm_matches_gather_then_plain_norm() {
         });
         ctx.queue.write_buffer(&table, 0, &bytes);
         let tokens = ctx.scratch_buffer("gather norm tokens", 8);
-        ctx.queue.write_buffer(&tokens, 0, &[3, 0, 0, 0, 0, 0, 0, 0]);
+        ctx.queue
+            .write_buffer(&tokens, 0, &[3, 0, 0, 0, 0, 0, 0, 0]);
         let tmp = ctx.scratch_buffer("gather norm tmp", (rows * width * 4) as u64);
         let ref_buf = ctx.scratch_buffer("gather norm ref", (rows * width * 4) as u64);
         let new_buf = ctx.scratch_buffer("gather norm new", (rows * width * 4) as u64);
@@ -1052,8 +1081,9 @@ fn k1_gated_activation_matches_the_composed_gate() {
     };
     let ctx = gpu.context();
     let plain = K1Pipeline::new(&ctx.device).expect("k1 pipeline");
-    let gated = K1Pipeline::with_shape_act(&ctx.device, k1_shipped(ctx.device.features()), ACT_GATED)
-        .expect("k1 gated pipeline");
+    let gated =
+        K1Pipeline::with_shape_act(&ctx.device, k1_shipped(ctx.device.features()), ACT_GATED)
+            .expect("k1 gated pipeline");
     let inn = 512;
     let out_rows = 8;
     let batch = 2usize;
@@ -1169,7 +1199,15 @@ fn k1_and_k2_swiglu_activation_match_the_composed_ffn() {
     let want1 = plain1.run(ctx, &w1, &act).expect("composed q4k run");
     let out_buf = ctx.scratch_buffer("swiglu out", (batch * out_rows * 4) as u64);
     let call = swiglu1
-        .prepare_act(ctx, &w1, &pair_buf, &pair_buf, &out_buf, batch as u32, &geom)
+        .prepare_act(
+            ctx,
+            &w1,
+            &pair_buf,
+            &pair_buf,
+            &out_buf,
+            batch as u32,
+            &geom,
+        )
         .expect("prepare k1 swiglu");
     let got1 = run_call(&gpu, |e| call.encode(e), &out_buf, batch * out_rows);
     let d = max_abs(&got1, &want1);
@@ -1186,7 +1224,15 @@ fn k1_and_k2_swiglu_activation_match_the_composed_ffn() {
         .expect("upload q6k down");
     let want2 = plain2.run(ctx, &w2, &act).expect("composed q6k run");
     let call = swiglu2
-        .prepare_act(ctx, &w2, &pair_buf, &pair_buf, &out_buf, batch as u32, &geom)
+        .prepare_act(
+            ctx,
+            &w2,
+            &pair_buf,
+            &pair_buf,
+            &out_buf,
+            batch as u32,
+            &geom,
+        )
         .expect("prepare k2 swiglu");
     let got2 = run_call(&gpu, |e| call.encode(e), &out_buf, batch * out_rows);
     let d = max_abs(&got2, &want2);

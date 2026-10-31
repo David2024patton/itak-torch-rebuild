@@ -50,6 +50,16 @@ var (
 	// flattening only with this named outcome in hand, never by
 	// silently assuming a format.
 	ErrNoChatTemplate = errors.New("engine: no chat template")
+	// ErrTimeout means the engine did not answer within the
+	// exchange deadline. A slow but healthy engine reports as a
+	// timeout, never as a handshake failure: the handshake is a
+	// different event and mislabeling it sends operators hunting
+	// for a protocol fault that does not exist.
+	ErrTimeout = errors.New("engine: timed out waiting for the engine")
+	// ErrFrameTooLarge means a peer sent a frame past the protocol
+	// size cap without terminating it. The read refuses by name
+	// instead of buffering without bound.
+	ErrFrameTooLarge = errors.New("engine: frame exceeds the maximum size")
 )
 
 // GenerateRequest is one completion job handed to the engine. The

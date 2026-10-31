@@ -1,0 +1,4 @@
+# Pinned to the toolchain installed on the build machine
+# (rustc 1.99.1, verified with rustc --version, Wave 2 record lane).
+[toolchain]
+channel = "1.99.1"

@@ -1,0 +1,45 @@
+# cargo-deny policy for the iTaK Torch rebuild workspace.
+# Written for the Wave 2 record lane (panel finding: cargo deny advisories
+# and licenses FAIL with no deny.toml in the tree). Run with: cargo deny check
+
+[advisories]
+# paste 1.0.15 carries RUSTSEC-2024-0436 (unmaintained, not a soundness or
+# vulnerability advisory). It is a proc-macro crate pulled in only by the
+# metal crate on wgpu-hal's Apple target path (cargo tree --target all -i
+# paste). It is never compiled for the Linux targets this project builds
+# and ships. Removing it would require forking wgpu-hal's dependency set,
+# so the advisory is ignored here with this justification instead.
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is an Apple-target-only proc-macro via wgpu-hal/metal; never compiled on Linux; unmaintained class only" },
+]
+
+[licenses]
+# Exactly the license families the crates in this tree declare, read from
+# cargo metadata: MIT, Apache-2.0, BSD-2-Clause, CC0-1.0, ISC,
+# Unicode-3.0, Unlicense, Zlib. All permissive; nothing copyleft.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "CC0-1.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+# "warn", not "deny": every wildcard-class entry in this tree is a
+# workspace-internal path dependency (this repo's own crates, which carry
+# no version field by design). cargo-deny only exempts path dependencies
+# for crates marked publish = false (allow-wildcard-paths), and these
+# crates are not so marked. All registry dependencies carry explicit
+# version requirements; if a true registry wildcard ever appears it will
+# surface here as a warning to be fixed.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

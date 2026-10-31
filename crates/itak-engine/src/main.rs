@@ -1013,7 +1013,15 @@ mod tests {
         write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
         let reply = read_reply(&mut client);
         assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
-        write_frame(&mut client, &"a".repeat(500));
+        // One combined write, not write_frame's two calls: the engine
+        // refuses and closes the moment it has read cap+1 bytes, and
+        // under full-suite load that close can land between the helper's
+        // payload and newline writes, failing the newline write with
+        // EPIPE even though the refusal behaved exactly as specified.
+        client
+            .get_mut()
+            .write_all(format!("{}\n", "a".repeat(500)).as_bytes())
+            .expect("write oversized frame");
         let reply = read_reply(&mut client);
         assert!(reply.contains("\"bad_frame\""), "reply: {reply}");
         assert_closed_after_refusal(&mut client);

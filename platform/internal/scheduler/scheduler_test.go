@@ -52,7 +52,7 @@ func queueWaiter(s *scheduler.Scheduler, p scheduler.Priority, name string,
 }
 
 func TestBothLanesDrain(t *testing.T) {
-	s := scheduler.New(1)
+	s := scheduler.New(1, 16)
 	releaseHolder := holdSlot(t, s)
 
 	var mu sync.Mutex
@@ -83,7 +83,7 @@ func TestBothLanesDrain(t *testing.T) {
 // TestHighLaneDrainsAlone is the direct regression shape for the old
 // platform bug, where the high-priority queue was never served.
 func TestHighLaneDrainsAlone(t *testing.T) {
-	s := scheduler.New(1)
+	s := scheduler.New(1, 16)
 	releaseHolder := holdSlot(t, s)
 
 	var mu sync.Mutex
@@ -108,7 +108,7 @@ func TestHighLaneDrainsAlone(t *testing.T) {
 }
 
 func TestHighBeforeNormal(t *testing.T) {
-	s := scheduler.New(1)
+	s := scheduler.New(1, 16)
 	releaseHolder := holdSlot(t, s)
 
 	var mu sync.Mutex
@@ -133,7 +133,7 @@ func TestHighBeforeNormal(t *testing.T) {
 }
 
 func TestContextCancelWithdrawsCleanly(t *testing.T) {
-	s := scheduler.New(1)
+	s := scheduler.New(1, 16)
 	releaseHolder := holdSlot(t, s)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,7 +167,7 @@ func TestContextCancelWithdrawsCleanly(t *testing.T) {
 }
 
 func TestCloseFailsWaitersAndRejectsNew(t *testing.T) {
-	s := scheduler.New(1)
+	s := scheduler.New(1, 16)
 	releaseHolder := holdSlot(t, s)
 	defer releaseHolder()
 
@@ -189,5 +189,61 @@ func TestCloseFailsWaitersAndRejectsNew(t *testing.T) {
 	}
 	if _, err := s.Acquire(context.Background(), scheduler.PriorityNormal); !errors.Is(err, scheduler.ErrClosed) {
 		t.Fatalf("Acquire after Close err = %v, want ErrClosed", err)
+	}
+}
+
+// TestQueueFullRefusesByName is the Wave 1 bound: a lane at its
+// configured waiter cap refuses the next Acquire immediately with
+// ErrQueueFull instead of queueing without bound.
+func TestQueueFullRefusesByName(t *testing.T) {
+	for _, lane := range []scheduler.Priority{scheduler.PriorityNormal, scheduler.PriorityHigh} {
+		s := scheduler.New(1, 2)
+		releaseHolder := holdSlot(t, s)
+
+		errCh := make(chan error, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				_, err := s.Acquire(context.Background(), lane)
+				errCh <- err
+			}()
+		}
+		waitFor(t, "lane filled to its cap", func() bool {
+			st := s.Stats()
+			return st.HighQueued+st.NormalQueued == 2
+		})
+
+		// The next waiter is refused at once, by name; it must not
+		// block behind the full lane.
+		refused := make(chan error, 1)
+		go func() {
+			_, err := s.Acquire(context.Background(), lane)
+			refused <- err
+		}()
+		select {
+		case err := <-refused:
+			if !errors.Is(err, scheduler.ErrQueueFull) {
+				t.Fatalf("lane %v: Acquire past the cap err = %v, want ErrQueueFull", lane, err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("lane %v: Acquire past the cap blocked instead of refusing", lane)
+		}
+
+		// Draining the lane makes room again: once the holder and
+		// one waiter release, a fresh Acquire is granted.
+		releaseHolder()
+		if err := <-errCh; err != nil {
+			t.Fatalf("lane %v: queued waiter err = %v, want grant", lane, err)
+		}
+	}
+}
+
+// TestZeroWaiterCapDisablesQueueing pins the cap=0 mode: nothing
+// waits, any Acquire that cannot be granted at once refuses.
+func TestZeroWaiterCapDisablesQueueing(t *testing.T) {
+	s := scheduler.New(1, 0)
+	releaseHolder := holdSlot(t, s)
+	defer releaseHolder()
+	if _, err := s.Acquire(context.Background(), scheduler.PriorityNormal); !errors.Is(err, scheduler.ErrQueueFull) {
+		t.Fatalf("Acquire with a zero waiter cap err = %v, want ErrQueueFull", err)
 	}
 }

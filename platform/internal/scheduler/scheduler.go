@@ -1,7 +1,9 @@
 // Package scheduler is the platform's request scheduling gate.
 //
 // It bounds how many engine jobs run at once and queues the rest in two
-// priority lanes. The design answers a specific defect in the old
+// priority lanes, each lane capped at a configured number of waiters so
+// a pinned engine cannot accumulate unbounded queued requests. The
+// design answers a specific defect in the old
 // platform: its batch scheduler never drained its high-priority queue
 // (scheduler.go:310-313 over there), so elevated requests hung forever.
 // Here both lanes are served by one grant loop: whenever a slot frees,
@@ -29,28 +31,43 @@ const (
 // ErrClosed is returned to waiters and new callers after Close.
 var ErrClosed = errors.New("scheduler: closed")
 
+// ErrQueueFull is returned when a call would have to wait but its
+// lane already holds the configured maximum number of waiters. It is
+// the platform-side mirror of the engine's engine_busy refusal: the
+// caller is refused by name and may retry, never queued without
+// bound behind a pinned engine.
+var ErrQueueFull = errors.New("scheduler: queue full")
+
 type waiter struct {
 	grant chan error // buffered 1: receives nil on grant, ErrClosed on Close
 }
 
 // Scheduler is a goroutine-safe priority gate over engine work.
 type Scheduler struct {
-	mu      sync.Mutex
-	max     int
-	running int
-	high    []*waiter
-	normal  []*waiter
-	closed  bool
+	mu         sync.Mutex
+	max        int
+	maxWaiters int
+	running    int
+	high       []*waiter
+	normal     []*waiter
+	closed     bool
 }
 
-// New builds a scheduler allowing maxConcurrent jobs at once. Values
-// below 1 are clamped to 1: a zero-slot scheduler would hang every
-// caller, which is a configuration error, not a mode.
-func New(maxConcurrent int) *Scheduler {
+// New builds a scheduler allowing maxConcurrent jobs at once and at
+// most maxWaitersPerLane queued waiters in each lane; an Acquire that
+// would wait beyond the lane cap refuses with ErrQueueFull.
+// maxConcurrent below 1 is clamped to 1: a zero-slot scheduler would
+// hang every caller, which is a configuration error, not a mode.
+// maxWaitersPerLane below 0 is clamped to 0, which disables queueing:
+// any Acquire that cannot be granted at once refuses.
+func New(maxConcurrent, maxWaitersPerLane int) *Scheduler {
 	if maxConcurrent < 1 {
 		maxConcurrent = 1
 	}
-	return &Scheduler{max: maxConcurrent}
+	if maxWaitersPerLane < 0 {
+		maxWaitersPerLane = 0
+	}
+	return &Scheduler{max: maxConcurrent, maxWaiters: maxWaitersPerLane}
 }
 
 // Acquire blocks until a slot is granted, the context ends, or the
@@ -72,8 +89,16 @@ func (s *Scheduler) Acquire(ctx context.Context, p Priority) (release func(), er
 	}
 	w := &waiter{grant: make(chan error, 1)}
 	if p == PriorityHigh {
+		if len(s.high) >= s.maxWaiters {
+			s.mu.Unlock()
+			return nil, ErrQueueFull
+		}
 		s.high = append(s.high, w)
 	} else {
+		if len(s.normal) >= s.maxWaiters {
+			s.mu.Unlock()
+			return nil, ErrQueueFull
+		}
 		s.normal = append(s.normal, w)
 	}
 	s.mu.Unlock()
@@ -172,6 +197,7 @@ func (s *Scheduler) Close() {
 // Stats is the scheduler's debug summary.
 type Stats struct {
 	Max          int `json:"max"`
+	MaxWaiters   int `json:"max_waiters_per_lane"`
 	Running      int `json:"running"`
 	HighQueued   int `json:"high_queued"`
 	NormalQueued int `json:"normal_queued"`
@@ -183,6 +209,7 @@ func (s *Scheduler) Stats() Stats {
 	defer s.mu.Unlock()
 	return Stats{
 		Max:          s.max,
+		MaxWaiters:   s.maxWaiters,
 		Running:      s.running,
 		HighQueued:   len(s.high),
 		NormalQueued: len(s.normal),

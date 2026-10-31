@@ -40,6 +40,19 @@
 // error, never a silently flattened prompt: falling back is a
 // decision the caller makes with the error in hand, not something
 // this package hides.
+//
+// The template is attacker-controlled input (it arrives inside a
+// model file's metadata), so rendering also runs under hard
+// resource budgets, counted in the render state and shared by
+// nested macros, loops and branches: a maximum macro call depth,
+// a maximum count of evaluated nodes and loop iterations, and a
+// maximum output size. A template that exhausts a budget fails
+// with ErrBudget naming the limit, never with a stack overflow,
+// a panic or unbounded growth: without the budgets, a
+// self-recursive macro is a one-line kill switch for the serving
+// process, whose fatal stack error no handler can recover.
+// Legitimate templates, including this model's own ATEM
+// template, render far below every budget.
 package chattemplate
 
 import (
@@ -53,6 +66,40 @@ import (
 // ErrUnsupported names a template construct outside the rendered
 // subset. The message carries the construct itself.
 var ErrUnsupported = errors.New("chattemplate: unsupported construct")
+
+// ErrBudget names a render that exhausted one of the resource
+// budgets below. Refusing is the designed outcome for a hostile
+// or pathological template: a caller maps it to the same named
+// chat_template_error as any other refusal this package returns.
+var ErrBudget = errors.New("chattemplate: render budget exhausted")
+
+// The render budgets. These are safety limits, not operator
+// configuration: they bound what any single template can make
+// the process do, and they sit orders of magnitude above what a
+// legitimate chat template needs (the model's own ATEM template
+// renders a long conversation in a few thousand steps and a few
+// tens of kilobytes). The depth cap alone does not bound work:
+// a macro that calls two macros that each call two more stays
+// shallow while its node count and output double per level, so
+// the step and output budgets are the ones that stop fan-out.
+const (
+	// maxMacroDepth bounds nested macro calls. Jinja itself
+	// leans on the interpreter recursion limit for this; here
+	// the cap is explicit so recursion fails by name.
+	maxMacroDepth = 64
+	// maxRenderSteps bounds the total nodes rendered and loop
+	// iterations executed in one Render call, across all
+	// nesting. Each loop iteration over real messages costs a
+	// handful of steps, so this still allows prompts built
+	// from tens of thousands of messages.
+	maxRenderSteps = 1 << 20
+	// maxRenderOutput bounds the bytes a render may produce,
+	// including text accumulated inside macro calls before it
+	// reaches the print site. Real prompts are message text
+	// plus template scaffolding; 16 MiB is far past any
+	// legitimate render.
+	maxRenderOutput = 16 << 20
+)
 
 // Message is one chat message, as templates see it.
 type Message struct {
@@ -107,7 +154,7 @@ func Render(template string, messages []Message, p Params) (string, error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
-	env := &env{global: global, cur: global, macros: map[string]*macroNode{}, now: now}
+	env := &env{global: global, cur: global, macros: map[string]*macroNode{}, now: now, budget: &renderBudget{}}
 	var sb strings.Builder
 	if err := renderNodes(nodes, env, &sb); err != nil {
 		return "", err
@@ -1141,16 +1188,61 @@ type env struct {
 	cur    *scope
 	macros map[string]*macroNode
 	now    time.Time
+	budget *renderBudget
 }
 
 func (e *env) child(vars map[string]value) *env {
-	return &env{global: e.global, cur: &scope{vars: vars, parent: e.cur}, macros: e.macros, now: e.now}
+	return &env{global: e.global, cur: &scope{vars: vars, parent: e.cur}, macros: e.macros, now: e.now, budget: e.budget}
+}
+
+// renderBudget is the shared accounting every render in one
+// Render call draws from: child scopes and macro invocations all
+// carry the same pointer, so nesting cannot reset a budget.
+type renderBudget struct {
+	steps   int // nodes rendered plus loop iterations executed
+	depth   int // macro calls currently open
+	written int // bytes produced, output and intermediate alike
+}
+
+// step charges one unit of work against the step budget.
+func (b *renderBudget) step() error {
+	b.steps++
+	if b.steps > maxRenderSteps {
+		return fmt.Errorf("%w: more than %d evaluated nodes and loop iterations", ErrBudget, maxRenderSteps)
+	}
+	return nil
+}
+
+// write charges produced text against the output budget. Every
+// sink counts, including a macro's private buffer, so text must
+// fit the budget at production time, not at the print site.
+func (b *renderBudget) write(n int) error {
+	b.written += n
+	if b.written > maxRenderOutput {
+		return fmt.Errorf("%w: more than %d bytes of output", ErrBudget, maxRenderOutput)
+	}
+	return nil
+}
+
+// enterMacro opens a macro call against the depth budget.
+func (b *renderBudget) enterMacro(name string) error {
+	b.depth++
+	if b.depth > maxMacroDepth {
+		return fmt.Errorf("%w: macro call depth over %d at %q", ErrBudget, maxMacroDepth, name)
+	}
+	return nil
 }
 
 func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 	for _, n := range nodes {
+		if err := e.budget.step(); err != nil {
+			return err
+		}
 		switch n := n.(type) {
 		case textNode:
+			if err := e.budget.write(len(n.s)); err != nil {
+				return err
+			}
 			sb.WriteString(n.s)
 		case printNode:
 			v, err := eval(n.expr, e)
@@ -1159,6 +1251,9 @@ func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 			}
 			s, err := v.stringify()
 			if err != nil {
+				return err
+			}
+			if err := e.budget.write(len(s)); err != nil {
 				return err
 			}
 			sb.WriteString(s)
@@ -1181,6 +1276,13 @@ func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
 				return fmt.Errorf("%w: for over a non-list value", ErrUnsupported)
 			}
 			for i, item := range iter.list {
+				// An empty loop body spends no node steps, so
+				// iterations charge the step budget directly:
+				// a loop over an attacker-sized list is work
+				// even when it prints nothing.
+				if err := e.budget.step(); err != nil {
+					return err
+				}
 				vars := map[string]value{
 					"loop": dictValue(map[string]value{
 						"index":  numValue(float64(i + 1)),
@@ -1310,7 +1412,18 @@ func eval(x *vExpr, e *env) (value, error) {
 		if err != nil {
 			return value{}, err
 		}
-		return addValues(l, r)
+		out, err := addValues(l, r)
+		if err != nil {
+			return value{}, err
+		}
+		// Concatenation materializes a new string or list, so
+		// it charges the output budget: a doubling chain of
+		// '+' over a value produces bytes long before any
+		// print site sees them.
+		if err := e.budget.write(valueBytes(out)); err != nil {
+			return value{}, err
+		}
+		return out, nil
 	case "eq", "ne":
 		l, err := eval(x.lhs, e)
 		if err != nil {
@@ -1439,6 +1552,29 @@ func addValues(l, r value) (value, error) {
 	return value{}, fmt.Errorf("%w: '+' over values that do not add", ErrUnsupported)
 }
 
+// valueBytes measures the bytes a value stands for, for the
+// output budget: the string itself, or the element total of a
+// container. Scalars carry no production cost worth charging.
+func valueBytes(v value) int {
+	switch v.kind {
+	case vStr:
+		return len(v.s)
+	case vList:
+		n := 0
+		for _, el := range v.list {
+			n += valueBytes(el)
+		}
+		return n
+	case vDict:
+		n := 0
+		for _, el := range v.dict {
+			n += valueBytes(el)
+		}
+		return n
+	}
+	return 0
+}
+
 func evalTest(x *vExpr, e *env) (value, error) {
 	v, err := eval(x.lhs, e)
 	if err != nil {
@@ -1512,7 +1648,14 @@ func evalFilter(x *vExpr, e *env) (value, error) {
 		if err != nil {
 			return value{}, err
 		}
-		return strValue(strings.ReplaceAll(base.s, from, to)), nil
+		out := strings.ReplaceAll(base.s, from, to)
+		// A replace can multiply its input (every byte becomes
+		// a longer string), so the result charges the output
+		// budget like any other produced text.
+		if err := e.budget.write(len(out)); err != nil {
+			return value{}, err
+		}
+		return strValue(out), nil
 	case "join":
 		if base.kind != vList {
 			return value{}, fmt.Errorf("%w: filter join over a non-list", ErrUnsupported)
@@ -1529,7 +1672,11 @@ func evalFilter(x *vExpr, e *env) (value, error) {
 			}
 			parts = append(parts, s)
 		}
-		return strValue(strings.Join(parts, sep)), nil
+		out := strings.Join(parts, sep)
+		if err := e.budget.write(len(out)); err != nil {
+			return value{}, err
+		}
+		return strValue(out), nil
 	}
 	return value{}, fmt.Errorf("%w: filter %q", ErrUnsupported, x.s)
 }
@@ -1644,10 +1791,16 @@ func evalCall(x *vExpr, e *env) (value, error) {
 			if err != nil {
 				return value{}, err
 			}
+			if err := e.budget.write(valueBytes(v)); err != nil {
+				return value{}, err
+			}
 			vars[param] = v
 		} else if kwExpr, ok := x.kw[param]; ok {
 			v, err := eval(kwExpr, e)
 			if err != nil {
+				return value{}, err
+			}
+			if err := e.budget.write(valueBytes(v)); err != nil {
 				return value{}, err
 			}
 			vars[param] = v
@@ -1655,11 +1808,30 @@ func evalCall(x *vExpr, e *env) (value, error) {
 			vars[param] = undefValue(param)
 		}
 	}
+	// A macro call charges a step of its own, on top of the
+	// nodes its body renders, so the total call count in one
+	// render is bounded directly and not only through bodies.
+	if err := e.budget.step(); err != nil {
+		return value{}, err
+	}
+	if err := e.budget.enterMacro(x.s); err != nil {
+		return value{}, err
+	}
+	defer func() { e.budget.depth-- }()
 	// Macros see the global scope plus their parameters, as in
 	// Jinja; the caller's locals do not leak in.
-	macroEnv := &env{global: e.global, cur: &scope{vars: vars, parent: e.global}, macros: e.macros, now: e.now}
+	macroEnv := &env{global: e.global, cur: &scope{vars: vars, parent: e.global}, macros: e.macros, now: e.now, budget: e.budget}
 	var sb strings.Builder
 	if err := renderNodes(m.body, macroEnv, &sb); err != nil {
+		return value{}, err
+	}
+	// The returned text is materialized here and will be
+	// charged again wherever it is consumed (printed or passed
+	// on as an argument); charging it at production too keeps
+	// a macro that duplicates its argument a constant number
+	// of times per call from growing memory a level at a time
+	// while the charges land only at the final print.
+	if err := e.budget.write(sb.Len()); err != nil {
 		return value{}, err
 	}
 	return strValue(sb.String()), nil

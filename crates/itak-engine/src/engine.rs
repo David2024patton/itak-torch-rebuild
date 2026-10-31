@@ -349,6 +349,12 @@ fn run_embed(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, job: EmbedJob) {
         st.queued = st.queued.saturating_sub(1);
     }
     let outcome = embed_batch(loaded, &job.inputs, job.max_tokens_per_input);
+    if let Err((code, message)) = &outcome {
+        // The batch's refusal is recorded under its protocol code
+        // (the per-input cap's bad_request lands here) before the
+        // outcome goes back to the connection thread.
+        crate::diag::error(code, message);
+    }
     if outcome.is_ok() {
         let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
         st.embeddings += 1;
@@ -477,6 +483,11 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         st.queued = st.queued.saturating_sub(1);
     }
     let fail = |code: &str, message: String| {
+        // Every named job failure is recorded on the diagnostic
+        // channel under its protocol code as it is reported: the
+        // tokenize bad_request, the empty-prompt bad_request, and
+        // the context_overflow refusal all leave through here.
+        crate::diag::error(code, &message);
         let _ = reply.send(GenEvent::Error {
             code: code.to_string(),
             message,
@@ -517,13 +528,16 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
             ),
         );
     }
-    crate::log_line(&format!(
-        "generate start: prompt_tokens={} max_tokens={} temperature={} top_p={}",
-        ids.len(),
-        max_tokens,
-        temperature,
-        top_p
-    ));
+    crate::diag::emit(
+        "generate_start",
+        &format!(
+            "generate start: prompt_tokens={} max_tokens={} temperature={} top_p={}",
+            ids.len(),
+            max_tokens,
+            temperature,
+            top_p
+        ),
+    );
     // The full id list is content, not diagnostics: token ids are
     // reversible to prompt text with the model's own tokenizer, so
     // it is logged only under the operator's --log-content. It is
@@ -531,7 +545,7 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
     // the order of a megabyte on one line), which is half of how
     // the supervisor's stderr pump wedged (adjudication H-2).
     if log_content {
-        crate::log_line(&format!("prompt ids: {ids:?}"));
+        crate::diag::emit("generate_prompt_ids", &format!("prompt ids: {ids:?}"));
     }
 
     {
@@ -570,27 +584,34 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
             st.last_generated_tokens = generated;
             st.last_cache_position = ids.len() + generated;
             drop(st);
-            crate::log_line(&done_log_line(
-                &finish_reason,
-                generated,
-                started.elapsed().as_millis(),
-                &text,
-                log_content,
-            ));
+            crate::diag::emit(
+                "generate_done",
+                &done_log_line(
+                    &finish_reason,
+                    generated,
+                    started.elapsed().as_millis(),
+                    &text,
+                    log_content,
+                ),
+            );
             let _ = reply.send(GenEvent::Done { finish_reason });
         }
         JobOutcome::Failed { code, message } => {
             drop(st);
-            crate::log_line(&format!(
-                "generate failed: code={} message={}",
-                code, message
-            ));
-            fail(&code, message);
+            // The job's failure record is this line (the forward
+            // and detokenize refusals land here, named in its
+            // fields); the error frame is sent directly rather
+            // than through fail(), which would record it twice.
+            crate::diag::emit(
+                "generate_failed",
+                &format!("generate failed: code={} message={}", code, message),
+            );
+            let _ = reply.send(GenEvent::Error { code, message });
         }
         JobOutcome::Aborted { generated } => {
             st.last_generated_tokens = generated;
             drop(st);
-            crate::log_line("generate aborted: client disconnected");
+            crate::diag::emit("generate_aborted", "generate aborted: client disconnected");
         }
     }
 }

@@ -42,6 +42,7 @@
 //! exits the process non-zero with the named error: a partial model
 //! never serves.
 
+mod diag;
 mod engine;
 mod json;
 mod protocol;
@@ -60,16 +61,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use engine::{EmbedJob, EmbedOutcome, EngineConfig, GenEvent, Job, ModelInfo, Stats, Work};
 use json::Value;
 
-/// One timestamped line to stderr: the engine's diagnostic channel
-/// until the diag crate lands.
-pub fn log_line(message: &str) {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    eprintln!("[itak-engine {secs}] {message}");
-}
-
 fn main() {
     std::process::exit(run());
 }
@@ -84,30 +75,36 @@ fn run() -> i32 {
         model_path: config.model_path.clone(),
         model_name: config.model_name.clone(),
     };
-    log_line(&format!(
-        "loading model {} (this takes seconds: parse, coverage gate, weights)",
-        config.model_path.display()
-    ));
+    diag::emit(
+        "model_load_begin",
+        &format!(
+            "loading model {} (this takes seconds: parse, coverage gate, weights)",
+            config.model_path.display()
+        ),
+    );
     let load_started = Instant::now();
     let (info, loaded) = match engine::load(&engine_config) {
         Ok(pair) => pair,
         Err(e) => {
-            log_line(&format!("model load FAILED: {e}"));
+            diag::error("model_load_failed", &format!("model load FAILED: {e}"));
             return 1;
         }
     };
-    log_line(&format!(
-        "model loaded in {} ms: name={} arch={} layers={} hidden={} vocab={} context={} coverage={}/{}",
-        load_started.elapsed().as_millis(),
-        info.name,
-        info.architecture,
-        info.layers,
-        info.hidden,
-        info.vocab,
-        info.context_length,
-        info.coverage_found,
-        info.coverage_expected
-    ));
+    diag::emit(
+        "model_loaded",
+        &format!(
+            "model loaded in {} ms: name={} arch={} layers={} hidden={} vocab={} context={} coverage={}/{}",
+            load_started.elapsed().as_millis(),
+            info.name,
+            info.architecture,
+            info.layers,
+            info.hidden,
+            info.vocab,
+            info.context_length,
+            info.coverage_found,
+            info.coverage_expected
+        ),
+    );
 
     let stats = Arc::new(Mutex::new(Stats::default()));
     // The queue capacity is the concurrency contract (TODO T-9.14):
@@ -130,20 +127,26 @@ fn run() -> i32 {
     let listener = match bind_socket(&socket_path) {
         Ok(listener) => listener,
         Err(e) => {
-            log_line(&e);
+            diag::error("socket_bind_failed", &e);
             return 1;
         }
     };
-    log_line(&format!(
-        "serving on {} (protocol {})",
-        socket_path.display(),
-        protocol::PROTO_VERSION
-    ));
+    diag::emit(
+        "serving",
+        &format!(
+            "serving on {} (protocol {})",
+            socket_path.display(),
+            protocol::PROTO_VERSION
+        ),
+    );
 
-    log_line(&format!(
-        "concurrency: slots={} max_queued={} (submissions past capacity refuse as engine_busy)",
-        config.slots, config.max_queued
-    ));
+    diag::emit(
+        "concurrency",
+        &format!(
+            "concurrency: slots={} max_queued={} (submissions past capacity refuse as engine_busy)",
+            config.slots, config.max_queued
+        ),
+    );
     let started = Instant::now();
     for conn in listener.incoming() {
         match conn {
@@ -161,7 +164,7 @@ fn run() -> i32 {
                 };
                 std::thread::spawn(move || handle_conn(stream, tx, info, stats, started, limits));
             }
-            Err(e) => log_line(&format!("accept failed: {e}")),
+            Err(e) => diag::error("accept_failed", &format!("accept failed: {e}")),
         }
     }
     0
@@ -188,10 +191,10 @@ fn bind_socket(socket_path: &Path) -> Result<UnixListener, String> {
                 socket_path.display()
             ));
         }
-        log_line(&format!(
-            "removing stale socket file {}",
-            socket_path.display()
-        ));
+        diag::emit(
+            "stale_socket_removed",
+            &format!("removing stale socket file {}", socket_path.display()),
+        );
         std::fs::remove_file(socket_path)
             .map_err(|e| format!("cannot remove stale socket: {e}"))?;
     }
@@ -364,6 +367,16 @@ fn check_peer(stream: &UnixStream) -> Result<(), String> {
     }
 }
 
+/// Send a named refusal frame and record the refusal on the
+/// diagnostic channel under the same code, at the point of
+/// refusal: every refusal the engine makes is observable in its
+/// log with the code the client was told, not just on the wire.
+/// Returns what [`send`] returns (false means the peer is gone).
+fn refuse(writer: &mut UnixStream, code: &str, message: &str) -> bool {
+    diag::error(code, message);
+    send(writer, &protocol::error_frame(code, message))
+}
+
 fn handle_conn(
     stream: UnixStream,
     jobs: SyncSender<Work>,
@@ -375,12 +388,15 @@ fn handle_conn(
     let mut writer = match stream.try_clone() {
         Ok(writer) => writer,
         Err(e) => {
-            log_line(&format!("connection clone failed: {e}"));
+            diag::error(
+                "connection_failed",
+                &format!("connection clone failed: {e}"),
+            );
             return;
         }
     };
     if let Err(msg) = check_peer(&stream) {
-        log_line(&format!("connection refused: {msg}"));
+        diag::error("peer_refused", &format!("connection refused: {msg}"));
         let _ = send(&mut writer, &protocol::error_frame("peer_refused", &msg));
         return;
     }
@@ -407,7 +423,10 @@ fn handle_conn(
             Ok(0) => return, // client closed
             Ok(_) => {}
             Err(e) => {
-                log_line(&format!("connection read failed: {e}"));
+                diag::error(
+                    "connection_read_failed",
+                    &format!("connection read failed: {e}"),
+                );
                 return;
             }
         }
@@ -416,7 +435,7 @@ fn handle_conn(
                 "frame exceeds the maximum frame size of {} bytes",
                 limits.max_frame_bytes
             );
-            let _ = send(&mut writer, &protocol::error_frame("bad_frame", &msg));
+            let _ = refuse(&mut writer, "bad_frame", &msg);
             return;
         }
         let trimmed = line.trim_end();
@@ -426,7 +445,7 @@ fn handle_conn(
         let frame = match json::parse(trimmed) {
             Ok(frame) => frame,
             Err(e) => {
-                if !send(&mut writer, &protocol::error_frame("bad_frame", &e)) {
+                if !refuse(&mut writer, "bad_frame", &e) {
                     return;
                 }
                 continue;
@@ -435,10 +454,7 @@ fn handle_conn(
         let op = frame.get("op").and_then(Value::as_str).unwrap_or("");
         if op != "hello" && !greeted {
             let msg = format!("first frame on a connection must be hello, not {op:?}");
-            let _ = send(
-                &mut writer,
-                &protocol::error_frame("protocol_mismatch", &msg),
-            );
+            let _ = refuse(&mut writer, "protocol_mismatch", &msg);
             return;
         }
         match op {
@@ -455,19 +471,14 @@ fn handle_conn(
                             "protocol version {v} not spoken here; this engine speaks {}",
                             protocol::PROTO_VERSION
                         );
-                        let _ = send(
-                            &mut writer,
-                            &protocol::error_frame("protocol_mismatch", &msg),
-                        );
+                        let _ = refuse(&mut writer, "protocol_mismatch", &msg);
                         return;
                     }
                     None => {
-                        let _ = send(
+                        let _ = refuse(
                             &mut writer,
-                            &protocol::error_frame(
-                                "protocol_mismatch",
-                                "hello frame carries no proto version",
-                            ),
+                            "protocol_mismatch",
+                            "hello frame carries no proto version",
                         );
                         return;
                     }
@@ -479,6 +490,7 @@ fn handle_conn(
                     info.name,
                     info.architecture
                 );
+                diag::emit("hello", &detail);
                 if !send(&mut writer, &protocol::hello_ack(&detail)) {
                     return;
                 }
@@ -506,22 +518,24 @@ fn handle_conn(
                 }
             }
             "chat_template" => {
-                let reply = match &info.chat_template {
-                    Some(template) => {
-                        protocol::chat_template_frame(template, &info.bos_token, &info.eos_token)
-                    }
-                    None => protocol::error_frame(
+                let alive = match &info.chat_template {
+                    Some(template) => send(
+                        &mut writer,
+                        &protocol::chat_template_frame(template, &info.bos_token, &info.eos_token),
+                    ),
+                    None => refuse(
+                        &mut writer,
                         "no_chat_template",
                         "the model file carries no tokenizer.chat_template",
                     ),
                 };
-                if !send(&mut writer, &reply) {
+                if !alive {
                     return;
                 }
             }
             other => {
                 let msg = format!("unknown op {other:?}");
-                if !send(&mut writer, &protocol::error_frame("unknown_op", &msg)) {
+                if !refuse(&mut writer, "unknown_op", &msg) {
                     return;
                 }
             }
@@ -542,7 +556,7 @@ fn handle_generate(
     let req = match protocol::parse_generate(frame) {
         Ok(req) => req,
         Err(e) => {
-            return send(writer, &protocol::error_frame("bad_request", &e));
+            return refuse(writer, "bad_request", &e);
         }
     };
     if !req.model.is_empty() && req.model != info.name {
@@ -550,7 +564,7 @@ fn handle_generate(
             "this engine serves model {:?}, not {:?}",
             info.name, req.model
         );
-        return send(writer, &protocol::error_frame("model_not_found", &msg));
+        return refuse(writer, "model_not_found", &msg);
     }
     let (reply_tx, reply_rx) = channel::<GenEvent>();
     // A request seed makes the sampled run reproducible; only a
@@ -587,13 +601,10 @@ fn handle_generate(
                 "engine busy: {} slot(s) running and the queue is full (max_queued {})",
                 limits.slots, limits.max_queued
             );
-            return send(writer, &protocol::error_frame("engine_busy", &msg));
+            return refuse(writer, "engine_busy", &msg);
         }
         Err(TrySendError::Disconnected(_)) => {
-            return send(
-                writer,
-                &protocol::error_frame("engine_died", "the engine worker is gone"),
-            );
+            return refuse(writer, "engine_died", "the engine worker is gone");
         }
     }
     loop {
@@ -610,18 +621,20 @@ fn handle_generate(
                 );
             }
             Ok(GenEvent::Error { code, message }) => {
+                // The worker already recorded this failure on the
+                // diagnostic channel when it named it; the
+                // connection only relays the frame.
                 return send(writer, &protocol::error_frame(&code, &message));
             }
             Err(_) => {
                 // The worker dropped the job without a terminal
                 // event: it died, and the platform should hear that
-                // by name, not as a silent close.
-                return send(
+                // by name, not as a silent close. The worker emitted
+                // nothing, so the connection side records it.
+                return refuse(
                     writer,
-                    &protocol::error_frame(
-                        "engine_died",
-                        "the engine worker stopped mid-generation",
-                    ),
+                    "engine_died",
+                    "the engine worker stopped mid-generation",
                 );
             }
         }
@@ -643,12 +656,12 @@ fn handle_embed(
     let (model, inputs) = match protocol::parse_embed(frame) {
         Ok(pair) => pair,
         Err(e) => {
-            return send(writer, &protocol::error_frame("bad_request", &e));
+            return refuse(writer, "bad_request", &e);
         }
     };
     if !model.is_empty() && model != info.name {
         let msg = format!("this engine serves model {:?}, not {:?}", info.name, model);
-        return send(writer, &protocol::error_frame("model_not_found", &msg));
+        return refuse(writer, "model_not_found", &msg);
     }
     // The batch cap is enforced here, before the batch can occupy
     // a slot: a frame may be large (up to --max-frame-bytes) and a
@@ -661,7 +674,7 @@ fn handle_embed(
             inputs.len(),
             limits.max_embed_inputs
         );
-        return send(writer, &protocol::error_frame("bad_request", &msg));
+        return refuse(writer, "bad_request", &msg);
     }
     let (reply_tx, reply_rx) = channel::<EmbedOutcome>();
     let job = EmbedJob {
@@ -679,21 +692,21 @@ fn handle_embed(
                 "engine busy: {} slot(s) running and the queue is full (max_queued {})",
                 limits.slots, limits.max_queued
             );
-            return send(writer, &protocol::error_frame("engine_busy", &msg));
+            return refuse(writer, "engine_busy", &msg);
         }
         Err(TrySendError::Disconnected(_)) => {
-            return send(
-                writer,
-                &protocol::error_frame("engine_died", "the engine worker is gone"),
-            );
+            return refuse(writer, "engine_died", "the engine worker is gone");
         }
     }
     match reply_rx.recv() {
         Ok(Ok(vectors)) => send(writer, &protocol::embeddings_frame(&info.name, &vectors)),
+        // The worker recorded the failure on the diagnostic
+        // channel when it named it; this only relays the frame.
         Ok(Err((code, message))) => send(writer, &protocol::error_frame(&code, &message)),
-        Err(_) => send(
+        Err(_) => refuse(
             writer,
-            &protocol::error_frame("engine_died", "the engine worker stopped mid-embedding"),
+            "engine_died",
+            "the engine worker stopped mid-embedding",
         ),
     }
 }
@@ -1106,5 +1119,45 @@ mod tests {
         // The refused job was not counted as queued.
         let st = stats.lock().expect("stats");
         assert_eq!(st.queued, 0);
+    }
+
+    #[test]
+    fn op_before_hello_refusal_emits_its_diag_event() {
+        // The diagnostic half of the handshake gate: the refusal
+        // is not only on the wire, it is on the engine's diagnostic
+        // channel under its protocol code. Captured through the
+        // sink seam (see diag.rs); the lock keeps the other sink
+        // swapping test from interleaving with this one.
+        #[derive(Default)]
+        struct Capture {
+            events: Mutex<Vec<(String, String)>>,
+        }
+        impl diag::Diag for Capture {
+            fn event(&self, event: &str, detail: &str) {
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push((event.to_string(), detail.to_string()));
+            }
+        }
+        let _guard = diag::SINK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let capture = Arc::new(Capture::default());
+        diag::set_sink(capture.clone());
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"ping"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"protocol_mismatch\""), "reply: {reply}");
+        drop(client);
+        handle.join().expect("conn thread");
+        diag::set_sink(Arc::new(diag::StderrDiag));
+        let events = capture.events.lock().expect("capture lock");
+        assert!(
+            events.iter().any(|(event, detail)| {
+                event == "protocol_mismatch" && detail.contains("first frame on a connection")
+            }),
+            "the refusal must emit its named diag event; captured: {events:?}"
+        );
     }
 }

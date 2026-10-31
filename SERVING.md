@@ -140,7 +140,9 @@ load failure exits non-zero with the named error.
   GGUF chat template (a bounded Jinja subset; constructs outside
   it refuse by name rather than rendering wrong). Only a model
   whose file carries no template gets the plain `role: content`
-  flattening, and /debug says so.
+  flattening, and /debug says so. On the Glimmer file the
+  rendered prompt's token ids match llama.cpp's templated ids
+  exactly (T-9.17, bench/t917-proof-2026-10-30.md).
 - Supervision: with `-engine-bin`, torchd restarts a dead engine
   within its budget; in-flight generations end with the named
   `engine_died` error, and an engine-reported mid-generation

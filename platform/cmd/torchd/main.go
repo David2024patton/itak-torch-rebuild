@@ -5,7 +5,8 @@
 //
 // Configuration is flags plus two environment variables:
 //
-//	TORCH_API_KEY        required API key (no default, never hardcoded)
+//	TORCH_API_KEY        required API key (no default, never hardcoded);
+//	                     at least 16 characters or startup refuses
 //	TORCH_ALLOW_NO_AUTH  set to 1 to run without a key (loudly logged)
 //
 // The bind defaults to 127.0.0.1. Exposing the platform beyond localhost
@@ -46,17 +47,25 @@ func run() int {
 	models := flag.String("models", "glimmer", "comma-separated model ids advertised on /v1/models")
 	maxConcurrent := flag.Int("max-concurrent", 4, "maximum simultaneous engine jobs")
 	cacheTTL := flag.Duration("cache-ttl", 5*time.Minute, "response cache TTL; 0 disables caching")
+	maxTokens := flag.Int("max-tokens", 8192, "maximum max_tokens one chat request may ask for; requests past the cap are refused by name")
+	generationTimeout := flag.Duration("generation-timeout", time.Hour, "per-generation wall-clock deadline; a generation that runs past it ends with a named failure")
+	maxBodyBytes := flag.Int64("max-body-bytes", 1<<20, "maximum request body size in bytes")
+	readHeaderTimeout := flag.Duration("read-header-timeout", 10*time.Second, "how long a client may take to send request headers")
+	idleTimeout := flag.Duration("idle-timeout", 90*time.Second, "how long an idle keep-alive connection is held open")
+	maxWaiters := flag.Int("max-waiters-per-lane", 128, "maximum requests queued in each scheduler lane; past the cap a request is refused as engine_busy")
+	cacheMaxEntries := flag.Int("cache-max-entries", 1024, "maximum response cache entries; past the cap the soonest to expire are evicted")
+	cachePurgeInterval := flag.Duration("cache-purge-interval", time.Minute, "how often the response cache janitor purges expired entries")
 	flag.Parse()
 
 	log := newLogger()
 	slog.SetDefault(log)
 
 	apiKey := os.Getenv("TORCH_API_KEY")
+	if problem := apiKeyProblem(apiKey); problem != "" {
+		log.Error(problem)
+		return 1
+	}
 	if apiKey == "" {
-		if os.Getenv("TORCH_ALLOW_NO_AUTH") != "1" {
-			log.Error("TORCH_API_KEY is not set; refusing to start an unauthenticated server (set TORCH_ALLOW_NO_AUTH=1 to override deliberately)")
-			return 1
-		}
 		log.Warn("TORCH_ALLOW_NO_AUTH=1: running WITHOUT authentication; every route is open")
 	}
 
@@ -73,12 +82,20 @@ func run() int {
 	}
 
 	srv := server.New(server.Config{
-		Engine:        eng,
-		APIKey:        apiKey,
-		Models:        splitModels(*models),
-		CacheTTL:      *cacheTTL,
-		MaxConcurrent: *maxConcurrent,
-		Logger:        log,
+		Engine:             eng,
+		APIKey:             apiKey,
+		Models:             splitModels(*models),
+		CacheTTL:           *cacheTTL,
+		MaxConcurrent:      *maxConcurrent,
+		MaxTokensCap:       *maxTokens,
+		GenerationTimeout:  *generationTimeout,
+		MaxBodyBytes:       *maxBodyBytes,
+		ReadHeaderTimeout:  *readHeaderTimeout,
+		IdleTimeout:        *idleTimeout,
+		MaxWaitersPerLane:  *maxWaiters,
+		CacheMaxEntries:    *cacheMaxEntries,
+		CachePurgeInterval: *cachePurgeInterval,
+		Logger:             log,
 	})
 	httpSrv := srv.HTTPServer(*addr)
 
@@ -162,6 +179,29 @@ func superviseEngine(bin, model, name, socketPath string, maxRestarts int, windo
 	log.Info("engine supervised", "bin", bin, "model", model, "socket", socketPath,
 		"max_restarts", maxRestarts, "restart_window", window)
 	return sup, sup.Stop
+}
+
+// minAPIKeyLen is the shortest TORCH_API_KEY torchd will run with.
+// The key is the only credential on the platform's front door; a
+// short one is a guessing target, so a short configured key is a
+// named startup refusal, not a silent weakness.
+const minAPIKeyLen = 16
+
+// apiKeyProblem returns the startup refusal for an unusable API key
+// configuration, or "" when the configuration may run: a key of at
+// least minAPIKeyLen characters, or no key at all with the loud
+// TORCH_ALLOW_NO_AUTH=1 opt-out.
+func apiKeyProblem(apiKey string) string {
+	if apiKey == "" {
+		if os.Getenv("TORCH_ALLOW_NO_AUTH") != "1" {
+			return "TORCH_API_KEY is not set; refusing to start an unauthenticated server (set TORCH_ALLOW_NO_AUTH=1 to override deliberately)"
+		}
+		return ""
+	}
+	if len(apiKey) < minAPIKeyLen {
+		return fmt.Sprintf("TORCH_API_KEY is too short: %d characters, minimum %d; refusing to start with a guessable key", len(apiKey), minAPIKeyLen)
+	}
+	return ""
 }
 
 func splitModels(csv string) []string {

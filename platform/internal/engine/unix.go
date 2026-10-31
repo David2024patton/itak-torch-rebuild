@@ -19,6 +19,55 @@ import (
 // else.
 const protoVersion = 1
 
+// maxFrameBytes caps one protocol frame at 4 MiB, matching the
+// engine side's frame cap. A peer that streams past the cap without
+// a newline is refused with ErrFrameTooLarge instead of buffering
+// the platform out of memory.
+const maxFrameBytes = 4 << 20
+
+// readFrame reads one newline-terminated frame from r, refusing
+// past maxFrameBytes. bufio.Reader.ReadBytes would accumulate
+// without bound; ReadSlice fragments are assembled here under the
+// cap instead.
+func readFrame(r *bufio.Reader) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		if len(buf) > maxFrameBytes {
+			return nil, fmt.Errorf("%w: more than %d bytes without a complete frame", ErrFrameTooLarge, maxFrameBytes)
+		}
+		switch {
+		case err == nil:
+			return buf, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		default:
+			return nil, err
+		}
+	}
+}
+
+// classifyReplyErr names a failed frame read on an established
+// connection. A deadline expiry is a timeout (ErrTimeout): the
+// engine may be perfectly healthy and merely slow, and calling it a
+// handshake failure mislabels the fault. An oversized frame keeps
+// its own name. Anything else keeps the historical ErrHandshake
+// wrap.
+func classifyReplyErr(err error) error {
+	if errors.Is(err, ErrFrameTooLarge) {
+		return err
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %w", ErrTimeout, err)
+	}
+	return fmt.Errorf("%w: read reply: %w", ErrHandshake, err)
+}
+
 type frame struct {
 	Op      string `json:"op"`
 	Proto   int    `json:"proto,omitempty"`
@@ -133,9 +182,9 @@ func (c *UnixClient) exchangeAnyLocked(ctx context.Context, send any) ([]byte, e
 	if _, err := c.conn.Write(append(line, '\n')); err != nil {
 		return nil, fmt.Errorf("%w: write frame: %w", ErrHandshake, err)
 	}
-	raw, err := c.r.ReadBytes('\n')
+	raw, err := readFrame(c.r)
 	if err != nil {
-		return nil, fmt.Errorf("%w: read reply: %w", ErrHandshake, err)
+		return nil, classifyReplyErr(err)
 	}
 	return raw, nil
 }
@@ -284,9 +333,15 @@ func (c *UnixClient) streamGenerate(ctx context.Context, out chan<- TokenEvent, 
 		}
 	}
 	for {
-		raw, err := c.r.ReadBytes('\n')
+		raw, err := readFrame(c.r)
 		if err != nil {
+			// An oversized frame keeps its own name; every other
+			// read failure means the connection died under the
+			// generation.
 			died := fmt.Errorf("%w: generate stream closed early: %w", ErrEngineDied, err)
+			if errors.Is(err, ErrFrameTooLarge) {
+				died = err
+			}
 			switch {
 			case ctx.Err() != nil:
 				signal(ctx.Err())

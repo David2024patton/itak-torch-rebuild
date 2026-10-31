@@ -11,6 +11,10 @@
 //     unimplemented engine op = 501 not_implemented.
 //   - Requests flow through the scheduler's priority lanes and
 //     non-streaming completions through the exact-match response cache.
+//   - Every operational limit (generation cap and deadline, body
+//     size, header and idle timeouts, lane queue caps, cache size)
+//     is operator config with a default, threaded from torchd's
+//     flags; nothing is a compiled-in literal.
 //   - /debug (behind auth) serves the diag registry plus scheduler and
 //     cache stats, so the running system can explain itself.
 package server
@@ -38,7 +42,19 @@ import (
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/scheduler"
 )
 
-const maxBodyBytes = 1 << 20 // 1 MiB request cap
+// Defaults for the operational limits Config leaves unset. They are
+// the values torchd's flags default to as well; the flags are how an
+// operator changes them, never a rebuild.
+const (
+	defaultMaxTokensCap       = 8192
+	defaultGenerationTimeout  = time.Hour
+	defaultMaxBodyBytes       = 1 << 20 // 1 MiB
+	defaultReadHeaderTimeout  = 10 * time.Second
+	defaultIdleTimeout        = 90 * time.Second
+	defaultMaxWaitersPerLane  = 128
+	defaultCacheMaxEntries    = 1024
+	defaultCachePurgeInterval = time.Minute
+)
 
 // Config wires the server. Zero values get safe defaults in New.
 type Config struct {
@@ -54,6 +70,30 @@ type Config struct {
 	CacheTTL time.Duration
 	// MaxConcurrent bounds simultaneous engine jobs; < 1 becomes 4.
 	MaxConcurrent int
+	// MaxTokensCap bounds one request's max_tokens; a request past
+	// the cap is refused by name before the engine is touched.
+	// < 1 becomes 8192.
+	MaxTokensCap int
+	// GenerationTimeout is the per-generation wall-clock deadline:
+	// one generation may hold its engine slot at most this long.
+	// <= 0 becomes 1 hour.
+	GenerationTimeout time.Duration
+	// MaxBodyBytes caps one request body. < 1 becomes 1 MiB.
+	MaxBodyBytes int64
+	// ReadHeaderTimeout bounds how long a client may take to send
+	// request headers. <= 0 becomes 10 seconds.
+	ReadHeaderTimeout time.Duration
+	// IdleTimeout bounds how long an idle keep-alive connection is
+	// held open. <= 0 becomes 90 seconds.
+	IdleTimeout time.Duration
+	// MaxWaitersPerLane caps each scheduler lane's wait queue; a
+	// request past the cap is refused as engine_busy. < 1 becomes 128.
+	MaxWaitersPerLane int
+	// CacheMaxEntries caps the response cache's size. < 1 becomes 1024.
+	CacheMaxEntries int
+	// CachePurgeInterval is how often the cache janitor runs
+	// PurgeExpired. <= 0 becomes 1 minute.
+	CachePurgeInterval time.Duration
 	// ChatTemplate, when set, is the chat template every chat
 	// request is rendered with (TODO T-9.16), overriding the
 	// engine-reported one. ChatBOSToken and ChatEOSToken supply its
@@ -79,6 +119,12 @@ type Server struct {
 	sched *scheduler.Scheduler
 	mux   http.Handler
 
+	// Cache janitor lifecycle: the goroutine runs while the server
+	// does, and Close stops it before closing the scheduler.
+	cacheStop chan struct{}
+	cacheDone chan struct{}
+	closeOnce sync.Once
+
 	// Chat template resolution (TODO T-9.16): resolved lazily and
 	// cached once the outcome is definitive (a template, or the
 	// engine's named no-template answer). Transient fetch errors
@@ -97,6 +143,30 @@ func New(cfg Config) *Server {
 	if cfg.MaxConcurrent < 1 {
 		cfg.MaxConcurrent = 4
 	}
+	if cfg.MaxTokensCap < 1 {
+		cfg.MaxTokensCap = defaultMaxTokensCap
+	}
+	if cfg.GenerationTimeout <= 0 {
+		cfg.GenerationTimeout = defaultGenerationTimeout
+	}
+	if cfg.MaxBodyBytes < 1 {
+		cfg.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if cfg.ReadHeaderTimeout <= 0 {
+		cfg.ReadHeaderTimeout = defaultReadHeaderTimeout
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = defaultIdleTimeout
+	}
+	if cfg.MaxWaitersPerLane < 1 {
+		cfg.MaxWaitersPerLane = defaultMaxWaitersPerLane
+	}
+	if cfg.CacheMaxEntries < 1 {
+		cfg.CacheMaxEntries = defaultCacheMaxEntries
+	}
+	if cfg.CachePurgeInterval <= 0 {
+		cfg.CachePurgeInterval = defaultCachePurgeInterval
+	}
 	eng := cfg.Engine
 	if eng == nil {
 		eng = engine.Unavailable{}
@@ -106,8 +176,13 @@ func New(cfg Config) *Server {
 		log:   cfg.Logger,
 		eng:   eng,
 		diag:  diag.New(),
-		cache: cache.New[[]byte](cfg.CacheTTL),
-		sched: scheduler.New(cfg.MaxConcurrent),
+		cache: cache.NewWithLimit[[]byte](cfg.CacheTTL, cfg.CacheMaxEntries),
+		sched: scheduler.New(cfg.MaxConcurrent, cfg.MaxWaitersPerLane),
+	}
+	if cfg.CacheTTL > 0 {
+		s.cacheStop = make(chan struct{})
+		s.cacheDone = make(chan struct{})
+		go s.cacheJanitor()
 	}
 
 	mux := http.NewServeMux()
@@ -125,18 +200,47 @@ func New(cfg Config) *Server {
 // Handler returns the fully wrapped route table.
 func (s *Server) Handler() http.Handler { return s.mux }
 
-// Close stops the scheduler, failing any queued requests.
-func (s *Server) Close() { s.sched.Close() }
+// Close stops the cache janitor, then the scheduler, failing any
+// queued requests. It is safe to call more than once.
+func (s *Server) Close() {
+	s.closeOnce.Do(func() {
+		if s.cacheStop != nil {
+			close(s.cacheStop)
+			<-s.cacheDone
+		}
+		s.sched.Close()
+	})
+}
+
+// cacheJanitor is the production caller of the cache's PurgeExpired:
+// expired entries leave on the configured interval instead of only
+// when their key happens to be read again.
+func (s *Server) cacheJanitor() {
+	defer close(s.cacheDone)
+	t := time.NewTicker(s.cfg.CachePurgeInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.cacheStop:
+			return
+		case <-t.C:
+			if n := s.cache.PurgeExpired(); n > 0 {
+				s.log.Debug("response cache janitor purged expired entries", "count", n)
+			}
+		}
+	}
+}
 
 // HTTPServer builds the http.Server with production timeouts. There is
 // deliberately no WriteTimeout or ReadTimeout: generations stream for
-// minutes. Header reads and idle conns are bounded.
+// minutes (bounded by the per-generation deadline instead). Header
+// reads and idle conns are bounded by the configured values.
 func (s *Server) HTTPServer(addr string) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           s.mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       90 * time.Second,
+		ReadHeaderTimeout: s.cfg.ReadHeaderTimeout,
+		IdleTimeout:       s.cfg.IdleTimeout,
 	}
 }
 
@@ -185,6 +289,10 @@ func engineErrorStatus(err error) (status int, code string) {
 		return http.StatusServiceUnavailable, "engine_busy"
 	case errors.Is(err, engine.ErrGenerationFailed):
 		return http.StatusBadGateway, "generation_failed"
+	case errors.Is(err, engine.ErrTimeout):
+		return http.StatusGatewayTimeout, "engine_timeout"
+	case errors.Is(err, engine.ErrFrameTooLarge):
+		return http.StatusBadGateway, "engine_frame_too_large"
 	default:
 		return http.StatusBadGateway, "engine_error"
 	}
@@ -200,8 +308,8 @@ func (s *Server) engineError(w http.ResponseWriter, err error) {
 	s.writeError(w, status, code, err.Error(), "")
 }
 
-func decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
+func (s *Server) decodeBody(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("body is not valid JSON: %w", err)
@@ -217,21 +325,24 @@ func newID(prefix string) string {
 	return prefix + hex.EncodeToString(b[:])
 }
 
-func priorityOf(r *http.Request) scheduler.Priority {
-	if strings.EqualFold(r.Header.Get("X-Torch-Priority"), "high") {
-		return scheduler.PriorityHigh
-	}
-	return scheduler.PriorityNormal
-}
-
 // acquire takes a scheduler slot for an engine call, writing the error
 // response itself when the slot cannot be had. ok=false means the
 // handler must return immediately.
+//
+// Priority is assigned here, server-side, and every HTTP request takes
+// the normal lane: the high lane is reserved for in-process operator
+// work, and a client header must never be able to claim it (the old
+// X-Torch-Priority header is ignored).
 func (s *Server) acquire(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
-	release, err := s.sched.Acquire(r.Context(), priorityOf(r))
+	release, err := s.sched.Acquire(r.Context(), scheduler.PriorityNormal)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrClosed) {
 			s.writeError(w, http.StatusServiceUnavailable, "scheduler_closed", "server is shutting down", "")
+		}
+		if errors.Is(err, scheduler.ErrQueueFull) {
+			// The same refusal the engine gives when its own
+			// bounded queue fills: engine_busy, by name.
+			s.writeError(w, http.StatusServiceUnavailable, "engine_busy", "all engine slots are busy and the wait queue is full", "")
 		}
 		// Otherwise the client went away mid-wait; nothing to write to.
 		return nil, false
@@ -245,13 +356,19 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	s.diag.RecordRequest("GET /healthz")
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	h, err := s.eng.Health(ctx)
-	if err != nil {
-		h = engine.HealthStatus{OK: false, Detail: err.Error()}
+	h, _ := s.eng.Health(ctx)
+	// This route is unauthenticated, so its detail is static: a
+	// coarse state class only. The engine's own error strings
+	// (socket paths, supervisor state) stay behind auth on /debug.
+	detail := "down"
+	if h.OK {
+		detail = "ok"
+	} else if _, unavail := s.eng.(engine.Unavailable); unavail {
+		detail = "unavailable"
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
-		"engine": map[string]any{"ok": h.OK, "detail": h.Detail},
+		"engine": map[string]any{"ok": h.OK, "detail": detail},
 	})
 }
 
@@ -287,7 +404,7 @@ type chatRequest struct {
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.diag.RecordRequest("POST /v1/chat/completions")
 	var req chatRequest
-	if err := decodeBody(w, r, &req); err != nil {
+	if err := s.decodeBody(w, r, &req); err != nil {
 		s.invalidRequest(w, err.Error(), "")
 		return
 	}
@@ -295,6 +412,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.invalidRequest(w, msg.text, msg.param)
 		return
 	}
+	if req.MaxTokens > s.cfg.MaxTokensCap {
+		s.invalidRequest(w, fmt.Sprintf("max_tokens exceeds the server cap of %d", s.cfg.MaxTokensCap), "max_tokens")
+		return
+	}
+	// One generation gets one bounded context. The per-generation
+	// deadline is what keeps a single context-sized request from
+	// holding its engine slot on any operational horizon: when it
+	// fires, the generation ends and is named, below and in the
+	// streaming path.
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.GenerationTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
 	prompt, err := s.buildPrompt(r.Context(), req.Messages)
 	if err != nil {
 		// The model's own template could not be rendered. That is
@@ -368,15 +497,21 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !sawDone {
-		if r.Context().Err() != nil {
+		switch {
+		case errors.Is(r.Context().Err(), context.DeadlineExceeded):
+			// The per-generation deadline fired and ended the
+			// stream: a named failure, never a short success.
+			s.engineError(w, fmt.Errorf("%w: generation exceeded the configured deadline of %s",
+				engine.ErrGenerationFailed, s.cfg.GenerationTimeout))
+		case r.Context().Err() != nil:
 			// The stream died with the client; no honest response exists.
 			s.diag.RecordEngineError()
-			return
+		default:
+			// The client closed the channel with neither a done nor an
+			// error event: a contract violation, reported as an engine
+			// death rather than served as a short completion.
+			s.engineError(w, fmt.Errorf("%w: generation stream ended without a terminal event", engine.ErrEngineDied))
 		}
-		// The client closed the channel with neither a done nor an
-		// error event: a contract violation, reported as an engine
-		// death rather than served as a short completion.
-		s.engineError(w, fmt.Errorf("%w: generation stream ended without a terminal event", engine.ErrEngineDied))
 		return
 	}
 
@@ -443,6 +578,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, greq engine.
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 		flusher.Flush()
 	}
+	sawDone := false
 	for ev := range ch {
 		if ev.Err != nil {
 			// Terminal error event (TODO T-9.12): the 200 and any
@@ -458,6 +594,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, greq engine.
 			return
 		}
 		if ev.Done {
+			sawDone = true
 			fr := ev.FinishReason
 			if fr == "" {
 				fr = "stop"
@@ -467,7 +604,34 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, greq engine.
 			writeChunk(ev.Text, nil)
 		}
 	}
-	_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	// The channel closed. [DONE] is written only when the engine
+	// actually finished: a channel that closes with neither a done
+	// nor an error event is the client contract violation the
+	// non-streaming path names as an engine death, and it is named
+	// here too, never dressed as a clean end.
+	switch {
+	case sawDone:
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	case errors.Is(r.Context().Err(), context.DeadlineExceeded):
+		s.writeStreamError(w, flusher, engine.ErrGenerationFailed,
+			fmt.Sprintf("generation exceeded the configured deadline of %s", s.cfg.GenerationTimeout))
+	case r.Context().Err() != nil:
+		// The client went away mid-stream; nothing honest to send.
+		s.diag.RecordEngineError()
+	default:
+		s.writeStreamError(w, flusher, engine.ErrEngineDied,
+			"generation stream ended without a terminal event")
+	}
+}
+
+// writeStreamError sends one named terminal error frame on an open
+// event stream and flushes it.
+func (s *Server) writeStreamError(w http.ResponseWriter, flusher http.Flusher, err error, message string) {
+	_, code := engineErrorStatus(err)
+	s.diag.RecordEngineError()
+	b, _ := json.Marshal(errorBody{Error: apiError{Code: code, Message: message}})
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 	flusher.Flush()
 }
 
@@ -621,7 +785,7 @@ type embedRequestBody struct {
 func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	s.diag.RecordRequest("POST /v1/embeddings")
 	var body embedRequestBody
-	if err := decodeBody(w, r, &body); err != nil {
+	if err := s.decodeBody(w, r, &body); err != nil {
 		s.invalidRequest(w, err.Error(), "")
 		return
 	}

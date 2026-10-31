@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -451,5 +452,257 @@ func TestDebugReportsModules(t *testing.T) {
 		if _, ok := v[key]; !ok {
 			t.Fatalf("debug summary missing %q: %s", key, body)
 		}
+	}
+}
+
+// --- Wave 1 bounds -----------------------------------------------------
+
+// silentCloseEngine streams one token, then closes the channel with
+// neither a done nor an error event: the client contract violation.
+type silentCloseEngine struct{ *fakeEngine }
+
+func (silentCloseEngine) Generate(context.Context, engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+	ch := make(chan engine.TokenEvent, 1)
+	ch <- engine.TokenEvent{Text: "Hello", TokenID: 1}
+	close(ch)
+	return ch, nil
+}
+
+// blockingEngine never emits; its channel closes when the request
+// context ends, which is how a real client's stream ends when the
+// per-generation deadline fires.
+type blockingEngine struct{ *fakeEngine }
+
+func (blockingEngine) Generate(ctx context.Context, _ engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+	ch := make(chan engine.TokenEvent)
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, nil
+}
+
+// gateEngine blocks inside Generate until released, so a test can
+// hold the only scheduler slot and watch the queue behind it.
+type gateEngine struct {
+	*fakeEngine
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGateEngine() *gateEngine {
+	return &gateEngine{
+		fakeEngine: &fakeEngine{},
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (g *gateEngine) Generate(ctx context.Context, _ engine.GenerateRequest) (<-chan engine.TokenEvent, error) {
+	g.once.Do(func() { close(g.started) })
+	ch := make(chan engine.TokenEvent, 1)
+	go func() {
+		defer close(ch)
+		select {
+		case <-g.release:
+			ch <- engine.TokenEvent{Text: "", Done: true, FinishReason: "stop"}
+		case <-ctx.Done():
+		}
+	}()
+	return ch, nil
+}
+
+func waitForBody(t *testing.T, ts *httptest.Server, what, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, body := do(t, ts, http.MethodGet, "/debug", "", testKey)
+		if strings.Contains(string(body), want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s (%q in /debug)", what, want)
+}
+
+func TestChatMaxTokensCapRefusedByName(t *testing.T) {
+	ts := newServerWithConfig(t, &fakeEngine{}, func(c *server.Config) {
+		c.MaxTokensCap = 4
+	})
+	over := `{"model":"glimmer","max_tokens":5,"messages":[{"role":"user","content":"hi"}]}`
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", over, testKey)
+	if code != http.StatusBadRequest || errorCode(t, body) != "invalid_request" {
+		t.Fatalf("over-cap status = %d, body = %s; want 400 invalid_request", code, body)
+	}
+	at := `{"model":"glimmer","max_tokens":4,"messages":[{"role":"user","content":"hi"}]}`
+	code, _, body = do(t, ts, http.MethodPost, "/v1/chat/completions", at, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("at-cap status = %d (%s), want 200", code, body)
+	}
+}
+
+func TestGenerationDeadlineNonStreaming(t *testing.T) {
+	ts := newServerWithConfig(t, blockingEngine{&fakeEngine{}}, func(c *server.Config) {
+		c.GenerationTimeout = 100 * time.Millisecond
+	})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusBadGateway || errorCode(t, body) != "generation_failed" {
+		t.Fatalf("status = %d, body = %s; want 502 generation_failed naming the deadline", code, body)
+	}
+	if !strings.Contains(string(body), "deadline") {
+		t.Fatalf("body does not name the deadline: %s", body)
+	}
+}
+
+func TestGenerationDeadlineStreaming(t *testing.T) {
+	ts := newServerWithConfig(t, blockingEngine{&fakeEngine{}}, func(c *server.Config) {
+		c.GenerationTimeout = 100 * time.Millisecond
+	})
+	streamBody := `{"model":"glimmer","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", streamBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("stream status = %d (%s)", code, body)
+	}
+	s := string(body)
+	if !strings.Contains(s, `"code":"generation_failed"`) {
+		t.Fatalf("stream missing the named deadline frame: %s", s)
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("deadline-killed stream must not end with [DONE]: %s", s)
+	}
+}
+
+func TestStreamSilentCloseIsEngineDiedFrame(t *testing.T) {
+	ts := newServer(t, silentCloseEngine{&fakeEngine{}})
+	streamBody := `{"model":"glimmer","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", streamBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("stream status = %d (%s)", code, body)
+	}
+	s := string(body)
+	if !strings.Contains(s, "Hello") {
+		t.Fatalf("stream missing the token sent before the close: %s", s)
+	}
+	if !strings.Contains(s, `"code":"engine_died"`) {
+		t.Fatalf("stream missing the engine_died terminal frame: %s", s)
+	}
+	if strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("silently truncated stream must not end with [DONE]: %s", s)
+	}
+}
+
+func TestHealthzDetailIsStatic(t *testing.T) {
+	ts := newServer(t, &fakeEngine{})
+	_, _, body := do(t, ts, http.MethodGet, "/healthz", "", "")
+	if !strings.Contains(string(body), `"detail":"ok"`) {
+		t.Fatalf("healthz detail = %s, want the static ok class", body)
+	}
+	if strings.Contains(string(body), "fake engine") {
+		t.Fatalf("healthz leaked the engine's own detail string: %s", body)
+	}
+
+	tsDown := newServer(t, nil) // no engine configured
+	_, _, body = do(t, tsDown, http.MethodGet, "/healthz", "", "")
+	if !strings.Contains(string(body), `"detail":"unavailable"`) {
+		t.Fatalf("healthz with no engine = %s, want the static unavailable class", body)
+	}
+	if strings.Contains(string(body), "no engine configured") {
+		t.Fatalf("healthz leaked the engine's own detail string: %s", body)
+	}
+}
+
+func TestPriorityHeaderDoesNotClaimHighLane(t *testing.T) {
+	gate := newGateEngine()
+	ts := newServerWithConfig(t, gate, func(c *server.Config) {
+		c.MaxConcurrent = 1
+	})
+	done := make(chan int, 2)
+	post := func(priority string) {
+		req, err := http.NewRequest(http.MethodPost, ts.URL+"/v1/chat/completions", strings.NewReader(chatBody))
+		if err != nil {
+			done <- -1
+			return
+		}
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		req.Header.Set("Content-Type", "application/json")
+		if priority != "" {
+			req.Header.Set("X-Torch-Priority", priority)
+		}
+		resp, err := ts.Client().Do(req)
+		if err != nil {
+			done <- -1
+			return
+		}
+		_ = resp.Body.Close()
+		done <- resp.StatusCode
+	}
+	go post("")
+	<-gate.started // the only slot is held
+	go post("high")
+	// The header-carrying request must queue in the NORMAL lane.
+	waitForBody(t, ts, "second request queued in the normal lane", `"normal_queued":1`)
+	_, _, dbg := do(t, ts, http.MethodGet, "/debug", "", testKey)
+	if !strings.Contains(string(dbg), `"high_queued":0`) {
+		t.Fatalf("client header claimed the high lane: %s", dbg)
+	}
+	close(gate.release)
+	for i := 0; i < 2; i++ {
+		if code := <-done; code != http.StatusOK {
+			t.Fatalf("queued request status = %d, want 200", code)
+		}
+	}
+}
+
+func TestSchedulerQueueFullMapsToEngineBusy(t *testing.T) {
+	gate := newGateEngine()
+	ts := newServerWithConfig(t, gate, func(c *server.Config) {
+		c.MaxConcurrent = 1
+		c.MaxWaitersPerLane = 1
+	})
+	done := make(chan int, 2)
+	post := func() {
+		code, _, _ := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+		done <- code
+	}
+	go post()
+	<-gate.started
+	go post()
+	waitForBody(t, ts, "one waiter queued", `"normal_queued":1`)
+
+	// Slot held, lane full: the third request is refused at once
+	// with the engine's own busy name.
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusServiceUnavailable || errorCode(t, body) != "engine_busy" {
+		t.Fatalf("status = %d, body = %s; want 503 engine_busy", code, body)
+	}
+	close(gate.release)
+	for i := 0; i < 2; i++ {
+		if c := <-done; c != http.StatusOK {
+			t.Fatalf("queued request status = %d, want 200", c)
+		}
+	}
+}
+
+func TestCacheJanitorPurgesExpired(t *testing.T) {
+	ts := newServerWithConfig(t, &fakeEngine{}, func(c *server.Config) {
+		c.CacheTTL = 50 * time.Millisecond
+		c.CachePurgeInterval = 10 * time.Millisecond
+	})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("chat status = %d (%s)", code, body)
+	}
+	// Nobody reads the key again; only the janitor can drop it.
+	waitForBody(t, ts, "janitor purge of the expired entry", `"entries":0`)
+}
+
+func TestBodyCapComesFromConfig(t *testing.T) {
+	ts := newServerWithConfig(t, &fakeEngine{}, func(c *server.Config) {
+		c.MaxBodyBytes = 32
+	})
+	code, _, body := do(t, ts, http.MethodPost, "/v1/chat/completions", chatBody, testKey)
+	if code != http.StatusBadRequest || errorCode(t, body) != "invalid_request" {
+		t.Fatalf("status = %d, body = %s; want 400 invalid_request from the configured body cap", code, body)
 	}
 }

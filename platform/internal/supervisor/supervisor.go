@@ -34,8 +34,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,10 +157,35 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	return nil
 }
 
+// stderrLineCap is the stderr pump's per-line buffer. The engine
+// logs whole prompt summaries on single lines; the bufio default
+// of 64 KiB ended the pump on the first long line and wedged the
+// engine on a full pipe (merged adjudication H-2), so the cap is
+// set explicitly, at 1 MiB.
+const stderrLineCap = 1 << 20
+
+// childEnv builds the engine child's environment from an allowlist:
+// PATH plus the engine's own ITAK_ENGINE_* variables. The child
+// never inherits the platform's wider environment, in particular
+// TORCH_API_KEY: the engine has no use for the platform credential,
+// and leaving it in the child's environment exposes it to any
+// same-uid reader of /proc for the child's whole life.
+func childEnv() []string {
+	env := make([]string, 0, 8)
+	for _, kv := range os.Environ() {
+		key, _, _ := strings.Cut(kv, "=")
+		if key == "PATH" || strings.HasPrefix(key, "ITAK_ENGINE_") {
+			env = append(env, kv)
+		}
+	}
+	return env
+}
+
 // launch starts one incarnation and dials it. On any failure the
 // half-started process is killed and waited on before returning.
 func (s *Supervisor) launch(ctx context.Context) error {
 	cmd := exec.Command(s.cfg.Command, s.cfg.Args...) //nolint:gosec // operator-configured engine binary and args, by design
+	cmd.Env = childEnv()
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("supervisor: engine stderr pipe: %w", err)
@@ -166,19 +194,11 @@ func (s *Supervisor) launch(ctx context.Context) error {
 		return fmt.Errorf("supervisor: start engine %q: %w", s.cfg.Command, err)
 	}
 	inc := &incarnation{cmd: cmd, done: make(chan struct{})}
-	go func() {
-		// The engine's stderr is its diagnostic channel; forward it
-		// into the platform log until the process ends.
-		sc := bufio.NewScanner(stderr)
-		for sc.Scan() {
-			s.log.Info("engine output", "line", sc.Text())
-		}
-	}()
+	go s.pumpStderr(stderr)
 	go func() {
 		inc.err = cmd.Wait()
 		close(inc.done)
 	}()
-
 	s.mu.Lock()
 	s.inc = inc
 	s.startedAt = time.Now()
@@ -198,6 +218,25 @@ func (s *Supervisor) launch(ctx context.Context) error {
 	s.mu.Unlock()
 	s.log.Info("engine serving", "pid", cmd.Process.Pid, "socket", s.cfg.SocketPath)
 	return nil
+}
+
+// pumpStderr forwards the engine's stderr, its diagnostic channel,
+// into the platform log until the process ends. The scanner buffer
+// is sized explicitly (stderrLineCap): with the bufio default, one
+// long engine line ends the scan, the pipe stops draining, and the
+// engine blocks mid-job on a full pipe while the supervisor reports
+// it running. An abnormal pump end is reported through the log; a
+// clean EOF at process exit is silent.
+func (s *Supervisor) pumpStderr(stderr io.Reader) {
+	sc := bufio.NewScanner(stderr)
+	sc.Buffer(make([]byte, 0, 64<<10), stderrLineCap)
+	for sc.Scan() {
+		s.log.Info("engine output", "line", sc.Text())
+	}
+	if err := sc.Err(); err != nil {
+		s.log.Error("engine stderr forwarding ended abnormally; later engine output is lost",
+			"err", err)
+	}
 }
 
 // dialUntil polls the socket until the engine serves or the

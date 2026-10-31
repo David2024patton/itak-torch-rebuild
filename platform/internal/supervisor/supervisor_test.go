@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,15 +24,34 @@ import (
 // of the socket protocol to serve generations, and a generate whose
 // prompt contains "die" kills the process mid-stream after one
 // token, which is the T-9.11 fault: engine death during generation.
+// The role and socket arrive as ITAK_ENGINE_* variables, which are
+// exactly what the supervisor's child-environment allowlist passes.
 func TestHelperProcess(_ *testing.T) {
-	if os.Getenv("ITAK_FAKE_ENGINE") != "1" {
+	if os.Getenv("ITAK_ENGINE_FAKE") != "1" {
 		return
 	}
-	runFakeEngine(os.Getenv("ITAK_FAKE_SOCKET"))
+	runFakeEngine(os.Getenv("ITAK_ENGINE_FAKESOCKET"))
 	os.Exit(0)
 }
 
 func runFakeEngine(socketPath string) {
+	// Wave 1 probes, scripted by the environment: report which
+	// variables survived the supervisor's allowlist, and burst a
+	// single stderr line past the old 64 KiB scanner default
+	// followed by a marker line.
+	if report := os.Getenv("ITAK_ENGINE_ENVREPORT"); report != "" {
+		_, keyPresent := os.LookupEnv("TORCH_API_KEY")
+		_, markPresent := os.LookupEnv("ITAK_ENGINE_TESTMARK")
+		_, pathPresent := os.LookupEnv("PATH")
+		content := "TORCH_API_KEY=" + presentWord(keyPresent) +
+			"\nITAK_ENGINE_TESTMARK=" + presentWord(markPresent) +
+			"\nPATH=" + presentWord(pathPresent) + "\n"
+		_ = os.WriteFile(report, []byte(content), 0o600)
+	}
+	if os.Getenv("ITAK_ENGINE_STDERRBURST") == "1" {
+		fmt.Fprintf(os.Stderr, "%s\n", strings.Repeat("x", 200_000))
+		fmt.Fprintln(os.Stderr, "stderr-after-big-line")
+	}
 	// Like the real engine: a restarted process removes the stale
 	// socket file its previous incarnation left behind.
 	_ = os.Remove(socketPath) //nolint:gosec // test-controlled socket path from the test's own env
@@ -44,6 +66,13 @@ func runFakeEngine(socketPath string) {
 		}
 		go serveFakeConn(conn)
 	}
+}
+
+func presentWord(present bool) string {
+	if present {
+		return "present"
+	}
+	return "absent"
 }
 
 func serveFakeConn(conn net.Conn) {
@@ -114,9 +143,10 @@ func startSupervisor(t *testing.T, maxRestarts int) *supervisor.Supervisor {
 		MaxBackoff:  100 * time.Millisecond,
 		DialTimeout: 10 * time.Second,
 	})
-	// The child learns its socket and role from the environment.
-	t.Setenv("ITAK_FAKE_ENGINE", "1")
-	t.Setenv("ITAK_FAKE_SOCKET", socket)
+	// The child learns its socket and role from the environment,
+	// under the ITAK_ENGINE_* names the allowlist passes.
+	t.Setenv("ITAK_ENGINE_FAKE", "1")
+	t.Setenv("ITAK_ENGINE_FAKESOCKET", socket)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := sup.Start(ctx); err != nil {
@@ -218,5 +248,106 @@ func TestSupervisorRestartBudgetExhaustion(t *testing.T) {
 	h, err := sup.Health(ctx)
 	if err != nil || h.OK || !strings.Contains(h.Detail, "restart budget exhausted") {
 		t.Fatalf("Health after exhaustion = %+v, %v; want not-OK naming the budget", h, err)
+	}
+}
+
+// TestSupervisorChildEnvIsAllowlisted is the Wave 1 environment fix:
+// the engine child receives PATH and ITAK_ENGINE_* variables only.
+// TORCH_API_KEY, set in the supervisor's own environment here, must
+// not reach the child.
+func TestSupervisorChildEnvIsAllowlisted(t *testing.T) {
+	report := filepath.Join(t.TempDir(), "env-report.txt")
+	t.Setenv("TORCH_API_KEY", "must-not-reach-the-engine")
+	t.Setenv("ITAK_ENGINE_TESTMARK", "1")
+	t.Setenv("ITAK_ENGINE_ENVREPORT", report)
+	startSupervisor(t, 1)
+
+	waitFor(t, "child env report", func() bool {
+		_, err := os.Stat(report)
+		return err == nil
+	})
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("read env report: %v", err)
+	}
+	for _, want := range []string{"TORCH_API_KEY=absent", "ITAK_ENGINE_TESTMARK=present", "PATH=present"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("env report missing %q:\n%s", want, data)
+		}
+	}
+}
+
+// logCapture is a slog handler that records messages and the "line"
+// attribute of forwarded engine output.
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	text := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "line" {
+			text += "|" + a.Value.String()
+		}
+		return true
+	})
+	c.mu.Lock()
+	c.lines = append(c.lines, text)
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCapture) contains(substr string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, l := range c.lines {
+		if strings.Contains(l, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestSupervisorStderrPumpSurvivesLongLines is the H-2 regression:
+// the fake engine writes one 200 KB stderr line (past the bufio
+// default that used to kill the pump), then a marker line. Both the
+// long line and the marker must reach the platform log; with the
+// old scanner the marker never arrived and the pipe wedged.
+func TestSupervisorStderrPumpSurvivesLongLines(t *testing.T) {
+	t.Setenv("ITAK_ENGINE_STDERRBURST", "1")
+	capture := &logCapture{}
+	socket := filepath.Join(t.TempDir(), "engine.sock")
+	sup := supervisor.New(supervisor.Config{
+		Command:     os.Args[0],
+		Args:        []string{"-test.run=TestHelperProcess"},
+		SocketPath:  socket,
+		MaxRestarts: 1,
+		Window:      time.Minute,
+		DialTimeout: 10 * time.Second,
+		Logger:      slog.New(capture),
+	})
+	t.Setenv("ITAK_ENGINE_FAKE", "1")
+	t.Setenv("ITAK_ENGINE_FAKESOCKET", socket)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := sup.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(sup.Stop)
+
+	waitFor(t, "the long stderr line to be forwarded", func() bool {
+		return capture.contains(strings.Repeat("x", 1000))
+	})
+	waitFor(t, "the marker line after the long line", func() bool {
+		return capture.contains("stderr-after-big-line")
+	})
+	if capture.contains("forwarding ended abnormally") {
+		t.Fatal("stderr pump reported an abnormal end on a line under the configured cap")
 	}
 }

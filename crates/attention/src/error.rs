@@ -17,6 +17,13 @@ pub enum AttentionError {
         /// The offending window size.
         window: usize,
     },
+    /// A size computed from caller-supplied dimensions overflowed
+    /// `usize`: the cache refuses by name instead of wrapping into
+    /// a small allocation or attempting an unrepresentable one.
+    SizeOverflow {
+        /// Which size computation overflowed.
+        what: &'static str,
+    },
     /// A tensor slice did not have the expected element count.
     ShapeMismatch {
         /// Which tensor or index mismatched.
@@ -115,6 +122,9 @@ impl fmt::Display for AttentionError {
             }
             Self::InvalidWindow { window } => {
                 write!(f, "sliding window must be positive, got {window}")
+            }
+            Self::SizeOverflow { what } => {
+                write!(f, "{what}: element count overflows usize")
             }
             Self::ShapeMismatch {
                 what,

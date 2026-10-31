@@ -23,6 +23,10 @@
 //! - `--max-queued N` / `ITAK_ENGINE_MAX_QUEUED`: generations that
 //!   may wait for a slot before submissions refuse as engine_busy
 //!   (default 8).
+//! - `--max-frame-bytes N` / `ITAK_ENGINE_MAX_FRAME_BYTES`: the
+//!   largest protocol frame, in bytes, a connection will read
+//!   before refusing it as bad_frame and closing (default
+//!   4194304).
 //!
 //! A model that fails to load (including the tensor coverage gate)
 //! exits the process non-zero with the named error: a partial model
@@ -34,7 +38,7 @@ mod protocol;
 mod sampler;
 mod streamer;
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -140,6 +144,7 @@ fn run() -> i32 {
                 let limits = Limits {
                     slots: config.slots,
                     max_queued: config.max_queued,
+                    max_frame_bytes: config.max_frame_bytes,
                 };
                 std::thread::spawn(move || handle_conn(stream, tx, info, stats, started, limits));
             }
@@ -184,12 +189,14 @@ fn bind_socket(socket_path: &Path) -> Result<UnixListener, String> {
     Ok(listener)
 }
 
-/// The engine's concurrency contract, carried to connection threads
-/// so refusals can name the state that refused.
+/// The engine's configured bounds, carried to connection threads
+/// so refusals can name the state that refused: the concurrency
+/// contract (slots and queue depth) and the frame size cap.
 #[derive(Clone, Copy)]
 struct Limits {
     slots: usize,
     max_queued: usize,
+    max_frame_bytes: usize,
 }
 
 struct CliConfig {
@@ -199,6 +206,7 @@ struct CliConfig {
     default_max_tokens: usize,
     slots: usize,
     max_queued: usize,
+    max_frame_bytes: usize,
 }
 
 fn parse_args() -> Result<CliConfig, i32> {
@@ -208,6 +216,7 @@ fn parse_args() -> Result<CliConfig, i32> {
     let mut default_max: Option<String> = std::env::var("ITAK_ENGINE_DEFAULT_MAX_TOKENS").ok();
     let mut slots: Option<String> = std::env::var("ITAK_ENGINE_SLOTS").ok();
     let mut max_queued: Option<String> = std::env::var("ITAK_ENGINE_MAX_QUEUED").ok();
+    let mut max_frame: Option<String> = std::env::var("ITAK_ENGINE_MAX_FRAME_BYTES").ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -218,9 +227,10 @@ fn parse_args() -> Result<CliConfig, i32> {
             "--default-max-tokens" => (&mut default_max, "--default-max-tokens"),
             "--slots" => (&mut slots, "--slots"),
             "--max-queued" => (&mut max_queued, "--max-queued"),
+            "--max-frame-bytes" => (&mut max_frame, "--max-frame-bytes"),
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N]"
+                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N] [--max-frame-bytes N]"
                 );
                 return Err(0);
             }
@@ -262,6 +272,7 @@ fn parse_args() -> Result<CliConfig, i32> {
     let default_max_tokens = parse_count(default_max, "--default-max-tokens", 128, 1)?;
     let slots = parse_count(slots, "--slots", 1, 1)?;
     let max_queued = parse_count(max_queued, "--max-queued", 8, 0)?;
+    let max_frame_bytes = parse_count(max_frame, "--max-frame-bytes", 4_194_304, 1024)?;
     Ok(CliConfig {
         model_path: PathBuf::from(model),
         socket_path: PathBuf::from(socket.unwrap_or_else(|| "/tmp/itak-engine.sock".to_string())),
@@ -269,6 +280,7 @@ fn parse_args() -> Result<CliConfig, i32> {
         default_max_tokens,
         slots,
         max_queued,
+        max_frame_bytes,
     })
 }
 
@@ -343,13 +355,30 @@ fn handle_conn(
     let mut greeted = false;
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        // The frame cap is a hard bound on memory: read at most one
+        // byte past the cap, which is exactly enough to prove the
+        // frame is over it. Before this, read_line grew the buffer
+        // until the peer sent a newline or the process ran out of
+        // memory, whichever came first (adjudication CB).
+        let read = reader
+            .by_ref()
+            .take((limits.max_frame_bytes + 1) as u64)
+            .read_line(&mut line);
+        match read {
             Ok(0) => return, // client closed
             Ok(_) => {}
             Err(e) => {
                 log_line(&format!("connection read failed: {e}"));
                 return;
             }
+        }
+        if line.len() > limits.max_frame_bytes {
+            let msg = format!(
+                "frame exceeds the maximum frame size of {} bytes",
+                limits.max_frame_bytes
+            );
+            let _ = send(&mut writer, &protocol::error_frame("bad_frame", &msg));
+            return;
         }
         let trimmed = line.trim_end();
         if trimmed.is_empty() {
@@ -788,6 +817,16 @@ mod tests {
         std::sync::mpsc::Receiver<Work>,
         std::thread::JoinHandle<()>,
     ) {
+        serve_conn_with_frame_cap(4_194_304)
+    }
+
+    fn serve_conn_with_frame_cap(
+        max_frame_bytes: usize,
+    ) -> (
+        BufReader<UnixStream>,
+        std::sync::mpsc::Receiver<Work>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (engine_side, client_side) = UnixStream::pair().expect("stream pair");
         client_side
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -804,6 +843,7 @@ mod tests {
                 Limits {
                     slots: 1,
                     max_queued: 0,
+                    max_frame_bytes,
                 },
             );
         });
@@ -892,6 +932,42 @@ mod tests {
     }
 
     #[test]
+    fn oversized_frame_is_refused_and_the_connection_closes() {
+        // The adjudication's attack shape: a frame far past the cap.
+        // The engine must refuse it by name at the cap, not buffer it.
+        let (mut client, _rx, handle) = serve_conn_with_frame_cap(64);
+        write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
+        write_frame(&mut client, &"a".repeat(500));
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"bad_frame\""), "reply: {reply}");
+        assert_closed_after_refusal(&mut client);
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
+    fn unterminated_frame_is_refused_at_the_cap() {
+        // The OOM shape exactly: no newline ever arrives. The read
+        // must stop one byte past the cap and refuse, not grow.
+        let (mut client, _rx, handle) = serve_conn_with_frame_cap(64);
+        write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
+        let stream = client.get_mut();
+        stream
+            .write_all(&[b'x'; 500])
+            .expect("write unterminated bytes");
+        stream.flush().expect("flush");
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"bad_frame\""), "reply: {reply}");
+        assert_closed_after_refusal(&mut client);
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
     fn full_queue_refuses_engine_busy_by_name() {
         // Capacity 1 and it is already full: the next submission is
         // refused with the engine_busy code, not queued, not run.
@@ -910,6 +986,7 @@ mod tests {
             Limits {
                 slots: 1,
                 max_queued: 0,
+                max_frame_bytes: 4_194_304,
             },
         );
         assert!(ok, "the connection survives a busy refusal");

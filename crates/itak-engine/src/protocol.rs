@@ -113,7 +113,19 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let max_tokens = frame.get("max_tokens").and_then(Value::as_usize);
+    let max_tokens = match frame.get("max_tokens") {
+        // A present max_tokens must be a real count. Falling back
+        // to the default on a malformed one would silently accept
+        // exactly the frames adjudication H-1 is about (2^64, which
+        // used to saturate and wrap the context check), so a
+        // present-but-invalid value is a named refusal instead.
+        Some(value) => Some(
+            value
+                .as_usize()
+                .ok_or_else(|| "max_tokens is not a valid token count".to_string())?,
+        ),
+        None => None,
+    };
     let temperature = frame
         .get("temperature")
         .and_then(Value::as_f64)
@@ -298,6 +310,18 @@ mod tests {
     fn generate_without_prompt_is_a_named_error() {
         let frame = parse(r#"{"op":"generate"}"#).expect("frame");
         assert!(parse_generate(&frame).is_err());
+    }
+
+    #[test]
+    fn generate_with_wrapping_max_tokens_is_refused() {
+        // Adjudication H-1's frame: max_tokens of 2^64 saturated to
+        // usize::MAX and wrapped the engine's context check into
+        // admitting an unbounded generation. It is now a parse
+        // refusal, which the connection maps to bad_request.
+        let frame = parse(r#"{"op":"generate","prompt":"x","max_tokens":18446744073709551616}"#)
+            .expect("frame");
+        let err = parse_generate(&frame).expect_err("the wrapping frame must refuse");
+        assert!(err.contains("max_tokens"), "error: {err}");
     }
 
     #[test]

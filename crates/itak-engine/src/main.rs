@@ -968,6 +968,27 @@ mod tests {
     }
 
     #[test]
+    fn wrapping_max_tokens_is_refused_by_name_over_the_wire() {
+        // Adjudication H-1's frame, end to end: the refusal is the
+        // named bad_request and the connection stays usable.
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
+        write_frame(
+            &mut client,
+            r#"{"op":"generate","prompt":"x","max_tokens":18446744073709551616}"#,
+        );
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"bad_request\""), "reply: {reply}");
+        write_frame(&mut client, r#"{"op":"ping"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"pong\""), "reply: {reply}");
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
     fn full_queue_refuses_engine_busy_by_name() {
         // Capacity 1 and it is already full: the next submission is
         // refused with the engine_busy code, not queued, not run.

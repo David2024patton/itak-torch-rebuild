@@ -51,11 +51,17 @@ impl Value {
         }
     }
 
-    /// The numeric value as usize, if it is a non-negative integer in
-    /// range. Fractional or negative numbers return None.
+    /// The numeric value as usize, if it is a non-negative integer
+    /// in range. Fractional or negative numbers return None, and so
+    /// does anything above u32::MAX: counts in this protocol are
+    /// token counts and batch sizes, and a value near usize::MAX is
+    /// not a count but an attempt to wrap a caller's length
+    /// arithmetic (adjudication H-1, where a max_tokens of 2^64
+    /// saturated this conversion to usize::MAX and wrapped the
+    /// engine's context check).
     pub fn as_usize(&self) -> Option<usize> {
         match self {
-            Value::Num(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= usize::MAX as f64 => {
+            Value::Num(n) if *n >= 0.0 && n.fract() == 0.0 && *n <= u32::MAX as f64 => {
                 Some(*n as usize)
             }
             _ => None,
@@ -459,6 +465,18 @@ mod tests {
         assert_eq!(stringify(&Value::Num(13796.0)), "13796");
         assert_eq!(stringify(&Value::Num(0.5)), "0.5");
         assert_eq!(parse("1e3").expect("parses"), Value::Num(1000.0));
+    }
+
+    #[test]
+    fn usize_conversion_rejects_values_past_u32() {
+        // Adjudication H-1's input exactly: 2^64 used to saturate to
+        // usize::MAX here. No protocol count may.
+        let at = parse("4294967295").expect("parses");
+        assert_eq!(at.as_usize(), Some(4_294_967_295));
+        for too_big in ["4294967296", "18446744073709551616", "1e30"] {
+            let v = parse(too_big).expect("parses");
+            assert_eq!(v.as_usize(), None, "{too_big} must not become a count");
+        }
     }
 
     #[test]

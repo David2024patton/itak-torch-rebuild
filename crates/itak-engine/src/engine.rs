@@ -470,7 +470,12 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
     }
     let max_tokens = max_tokens.filter(|&n| n > 0).unwrap_or(default_max_tokens);
     let context = loaded.cfg.context_length as usize;
-    if ids.len() + max_tokens > context {
+    // checked_add, not addition: a max_tokens near usize::MAX (the
+    // configured default is operator input too) must refuse as a
+    // context overflow, never wrap the sum under the context length
+    // and admit an unbounded generation (adjudication H-1).
+    let fits = matches!(ids.len().checked_add(max_tokens), Some(total) if total <= context);
+    if !fits {
         return fail(
             "context_overflow",
             format!(

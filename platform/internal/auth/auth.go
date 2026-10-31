@@ -8,6 +8,9 @@
 //     environment in main); it is never hardcoded or defaulted here.
 //   - Comparison is constant-time.
 //   - An empty configured key fails closed: every request is rejected.
+//   - Repeated failures from one source are throttled: past a small
+//     threshold, each failure is answered after a growing delay, so
+//     online guessing costs time instead of running at line rate.
 //   - /healthz is the only exempt path, so liveness probes work while
 //     everything else, including /debug, sits behind the key.
 package auth
@@ -15,8 +18,11 @@ package auth
 import (
 	"crypto/subtle"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 )
 
 // FailureRecorder is the slice of diag the middleware needs; kept as an
@@ -25,11 +31,33 @@ type FailureRecorder interface {
 	RecordAuthFailure()
 }
 
+// Failure throttle tuning. The first throttleThreshold failures
+// from a source are answered at once (a fat-fingered operator is
+// not punished); each failure past the threshold waits one more
+// throttleStep before its 401, up to throttleMaxDelay. A success
+// clears the source's count.
+const (
+	throttleThreshold = 3
+	throttleStep      = 200 * time.Millisecond
+	throttleMaxDelay  = 2 * time.Second
+	// throttleIdle drops a source's count after this long without
+	// a failure; entries are swept lazily when the map grows.
+	throttleIdle = 10 * time.Minute
+)
+
 // Middleware returns a handler wrapper enforcing the API key.
 type Middleware struct {
 	key      string
 	exempt   map[string]bool
 	recorder FailureRecorder
+
+	mu       sync.Mutex
+	failures map[string]*failState
+}
+
+type failState struct {
+	count int
+	last  time.Time
 }
 
 // New builds the middleware. exempt lists exact paths reachable without a
@@ -39,7 +67,7 @@ func New(key string, recorder FailureRecorder, exempt ...string) *Middleware {
 	for _, p := range exempt {
 		set[p] = true
 	}
-	return &Middleware{key: key, exempt: set, recorder: recorder}
+	return &Middleware{key: key, exempt: set, recorder: recorder, failures: make(map[string]*failState)}
 }
 
 // Wrap enforces the key on next unless the path is exempt.
@@ -53,6 +81,7 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			if m.recorder != nil {
 				m.recorder.RecordAuthFailure()
 			}
+			m.throttle(r)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			w.WriteHeader(http.StatusUnauthorized)
@@ -64,8 +93,58 @@ func (m *Middleware) Wrap(next http.Handler) http.Handler {
 			})
 			return
 		}
+		m.clearFailures(r)
 		next.ServeHTTP(w, r)
 	})
+}
+
+// throttle records one failure for the request's source and sleeps
+// the penalty it has earned. The sleep happens before the 401 is
+// written, so a guessing loop pays it on every attempt.
+func (m *Middleware) throttle(r *http.Request) {
+	src := sourceOf(r)
+	now := time.Now()
+	m.mu.Lock()
+	st, ok := m.failures[src]
+	if !ok || now.Sub(st.last) > throttleIdle {
+		st = &failState{}
+		m.failures[src] = st
+	}
+	st.count++
+	st.last = now
+	over := st.count - throttleThreshold
+	if len(m.failures) > 1024 {
+		for k, v := range m.failures {
+			if now.Sub(v.last) > throttleIdle {
+				delete(m.failures, k)
+			}
+		}
+	}
+	m.mu.Unlock()
+	if over <= 0 {
+		return
+	}
+	delay := time.Duration(over) * throttleStep
+	if delay > throttleMaxDelay {
+		delay = throttleMaxDelay
+	}
+	time.Sleep(delay)
+}
+
+// clearFailures resets a source's failure count after a success.
+func (m *Middleware) clearFailures(r *http.Request) {
+	m.mu.Lock()
+	delete(m.failures, sourceOf(r))
+	m.mu.Unlock()
+}
+
+// sourceOf names the request's origin for throttling: the peer IP,
+// without its ephemeral port.
+func sourceOf(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 // authorized extracts the presented key from the Authorization bearer

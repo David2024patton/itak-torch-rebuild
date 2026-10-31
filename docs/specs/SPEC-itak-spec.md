@@ -842,7 +842,7 @@ Phase 7 (PLAN S10):
 
 Phase 9 (PLAN S13):
 
-- [ ] T-9.11 dflash arch module: config from the draft file's own
+- [ ] T-9.18 dflash arch module: config from the draft file's own
   metadata, tensor map from its census, conditioning question
   (SPEC-itak-spec Q1) answered from the census and the llama.cpp
   source before the module is written (proof: the draft GGUF loads

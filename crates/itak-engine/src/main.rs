@@ -35,8 +35,9 @@ mod sampler;
 mod streamer;
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -111,20 +112,10 @@ fn run() -> i32 {
         let _ = slot;
     }
 
-    if socket_path.exists() {
-        log_line(&format!(
-            "removing stale socket file {}",
-            socket_path.display()
-        ));
-        if let Err(e) = std::fs::remove_file(&socket_path) {
-            log_line(&format!("cannot remove stale socket: {e}"));
-            return 1;
-        }
-    }
-    let listener = match UnixListener::bind(&socket_path) {
+    let listener = match bind_socket(&socket_path) {
         Ok(listener) => listener,
         Err(e) => {
-            log_line(&format!("bind {} failed: {e}", socket_path.display()));
+            log_line(&e);
             return 1;
         }
     };
@@ -155,6 +146,41 @@ fn run() -> i32 {
         }
     }
     0
+}
+
+/// Bind the serving socket.
+///
+/// A stale socket file from a previous incarnation is removed, but
+/// anything else found at the path is never deleted: the path is
+/// operator-controlled (--socket / ITAK_ENGINE_SOCKET), and a
+/// mistyped path must not erase a real file, so a non-socket is a
+/// named startup refusal. After the bind, the socket file is pinned
+/// to owner-only permissions (0600): the socket is the engine's
+/// control plane, and the file mode is the first half of its access
+/// control (the peer credential check in handle_conn is the second).
+fn bind_socket(socket_path: &Path) -> Result<UnixListener, String> {
+    if socket_path.exists() {
+        let is_socket = std::fs::metadata(socket_path)
+            .map(|m| m.file_type().is_socket())
+            .unwrap_or(false);
+        if !is_socket {
+            return Err(format!(
+                "{} exists and is not a socket; refusing to remove it",
+                socket_path.display()
+            ));
+        }
+        log_line(&format!(
+            "removing stale socket file {}",
+            socket_path.display()
+        ));
+        std::fs::remove_file(socket_path)
+            .map_err(|e| format!("cannot remove stale socket: {e}"))?;
+    }
+    let listener = UnixListener::bind(socket_path)
+        .map_err(|e| format!("bind {} failed: {e}", socket_path.display()))?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("cannot set socket permissions: {e}"))?;
+    Ok(listener)
 }
 
 /// The engine's concurrency contract, carried to connection threads
@@ -219,18 +245,19 @@ fn parse_args() -> Result<CliConfig, i32> {
             return Err(2);
         }
     };
-    let parse_count = |text: Option<String>, label: &str, default: usize, min: usize| -> Result<usize, i32> {
-        match text {
-            Some(text) => match text.parse::<usize>() {
-                Ok(n) if n >= min => Ok(n),
-                _ => {
-                    eprintln!("itak-engine: {label} must be an integer >= {min}");
-                    Err(2)
-                }
-            },
-            None => Ok(default),
-        }
-    };
+    let parse_count =
+        |text: Option<String>, label: &str, default: usize, min: usize| -> Result<usize, i32> {
+            match text {
+                Some(text) => match text.parse::<usize>() {
+                    Ok(n) if n >= min => Ok(n),
+                    _ => {
+                        eprintln!("itak-engine: {label} must be an integer >= {min}");
+                        Err(2)
+                    }
+                },
+                None => Ok(default),
+            }
+        };
     let default_max_tokens = parse_count(default_max, "--default-max-tokens", 128, 1)?;
     let slots = parse_count(slots, "--slots", 1, 1)?;
     let max_queued = parse_count(max_queued, "--max-queued", 8, 0)?;
@@ -337,11 +364,9 @@ fn handle_conn(
             }
             "chat_template" => {
                 let reply = match &info.chat_template {
-                    Some(template) => protocol::chat_template_frame(
-                        template,
-                        &info.bos_token,
-                        &info.eos_token,
-                    ),
+                    Some(template) => {
+                        protocol::chat_template_frame(template, &info.bos_token, &info.eos_token)
+                    }
                     None => protocol::error_frame(
                         "no_chat_template",
                         "the model file carries no tokenizer.chat_template",
@@ -478,10 +503,7 @@ fn handle_embed(
         }
     };
     if !model.is_empty() && model != info.name {
-        let msg = format!(
-            "this engine serves model {:?}, not {:?}",
-            info.name, model
-        );
+        let msg = format!("this engine serves model {:?}, not {:?}", info.name, model);
         return send(writer, &protocol::error_frame("model_not_found", &msg));
     }
     let (reply_tx, reply_rx) = channel::<EmbedOutcome>();
@@ -513,10 +535,7 @@ fn handle_embed(
         Ok(Err((code, message))) => send(writer, &protocol::error_frame(&code, &message)),
         Err(_) => send(
             writer,
-            &protocol::error_frame(
-                "engine_died",
-                "the engine worker stopped mid-embedding",
-            ),
+            &protocol::error_frame("engine_died", "the engine worker stopped mid-embedding"),
         ),
     }
 }
@@ -530,7 +549,12 @@ fn stats_busy(stats: &Arc<Mutex<Stats>>) -> bool {
 /// platform's /debug view. The concurrency fields (slots, active,
 /// queued, max_queued) are how an operator sees the T-9.14 contract
 /// and which jobs hold it.
-fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64, limits: Limits) -> Value {
+fn debug_info(
+    info: &ModelInfo,
+    stats: &Arc<Mutex<Stats>>,
+    uptime_secs: u64,
+    limits: Limits,
+) -> Value {
     let st = stats.lock().unwrap_or_else(|p| p.into_inner());
     json::obj(vec![
         ("op", Value::Str("debug_info".into())),
@@ -552,7 +576,10 @@ fn debug_info(info: &ModelInfo, stats: &Arc<Mutex<Stats>>, uptime_secs: u64, lim
         ),
         ("coverage_found", Value::Num(info.coverage_found as f64)),
         ("busy", Value::Bool(st.active > 0)),
-        ("has_chat_template", Value::Bool(info.chat_template.is_some())),
+        (
+            "has_chat_template",
+            Value::Bool(info.chat_template.is_some()),
+        ),
         ("slots", Value::Num(limits.slots as f64)),
         ("active", Value::Num(st.active as f64)),
         ("queued", Value::Num(st.queued as f64)),
@@ -621,6 +648,61 @@ mod tests {
             frequency_penalty: 0.0,
             reply: reply_tx,
         }
+    }
+
+    fn temp_socket_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "itak-engine-test-{tag}-{}-{nanos}.sock",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn stale_regular_file_is_never_deleted() {
+        // The attack/accident shape: --socket points at a real file.
+        // Startup must refuse by name and leave the file untouched.
+        let path = temp_socket_path("notasock");
+        std::fs::write(&path, b"precious").expect("write file");
+        let err = match bind_socket(&path) {
+            Ok(_) => panic!("bind must refuse a non-socket path"),
+            Err(e) => e,
+        };
+        assert!(err.contains("not a socket"), "error: {err}");
+        assert_eq!(
+            std::fs::read(&path).expect("file still there"),
+            b"precious",
+            "the file must survive the refused startup"
+        );
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn bound_socket_is_owner_only() {
+        let path = temp_socket_path("mode");
+        let listener = bind_socket(&path).expect("bind");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "socket mode: {mode:o}");
+        drop(listener);
+        std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn stale_socket_file_is_removed_and_rebound() {
+        let path = temp_socket_path("stale");
+        let first = bind_socket(&path).expect("first bind");
+        drop(first);
+        // The socket file outlives the listener; the next bind must
+        // clear it and serve, not fail with AddrInUse.
+        let second = bind_socket(&path).expect("second bind clears the stale socket");
+        drop(second);
+        std::fs::remove_file(&path).expect("cleanup");
     }
 
     #[test]

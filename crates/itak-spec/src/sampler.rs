@@ -467,13 +467,25 @@ mod tests {
         // Probe site: the one-hot write over an empty row (greedy path).
         let err = distribution(&[], 0.0, 1.0).expect_err("empty logits must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "distribution", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "distribution",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
         // The sampled path refuses the same input the same way.
         let err = distribution(&[], 1.0, 1.0).expect_err("empty logits must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "distribution", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "distribution",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -484,7 +496,13 @@ mod tests {
         // end when the rows run out mid-proposal.
         let err = correct_greedy(&[10], &[10, 20]).expect_err("short rows must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "correct_greedy", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "correct_greedy",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -494,7 +512,13 @@ mod tests {
         // Probe site: full acceptance reads the bonus row at index n.
         let err = correct_greedy(&[10, 20], &[10, 20]).expect_err("missing bonus row must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "correct_greedy", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "correct_greedy",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -508,7 +532,13 @@ mod tests {
         let err = correct_sampled(&[p0], &[q0], &[1], &mut rng)
             .expect_err("missing bonus row must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "correct_sampled", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "correct_sampled",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }
@@ -524,7 +554,13 @@ mod tests {
         let err = correct_sampled(&[p0, p1], &[q0], &[7], &mut rng)
             .expect_err("out-of-range token must refuse");
         assert!(
-            matches!(err, SpecError::SamplerContract { entry: "correct_sampled", .. }),
+            matches!(
+                err,
+                SpecError::SamplerContract {
+                    entry: "correct_sampled",
+                    ..
+                }
+            ),
             "got {err:?}"
         );
     }

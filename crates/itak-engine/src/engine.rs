@@ -934,12 +934,11 @@ mod tests {
 
     impl muse_glimmer::TensorSource for FixtureSource {
         fn tensor(&self, name: &str) -> muse_glimmer::Result<muse_glimmer::TensorView> {
-            self.tensors
-                .get(name)
-                .cloned()
-                .ok_or_else(|| muse_glimmer::GlimmerError::MissingTensor {
+            self.tensors.get(name).cloned().ok_or_else(|| {
+                muse_glimmer::GlimmerError::MissingTensor {
                     name: name.to_string(),
-                })
+                }
+            })
         }
     }
 
@@ -1091,8 +1090,8 @@ mod tests {
                 vec![1.0; hidden],
             );
         }
-        let weights = Weights::load(&FixtureSource { tensors }, &cfg)
-            .expect("synthetic weights load");
+        let weights =
+            Weights::load(&FixtureSource { tensors }, &cfg).expect("synthetic weights load");
         let tokenizer = Tokenizer::new(TokenizerData {
             model: Some("gpt2".to_string()),
             tokens: (0..vocab).map(|i| format!("tok{i}")).collect(),

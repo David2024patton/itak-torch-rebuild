@@ -31,6 +31,15 @@
 //! by a temperature: a numerically stable softmax over `(z - max) / T` in
 //! f64, nucleus truncation that sorts by probability descending with ties
 //! broken by the lower token id, and argmax ties broken by the lowest id.
+//!
+//! Contract: every public entry point states the shape it needs (a
+//! non-empty logit row; a walk whose target rows cover the proposal
+//! plus the bonus row; proposal tokens inside the rows they index)
+//! and refuses a violating input by name with
+//! [`SpecError::SamplerContract`] instead of panicking on the
+//! indexing. Behavior on contract-respecting inputs is unchanged.
+
+use crate::error::{Result, SpecError};
 
 /// The greedy choice over a finished logit row: the largest logit, lowest
 /// token id on ties (the engine sampler's tie rule).
@@ -52,11 +61,20 @@ pub fn argmax(logits: &[f32]) -> u32 {
 /// argmax, which is the honest greedy distribution. Positive temperatures
 /// apply the stable softmax; `top_p` in `(0, 1)` then nucleus-truncates
 /// and renormalizes; any other `top_p` disables truncation.
-pub fn distribution(logits: &[f32], temperature: f32, top_p: f32) -> Vec<f32> {
+///
+/// An empty logit row refuses by name: there is no distribution over
+/// zero tokens, and the greedy path used to panic indexing it.
+pub fn distribution(logits: &[f32], temperature: f32, top_p: f32) -> Result<Vec<f32>> {
+    if logits.is_empty() {
+        return Err(SpecError::SamplerContract {
+            entry: "distribution",
+            detail: "logit row is empty; a distribution needs at least one token".to_string(),
+        });
+    }
     if temperature <= 0.0 {
         let mut out = vec![0.0f32; logits.len()];
         out[argmax(logits) as usize] = 1.0;
-        return out;
+        return Ok(out);
     }
     let t = f64::from(temperature);
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -73,7 +91,7 @@ pub fn distribution(logits: &[f32], temperature: f32, top_p: f32) -> Vec<f32> {
     if top_p > 0.0 && top_p < 1.0 {
         nucleus_truncate(&mut probs, f64::from(top_p));
     }
-    probs.iter().map(|&p| p as f32).collect()
+    Ok(probs.iter().map(|&p| p as f32).collect())
 }
 
 /// Nucleus truncation in place: keep the smallest set of highest-probability
@@ -182,24 +200,39 @@ pub struct WalkOutcome {
 ///
 /// Pure prefix matching against the target's own greedy choices, which is
 /// what makes the temperature-0 identity hold by construction.
-pub fn correct_greedy(p_argmax: &[u32], proposal: &[u32]) -> WalkOutcome {
+///
+/// Fewer than `proposal.len() + 1` target rows refuses by name: prefix
+/// matching reads one row per proposal token, and full acceptance reads
+/// the bonus row after them.
+pub fn correct_greedy(p_argmax: &[u32], proposal: &[u32]) -> Result<WalkOutcome> {
     let n = proposal.len();
+    if p_argmax.len() < n + 1 {
+        return Err(SpecError::SamplerContract {
+            entry: "correct_greedy",
+            detail: format!(
+                "walk over {} proposal tokens needs {} target rows (one per token plus the bonus row), got {}",
+                n,
+                n + 1,
+                p_argmax.len()
+            ),
+        });
+    }
     let mut accepted = 0;
     while accepted < n && proposal[accepted] == p_argmax[accepted] {
         accepted += 1;
     }
     if accepted == n {
-        WalkOutcome {
+        Ok(WalkOutcome {
             accepted,
             token: p_argmax[n],
             first_rejection: None,
-        }
+        })
     } else {
-        WalkOutcome {
+        Ok(WalkOutcome {
             accepted,
             token: p_argmax[accepted],
             first_rejection: Some(accepted + 1),
-        }
+        })
     }
 }
 
@@ -209,13 +242,50 @@ pub fn correct_greedy(p_argmax: &[u32], proposal: &[u32]) -> WalkOutcome {
 /// uniform draws in `[0, 1)`; a full-acceptance walk consumes `n + 1`
 /// draws (one per proposal token plus the bonus), a walk rejected at `j`
 /// consumes `j + 1` (the rejections draws plus the residual draw).
+///
+/// Missing rows refuse by name: `p_rows` must cover the proposal plus
+/// the bonus row and `q_rows` the proposal, and every proposal token
+/// must index inside the rows it is judged against.
 pub fn correct_sampled(
     p_rows: &[&[f32]],
     q_rows: &[&[f32]],
     proposal: &[u32],
     rng: &mut dyn FnMut() -> f64,
-) -> WalkOutcome {
+) -> Result<WalkOutcome> {
     let n = proposal.len();
+    if p_rows.len() < n + 1 {
+        return Err(SpecError::SamplerContract {
+            entry: "correct_sampled",
+            detail: format!(
+                "walk over {n} proposal tokens needs {} target rows (one per token plus the bonus row), got {}",
+                n + 1,
+                p_rows.len()
+            ),
+        });
+    }
+    if q_rows.len() < n {
+        return Err(SpecError::SamplerContract {
+            entry: "correct_sampled",
+            detail: format!(
+                "walk over {n} proposal tokens needs {n} draft rows, got {}",
+                q_rows.len()
+            ),
+        });
+    }
+    for k in 0..n {
+        let token = proposal[k] as usize;
+        if token >= p_rows[k].len() || token >= q_rows[k].len() {
+            return Err(SpecError::SamplerContract {
+                entry: "correct_sampled",
+                detail: format!(
+                    "proposal token {} at position {k} is outside its target row of {} entries or its draft row of {} entries",
+                    proposal[k],
+                    p_rows[k].len(),
+                    q_rows[k].len()
+                ),
+            });
+        }
+    }
     for k in 0..n {
         let token = proposal[k] as usize;
         let p_t = f64::from(p_rows[k][token]);
@@ -232,18 +302,18 @@ pub fn correct_sampled(
             continue;
         }
         let replacement = sample_residual(p_rows[k], q_rows[k], rng());
-        return WalkOutcome {
+        return Ok(WalkOutcome {
             accepted: k,
             token: replacement,
             first_rejection: Some(k + 1),
-        };
+        });
     }
     let bonus = sample_from(p_rows[n], rng());
-    WalkOutcome {
+    Ok(WalkOutcome {
         accepted: n,
         token: bonus,
         first_rejection: None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -263,18 +333,18 @@ mod tests {
 
     #[test]
     fn distribution_at_zero_temperature_is_one_hot() {
-        let d = distribution(&[0.0, 2.0, 1.0], 0.0, 1.0);
+        let d = distribution(&[0.0, 2.0, 1.0], 0.0, 1.0).expect("distribution");
         assert_eq!(d, vec![0.0, 1.0, 0.0]);
     }
 
     #[test]
     fn distribution_softmax_matches_hand_math() {
         // logits [0, ln 2] at T=1: exp gives [1, 2], normalized [1/3, 2/3].
-        let d = distribution(&[0.0, std::f32::consts::LN_2], 1.0, 1.0);
+        let d = distribution(&[0.0, std::f32::consts::LN_2], 1.0, 1.0).expect("distribution");
         assert!((d[0] - 1.0 / 3.0).abs() < 1e-6, "got {d:?}");
         assert!((d[1] - 2.0 / 3.0).abs() < 1e-6, "got {d:?}");
         // Temperature 2 flattens: exp([0, ln2 / 2]) = [1, sqrt(2)].
-        let d2 = distribution(&[0.0, std::f32::consts::LN_2], 2.0, 1.0);
+        let d2 = distribution(&[0.0, std::f32::consts::LN_2], 2.0, 1.0).expect("distribution");
         let sqrt2 = std::f64::consts::SQRT_2;
         let expect0 = (1.0 / (1.0 + sqrt2)) as f32;
         assert!((d2[0] - expect0).abs() < 1e-6, "got {d2:?}");
@@ -284,7 +354,7 @@ mod tests {
     fn distribution_nucleus_truncates_and_renormalizes() {
         // Probs before truncation: [0.5, 0.3, 0.2] via logits ln of those.
         let logits = [0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()];
-        let d = distribution(&logits, 1.0, 0.6);
+        let d = distribution(&logits, 1.0, 0.6).expect("distribution");
         // Top token alone is 0.5 < 0.6, so the nucleus is {0, 1} with mass
         // 0.8, renormalized to [0.625, 0.375, 0].
         assert!((d[0] - 0.625).abs() < 1e-5, "got {d:?}");
@@ -297,7 +367,7 @@ mod tests {
         // Target argmaxes per row p[0..=3]; proposal matches twice, then
         // diverges: replacement is the target argmax at the mismatch row.
         let p_argmax = [10, 20, 30, 40];
-        let out = correct_greedy(&p_argmax, &[10, 20, 99]);
+        let out = correct_greedy(&p_argmax, &[10, 20, 99]).expect("walk");
         assert_eq!(out.accepted, 2);
         assert_eq!(out.token, 30);
         assert_eq!(out.first_rejection, Some(3));
@@ -306,7 +376,7 @@ mod tests {
     #[test]
     fn greedy_walk_full_acceptance_takes_the_bonus() {
         let p_argmax = [10, 20, 30, 40];
-        let out = correct_greedy(&p_argmax, &[10, 20, 30]);
+        let out = correct_greedy(&p_argmax, &[10, 20, 30]).expect("walk");
         assert_eq!(out.accepted, 3);
         assert_eq!(out.token, 40);
         assert_eq!(out.first_rejection, None);
@@ -315,7 +385,7 @@ mod tests {
     #[test]
     fn greedy_walk_first_token_mismatch() {
         let p_argmax = [10, 20];
-        let out = correct_greedy(&p_argmax, &[77]);
+        let out = correct_greedy(&p_argmax, &[77]).expect("walk");
         assert_eq!(out.accepted, 0);
         assert_eq!(out.token, 10);
         assert_eq!(out.first_rejection, Some(1));
@@ -323,7 +393,7 @@ mod tests {
 
     #[test]
     fn greedy_walk_empty_proposal_is_all_bonus() {
-        let out = correct_greedy(&[55], &[]);
+        let out = correct_greedy(&[55], &[]).expect("walk");
         assert_eq!(out.accepted, 0);
         assert_eq!(out.token, 55);
         assert_eq!(out.first_rejection, None);
@@ -342,7 +412,7 @@ mod tests {
             used += 1;
             d
         };
-        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng);
+        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng).expect("walk");
         assert_eq!(out.accepted, 1);
         assert_eq!(out.first_rejection, None);
         // Bonus draw 0.5 against p1 = [0.1, 0.9] lands on token 1.
@@ -364,7 +434,7 @@ mod tests {
             used += 1;
             d
         };
-        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng);
+        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng).expect("walk");
         assert_eq!(out.accepted, 0);
         assert_eq!(out.token, 0);
         assert_eq!(out.first_rejection, Some(1));
@@ -384,9 +454,79 @@ mod tests {
             used += 1;
             d
         };
-        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng);
+        let out = correct_sampled(&[p0, p1], &[q0], &[1], &mut rng).expect("walk");
         assert_eq!(out.accepted, 1);
         assert_eq!(out.token, 0);
+    }
+
+    // The four contract violations the panel's probes panicked on,
+    // one per probe site: each now refuses by name instead.
+
+    #[test]
+    fn distribution_refuses_empty_logits_by_name() {
+        // Probe site: the one-hot write over an empty row (greedy path).
+        let err = distribution(&[], 0.0, 1.0).expect_err("empty logits must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "distribution", .. }),
+            "got {err:?}"
+        );
+        // The sampled path refuses the same input the same way.
+        let err = distribution(&[], 1.0, 1.0).expect_err("empty logits must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "distribution", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn greedy_walk_refuses_rows_shorter_than_the_proposal_by_name() {
+        // Probe site: prefix matching reads one target row past the
+        // end when the rows run out mid-proposal.
+        let err = correct_greedy(&[10], &[10, 20]).expect_err("short rows must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "correct_greedy", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn greedy_walk_refuses_a_missing_bonus_row_by_name() {
+        // Probe site: full acceptance reads the bonus row at index n.
+        let err = correct_greedy(&[10, 20], &[10, 20]).expect_err("missing bonus row must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "correct_greedy", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sampled_walk_refuses_a_missing_bonus_row_by_name() {
+        // Probe site: the full-acceptance bonus draw reads p_rows[n].
+        let p0: &[f32] = &[0.5, 0.5];
+        let q0: &[f32] = &[0.25, 0.75];
+        let mut rng = || 0.0f64;
+        let err = correct_sampled(&[p0], &[q0], &[1], &mut rng)
+            .expect_err("missing bonus row must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "correct_sampled", .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn sampled_walk_refuses_an_out_of_range_proposal_token_by_name() {
+        // Same entry point, the other indexing the walk performs: a
+        // proposal token outside the rows it is judged against.
+        let p0: &[f32] = &[0.5, 0.5];
+        let p1: &[f32] = &[0.5, 0.5];
+        let q0: &[f32] = &[0.25, 0.75];
+        let mut rng = || 0.0f64;
+        let err = correct_sampled(&[p0, p1], &[q0], &[7], &mut rng)
+            .expect_err("out-of-range token must refuse");
+        assert!(
+            matches!(err, SpecError::SamplerContract { entry: "correct_sampled", .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

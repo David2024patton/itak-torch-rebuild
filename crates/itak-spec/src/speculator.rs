@@ -259,7 +259,7 @@ impl DflashSpeculator {
             match arm {
                 DraftArm::Greedy => tokens.push(sampler::argmax(row)),
                 DraftArm::Sampled { temperature } => {
-                    let dist = sampler::distribution(row, temperature, 1.0);
+                    let dist = sampler::distribution(row, temperature, 1.0)?;
                     tokens.push(sampler::sample_from(&dist, rng()));
                     dists.push(dist);
                 }

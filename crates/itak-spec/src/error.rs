@@ -122,6 +122,18 @@ pub enum SpecError {
         /// What was wrong with the call order or staged state.
         detail: String,
     },
+    /// A sampler entry point was handed inputs that violate its stated
+    /// contract: an empty logit row, a correction walk whose target rows
+    /// do not cover the proposal plus the bonus row, or a proposal token
+    /// outside the rows it indexes. The sampler refuses by name instead
+    /// of panicking on the indexing (panel B4, executed probes).
+    SamplerContract {
+        /// The entry point that refused (`distribution`,
+        /// `correct_greedy`, `correct_sampled`).
+        entry: &'static str,
+        /// What was wrong with the inputs.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for SpecError {
@@ -197,6 +209,9 @@ impl std::fmt::Display for SpecError {
                 "round bound {max_round_tokens} cannot hold depth {depth} plus the pending token"
             ),
             SpecError::SessionState { detail } => write!(f, "session state error: {detail}"),
+            SpecError::SamplerContract { entry, detail } => {
+                write!(f, "sampler contract refused at {entry}: {detail}")
+            }
         }
     }
 }

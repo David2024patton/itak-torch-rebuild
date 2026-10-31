@@ -283,7 +283,7 @@ impl SpecSession {
                 }
             })?,
         };
-        self.pending = self.draw(&logits);
+        self.pending = self.draw(&logits)?;
         self.begun = true;
         Ok(self.pending)
     }
@@ -343,12 +343,12 @@ impl SpecSession {
 
     /// Draw one token from a finished target logit row under the session's
     /// sampling configuration.
-    fn draw(&mut self, logits: &[f32]) -> u32 {
+    fn draw(&mut self, logits: &[f32]) -> Result<u32> {
         if self.config.temperature <= 0.0 {
-            sampler::argmax(logits)
+            Ok(sampler::argmax(logits))
         } else {
-            let dist = sampler::distribution(logits, self.config.temperature, self.config.top_p);
-            sampler::sample_from(&dist, self.rng.next_f64())
+            let dist = sampler::distribution(logits, self.config.temperature, self.config.top_p)?;
+            Ok(sampler::sample_from(&dist, self.rng.next_f64()))
         }
     }
 
@@ -399,7 +399,7 @@ impl SpecSession {
             .map_err(|e| SpecError::TargetRefused {
                 source: Box::new(e),
             })?;
-        let token = self.draw(&logits);
+        let token = self.draw(&logits)?;
         self.pending = token;
         let emitted = vec![token];
         let mut stopped = false;
@@ -568,16 +568,16 @@ impl SpecSession {
         let vocab = self.target.config().vocab_size as usize;
         let walk = if greedy {
             let p_argmax: Vec<u32> = logits.chunks_exact(vocab).map(sampler::argmax).collect();
-            sampler::correct_greedy(&p_argmax, &proposal.tokens)
+            sampler::correct_greedy(&p_argmax, &proposal.tokens)?
         } else {
             let p_rows: Vec<Vec<f32>> = logits
                 .chunks_exact(vocab)
                 .map(|row| sampler::distribution(row, self.config.temperature, self.config.top_p))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let p_refs: Vec<&[f32]> = p_rows.iter().map(Vec::as_slice).collect();
             let q_refs: Vec<&[f32]> = proposal.dists.iter().map(Vec::as_slice).collect();
             let mut rng = || self.rng.next_f64();
-            sampler::correct_sampled(&p_refs, &q_refs, &proposal.tokens, &mut rng)
+            sampler::correct_sampled(&p_refs, &q_refs, &proposal.tokens, &mut rng)?
         };
         let accepted = walk.accepted;
         let keep = base + 1 + accepted;

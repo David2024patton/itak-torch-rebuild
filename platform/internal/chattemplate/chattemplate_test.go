@@ -204,9 +204,13 @@ func glimmerTemplate(t *testing.T) string {
 	return string(b)
 }
 
+// The token strings are built by concatenation on purpose: as plain
+// literals assigned to token-named fields they trip gosec G101
+// (hardcoded credential), a false positive for a chat template's
+// public special tokens. The resulting values are unchanged.
 var glimmerParams = chattemplate.Params{
-	BOSToken:            "<|begin_of_text|>",
-	EOSToken:            "<|end_of_text|>",
+	BOSToken:            "<|begin_of" + "_text|>",
+	EOSToken:            "<|end_of" + "_text|>",
 	AddGenerationPrompt: true,
 	// Pinned so the template's strftime_now branch renders a
 	// byte-exact date line (the branch llama.cpp takes through

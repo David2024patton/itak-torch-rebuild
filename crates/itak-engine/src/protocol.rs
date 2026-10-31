@@ -59,7 +59,13 @@
 //!   `forward_failed`, `detokenize_failed`, `engine_died`,
 //!   `unknown_op`, `bad_frame`, `internal`. And `engine_busy` maps
 //!   to 503: every slot is running and the bounded job queue is
-//!   full (TODO T-9.14).
+//!   full (TODO T-9.14). One code is not an op refusal at all:
+//!   `peer_refused` is sent once, before the handshake, when the
+//!   connecting process runs under a different uid than the engine
+//!   (the kernel reports the peer's credentials, SO_PEERCRED), and
+//!   the connection closes immediately; a correct deployment, where
+//!   the platform and the engine run as the same user, never sees
+//!   it.
 
 use crate::json::{obj, Value};
 
@@ -107,7 +113,19 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let max_tokens = frame.get("max_tokens").and_then(Value::as_usize);
+    let max_tokens = match frame.get("max_tokens") {
+        // A present max_tokens must be a real count. Falling back
+        // to the default on a malformed one would silently accept
+        // exactly the frames adjudication H-1 is about (2^64, which
+        // used to saturate and wrap the context check), so a
+        // present-but-invalid value is a named refusal instead.
+        Some(value) => Some(
+            value
+                .as_usize()
+                .ok_or_else(|| "max_tokens is not a valid token count".to_string())?,
+        ),
+        None => None,
+    };
     let temperature = frame
         .get("temperature")
         .and_then(Value::as_f64)
@@ -124,7 +142,10 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let seed = frame.get("seed").and_then(Value::as_usize).map(|n| n as u64);
+    let seed = frame
+        .get("seed")
+        .and_then(Value::as_usize)
+        .map(|n| n as u64);
     let top_k = frame.get("top_k").and_then(Value::as_usize);
     let presence_penalty = frame
         .get("presence_penalty")
@@ -183,9 +204,7 @@ pub fn embeddings_frame(model: &str, vectors: &[Vec<f32>]) -> Value {
             Value::Arr(
                 vectors
                     .iter()
-                    .map(|v| {
-                        Value::Arr(v.iter().map(|&x| Value::Num(f64::from(x))).collect())
-                    })
+                    .map(|v| Value::Arr(v.iter().map(|&x| Value::Num(f64::from(x))).collect()))
                     .collect(),
             ),
         ),
@@ -294,8 +313,21 @@ mod tests {
     }
 
     #[test]
+    fn generate_with_wrapping_max_tokens_is_refused() {
+        // Adjudication H-1's frame: max_tokens of 2^64 saturated to
+        // usize::MAX and wrapped the engine's context check into
+        // admitting an unbounded generation. It is now a parse
+        // refusal, which the connection maps to bad_request.
+        let frame = parse(r#"{"op":"generate","prompt":"x","max_tokens":18446744073709551616}"#)
+            .expect("frame");
+        let err = parse_generate(&frame).expect_err("the wrapping frame must refuse");
+        assert!(err.contains("max_tokens"), "error: {err}");
+    }
+
+    #[test]
     fn embed_frame_parses_and_validates() {
-        let frame = parse(r#"{"op":"embed","model":"glimmer","input":["a","b c"]}"#).expect("frame");
+        let frame =
+            parse(r#"{"op":"embed","model":"glimmer","input":["a","b c"]}"#).expect("frame");
         let (model, inputs) = parse_embed(&frame).expect("request");
         assert_eq!(model, "glimmer");
         assert_eq!(inputs, vec!["a".to_string(), "b c".to_string()]);
@@ -316,11 +348,11 @@ mod tests {
         let frame = embeddings_frame("glimmer", &[vec![0.5, -0.25], vec![1.0, 2.0]]);
         let text = crate::json::stringify(&frame);
         let back = parse(&text).expect("own output parses");
-        assert_eq!(
-            back.get("op").and_then(Value::as_str),
-            Some("embeddings")
-        );
-        let vecs = back.get("embeddings").and_then(Value::as_arr).expect("vecs");
+        assert_eq!(back.get("op").and_then(Value::as_str), Some("embeddings"));
+        let vecs = back
+            .get("embeddings")
+            .and_then(Value::as_arr)
+            .expect("vecs");
         assert_eq!(vecs.len(), 2);
     }
 }

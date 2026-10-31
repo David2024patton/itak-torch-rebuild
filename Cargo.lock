@@ -396,6 +396,7 @@ dependencies = [
  "cpu-compute",
  "gguf",
  "itak-loader",
+ "libc",
  "muse-glimmer",
  "tokenizer",
 ]

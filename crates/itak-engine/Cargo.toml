@@ -10,6 +10,7 @@ description = "The iTaK Torch engine binary (ARCHITECTURE.md module grid): owns 
 cpu-compute = { path = "../cpu-compute" }
 gguf = { path = "../gguf" }
 itak-loader = { path = "../itak-loader" }
+libc = "0.2"
 muse-glimmer = { path = "../muse-glimmer" }
 tokenizer = { path = "../tokenizer" }
 

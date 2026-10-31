@@ -445,25 +445,69 @@ mod tests {
         assert_eq!(spec.committed_len(), 3, "a refused commit changes nothing");
     }
 
+    /// One agreement probe between the trait's borrowed view and the
+    /// owned block proposal: for the same speculator state, pending
+    /// token, and depth, the view's tokens must equal the block
+    /// proposal's tokens one for one, and each of the view's
+    /// distributions must be the one-hot row at exactly its token.
+    fn assert_proposals_agree(spec: &mut DflashSpeculator, pending: u32, n: usize) {
+        let (view_tokens, view_argmax): (Vec<u32>, Vec<u32>) = {
+            let view = spec.propose(pending, n).expect("trait propose");
+            let argmaxes = view
+                .dists
+                .iter()
+                .map(|dist| {
+                    let mass: f32 = dist.probs.iter().sum();
+                    assert!(
+                        (mass - 1.0).abs() < 1e-6,
+                        "greedy dists are one-hot, mass {mass}"
+                    );
+                    sampler::argmax(dist.probs)
+                })
+                .collect();
+            (view.tokens.to_vec(), argmaxes)
+        };
+        assert_eq!(
+            view_argmax, view_tokens,
+            "view dists must be one-hot at the view tokens (pending {pending}, n {n})"
+        );
+        let mut no_draws = || 0.0f64;
+        let block = spec
+            .propose_block(pending, n, DraftArm::Greedy, &mut no_draws)
+            .expect("block propose");
+        assert_eq!(
+            view_tokens, block.tokens,
+            "trait view and block proposal diverge (pending {pending}, n {n})"
+        );
+    }
+
     /// The trait's borrowed proposal view agrees with the owned block
-    /// proposal the session consumes.
+    /// proposal the session consumes: the same tokens, compared
+    /// directly. The discarding shape of the trait view is accepted
+    /// design (the panel merge ruled it so); this test is the guard
+    /// that keeps the two proposal paths from drifting apart
+    /// silently, which a lengths-and-mass check cannot do.
     #[test]
     fn trait_proposal_matches_block_proposal() {
         let compute = std::rc::Rc::new(CpuCompute::new());
         let fixture = testkit::build_target(Box::new(SharedCompute(compute)));
+
+        // A fresh speculator, nothing committed yet.
+        let mut fresh = testkit::build_speculator(&fixture, 5);
+        assert_proposals_agree(&mut fresh, 0, 2);
+        assert_proposals_agree(&mut fresh, 127, 3);
+
+        // A speculator with a committed prefix, probed below, at,
+        // and past its maximum depth.
         let mut spec = testkit::build_speculator(&fixture, 5);
         spec.note_captures(0, &captures(3, &[1, 3])).expect("stage");
         spec.commit(&[4, 5, 6]).expect("commit");
-        let view = spec.propose(6, 3).expect("trait propose");
-        assert_eq!(view.tokens.len(), 3);
-        assert_eq!(view.dists.len(), 3);
-        for dist in &view.dists {
-            let mass: f32 = dist.probs.iter().sum();
-            assert!(
-                (mass - 1.0).abs() < 1e-6,
-                "greedy dists are one-hot, mass {mass}"
-            );
-        }
+        assert_proposals_agree(&mut spec, 6, 1);
+        assert_proposals_agree(&mut spec, 6, 3);
+        assert_proposals_agree(&mut spec, 6, 4);
+        assert_proposals_agree(&mut spec, 9, 2);
+        assert_proposals_agree(&mut spec, 6, 5);
+
         assert_eq!(spec.max_depth(), 4);
         assert_eq!(spec.mode(), crate::SpecMode::Dflash);
     }

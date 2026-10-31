@@ -124,7 +124,10 @@ pub fn parse_generate(frame: &Value) -> Result<GenerateRequest, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let seed = frame.get("seed").and_then(Value::as_usize).map(|n| n as u64);
+    let seed = frame
+        .get("seed")
+        .and_then(Value::as_usize)
+        .map(|n| n as u64);
     let top_k = frame.get("top_k").and_then(Value::as_usize);
     let presence_penalty = frame
         .get("presence_penalty")
@@ -183,9 +186,7 @@ pub fn embeddings_frame(model: &str, vectors: &[Vec<f32>]) -> Value {
             Value::Arr(
                 vectors
                     .iter()
-                    .map(|v| {
-                        Value::Arr(v.iter().map(|&x| Value::Num(f64::from(x))).collect())
-                    })
+                    .map(|v| Value::Arr(v.iter().map(|&x| Value::Num(f64::from(x))).collect()))
                     .collect(),
             ),
         ),
@@ -295,7 +296,8 @@ mod tests {
 
     #[test]
     fn embed_frame_parses_and_validates() {
-        let frame = parse(r#"{"op":"embed","model":"glimmer","input":["a","b c"]}"#).expect("frame");
+        let frame =
+            parse(r#"{"op":"embed","model":"glimmer","input":["a","b c"]}"#).expect("frame");
         let (model, inputs) = parse_embed(&frame).expect("request");
         assert_eq!(model, "glimmer");
         assert_eq!(inputs, vec!["a".to_string(), "b c".to_string()]);
@@ -316,11 +318,11 @@ mod tests {
         let frame = embeddings_frame("glimmer", &[vec![0.5, -0.25], vec![1.0, 2.0]]);
         let text = crate::json::stringify(&frame);
         let back = parse(&text).expect("own output parses");
-        assert_eq!(
-            back.get("op").and_then(Value::as_str),
-            Some("embeddings")
-        );
-        let vecs = back.get("embeddings").and_then(Value::as_arr).expect("vecs");
+        assert_eq!(back.get("op").and_then(Value::as_str), Some("embeddings"));
+        let vecs = back
+            .get("embeddings")
+            .and_then(Value::as_arr)
+            .expect("vecs");
         assert_eq!(vecs.len(), 2);
     }
 }

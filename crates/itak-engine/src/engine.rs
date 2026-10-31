@@ -368,14 +368,12 @@ fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (Str
             .embed(&loaded.weights.embedding, &ids, &loaded.cfg)
             .map_err(|e| ("forward_failed".to_string(), format!("embed lookup: {e}")))?;
         let pooled = mean_pool(&rows, hidden, ids.len());
-        out.push(
-            l2_normalize(&pooled).ok_or_else(|| {
-                (
-                    "forward_failed".to_string(),
-                    "embedding pooled to a zero vector".to_string(),
-                )
-            })?,
-        );
+        out.push(l2_normalize(&pooled).ok_or_else(|| {
+            (
+                "forward_failed".to_string(),
+                "embedding pooled to a zero vector".to_string(),
+            )
+        })?);
     }
     Ok(out)
 }

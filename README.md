@@ -27,7 +27,7 @@ An inference engine and serving platform rebuilt the way it should have been bui
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-brightgreen)
 ![Languages](https://img.shields.io/badge/languages-Rust%20%2B%20Go-orange)
-![Status](https://img.shields.io/badge/status-design%20%2B%20evidence-blue)
+![Status](https://img.shields.io/badge/status-built%2C%20under%20review-blue)
 
 </div>
 
@@ -35,62 +35,68 @@ An inference engine and serving platform rebuilt the way it should have been bui
 
 ## What it is
 
-iTaK Torch began as a pure-Go inference engine with an unusually wide reach: an OpenAI-compatible server, speculative decoding, a full training stack (SFT, DPO, GRPO, ORPO, LoRA), continuous batching, clustering, model operations, and a native engine experimenting with hybrid state space models. It also had a fatal flaw: it depended on a shared support module that lived in a relative folder, was never published, and is lost. The engine cannot be built today. The audit of exactly what it contained, feature by feature, is in [PLAN.md](PLAN.md) and drives this rebuild.
+iTaK Torch began as a pure-Go inference engine with an unusually wide reach: an OpenAI-compatible server, speculative decoding, a full training stack (SFT, DPO, GRPO, ORPO, LoRA), continuous batching, clustering, model operations, and a native engine experimenting with hybrid state space models. It also had a fatal flaw: it depended on a shared support module that lived in a relative folder, was never published, and is lost. The original engine cannot be built today. The audit of exactly what it contained, feature by feature, is in [PLAN.md](PLAN.md) and drives this rebuild.
 
 The rebuild splits the system by what each language is best at:
 
-- **Rust owns the token loop.** Quantized kernels, KV caches, the state space scan, MoE expert streaming, speculative decoding, training compute, GPU backends. No garbage collector, no pause jitter, memory allocated once and pooled.
-- **Go owns the platform.** The API surface, scheduling, request caches, cluster coordination, tenancy, model pulls and integrity, observability. Most of the original Go platform code is architecturally sound and gets reattached, not rewritten.
-- **Mojo stays the research lab.** The Latent Reasoning Engine and new kernel ideas are prototyped there; winners graduate into the Rust crates.
+- **Rust owns the token loop.** Twelve crates: the GGUF loader, both tokenizer families, the reference math core, attention and KV caches, two architecture modules (dense llama-family and Muse Glimmer), a CPU reference backend, a wgpu/Vulkan backend, the DFlash draft module, the speculative loop, and the engine binary itself.
+- **Go owns the platform.** The OpenAI-compatible API surface, API-key auth, scheduling, response cache, engine supervision, and observability, in [platform/](platform/). The platform serves authenticated chat completions by driving the Rust engine over a Unix socket.
+- **Mojo stays the research lab.** New kernel ideas are prototyped there; winners graduate into the Rust crates.
 
-The design target has not changed since the original: huge model capability on hardware that should not be able to hold it. MoE experts stream from disk the way Colibri does it, state space layers keep constant-size state instead of a growing KV cache, and speculative decoding multiplies what a small card can produce.
+The design target has not changed since the original: huge model capability on hardware that should not be able to hold it.
 
 ## Proof so far
 
-The design is grounded in measurements taken on the target hardware, an AMD Radeon RX 7900 XTX (24 GB, gfx1100), running Meta Muse Glimmer 30B:
+Measured on the target hardware, an AMD Radeon RX 7900 XTX (24 GB, gfx1100), against the real Muse-Glimmer-30B GGUF:
 
-- Q4_K_M decodes at 44.07 tok/s solo (llama-bench, Vulkan), 37.14 tok/s per user with two users sharing the card.
-- The full 131K context costs about 1.70 GiB of KV cache thanks to sliding window attention.
-- ROCm/HIP on that machine is broken at the system level, proven four ways; Vulkan is the production backend. The diagnosis is written up in full because "ROCm is faster" articles keep assuming a clean install.
-
-Full record: [docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md](docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md). The Mamba lineage the SSM design stands on, including a grading of the author's own extrapolated Mamba-3 variant against the real Mamba-3 paper: [docs/research/2026-10-27-mamba-papers-ingest.md](docs/research/2026-10-27-mamba-papers-ingest.md).
+- The tokenizer matches the reference token for token on Glimmer's vocabulary (16/16 bench prompts, 16/16 decode round-trips; crates/tokenizer/CONFORMANCE.md).
+- The loader covers the real file completely: 731 of 731 tensors through the coverage gate, zero missing, zero unexpected.
+- The device-resident GPU forward reproduces the golden continuation exactly, 8 of 8 tokens (bench/gpu-resident-2026-10-30.md).
+- The speculative verify loop (DFlash draft plus rejection sampling) produces a stream token-identical to plain greedy over 16 tokens on the real files (bench/spec-loop-2026-10-30.md).
+- The serving pair passed its live proof run on the real file: sampling parity, two concurrent slots with independent outputs, embeddings geometry, and chat-template prompt ids matching llama.cpp 63 for 63 (bench/t917-proof-2026-10-30.md).
+- The reference-stack record the design stands on: llama.cpp decodes Glimmer Q4_K_M at 44.31 tok/s (Vulkan) on this card, and the DFlash depth sweep found its operating point at depth 6, 107.39 tok/s (bench/gpu-proof-2026-10-30.md; full record in docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md).
 
 ## Quickstart
 
-There is no engine binary yet; this repo is at the design and evidence stage (see Status). What can be reproduced today is the benchmark record:
+Build both halves and run the serving smoke:
 
 ```bash
-# On a machine with an RX 7900 XTX and a Vulkan-capable driver:
-git clone https://github.com/ggml-org/llama.cpp
-cmake -B llama.cpp/build-vulkan -S llama.cpp -DGGML_VULKAN=ON -DCMAKE_BUILD_TYPE=Release
-cmake --build llama.cpp/build-vulkan -j --target llama-bench llama-server
-# Download a Muse Glimmer 30B GGUF (for example the Meta Q4_K_M build), then:
-bench/bench-phase-a.sh   # per-quant speed and VRAM, llama-bench
-bench/bench-phase-b.sh   # serving behaviour, accuracy prompts, 2-user concurrency
+# Rust engine (workspace root)
+cargo build --release -p itak-engine
+
+# Go platform
+(cd platform && go build -o torchd ./cmd/torchd)
+
+# Start the engine on a GGUF, then the platform against its socket.
+./target/release/itak-engine --model /path/to/model.gguf --socket /tmp/itak-engine.sock
+TORCH_API_KEY=<your-key> ./platform/torchd -engine-socket /tmp/itak-engine.sock -models glimmer
 ```
+
+Operating the pair, flags and all, is in [SERVING.md](SERVING.md); the operations book is [docs/RUNBOOK.md](docs/RUNBOOK.md). The gates that must pass before any commit: `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --all -- --check`, `cargo deny check`, and in platform/ `go test ./...`, `go vet ./...`, `govulncheck ./...`.
 
 ## The grid: module map
 
 | Module | Kind | What it owns |
 | :--- | :--- | :--- |
-| itak-types | Rust crate (planned) | The shared contracts: request/response types, model info, token usage. Versioned, published, never a relative folder again. |
-| itak-diag | Rust crate (planned) | Engine-side diagnostics: structured logs, health, event channel. |
-| itak-loader | Rust crate (planned) | GGUF loading today, .itf later. Weights memory-mapped, never copied. |
-| itak-kernels | Rust crate (planned) | Quantized matmul and dequant (Q4_K, Q6_K, Q8_0, FP8, AWQ, ternary), RoPE, norms, softmax. |
-| itak-kv | Rust crate (planned) | KV caches: paged, ring, INT8, compressed, offloaded; prefix sharing; attention-sink eviction. |
-| itak-ssm | Rust crate (planned) | The state space scan: general three-term recurrence, data-dependent rotation on B and C, MIMO rank as config. |
-| itak-moe | Rust crate (planned) | MoE routing, expert streaming and offload, expert cache with prefetch. |
-| itak-spec | Rust crate (planned) | Speculative decoding: n-gram, Medusa, MTP, rejection sampling; EKF speculative update. |
-| itak-backend | Rust crate (planned) | One trait, many backends: CPU SIMD first, wgpu (Vulkan) second, others behind the seam. |
-| itak-train | Rust crates (planned) | Training compute: autograd, optimizers, LoRA, SFT/DPO/GRPO/ORPO trainers. |
-| Go platform | Go modules (planned) | API handlers (OpenAI and Ollama compatible), scheduler, batching, caches, cluster, tenancy, model operations, observability, Core (types, health, event, debug) as a versioned module. |
-| itak-dissect | Tool (planned) | Per-layer weight analysis and re-quantization planning; successor to the original dissector and itak-quant. |
+| gguf | Rust crate | Strict GGUF v3 loader: header, metadata, tensor directory, dequantization, fail-loud named errors. |
+| tokenizer | Rust crate | Byte-level BPE and SentencePiece BPE over the model's own GGUF vocabulary and merges. |
+| torch-math | Rust crate | Reference f32 math: RMSNorm, RoPE, gated FFN activations, logit softcap and scale, matmul and matvec. Every constant is a parameter. |
+| attention | Rust crate | KV cache (global layers plus sliding-window ring layers) and grouped-query attention. |
+| muse-glimmer | Rust crate | The Muse Glimmer architecture: config from GGUF metadata, the measured weight layout, the structured 52-layer forward. |
+| arch-llama | Rust crate | Generic dense architecture for the llama and qwen2 families, config and weights from the file's own metadata. |
+| itak-loader | Rust crate | The bridge: implements the architecture modules' Metadata and TensorSource traits over the gguf crate, with the tensor coverage gate. |
+| cpu-compute | Rust crate | CPU reference Compute backend: real f32 arithmetic via torch-math, KV storage via the attention crate. |
+| wgpu-compute | Rust crate | wgpu (Vulkan) Compute backend: kernels K1 through K14, including the device-resident forward session. |
+| dflash | Rust crate | The DFlash draft architecture: conditioning fused from named target layer inputs, non-causal block forward. |
+| itak-spec | Rust crate | The speculative decoding loop: block drafting, exact-output verification, KV checkpoint and rewind, rejection sampling. |
+| itak-engine | Rust binary | Owns one loaded model and serves the NDJSON-over-unix-socket protocol (hello, ping, debug, generate, embed, chat_template) with streamed token events and named errors. |
+| Go platform | Go service | API handlers (OpenAI-compatible), API-key auth, scheduler, response cache, engine client and supervision, chat-template rendering, the torchd daemon. |
 
-Full map with links traced both ways: [docs/MAP.md](docs/MAP.md).
+Full map with links traced both ways: [docs/MAP.md](docs/MAP.md). Still designed and not yet built: the training stack (Phase 7), the .itf format (Phase 8), MoE expert streaming, and the SSM scan crate; they are in PLAN.md and TODO.md, not in the table above.
 
 ## Status
 
-Design and evidence phase. Proven: the hardware benchmark record, the ROCm diagnosis, the complete feature inventory of the original engine, and the Mamba research base, all in this repo. Not started: engine code. Next moves are in [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
+The engine and platform exist and serve. The serving path today is the CPU reference backend behind the platform; the GPU-resident forward is proven as a bench, not yet wired into the serving engine, and the speculative loop is proven on CPU, not in the serving path. A double critic panel graded this tree DO NOT SHIP; fix wave Waves 1 and 2 have landed (socket and bounds hardening, the corrected record, toolchain pins, the dependency policy), and Wave 3 plus a cold panel re-run are still ahead. No claim in this repo outruns its proof note. Detail: [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
 
 ## License
 

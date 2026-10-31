@@ -15,9 +15,13 @@
 //! share the weights and nothing mutable.
 //!
 //! Every failure inside a job is a named [`GenEvent::Error`], never
-//! a panic and never a fabricated token: a bad prompt, a context
-//! overflow, and a forward refusal are distinct codes the platform
-//! maps to distinct HTTP answers.
+//! a fabricated token: a bad prompt, a context overflow, and a
+//! forward refusal are distinct codes the platform maps to distinct
+//! HTTP answers. A panic inside a job is contained by the worker
+//! loop (`catch_unwind` in [`run_worker`]): the job completes on
+//! its channel with the `engine_died` code and the slot keeps
+//! serving, instead of the dead worker stranding the caller on a
+//! channel that never completes.
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
@@ -317,6 +321,18 @@ pub fn load(config: &EngineConfig) -> Result<(Arc<ModelInfo>, Loaded), String> {
 /// submission past it is refused by the connection thread with the
 /// `engine_busy` code, never queued without limit and never run
 /// concurrently inside another job's state.
+///
+/// Each job runs under `catch_unwind`. A panic anywhere inside a
+/// job (a tokenizer edge, a forward bug, a sampler fault) used to
+/// kill the worker thread with the job's reply sender still
+/// uncompleted inside it, stranding the caller on a channel that
+/// would never deliver a terminal event (panel B1/B4). The loop
+/// now completes the job by name instead: the panic is recorded on
+/// the diag channel and the job's channel receives the
+/// `engine_died` outcome, the same code the connection thread
+/// reports when a worker is gone. The slot then takes the next
+/// job; the weights and stats it shares are behind the same
+/// poison-tolerant locks the rest of the engine uses.
 pub fn run_worker(
     loaded: Loaded,
     stats: Arc<Mutex<Stats>>,
@@ -329,8 +345,38 @@ pub fn run_worker(
             rx.recv()
         };
         match work {
-            Ok(Work::Generate(job)) => run_job(&loaded, &stats, default_max_tokens, job),
-            Ok(Work::Embed(job)) => run_embed(&loaded, &stats, job),
+            Ok(Work::Generate(job)) => {
+                let reply = job.reply.clone();
+                let contained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_job(&loaded, &stats, default_max_tokens, job)
+                }));
+                if contained.is_err() {
+                    crate::diag::error(
+                        "engine_died",
+                        "generation job panicked in the worker; completed as engine_died",
+                    );
+                    let _ = reply.send(GenEvent::Error {
+                        code: "engine_died".to_string(),
+                        message: "engine worker panicked during generation".to_string(),
+                    });
+                }
+            }
+            Ok(Work::Embed(job)) => {
+                let reply = job.reply.clone();
+                let contained = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_embed(&loaded, &stats, job)
+                }));
+                if contained.is_err() {
+                    crate::diag::error(
+                        "engine_died",
+                        "embedding job panicked in the worker; completed as engine_died",
+                    );
+                    let _ = reply.send(Err((
+                        "engine_died".to_string(),
+                        "engine worker panicked during embedding".to_string(),
+                    )));
+                }
+            }
             Err(_) => return,
         }
     }
@@ -462,6 +508,14 @@ fn assemble_prompt_ids(body: &[u32], add_bos: bool, bos: Option<u32>) -> Vec<u32
     ids
 }
 
+/// Test-only panic trigger: a generation job carrying this prompt
+/// panics inside the worker, so the containment test can prove a
+/// panicking job completes as `engine_died` instead of stranding
+/// its caller. Compiled only into test builds; no production path
+/// can set it off.
+#[cfg(test)]
+const TEST_PANIC_PROMPT: &str = "__itak_engine_worker_panic_test__";
+
 fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize, job: Job) {
     let Job {
         prompt,
@@ -476,6 +530,10 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
         log_content,
         reply,
     } = job;
+    #[cfg(test)]
+    if prompt == TEST_PANIC_PROMPT {
+        panic!("test-injected worker panic");
+    }
     // The job leaves the queue the moment a slot takes it, however
     // it ends from here (including the early named failures below).
     {
@@ -835,6 +893,312 @@ mod tests {
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
         assert!(l2_normalize(&[0.0, 0.0]).is_none());
+    }
+
+    /// Stable fixture values in [-0.25, 0.25): the same LCG the
+    /// spec fixtures use, so the synthetic weights are identical
+    /// on every run.
+    fn fixture_values(state: &mut u64, n: usize) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let v = ((*state >> 40) & 0xFF_FFFF) as f32 / (1u64 << 24) as f32;
+                (v - 0.5) * 0.5
+            })
+            .collect()
+    }
+
+    fn put_fixture_tensor(
+        tensors: &mut std::collections::HashMap<String, muse_glimmer::TensorView>,
+        name: String,
+        shape: &[u64],
+        values: Vec<f32>,
+    ) {
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        tensors.insert(
+            name.clone(),
+            muse_glimmer::TensorView {
+                name,
+                dtype: muse_glimmer::Dtype::F32,
+                shape: shape.to_vec(),
+                data: std::sync::Arc::from(data.into_boxed_slice()),
+            },
+        );
+    }
+
+    struct FixtureSource {
+        tensors: std::collections::HashMap<String, muse_glimmer::TensorView>,
+    }
+
+    impl muse_glimmer::TensorSource for FixtureSource {
+        fn tensor(&self, name: &str) -> muse_glimmer::Result<muse_glimmer::TensorView> {
+            self.tensors
+                .get(name)
+                .cloned()
+                .ok_or_else(|| muse_glimmer::GlimmerError::MissingTensor {
+                    name: name.to_string(),
+                })
+        }
+    }
+
+    /// A small synthetic [`Loaded`] (4 layers, hidden 32, vocab
+    /// 128: the spec fixtures' geometry) so the worker test drives
+    /// the real [`run_worker`] on an honest value. No generation
+    /// runs against it: the panic job dies on the test hook before
+    /// tokenizing, and the survival probe is an empty embedding
+    /// batch, which completes without touching the model.
+    fn tiny_loaded() -> Loaded {
+        use muse_glimmer::{LayerKind, PatternSource};
+        let hidden = 32usize;
+        let ffn = 64usize;
+        let vocab = 128usize;
+        let qw = 32usize; // q_heads 4 * key_length 8
+        let kw = 16usize; // kv_heads 2 * key_length 8
+        let vw = 16usize; // kv_heads 2 * value_length 8
+        let head_dim = 8usize;
+        let cfg = GlimmerConfig {
+            name: Some("synthetic worker-test target".to_string()),
+            block_count: 4,
+            context_length: 256,
+            hidden: hidden as u32,
+            ffn_hidden: ffn as u32,
+            q_heads: 4,
+            kv_heads: 2,
+            key_length: 8,
+            value_length: 8,
+            rope_freq_base: 10_000.0,
+            rope_freq_base_swa: 10_000.0,
+            rms_eps: 1e-6,
+            sliding_window: 16,
+            logit_softcap: 20.0,
+            logit_scale: 0.5,
+            vocab_size: vocab as u32,
+            layers: vec![
+                LayerKind::SlidingWindow,
+                LayerKind::Global,
+                LayerKind::SlidingWindow,
+                LayerKind::Global,
+            ],
+            pattern_source: PatternSource::MeasuredFallback,
+        };
+        let mut state: u64 = 0x5eed_0001;
+        let mut tensors: std::collections::HashMap<String, muse_glimmer::TensorView> =
+            std::collections::HashMap::new();
+        put_fixture_tensor(
+            &mut tensors,
+            "token_embd.weight".to_string(),
+            &[hidden as u64, vocab as u64],
+            fixture_values(&mut state, vocab * hidden),
+        );
+        put_fixture_tensor(
+            &mut tensors,
+            "output_norm.weight".to_string(),
+            &[hidden as u64],
+            vec![1.0; hidden],
+        );
+        put_fixture_tensor(
+            &mut tensors,
+            "output.weight".to_string(),
+            &[hidden as u64, vocab as u64],
+            fixture_values(&mut state, vocab * hidden),
+        );
+        for layer in 0..4usize {
+            let name = |suffix: &str| format!("blk.{layer}.{suffix}");
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_norm.weight"),
+                &[hidden as u64],
+                vec![1.0; hidden],
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_q.weight"),
+                &[hidden as u64, qw as u64],
+                fixture_values(&mut state, hidden * qw),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_k.weight"),
+                &[hidden as u64, kw as u64],
+                fixture_values(&mut state, hidden * kw),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_v.weight"),
+                &[hidden as u64, vw as u64],
+                fixture_values(&mut state, hidden * vw),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_q_norm.weight"),
+                &[head_dim as u64],
+                vec![1.0; head_dim],
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_k_norm.weight"),
+                &[head_dim as u64],
+                vec![1.0; head_dim],
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_gate.weight"),
+                &[hidden as u64, qw as u64],
+                fixture_values(&mut state, hidden * qw),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("attn_output.weight"),
+                &[qw as u64, hidden as u64],
+                fixture_values(&mut state, qw * hidden),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("post_attention_norm.weight"),
+                &[hidden as u64],
+                vec![1.0; hidden],
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("ffn_norm.weight"),
+                &[hidden as u64],
+                vec![1.0; hidden],
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("ffn_gate.weight"),
+                &[hidden as u64, ffn as u64],
+                fixture_values(&mut state, hidden * ffn),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("ffn_up.weight"),
+                &[hidden as u64, ffn as u64],
+                fixture_values(&mut state, hidden * ffn),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("ffn_down.weight"),
+                &[ffn as u64, hidden as u64],
+                fixture_values(&mut state, ffn * hidden),
+            );
+            put_fixture_tensor(
+                &mut tensors,
+                name("post_ffw_norm.weight"),
+                &[hidden as u64],
+                vec![1.0; hidden],
+            );
+        }
+        let weights = Weights::load(&FixtureSource { tensors }, &cfg)
+            .expect("synthetic weights load");
+        let tokenizer = Tokenizer::new(TokenizerData {
+            model: Some("gpt2".to_string()),
+            tokens: (0..vocab).map(|i| format!("tok{i}")).collect(),
+            token_types: Vec::new(),
+            merges: Vec::new(),
+            scores: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            unknown_token_id: None,
+            padding_token_id: None,
+        })
+        .expect("synthetic tokenizer builds");
+        Loaded {
+            cfg,
+            weights,
+            tokenizer: Arc::new(tokenizer),
+            add_bos: false,
+        }
+    }
+
+    /// The panic containment contract (panel B1/B4): a job that
+    /// panics inside the worker completes its channel with the
+    /// named `engine_died` outcome instead of hanging its caller,
+    /// the panic is recorded on the diag channel, and the slot
+    /// keeps serving afterwards.
+    #[test]
+    fn worker_panic_completes_the_job_as_engine_died() {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct Capture {
+            events: Mutex<Vec<(String, String)>>,
+        }
+        impl crate::diag::Diag for Capture {
+            fn event(&self, event: &str, detail: &str) {
+                self.events
+                    .lock()
+                    .expect("capture lock")
+                    .push((event.to_string(), detail.to_string()));
+            }
+        }
+        // The diag sink is process-global; hold the lock the diag
+        // tests use for the whole install, drive, read sequence.
+        let _guard = crate::diag::SINK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let capture = Arc::new(Capture::default());
+        crate::diag::set_sink(capture.clone());
+
+        let (job_tx, job_rx) = channel::<Work>();
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let worker = std::thread::spawn(move || {
+            run_worker(tiny_loaded(), stats, 8, Arc::new(Mutex::new(job_rx)))
+        });
+
+        let (reply_tx, reply_rx) = channel::<GenEvent>();
+        job_tx
+            .send(Work::Generate(Job {
+                prompt: TEST_PANIC_PROMPT.to_string(),
+                max_tokens: None,
+                temperature: 0.0,
+                top_p: 1.0,
+                stop: Vec::new(),
+                seed: 0,
+                top_k: None,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                log_content: false,
+                reply: reply_tx,
+            }))
+            .expect("queue the panic job");
+        let event = reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a panicking job must still complete its channel");
+        match event {
+            GenEvent::Error { code, .. } => assert_eq!(code, "engine_died"),
+            GenEvent::Token { .. } => panic!("a panicking job produced a token"),
+            GenEvent::Done { .. } => panic!("a panicking job reported done"),
+        }
+
+        // The slot survived: an empty embedding batch completes
+        // normally on the same worker.
+        let (embed_tx, embed_rx) = channel::<EmbedOutcome>();
+        job_tx
+            .send(Work::Embed(EmbedJob {
+                inputs: Vec::new(),
+                max_tokens_per_input: 8,
+                reply: embed_tx,
+            }))
+            .expect("queue the survival probe");
+        let outcome = embed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the worker must keep serving after a contained panic");
+        assert!(outcome.is_ok(), "survival probe failed: {outcome:?}");
+
+        drop(job_tx);
+        worker.join().expect("worker exits when the queue closes");
+
+        let events = capture.events.lock().expect("capture lock");
+        assert!(
+            events.iter().any(|(event, _)| event == "engine_died"),
+            "the panic must emit its diag event, got {events:?}"
+        );
+        drop(events);
+        crate::diag::set_sink(Arc::new(crate::diag::StderrDiag));
     }
 
     #[test]

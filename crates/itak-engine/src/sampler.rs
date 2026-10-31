@@ -30,9 +30,9 @@ pub struct SamplerConfig {
     pub top_p: f64,
     /// Candidate set cap; 0 disables top-k truncation.
     pub top_k: usize,
-    /// Per-occurrence logit penalty (OpenAI form).
-    pub presence_penalty: f64,
     /// Flat logit penalty for any prior occurrence (OpenAI form).
+    pub presence_penalty: f64,
+    /// Per-occurrence logit penalty (OpenAI form).
     pub frequency_penalty: f64,
     /// Generator seed; any value is accepted (zero is remapped,
     /// xorshift has no zero state). Ignored when greedy.

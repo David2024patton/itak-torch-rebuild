@@ -2,6 +2,7 @@ package chattemplate_test
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -251,6 +252,164 @@ func TestStrftimeNowBuiltin(t *testing.T) {
 	_, err = chattemplate.Render(`{{ strftime_now }}`, nil, p)
 	if !errors.Is(err, chattemplate.ErrUnsupported) {
 		t.Fatalf("printing the builtin err = %v, want ErrUnsupported", err)
+	}
+}
+
+// ---- render budgets (Wave 1 fix, adjudication CA) --------------
+//
+// The template is attacker-controlled model-file metadata. These
+// tests pin the designed outcome for hostile shapes: a named
+// ErrBudget refusal returned promptly, never a crash. Before the
+// budgets, the first template below killed the process with an
+// unrecoverable fatal stack overflow; four critic seats executed
+// that kill independently.
+
+func renderBudgeted(t *testing.T, tmpl string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := chattemplate.Render(tmpl, []chattemplate.Message{{Role: "user", Content: "x"}}, chattemplate.Params{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatalf("render did not return within 30s; the budget did not stop it")
+		return nil
+	}
+}
+
+func wantBudget(t *testing.T, name, tmpl string) {
+	t.Helper()
+	err := renderBudgeted(t, tmpl)
+	if !errors.Is(err, chattemplate.ErrBudget) {
+		t.Fatalf("%s: err = %v, want ErrBudget", name, err)
+	}
+}
+
+// The adjudication's attack input, verbatim: a macro that calls
+// itself. The depth budget refuses it by name.
+func TestSelfRecursiveMacroRefused(t *testing.T) {
+	wantBudget(t, "self-recursive macro",
+		`{% macro a() %}{{ a() }}{% endmacro %}{{ a() }}`)
+}
+
+// A macro calling itself with a growing argument: same depth
+// refusal, and the argument charges stack against the output
+// budget on the way down.
+func TestSelfRecursiveMacroWithGrowingArgumentRefused(t *testing.T) {
+	wantBudget(t, "growing-argument recursion",
+		`{% macro a(x) %}{{ a(x + x) }}{% endmacro %}{{ a('seed') }}`)
+}
+
+// Fan-out: each macro calls the next twice, so depth stays at
+// the chain length while output doubles per level. Depth alone
+// cannot stop this; the step and output budgets do.
+func TestDoublingFanOutRefused(t *testing.T) {
+	var b strings.Builder
+	const levels = 30
+	for i := 0; i < levels; i++ {
+		fmt.Fprintf(&b, "{%% macro m%d() %%}{{ m%d() }}{{ m%d() }}{%% endmacro %%}", i, i+1, i+1)
+	}
+	b.WriteString("{% macro m30() %}x{% endmacro %}{{ m0() }}")
+	wantBudget(t, "doubling fan-out", b.String())
+}
+
+// The same fan-out with a payload at the leaf: output doubles
+// per level against the output budget.
+func TestDoublingFanOutWithPayloadRefused(t *testing.T) {
+	var b strings.Builder
+	const levels = 26
+	for i := 0; i < levels; i++ {
+		fmt.Fprintf(&b, "{%% macro m%d() %%}{{ m%d() }}{{ m%d() }}{%% endmacro %%}", i, i+1, i+1)
+	}
+	b.WriteString("{% macro m26() %}0123456789{% endmacro %}{{ m0() }}")
+	wantBudget(t, "doubling fan-out with payload", b.String())
+}
+
+// Deeply nested if/for structure: loops nested inside loops
+// over the same list multiply the demanded iterations (eight
+// levels over 100 messages ask for 100^8 body executions). The
+// step budget refuses by name after a bounded slice of that
+// work instead of walking it without bound.
+func TestDeeplyNestedStructureRefused(t *testing.T) {
+	const depth = 8
+	tmpl := strings.Repeat("{% for m in messages %}{% if true %}", depth) +
+		"{{ m['content'] }}" +
+		strings.Repeat("{% endif %}{% endfor %}", depth)
+	msgs := make([]chattemplate.Message, 100)
+	for i := range msgs {
+		msgs[i] = chattemplate.Message{Role: "user", Content: "x"}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := chattemplate.Render(tmpl, msgs, chattemplate.Params{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, chattemplate.ErrBudget) {
+			t.Fatalf("err = %v, want ErrBudget", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("render did not return within 30s; the budget did not stop it")
+	}
+}
+
+// A loop that prints a long literal once per message, scaled
+// past the output budget: output refuses by name partway.
+func TestOversizedLoopOutputRefused(t *testing.T) {
+	chunk := strings.Repeat("a", 4096)
+	tmpl := "{% for m in messages %}" + chunk + "{% endfor %}"
+	msgs := make([]chattemplate.Message, 5000)
+	for i := range msgs {
+		msgs[i] = chattemplate.Message{Role: "user", Content: "x"}
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := chattemplate.Render(tmpl, msgs, chattemplate.Params{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, chattemplate.ErrBudget) {
+			t.Fatalf("err = %v, want ErrBudget", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("render did not return within 30s; the budget did not stop it")
+	}
+}
+
+// A loop with an empty body over a list far past the step
+// budget: iterations are work even when they print nothing. The
+// list comes from splitting one message's content, so the
+// fixture stays a single small message.
+func TestEmptyLoopOverHugeListRefused(t *testing.T) {
+	msgs := []chattemplate.Message{{Role: "user", Content: strings.Repeat(",", 1_100_000)}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := chattemplate.Render(`{% for p in messages[0]['content'].split(',') %}{% endfor %}`, msgs, chattemplate.Params{})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, chattemplate.ErrBudget) {
+			t.Fatalf("err = %v, want ErrBudget", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("render did not return within 30s; the budget did not stop it")
+	}
+}
+
+// Legitimate nesting renders fine: macros calling macros a few
+// levels deep over real messages, well inside every budget.
+func TestNestedMacrosWithinBudgetRender(t *testing.T) {
+	tmpl := `{% macro inner(c) %}[{{ c }}]{% endmacro %}{% macro mid(c) %}{{ inner(c) }}{{ inner(c) }}{% endmacro %}{% macro outer(c) %}{{ mid(c) }}{% endmacro %}{% for m in messages %}{{ outer(m['content']) }}{% endfor %}`
+	got := render(t, tmpl, []chattemplate.Message{{Role: "user", Content: "hi"}},
+		chattemplate.Params{})
+	if want := "[hi][hi]"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 

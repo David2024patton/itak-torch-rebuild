@@ -12,6 +12,7 @@
 //! [`PatternSource`] records which one produced the pattern so the origin
 //! is never silent.
 
+use crate::config::{KEY_BLOCK_COUNT, MAX_BLOCK_COUNT};
 use crate::error::{GlimmerError, Result};
 
 /// How one layer attends.
@@ -44,6 +45,11 @@ pub const SWA_PATTERN_KEY: &str = "muse-glimmer.attention.sliding_window_pattern
 
 /// Derive the layer pattern.
 ///
+/// A `block_count` above [`MAX_BLOCK_COUNT`] is refused before any
+/// allocation: the pattern vector is sized from the count, so an
+/// unbounded count from a corrupt or hostile file would abort the
+/// process here instead of failing by name.
+///
 /// With `pattern` present (read from [`SWA_PATTERN_KEY`]), it must hold
 /// exactly `block_count` characters of `S` or `G`; anything else is an
 /// [`GlimmerError::InvalidMetadata`] naming the key. Without it, the
@@ -53,6 +59,14 @@ pub fn derive_layer_pattern(
     block_count: u32,
     pattern: Option<&str>,
 ) -> Result<(Vec<LayerKind>, PatternSource)> {
+    if block_count > MAX_BLOCK_COUNT {
+        return Err(GlimmerError::InvalidMetadata {
+            key: KEY_BLOCK_COUNT,
+            detail: format!(
+                "block_count {block_count} exceeds the plausible layer ceiling of {MAX_BLOCK_COUNT}"
+            ),
+        });
+    }
     match pattern {
         Some(text) => {
             let mut layers = Vec::with_capacity(block_count as usize);
@@ -148,5 +162,15 @@ mod tests {
     fn pattern_rejects_unknown_characters() {
         let err = derive_layer_pattern(3, Some("SXG")).expect_err("bad character must fail");
         assert!(matches!(err, GlimmerError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn pattern_refuses_block_count_above_the_ceiling() {
+        let err = derive_layer_pattern(MAX_BLOCK_COUNT + 1, None)
+            .expect_err("absurd count must fail before allocation");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, KEY_BLOCK_COUNT),
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
     }
 }

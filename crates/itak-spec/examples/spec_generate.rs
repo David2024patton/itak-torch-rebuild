@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use cpu_compute::CpuCompute;
-use dflash::{DflashModel, TensorSource as _};
+use dflash::{DflashModel, StderrDiag as DflashStderrDiag, TensorSource as _};
 use itak_spec::{sampler, DflashSpeculator, SharedCompute, SpecConfig, SpecSession, StderrDiag};
 use muse_glimmer::{GlimmerModel, PositionCache};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
@@ -127,7 +127,11 @@ fn run(
     report.require_complete().map_err(|e| e.to_string())?;
     let dweights =
         itak_loader::load_dflash_weights(&draft_file, &dcfg).map_err(|e| e.to_string())?;
-    let draft = DflashModel::new(dcfg.clone(), dweights);
+    // The draft runs with its diagnostic sink attached (the
+    // dflash channel's own StderrDiag, aliased: the session below
+    // takes itak_spec's), so the draft's refusals and passes are
+    // as observable as the session's.
+    let draft = DflashModel::with_diag(dcfg.clone(), dweights, Arc::new(DflashStderrDiag));
 
     let target_file = gguf::GgufFile::open(Path::new(target_path)).map_err(|e| e.to_string())?;
     let gcfg = itak_loader::load_config(&target_file).map_err(|e| e.to_string())?;

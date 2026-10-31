@@ -24,10 +24,11 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Instant;
 
 use cpu_compute::CpuCompute;
-use dflash::{DflashCache, DflashModel, TargetTensors};
+use dflash::{DflashCache, DflashModel, StderrDiag, TargetTensors};
 use muse_glimmer::{GlimmerModel, PositionCache};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
 
@@ -140,7 +141,9 @@ fn run(draft_path: &str, target_path: &str, prompt: &str, block_len: usize) -> R
         dweights.embedding.is_some(),
         dweights.output.is_some()
     );
-    let draft = DflashModel::new(dcfg.clone(), dweights);
+    // The draft runs with its diagnostic sink attached, so its
+    // refusals and passes are observable in this proof's output.
+    let draft = DflashModel::with_diag(dcfg.clone(), dweights, Arc::new(StderrDiag));
     phase("draft load", t);
 
     // Phase 3: target forward with captured layer inputs.

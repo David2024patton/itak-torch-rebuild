@@ -156,13 +156,21 @@ pub fn parse(input: &str) -> Result<Value, String> {
         pos: 0,
     };
     p.skip_ws();
-    let value = p.parse_value()?;
+    let value = p.parse_value(0)?;
     p.skip_ws();
     if p.pos != p.bytes.len() {
         return Err(format!("trailing data at byte {}", p.pos));
     }
     Ok(value)
 }
+
+/// The deepest nesting the parser accepts. Protocol frames nest a
+/// handful of levels, so 128 is generous headroom; past it the
+/// input is not a frame but an attack on the recursive parser's
+/// call stack (20,000 nested arrays overflowed the stack and
+/// aborted the whole engine process, adjudication CB), and it is
+/// refused with a named parse error instead.
+const MAX_DEPTH: usize = 128;
 
 struct Parser<'a> {
     bytes: &'a [u8],
@@ -187,10 +195,16 @@ impl Parser<'_> {
             .ok_or_else(|| "unexpected end of input".to_string())
     }
 
-    fn parse_value(&mut self) -> Result<Value, String> {
+    fn parse_value(&mut self, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err(format!(
+                "nesting deeper than {MAX_DEPTH} levels at byte {}",
+                self.pos
+            ));
+        }
         match self.peek()? {
-            b'{' => self.parse_obj(),
-            b'[' => self.parse_arr(),
+            b'{' => self.parse_obj(depth),
+            b'[' => self.parse_arr(depth),
             b'"' => Ok(Value::Str(self.parse_string()?)),
             b't' => self.parse_lit("true", Value::Bool(true)),
             b'f' => self.parse_lit("false", Value::Bool(false)),
@@ -331,7 +345,7 @@ impl Parser<'_> {
         Ok(value)
     }
 
-    fn parse_obj(&mut self) -> Result<Value, String> {
+    fn parse_obj(&mut self, depth: usize) -> Result<Value, String> {
         self.pos += 1; // '{'
         let mut pairs = Vec::new();
         self.skip_ws();
@@ -351,7 +365,7 @@ impl Parser<'_> {
             }
             self.pos += 1;
             self.skip_ws();
-            let value = self.parse_value()?;
+            let value = self.parse_value(depth + 1)?;
             pairs.push((key, value));
             self.skip_ws();
             match self.peek()? {
@@ -365,7 +379,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_arr(&mut self) -> Result<Value, String> {
+    fn parse_arr(&mut self, depth: usize) -> Result<Value, String> {
         self.pos += 1; // '['
         let mut items = Vec::new();
         self.skip_ws();
@@ -375,7 +389,7 @@ impl Parser<'_> {
         }
         loop {
             self.skip_ws();
-            items.push(self.parse_value()?);
+            items.push(self.parse_value(depth + 1)?);
             self.skip_ws();
             match self.peek()? {
                 b',' => self.pos += 1,
@@ -445,5 +459,25 @@ mod tests {
         assert_eq!(stringify(&Value::Num(13796.0)), "13796");
         assert_eq!(stringify(&Value::Num(0.5)), "0.5");
         assert_eq!(parse("1e3").expect("parses"), Value::Num(1000.0));
+    }
+
+    #[test]
+    fn deep_nesting_is_a_named_error_not_a_stack_overflow() {
+        // The adjudication's executed attack: 20,000 nested arrays,
+        // about 40 KB of input, aborted the engine process with a
+        // stack overflow before the depth cap. It must now be an
+        // ordinary parse error.
+        let attack = format!("{}{}", "[".repeat(20_000), "]".repeat(20_000));
+        let err = parse(&attack).expect_err("the attack input must not parse");
+        assert!(err.contains("nesting deeper"), "error: {err}");
+        // Objects nest through the same counter.
+        let obj_attack = format!("{}1{}", "{\"a\":".repeat(500), "}".repeat(500));
+        assert!(parse(&obj_attack).is_err());
+    }
+
+    #[test]
+    fn nesting_within_the_limit_still_parses() {
+        let deep = format!("{}1{}", "[".repeat(100), "]".repeat(100));
+        assert!(parse(&deep).is_ok(), "100 levels is legitimate depth");
     }
 }

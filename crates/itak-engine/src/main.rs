@@ -288,6 +288,12 @@ fn handle_conn(
     };
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    // The handshake is a gate, not a convention: until a hello with
+    // a matching protocol version completes, no other op is served.
+    // Before this, hello was one dispatch arm among six and the
+    // version was checked only when the client volunteered it, so
+    // any local process could skip the handshake entirely.
+    let mut greeted = false;
     loop {
         line.clear();
         match reader.read_line(&mut line) {
@@ -312,24 +318,46 @@ fn handle_conn(
             }
         };
         let op = frame.get("op").and_then(Value::as_str).unwrap_or("");
+        if op != "hello" && !greeted {
+            let msg = format!("first frame on a connection must be hello, not {op:?}");
+            let _ = send(
+                &mut writer,
+                &protocol::error_frame("protocol_mismatch", &msg),
+            );
+            return;
+        }
         match op {
             "hello" => {
-                let theirs = frame.get("proto").and_then(Value::as_f64);
-                if let Some(theirs) = theirs {
-                    if theirs != protocol::PROTO_VERSION {
+                // The version is required, not volunteered: the
+                // platform's client always sends it, and a hello
+                // without one has not identified what it speaks.
+                // A refused handshake closes the connection; there
+                // is nothing to retry on the same socket.
+                match frame.get("proto").and_then(Value::as_f64) {
+                    Some(v) if v == protocol::PROTO_VERSION => {}
+                    Some(v) => {
                         let msg = format!(
-                            "protocol version {theirs} not spoken here; this engine speaks {}",
+                            "protocol version {v} not spoken here; this engine speaks {}",
                             protocol::PROTO_VERSION
                         );
-                        if !send(
+                        let _ = send(
                             &mut writer,
                             &protocol::error_frame("protocol_mismatch", &msg),
-                        ) {
-                            return;
-                        }
-                        continue;
+                        );
+                        return;
+                    }
+                    None => {
+                        let _ = send(
+                            &mut writer,
+                            &protocol::error_frame(
+                                "protocol_mismatch",
+                                "hello frame carries no proto version",
+                            ),
+                        );
+                        return;
                     }
                 }
+                greeted = true;
                 let detail = format!(
                     "itak-engine {} model={} arch={}",
                     env!("CARGO_PKG_VERSION"),
@@ -703,6 +731,105 @@ mod tests {
         let second = bind_socket(&path).expect("second bind clears the stale socket");
         drop(second);
         std::fs::remove_file(&path).expect("cleanup");
+    }
+
+    /// Run handle_conn on a thread over a stream pair and hand back
+    /// the client end. The job receiver stays alive in the caller so
+    /// the channel the connection holds never disconnects mid-test.
+    fn serve_conn() -> (
+        BufReader<UnixStream>,
+        std::sync::mpsc::Receiver<Work>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (engine_side, client_side) = UnixStream::pair().expect("stream pair");
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("read timeout");
+        let (tx, rx) = sync_channel::<Work>(4);
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let handle = std::thread::spawn(move || {
+            handle_conn(
+                engine_side,
+                tx,
+                test_info(),
+                stats,
+                Instant::now(),
+                Limits {
+                    slots: 1,
+                    max_queued: 0,
+                },
+            );
+        });
+        (BufReader::new(client_side), rx, handle)
+    }
+
+    fn write_frame(client: &mut BufReader<UnixStream>, text: &str) {
+        let stream = client.get_mut();
+        stream.write_all(text.as_bytes()).expect("write frame");
+        stream.write_all(b"\n").expect("write newline");
+        stream.flush().expect("flush");
+    }
+
+    fn read_reply(client: &mut BufReader<UnixStream>) -> String {
+        let mut line = String::new();
+        let n = client.read_line(&mut line).expect("read reply");
+        assert!(n > 0, "expected a reply frame, got EOF");
+        line
+    }
+
+    fn assert_closed_after_refusal(client: &mut BufReader<UnixStream>) {
+        let mut line = String::new();
+        let n = client.read_line(&mut line).expect("read after refusal");
+        assert_eq!(n, 0, "the connection must close after the refusal");
+    }
+
+    #[test]
+    fn op_before_hello_is_refused_and_the_connection_closes() {
+        // The adjudication's attack shape: a local process skips the
+        // handshake and goes straight for an op.
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"ping"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"protocol_mismatch\""), "reply: {reply}");
+        assert_closed_after_refusal(&mut client);
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
+    fn hello_without_proto_is_refused_and_the_connection_closes() {
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"hello"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"protocol_mismatch\""), "reply: {reply}");
+        assert!(reply.contains("no proto"), "reply: {reply}");
+        assert_closed_after_refusal(&mut client);
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
+    fn hello_with_wrong_proto_is_refused_and_the_connection_closes() {
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"hello","proto":99}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"protocol_mismatch\""), "reply: {reply}");
+        assert_closed_after_refusal(&mut client);
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
+    fn hello_then_ping_answers() {
+        let (mut client, _rx, handle) = serve_conn();
+        write_frame(&mut client, r#"{"op":"hello","proto":1,"client":"test"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
+        write_frame(&mut client, r#"{"op":"ping"}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"pong\""), "reply: {reply}");
+        drop(client);
+        handle.join().expect("conn thread");
     }
 
     #[test]

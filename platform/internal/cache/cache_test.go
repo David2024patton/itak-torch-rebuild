@@ -79,3 +79,62 @@ func TestStatsCountHitsAndMisses(t *testing.T) {
 		t.Fatalf("Stats = %+v, want hits=1 misses=1 entries=1", s)
 	}
 }
+
+func TestEntryCapEvictsSoonestToExpire(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	c := cache.NewWithLimit[string](time.Minute, 2)
+	c.SetClock(func() time.Time { return now })
+	c.Set("a", "1") // expires first
+	now = now.Add(time.Second)
+	c.Set("b", "2")
+	now = now.Add(time.Second)
+	c.Set("c", "3") // crosses the cap: "a" is closest to expiry
+	if c.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 at the cap", c.Len())
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("soonest-to-expire entry survived eviction")
+	}
+	if _, ok := c.Get("b"); !ok {
+		t.Fatal("entry b was wrongly evicted")
+	}
+	if _, ok := c.Get("c"); !ok {
+		t.Fatal("freshly set entry c was evicted")
+	}
+}
+
+func TestEntryCapDropsExpiredBeforeEvictingLive(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	c := cache.NewWithLimit[string](10*time.Second, 2)
+	c.SetClock(func() time.Time { return now })
+	c.Set("old", "1")
+	now = now.Add(9 * time.Second)
+	c.Set("live", "2")
+	now = now.Add(2 * time.Second) // old is 11s old (expired), live is 2s old
+	c.Set("new", "3")
+	if _, ok := c.Get("live"); !ok {
+		t.Fatal("live entry evicted while an expired one was available to drop")
+	}
+	if _, ok := c.Get("new"); !ok {
+		t.Fatal("freshly set entry missing")
+	}
+	if c.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", c.Len())
+	}
+}
+
+func TestEntryCapOverwriteDoesNotEvict(t *testing.T) {
+	c := cache.NewWithLimit[string](time.Minute, 2)
+	c.Set("a", "1")
+	c.Set("b", "2")
+	c.Set("a", "3") // overwrite of an existing key needs no room
+	if c.Len() != 2 {
+		t.Fatalf("Len = %d, want 2", c.Len())
+	}
+	if got, ok := c.Get("a"); !ok || got != "3" {
+		t.Fatalf("Get(a) = %q, %v; want the overwritten value", got, ok)
+	}
+	if _, ok := c.Get("b"); !ok {
+		t.Fatal("overwrite evicted an unrelated entry")
+	}
+}

@@ -139,6 +139,10 @@ pub type EmbedOutcome = Result<Vec<Vec<f32>>, (String, String)>;
 pub struct EmbedJob {
     /// The input texts, in order.
     pub inputs: Vec<String>,
+    /// Per-input token cap from the operator's configuration
+    /// (--max-embed-tokens); an input tokenizing past it refuses
+    /// the batch by name instead of occupying a slot without bound.
+    pub max_tokens_per_input: usize,
     /// Where the outcome goes.
     pub reply: Sender<EmbedOutcome>,
 }
@@ -340,7 +344,7 @@ fn run_embed(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, job: EmbedJob) {
         let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
         st.queued = st.queued.saturating_sub(1);
     }
-    let outcome = embed_batch(loaded, &job.inputs);
+    let outcome = embed_batch(loaded, &job.inputs, job.max_tokens_per_input);
     if outcome.is_ok() {
         let mut st = stats.lock().unwrap_or_else(|p| p.into_inner());
         st.embeddings += 1;
@@ -348,7 +352,11 @@ fn run_embed(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, job: EmbedJob) {
     let _ = job.reply.send(outcome);
 }
 
-fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (String, String)> {
+fn embed_batch(
+    loaded: &Loaded,
+    inputs: &[String],
+    max_tokens_per_input: usize,
+) -> Result<Vec<Vec<f32>>, (String, String)> {
     let compute = CpuCompute::new();
     let hidden = loaded.cfg.hidden as usize;
     let mut out = Vec::with_capacity(inputs.len());
@@ -364,6 +372,7 @@ fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (Str
                 "input produced no tokens".to_string(),
             ));
         }
+        check_embed_input(ids.len(), max_tokens_per_input)?;
         let rows = compute
             .embed(&loaded.weights.embedding, &ids, &loaded.cfg)
             .map_err(|e| ("forward_failed".to_string(), format!("embed lookup: {e}")))?;
@@ -376,6 +385,23 @@ fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (Str
         })?);
     }
     Ok(out)
+}
+
+/// The per-input token cap refusal for an embedding batch,
+/// factored out so its shape is unit-testable without a loaded
+/// model. Before the cap existed, one batch could carry any number
+/// of inputs of any length onto a shared worker slot and starve
+/// generation indefinitely (adjudication, embed path unbounded);
+/// the batch count half of the cap is enforced by the connection
+/// thread in main.rs, this is the per-input half.
+fn check_embed_input(tokens: usize, max_tokens: usize) -> Result<(), (String, String)> {
+    if tokens > max_tokens {
+        return Err((
+            "bad_request".to_string(),
+            format!("embed input of {tokens} tokens exceeds the per-input maximum of {max_tokens}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Mean of `n` rows of width `hidden`, laid out contiguously.
@@ -711,6 +737,15 @@ mod tests {
         assert_eq!(assemble_prompt_ids(&[954], true, None), vec![954]);
         // Empty body with BOS asked: the lone BOS is the prompt.
         assert_eq!(assemble_prompt_ids(&[], true, Some(200000)), vec![200000]);
+    }
+
+    #[test]
+    fn embed_input_cap_refuses_by_name() {
+        assert!(check_embed_input(8192, 8192).is_ok());
+        let (code, message) = check_embed_input(8193, 8192).expect_err("past the cap refuses");
+        assert_eq!(code, "bad_request");
+        assert!(message.contains("8193"), "message: {message}");
+        assert!(message.contains("8192"), "message: {message}");
     }
 
     #[test]

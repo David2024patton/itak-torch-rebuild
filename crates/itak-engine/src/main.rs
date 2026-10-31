@@ -27,6 +27,11 @@
 //!   largest protocol frame, in bytes, a connection will read
 //!   before refusing it as bad_frame and closing (default
 //!   4194304).
+//! - `--max-embed-inputs N` / `ITAK_ENGINE_MAX_EMBED_INPUTS`: the
+//!   largest embed batch, in inputs, one frame may carry (default
+//!   256).
+//! - `--max-embed-tokens N` / `ITAK_ENGINE_MAX_EMBED_TOKENS`: the
+//!   largest single embed input, in tokens (default 8192).
 //!
 //! A model that fails to load (including the tensor coverage gate)
 //! exits the process non-zero with the named error: a partial model
@@ -145,6 +150,8 @@ fn run() -> i32 {
                     slots: config.slots,
                     max_queued: config.max_queued,
                     max_frame_bytes: config.max_frame_bytes,
+                    max_embed_inputs: config.max_embed_inputs,
+                    max_embed_tokens: config.max_embed_tokens,
                 };
                 std::thread::spawn(move || handle_conn(stream, tx, info, stats, started, limits));
             }
@@ -191,12 +198,15 @@ fn bind_socket(socket_path: &Path) -> Result<UnixListener, String> {
 
 /// The engine's configured bounds, carried to connection threads
 /// so refusals can name the state that refused: the concurrency
-/// contract (slots and queue depth) and the frame size cap.
+/// contract (slots and queue depth), the frame size cap, and the
+/// embed batch caps.
 #[derive(Clone, Copy)]
 struct Limits {
     slots: usize,
     max_queued: usize,
     max_frame_bytes: usize,
+    max_embed_inputs: usize,
+    max_embed_tokens: usize,
 }
 
 struct CliConfig {
@@ -207,6 +217,8 @@ struct CliConfig {
     slots: usize,
     max_queued: usize,
     max_frame_bytes: usize,
+    max_embed_inputs: usize,
+    max_embed_tokens: usize,
 }
 
 fn parse_args() -> Result<CliConfig, i32> {
@@ -217,6 +229,8 @@ fn parse_args() -> Result<CliConfig, i32> {
     let mut slots: Option<String> = std::env::var("ITAK_ENGINE_SLOTS").ok();
     let mut max_queued: Option<String> = std::env::var("ITAK_ENGINE_MAX_QUEUED").ok();
     let mut max_frame: Option<String> = std::env::var("ITAK_ENGINE_MAX_FRAME_BYTES").ok();
+    let mut max_embed_inputs: Option<String> = std::env::var("ITAK_ENGINE_MAX_EMBED_INPUTS").ok();
+    let mut max_embed_tokens: Option<String> = std::env::var("ITAK_ENGINE_MAX_EMBED_TOKENS").ok();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -228,9 +242,11 @@ fn parse_args() -> Result<CliConfig, i32> {
             "--slots" => (&mut slots, "--slots"),
             "--max-queued" => (&mut max_queued, "--max-queued"),
             "--max-frame-bytes" => (&mut max_frame, "--max-frame-bytes"),
+            "--max-embed-inputs" => (&mut max_embed_inputs, "--max-embed-inputs"),
+            "--max-embed-tokens" => (&mut max_embed_tokens, "--max-embed-tokens"),
             "--help" | "-h" => {
                 eprintln!(
-                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N] [--max-frame-bytes N]"
+                    "usage: itak-engine --model PATH [--socket PATH] [--model-name NAME] [--default-max-tokens N] [--slots N] [--max-queued N] [--max-frame-bytes N] [--max-embed-inputs N] [--max-embed-tokens N]"
                 );
                 return Err(0);
             }
@@ -273,6 +289,8 @@ fn parse_args() -> Result<CliConfig, i32> {
     let slots = parse_count(slots, "--slots", 1, 1)?;
     let max_queued = parse_count(max_queued, "--max-queued", 8, 0)?;
     let max_frame_bytes = parse_count(max_frame, "--max-frame-bytes", 4_194_304, 1024)?;
+    let max_embed_inputs = parse_count(max_embed_inputs, "--max-embed-inputs", 256, 1)?;
+    let max_embed_tokens = parse_count(max_embed_tokens, "--max-embed-tokens", 8192, 1)?;
     Ok(CliConfig {
         model_path: PathBuf::from(model),
         socket_path: PathBuf::from(socket.unwrap_or_else(|| "/tmp/itak-engine.sock".to_string())),
@@ -281,6 +299,8 @@ fn parse_args() -> Result<CliConfig, i32> {
         slots,
         max_queued,
         max_frame_bytes,
+        max_embed_inputs,
+        max_embed_tokens,
     })
 }
 
@@ -610,9 +630,23 @@ fn handle_embed(
         let msg = format!("this engine serves model {:?}, not {:?}", info.name, model);
         return send(writer, &protocol::error_frame("model_not_found", &msg));
     }
+    // The batch cap is enforced here, before the batch can occupy
+    // a slot: a frame may be large (up to --max-frame-bytes) and a
+    // batch of tiny inputs inside it is still unbounded work
+    // without this. The per-input token half rides the job and is
+    // enforced by the worker after tokenization.
+    if inputs.len() > limits.max_embed_inputs {
+        let msg = format!(
+            "embed batch of {} inputs exceeds the maximum of {}",
+            inputs.len(),
+            limits.max_embed_inputs
+        );
+        return send(writer, &protocol::error_frame("bad_request", &msg));
+    }
     let (reply_tx, reply_rx) = channel::<EmbedOutcome>();
     let job = EmbedJob {
         inputs,
+        max_tokens_per_input: limits.max_embed_tokens,
         reply: reply_tx,
     };
     match jobs.try_send(Work::Embed(job)) {
@@ -827,6 +861,22 @@ mod tests {
         std::sync::mpsc::Receiver<Work>,
         std::thread::JoinHandle<()>,
     ) {
+        serve_conn_with_limits(Limits {
+            slots: 1,
+            max_queued: 0,
+            max_frame_bytes,
+            max_embed_inputs: 256,
+            max_embed_tokens: 8192,
+        })
+    }
+
+    fn serve_conn_with_limits(
+        limits: Limits,
+    ) -> (
+        BufReader<UnixStream>,
+        std::sync::mpsc::Receiver<Work>,
+        std::thread::JoinHandle<()>,
+    ) {
         let (engine_side, client_side) = UnixStream::pair().expect("stream pair");
         client_side
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
@@ -834,18 +884,7 @@ mod tests {
         let (tx, rx) = sync_channel::<Work>(4);
         let stats = Arc::new(Mutex::new(Stats::default()));
         let handle = std::thread::spawn(move || {
-            handle_conn(
-                engine_side,
-                tx,
-                test_info(),
-                stats,
-                Instant::now(),
-                Limits {
-                    slots: 1,
-                    max_queued: 0,
-                    max_frame_bytes,
-                },
-            );
+            handle_conn(engine_side, tx, test_info(), stats, Instant::now(), limits);
         });
         (BufReader::new(client_side), rx, handle)
     }
@@ -989,6 +1028,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_embed_batch_is_refused_by_name() {
+        // The embed attack shape: one frame carrying a batch far
+        // past the cap. The refusal happens before any slot is
+        // occupied, and names the cap.
+        let (mut client, _rx, handle) = serve_conn_with_limits(Limits {
+            slots: 1,
+            max_queued: 0,
+            max_frame_bytes: 4_194_304,
+            max_embed_inputs: 2,
+            max_embed_tokens: 8192,
+        });
+        write_frame(&mut client, r#"{"op":"hello","proto":1}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"hello_ack\""), "reply: {reply}");
+        write_frame(&mut client, r#"{"op":"embed","input":["a","b","c"]}"#);
+        let reply = read_reply(&mut client);
+        assert!(reply.contains("\"bad_request\""), "reply: {reply}");
+        assert!(reply.contains("maximum of 2"), "reply: {reply}");
+        drop(client);
+        handle.join().expect("conn thread");
+    }
+
+    #[test]
     fn full_queue_refuses_engine_busy_by_name() {
         // Capacity 1 and it is already full: the next submission is
         // refused with the engine_busy code, not queued, not run.
@@ -1008,6 +1070,8 @@ mod tests {
                 slots: 1,
                 max_queued: 0,
                 max_frame_bytes: 4_194_304,
+                max_embed_inputs: 256,
+                max_embed_tokens: 8192,
             },
         );
         assert!(ok, "the connection survives a busy refusal");

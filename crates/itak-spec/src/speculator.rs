@@ -14,8 +14,8 @@ use std::rc::Rc;
 use cpu_compute::{Checkpoint, CpuCompute};
 use dflash::{DflashCache, DflashModel, TargetTensors, TensorData};
 use muse_glimmer::{
-    AttentionRequest, Cache, Compute, GlimmerConfig, GlimmerError, LayerInputCapture,
-    LayerWeights, Result as GlimmerResult, TensorView,
+    AttentionRequest, Cache, Compute, GlimmerConfig, GlimmerError, LayerInputCapture, LayerWeights,
+    Result as GlimmerResult, TensorView,
 };
 
 use crate::error::{Result, SpecError};
@@ -31,10 +31,21 @@ use crate::sampler;
 pub struct SharedCompute(pub Rc<CpuCompute>);
 
 impl Compute for SharedCompute {
-    fn embed(&self, table: &TensorView, tokens: &[u32], cfg: &GlimmerConfig) -> GlimmerResult<Vec<f32>> {
+    fn embed(
+        &self,
+        table: &TensorView,
+        tokens: &[u32],
+        cfg: &GlimmerConfig,
+    ) -> GlimmerResult<Vec<f32>> {
         self.0.embed(table, tokens, cfg)
     }
-    fn rms_norm(&self, x: &[f32], weight: &TensorView, rows: usize, eps: f32) -> GlimmerResult<Vec<f32>> {
+    fn rms_norm(
+        &self,
+        x: &[f32],
+        weight: &TensorView,
+        rows: usize,
+        eps: f32,
+    ) -> GlimmerResult<Vec<f32>> {
         self.0.rms_norm(x, weight, rows, eps)
     }
     fn rms_norm_plain(&self, x: &[f32], rows: usize, eps: f32) -> GlimmerResult<Vec<f32>> {
@@ -52,10 +63,21 @@ impl Compute for SharedCompute {
     fn add(&self, a: &[f32], b: &[f32]) -> GlimmerResult<Vec<f32>> {
         self.0.add(a, b)
     }
-    fn swiglu_ffn(&self, x: &[f32], w: &LayerWeights, rows: usize, cfg: &GlimmerConfig) -> GlimmerResult<Vec<f32>> {
+    fn swiglu_ffn(
+        &self,
+        x: &[f32],
+        w: &LayerWeights,
+        rows: usize,
+        cfg: &GlimmerConfig,
+    ) -> GlimmerResult<Vec<f32>> {
         self.0.swiglu_ffn(x, w, rows, cfg)
     }
-    fn lm_head(&self, x: &[f32], head: &TensorView, cfg: &GlimmerConfig) -> GlimmerResult<Vec<f32>> {
+    fn lm_head(
+        &self,
+        x: &[f32],
+        head: &TensorView,
+        cfg: &GlimmerConfig,
+    ) -> GlimmerResult<Vec<f32>> {
         self.0.lm_head(x, head, cfg)
     }
 }
@@ -107,7 +129,11 @@ pub trait Speculator {
     /// tagged by absolute position. Modes that condition on target hidden
     /// states (DFlash) stage them for the next `commit`; modes that do not
     /// ignore them. The default implementation ignores them.
-    fn note_captures(&mut self, _base_position: usize, _captures: &[LayerInputCapture]) -> Result<()> {
+    fn note_captures(
+        &mut self,
+        _base_position: usize,
+        _captures: &[LayerInputCapture],
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -218,7 +244,9 @@ impl DflashSpeculator {
         let logits = self
             .model
             .forward_block(&self.cache, &block, start, &borrowed)
-            .map_err(|e| SpecError::DraftRefused { source: Box::new(e) })?;
+            .map_err(|e| SpecError::DraftRefused {
+                source: Box::new(e),
+            })?;
         let vocab = self.model.config().vocab_size as usize;
         let want = n.min(self.model.config().max_drafts() as usize);
         let mut tokens = Vec::with_capacity(want);
@@ -324,11 +352,17 @@ impl Speculator for DflashSpeculator {
         self.staged_from = None;
         self.model
             .inject(&mut self.cache, &features, &positions)
-            .map_err(|e| SpecError::DraftRefused { source: Box::new(e) })?;
+            .map_err(|e| SpecError::DraftRefused {
+                source: Box::new(e),
+            })?;
         Ok(())
     }
 
-    fn note_captures(&mut self, base_position: usize, captures: &[LayerInputCapture]) -> Result<()> {
+    fn note_captures(
+        &mut self,
+        base_position: usize,
+        captures: &[LayerInputCapture],
+    ) -> Result<()> {
         if self.staged_from.is_some() {
             return Err(SpecError::SessionState {
                 detail: "captures staged twice without a commit between them".to_string(),
@@ -346,9 +380,7 @@ impl Speculator for DflashSpeculator {
         for i in 0..rows {
             let mut row = Vec::with_capacity(width);
             for capture in captures {
-                row.extend_from_slice(
-                    &capture.rows[i * target_hidden..(i + 1) * target_hidden],
-                );
+                row.extend_from_slice(&capture.rows[i * target_hidden..(i + 1) * target_hidden]);
             }
             staged.push((base_position + i, row));
         }
@@ -427,7 +459,10 @@ mod tests {
         assert_eq!(view.dists.len(), 3);
         for dist in &view.dists {
             let mass: f32 = dist.probs.iter().sum();
-            assert!((mass - 1.0).abs() < 1e-6, "greedy dists are one-hot, mass {mass}");
+            assert!(
+                (mass - 1.0).abs() < 1e-6,
+                "greedy dists are one-hot, mass {mass}"
+            );
         }
         assert_eq!(spec.max_depth(), 4);
         assert_eq!(spec.mode(), crate::SpecMode::Dflash);

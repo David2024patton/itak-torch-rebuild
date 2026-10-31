@@ -56,7 +56,15 @@ fn main() -> ExitCode {
         .get(7)
         .map_or("plain_stream.txt", String::as_str)
         .to_string();
-    match run(target_path, draft_path, prompt, n_tokens, depth, mode, &stream_file) {
+    match run(
+        target_path,
+        draft_path,
+        prompt,
+        n_tokens,
+        depth,
+        mode,
+        &stream_file,
+    ) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(msg) => {
@@ -125,7 +133,11 @@ fn run(
     let gcfg = itak_loader::load_config(&target_file).map_err(|e| e.to_string())?;
     println!(
         "draft: block_size={} target_layers={:?} mask={} | target: layers={} hidden={} vocab={}",
-        dcfg.block_size, dcfg.target_layers, dcfg.mask_token_id, gcfg.block_count, gcfg.hidden,
+        dcfg.block_size,
+        dcfg.target_layers,
+        dcfg.mask_token_id,
+        gcfg.block_count,
+        gcfg.hidden,
         gcfg.vocab_size
     );
 
@@ -158,48 +170,51 @@ fn run(
         let text = std::fs::read_to_string(stream_file).map_err(|e| e.to_string())?;
         let ids: Vec<u32> = text
             .split_whitespace()
-            .map(|w| w.parse().map_err(|_| format!("bad token id {w:?} in {stream_file}")))
+            .map(|w| {
+                w.parse()
+                    .map_err(|_| format!("bad token id {w:?} in {stream_file}"))
+            })
             .collect::<Result<_, _>>()?;
         println!("expected stream read from {stream_file}: {ids:?}");
         ids
     } else {
-    let gweights = itak_loader::load_weights(&target_file, &gcfg).map_err(|e| e.to_string())?;
-    let stream = {
-        let target = GlimmerModel::new(gcfg.clone(), gweights, Box::new(CpuCompute::new()));
-        let mut cache = PositionCache::new();
-        let tp = Instant::now();
-        let mut logits = target
-            .forward(&prompt_ids, &mut cache)
-            .map_err(|e| e.to_string())?;
-        println!("plain prefill: {:.1}s", tp.elapsed().as_secs_f64());
-        let _ = std::io::stdout().flush();
-        let td = Instant::now();
-        let mut stream = Vec::with_capacity(n_tokens);
-        for i in 0..n_tokens {
-            let token = sampler::argmax(&logits);
-            stream.push(token);
-            if eos.contains(&token) {
-                println!("plain: EOS at generated position {i}");
-                break;
+        let gweights = itak_loader::load_weights(&target_file, &gcfg).map_err(|e| e.to_string())?;
+        let stream = {
+            let target = GlimmerModel::new(gcfg.clone(), gweights, Box::new(CpuCompute::new()));
+            let mut cache = PositionCache::new();
+            let tp = Instant::now();
+            let mut logits = target
+                .forward(&prompt_ids, &mut cache)
+                .map_err(|e| e.to_string())?;
+            println!("plain prefill: {:.1}s", tp.elapsed().as_secs_f64());
+            let _ = std::io::stdout().flush();
+            let td = Instant::now();
+            let mut stream = Vec::with_capacity(n_tokens);
+            for i in 0..n_tokens {
+                let token = sampler::argmax(&logits);
+                stream.push(token);
+                if eos.contains(&token) {
+                    println!("plain: EOS at generated position {i}");
+                    break;
+                }
+                if i + 1 < n_tokens {
+                    logits = target
+                        .forward(&[token], &mut cache)
+                        .map_err(|e| e.to_string())?;
+                }
             }
-            if i + 1 < n_tokens {
-                logits = target
-                    .forward(&[token], &mut cache)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        let decode_s = td.elapsed().as_secs_f64();
-        println!(
-            "plain stream: {stream:?} ({:.1}s decode, {:.2}s/token after prefill)",
-            decode_s,
-            decode_s / stream.len().max(1) as f64
-        );
+            let decode_s = td.elapsed().as_secs_f64();
+            println!(
+                "plain stream: {stream:?} ({:.1}s decode, {:.2}s/token after prefill)",
+                decode_s,
+                decode_s / stream.len().max(1) as f64
+            );
+            stream
+        };
+        let text: String = stream.iter().map(|id| format!("{id} ")).collect();
+        std::fs::write(stream_file, text).map_err(|e| e.to_string())?;
+        println!("plain stream written to {stream_file}");
         stream
-    };
-    let text: String = stream.iter().map(|id| format!("{id} ")).collect();
-    std::fs::write(stream_file, text).map_err(|e| e.to_string())?;
-    println!("plain stream written to {stream_file}");
-    stream
     };
     let plain_wall = t.elapsed().as_secs_f64();
     phase("phase A plain greedy", t);
@@ -244,9 +259,7 @@ fn run(
         tp.elapsed().as_secs_f64()
     );
     let _ = std::io::stdout().flush();
-    let spec_stream = session
-        .generate(n_tokens, &[])
-        .map_err(|e| e.to_string())?;
+    let spec_stream = session.generate(n_tokens, &[]).map_err(|e| e.to_string())?;
     let stats = session.finish();
     let spec_wall = t.elapsed().as_secs_f64();
     println!("spec stream: {spec_stream:?}");

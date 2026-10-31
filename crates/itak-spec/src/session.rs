@@ -25,7 +25,7 @@ use crate::diag::Diag;
 use crate::error::{Result, SpecError};
 use crate::rng::Rng;
 use crate::sampler;
-use crate::speculator::{cache_refused, DraftArm, DflashSpeculator, Speculator};
+use crate::speculator::{cache_refused, DflashSpeculator, DraftArm, Speculator};
 
 /// Cumulative session statistics, pullable at any time (the
 /// `spec_stats()` readout of SPEC-itak-spec Section 6.4).
@@ -142,7 +142,9 @@ impl SpecSession {
         }
         let mut capture_layers: Vec<usize> = Vec::new();
         if config.mode == SpecMode::Dflash {
-            let spec = draft.as_ref().ok_or_else(|| refuse(SpecError::DraftNotLoaded))?;
+            let spec = draft
+                .as_ref()
+                .ok_or_else(|| refuse(SpecError::DraftNotLoaded))?;
             let dcfg = spec.model().config();
             let tcfg = target.config();
             if dcfg.vocab_size != tcfg.vocab_size {
@@ -200,13 +202,13 @@ impl SpecSession {
             stats: SpecStats::default(),
         };
         if session.config.mode == SpecMode::Off {
+            session.diag.event(
+                "spec.disabled",
+                "mode=off plain generation, no draft attached",
+            );
             session
                 .diag
-                .event("spec.disabled", "mode=off plain generation, no draft attached");
-            session.diag.event(
-                "spec.session.begin",
-                "mode=off depth=0 draft=none",
-            );
+                .event("spec.session.begin", "mode=off depth=0 draft=none");
         } else {
             session.diag.event(
                 "spec.session.begin",
@@ -268,15 +270,18 @@ impl SpecSession {
                 let (logits, captures) = self
                     .target
                     .forward_capturing(prompt, &mut self.cache, &self.capture_layers)
-                    .map_err(|e| SpecError::TargetRefused { source: Box::new(e) })?;
+                    .map_err(|e| SpecError::TargetRefused {
+                        source: Box::new(e),
+                    })?;
                 spec.note_captures(0, &captures)?;
                 spec.commit(prompt)?;
                 logits
             }
-            _ => self
-                .target
-                .forward(prompt, &mut self.cache)
-                .map_err(|e| SpecError::TargetRefused { source: Box::new(e) })?,
+            _ => self.target.forward(prompt, &mut self.cache).map_err(|e| {
+                SpecError::TargetRefused {
+                    source: Box::new(e),
+                }
+            })?,
         };
         self.pending = self.draw(&logits);
         self.begun = true;
@@ -347,11 +352,7 @@ impl SpecSession {
         }
     }
 
-    fn round_internal(
-        &mut self,
-        cap: Option<usize>,
-        stops: &HashSet<u32>,
-    ) -> Result<RoundOutcome> {
+    fn round_internal(&mut self, cap: Option<usize>, stops: &HashSet<u32>) -> Result<RoundOutcome> {
         if !self.begun {
             return Err(SpecError::SessionState {
                 detail: "round called before begin".to_string(),
@@ -395,7 +396,9 @@ impl SpecSession {
         let logits = self
             .target
             .forward(&[pending], &mut self.cache)
-            .map_err(|e| SpecError::TargetRefused { source: Box::new(e) })?;
+            .map_err(|e| SpecError::TargetRefused {
+                source: Box::new(e),
+            })?;
         let token = self.draw(&logits);
         self.pending = token;
         let emitted = vec![token];
@@ -430,7 +433,11 @@ impl SpecSession {
     /// Roll the target cache back to `to` and release the checkpoint.
     /// Any failure here poisons the session: cache state is no longer
     /// provably the committed prefix.
-    fn rewind_and_release(&mut self, checkpoint: &crate::speculator::TargetCheckpoint, to: usize) -> Result<()> {
+    fn rewind_and_release(
+        &mut self,
+        checkpoint: &crate::speculator::TargetCheckpoint,
+        to: usize,
+    ) -> Result<()> {
         if let Err(e) = self.compute.cache_rewind(checkpoint, to) {
             let err = cache_refused("rewind", e);
             self.poisoned = Some(err.to_string());
@@ -470,7 +477,10 @@ impl SpecSession {
             DraftArm::Greedy
         } else {
             DraftArm::Sampled {
-                temperature: self.config.draft_temperature.unwrap_or(self.config.temperature),
+                temperature: self
+                    .config
+                    .draft_temperature
+                    .unwrap_or(self.config.temperature),
             }
         };
         let t0 = Instant::now();
@@ -518,7 +528,9 @@ impl SpecSession {
                 );
                 return match self.config.on_verify_error {
                     OnVerifyError::Refuse => {
-                        let err = SpecError::VerifyRefused { source: Box::new(e) };
+                        let err = SpecError::VerifyRefused {
+                            source: Box::new(e),
+                        };
                         self.diag
                             .event("spec.refused", &format!("round={round_no} error={err}"));
                         Err(err)
@@ -555,10 +567,7 @@ impl SpecSession {
         // Step 4: the correction walk over finished distributions.
         let vocab = self.target.config().vocab_size as usize;
         let walk = if greedy {
-            let p_argmax: Vec<u32> = logits
-                .chunks_exact(vocab)
-                .map(sampler::argmax)
-                .collect();
+            let p_argmax: Vec<u32> = logits.chunks_exact(vocab).map(sampler::argmax).collect();
             sampler::correct_greedy(&p_argmax, &proposal.tokens)
         } else {
             let p_rows: Vec<Vec<f32>> = logits
@@ -826,10 +835,7 @@ mod tests {
         assert_eq!(session.stats().proposed, 0);
     }
 
-    fn try_new(
-        config: SpecConfig,
-        draft: Option<DflashSpeculator>,
-    ) -> Result<SpecSession> {
+    fn try_new(config: SpecConfig, draft: Option<DflashSpeculator>) -> Result<SpecSession> {
         let compute = Rc::new(CpuCompute::new());
         let fixture = testkit::build_target(Box::new(SharedCompute(compute.clone())));
         SpecSession::new(fixture.model, compute, draft, config, Arc::new(NullDiag))
@@ -847,44 +853,68 @@ mod tests {
     #[test]
     fn creation_refusals_are_named() {
         // DraftNotLoaded.
-        let err = try_new(SpecConfig::default(), None).err().expect("no draft");
+        let err = try_new(SpecConfig::default(), None)
+            .err()
+            .expect("no draft");
         assert!(matches!(err, SpecError::DraftNotLoaded), "got {err}");
         // ModeUnavailable.
         let config = SpecConfig {
             mode: SpecMode::Ngram,
             ..SpecConfig::default()
         };
-        let err = try_new(config, Some(fixture_draft(5))).err().expect("ngram");
-        assert!(matches!(err, SpecError::ModeUnavailable { .. }), "got {err}");
+        let err = try_new(config, Some(fixture_draft(5)))
+            .err()
+            .expect("ngram");
+        assert!(
+            matches!(err, SpecError::ModeUnavailable { .. }),
+            "got {err}"
+        );
         // GrammarConflict.
         let config = SpecConfig {
             grammar_active: true,
             ..SpecConfig::default()
         };
-        let err = try_new(config, Some(fixture_draft(5))).err().expect("grammar");
+        let err = try_new(config, Some(fixture_draft(5)))
+            .err()
+            .expect("grammar");
         assert!(matches!(err, SpecError::GrammarConflict), "got {err}");
         // DepthOutOfRange: zero, and beyond the block's draft count.
         let config = SpecConfig {
             depth: 0,
             ..SpecConfig::default()
         };
-        let err = try_new(config, Some(fixture_draft(5))).err().expect("depth 0");
-        assert!(matches!(err, SpecError::DepthOutOfRange { .. }), "got {err}");
+        let err = try_new(config, Some(fixture_draft(5)))
+            .err()
+            .expect("depth 0");
+        assert!(
+            matches!(err, SpecError::DepthOutOfRange { .. }),
+            "got {err}"
+        );
         // Block 5 proposes at most 4, so depth 5 is out of range.
         let config = SpecConfig {
             depth: 5,
             ..SpecConfig::default()
         };
-        let err = try_new(config, Some(fixture_draft(5))).err().expect("depth 5 of block 5");
-        assert!(matches!(err, SpecError::DepthOutOfRange { .. }), "got {err}");
+        let err = try_new(config, Some(fixture_draft(5)))
+            .err()
+            .expect("depth 5 of block 5");
+        assert!(
+            matches!(err, SpecError::DepthOutOfRange { .. }),
+            "got {err}"
+        );
         // RoundBoundTooSmall: depth 4 needs a bound of at least 5.
         let config = SpecConfig {
             depth: 4,
             max_round_tokens: 4,
             ..SpecConfig::default()
         };
-        let err = try_new(config, Some(fixture_draft(5))).err().expect("bound");
-        assert!(matches!(err, SpecError::RoundBoundTooSmall { .. }), "got {err}");
+        let err = try_new(config, Some(fixture_draft(5)))
+            .err()
+            .expect("bound");
+        assert!(
+            matches!(err, SpecError::RoundBoundTooSmall { .. }),
+            "got {err}"
+        );
     }
 
     /// Call-order discipline: rounds need a begin, and begin runs once.

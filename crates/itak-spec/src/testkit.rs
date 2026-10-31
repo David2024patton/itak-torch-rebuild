@@ -146,7 +146,11 @@ pub fn build_target(compute: Box<dyn muse_glimmer::Compute>) -> TargetFixture {
         &[hidden as u64, vocab as u64],
         emb_values.clone(),
     );
-    put("output_norm.weight".to_string(), &[hidden as u64], ones(hidden));
+    put(
+        "output_norm.weight".to_string(),
+        &[hidden as u64],
+        ones(hidden),
+    );
     let head_values = rand_vec(&mut rng, vocab * hidden);
     put(
         "output.weight".to_string(),
@@ -156,18 +160,62 @@ pub fn build_target(compute: Box<dyn muse_glimmer::Compute>) -> TargetFixture {
     for layer in 0..cfg.block_count as usize {
         let name = |suffix: &str| format!("blk.{layer}.{suffix}");
         put(name("attn_norm.weight"), &[hidden as u64], ones(hidden));
-        put(name("attn_q.weight"), &[hidden as u64, qw as u64], rand_vec(&mut rng, hidden * qw));
-        put(name("attn_k.weight"), &[hidden as u64, kw as u64], rand_vec(&mut rng, hidden * kw));
-        put(name("attn_v.weight"), &[hidden as u64, vw as u64], rand_vec(&mut rng, hidden * vw));
-        put(name("attn_q_norm.weight"), &[head_dim as u64], ones(head_dim));
-        put(name("attn_k_norm.weight"), &[head_dim as u64], ones(head_dim));
-        put(name("attn_gate.weight"), &[hidden as u64, qw as u64], rand_vec(&mut rng, hidden * qw));
-        put(name("attn_output.weight"), &[qw as u64, hidden as u64], rand_vec(&mut rng, qw * hidden));
-        put(name("post_attention_norm.weight"), &[hidden as u64], ones(hidden));
+        put(
+            name("attn_q.weight"),
+            &[hidden as u64, qw as u64],
+            rand_vec(&mut rng, hidden * qw),
+        );
+        put(
+            name("attn_k.weight"),
+            &[hidden as u64, kw as u64],
+            rand_vec(&mut rng, hidden * kw),
+        );
+        put(
+            name("attn_v.weight"),
+            &[hidden as u64, vw as u64],
+            rand_vec(&mut rng, hidden * vw),
+        );
+        put(
+            name("attn_q_norm.weight"),
+            &[head_dim as u64],
+            ones(head_dim),
+        );
+        put(
+            name("attn_k_norm.weight"),
+            &[head_dim as u64],
+            ones(head_dim),
+        );
+        put(
+            name("attn_gate.weight"),
+            &[hidden as u64, qw as u64],
+            rand_vec(&mut rng, hidden * qw),
+        );
+        put(
+            name("attn_output.weight"),
+            &[qw as u64, hidden as u64],
+            rand_vec(&mut rng, qw * hidden),
+        );
+        put(
+            name("post_attention_norm.weight"),
+            &[hidden as u64],
+            ones(hidden),
+        );
         put(name("ffn_norm.weight"), &[hidden as u64], ones(hidden));
-        put(name("ffn_gate.weight"), &[hidden as u64, ffn as u64], rand_vec(&mut rng, hidden * ffn));
-        put(name("ffn_up.weight"), &[hidden as u64, ffn as u64], rand_vec(&mut rng, hidden * ffn));
-        put(name("ffn_down.weight"), &[ffn as u64, hidden as u64], rand_vec(&mut rng, ffn * hidden));
+        put(
+            name("ffn_gate.weight"),
+            &[hidden as u64, ffn as u64],
+            rand_vec(&mut rng, hidden * ffn),
+        );
+        put(
+            name("ffn_up.weight"),
+            &[hidden as u64, ffn as u64],
+            rand_vec(&mut rng, hidden * ffn),
+        );
+        put(
+            name("ffn_down.weight"),
+            &[ffn as u64, hidden as u64],
+            rand_vec(&mut rng, ffn * hidden),
+        );
         put(name("post_ffw_norm.weight"), &[hidden as u64], ones(hidden));
     }
     let source = TargetMapSource { tensors };
@@ -274,22 +322,70 @@ pub fn build_speculator(fixture: &TargetFixture, block_size: u32) -> DflashSpecu
             },
         );
     };
-    put("fc.weight".to_string(), &[cond_in as u64, hidden as u64], rand_vec(&mut rng, cond_in * hidden));
-    put("enc.output_norm.weight".to_string(), &[hidden as u64], ones(hidden));
-    put("output_norm.weight".to_string(), &[hidden as u64], ones(hidden));
+    put(
+        "fc.weight".to_string(),
+        &[cond_in as u64, hidden as u64],
+        rand_vec(&mut rng, cond_in * hidden),
+    );
+    put(
+        "enc.output_norm.weight".to_string(),
+        &[hidden as u64],
+        ones(hidden),
+    );
+    put(
+        "output_norm.weight".to_string(),
+        &[hidden as u64],
+        ones(hidden),
+    );
     for layer in 0..cfg.block_count as usize {
         let name = |suffix: &str| format!("blk.{layer}.{suffix}");
         put(name("attn_norm.weight"), &[hidden as u64], ones(hidden));
-        put(name("attn_q.weight"), &[hidden as u64, qw as u64], rand_vec(&mut rng, hidden * qw));
-        put(name("attn_k.weight"), &[hidden as u64, kw as u64], rand_vec(&mut rng, hidden * kw));
-        put(name("attn_v.weight"), &[hidden as u64, vw as u64], rand_vec(&mut rng, hidden * vw));
-        put(name("attn_q_norm.weight"), &[head_dim as u64], ones(head_dim));
-        put(name("attn_k_norm.weight"), &[head_dim as u64], ones(head_dim));
-        put(name("attn_output.weight"), &[out_w as u64, hidden as u64], rand_vec(&mut rng, out_w * hidden));
+        put(
+            name("attn_q.weight"),
+            &[hidden as u64, qw as u64],
+            rand_vec(&mut rng, hidden * qw),
+        );
+        put(
+            name("attn_k.weight"),
+            &[hidden as u64, kw as u64],
+            rand_vec(&mut rng, hidden * kw),
+        );
+        put(
+            name("attn_v.weight"),
+            &[hidden as u64, vw as u64],
+            rand_vec(&mut rng, hidden * vw),
+        );
+        put(
+            name("attn_q_norm.weight"),
+            &[head_dim as u64],
+            ones(head_dim),
+        );
+        put(
+            name("attn_k_norm.weight"),
+            &[head_dim as u64],
+            ones(head_dim),
+        );
+        put(
+            name("attn_output.weight"),
+            &[out_w as u64, hidden as u64],
+            rand_vec(&mut rng, out_w * hidden),
+        );
         put(name("ffn_norm.weight"), &[hidden as u64], ones(hidden));
-        put(name("ffn_gate.weight"), &[hidden as u64, ffn as u64], rand_vec(&mut rng, hidden * ffn));
-        put(name("ffn_up.weight"), &[hidden as u64, ffn as u64], rand_vec(&mut rng, hidden * ffn));
-        put(name("ffn_down.weight"), &[ffn as u64, hidden as u64], rand_vec(&mut rng, ffn * hidden));
+        put(
+            name("ffn_gate.weight"),
+            &[hidden as u64, ffn as u64],
+            rand_vec(&mut rng, hidden * ffn),
+        );
+        put(
+            name("ffn_up.weight"),
+            &[hidden as u64, ffn as u64],
+            rand_vec(&mut rng, hidden * ffn),
+        );
+        put(
+            name("ffn_down.weight"),
+            &[ffn as u64, hidden as u64],
+            rand_vec(&mut rng, ffn * hidden),
+        );
     }
     let source = DraftMapSource { tensors };
     let weights = DraftWeights::load(&source, &cfg).expect("synthetic draft weights load");

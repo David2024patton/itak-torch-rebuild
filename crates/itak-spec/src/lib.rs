@@ -44,5 +44,5 @@ pub use error::{Result, SpecError};
 pub use rng::Rng;
 pub use session::{RoundOutcome, SpecSession, SpecStats};
 pub use speculator::{
-    BlockProposal, DraftArm, DraftDist, DflashSpeculator, Proposal, SharedCompute, Speculator,
+    BlockProposal, DflashSpeculator, DraftArm, DraftDist, Proposal, SharedCompute, Speculator,
 };

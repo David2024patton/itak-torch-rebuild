@@ -173,8 +173,93 @@ impl std::error::Error for GgufError {
     }
 }
 
+impl GgufError {
+    /// Emit this error through the crate's diagnostic channel and
+    /// return it unchanged: the construction seam every error site
+    /// in the crate routes through (`GgufError::Variant { .. }
+    /// .logged()`), so a refusal is recorded exactly once, at the
+    /// point it is created, before it propagates (diag.rs documents
+    /// the same contract). The variant-to-event mapping lives in
+    /// [`emit`](Self::emit), whose match is exhaustive: adding a
+    /// variant fails compilation there until the new variant has
+    /// an event name and fields, so a new error cannot be born
+    /// silent by forgetting a call at its construction sites.
+    pub(crate) fn logged(self) -> Self {
+        self.emit();
+        self
+    }
+
+    /// The one place a variant becomes a diag event. Field shapes
+    /// follow the crate's `key=value` convention and, where the
+    /// parser had hand-written events before this seam existed,
+    /// keep those event names (bad_magic, missing_tensor, ...).
+    fn emit(&self) {
+        let (event, fields) = match self {
+            Self::Io(e) => ("io_error", format!("error={e}")),
+            Self::BadMagic { found } => ("bad_magic", format!("found={found:?}")),
+            Self::UnsupportedVersion(v) => ("unsupported_version", format!("version={v}")),
+            Self::Truncated {
+                context,
+                offset,
+                needed,
+                file_len,
+            } => (
+                "truncated",
+                format!("context={context} offset={offset} needed={needed} file_len={file_len}"),
+            ),
+            Self::InvalidUtf8 { context } => ("invalid_utf8", format!("context={context}")),
+            Self::UnknownMetadataType(id) => ("unknown_metadata_type", format!("type_id={id}")),
+            Self::LengthOverflow { context } => ("length_overflow", format!("context={context}")),
+            Self::MissingTensor(name) => ("missing_tensor", format!("name={name}")),
+            Self::BadElementCount {
+                tensor,
+                elements,
+                block_size,
+            } => (
+                "bad_element_count",
+                format!("tensor={tensor} elements={elements} block_size={block_size}"),
+            ),
+            Self::TensorOutOfBounds {
+                tensor,
+                offset,
+                len,
+                file_len,
+            } => (
+                "tensor_out_of_bounds",
+                format!("name={tensor} offset={offset} len={len} file_len={file_len}"),
+            ),
+            Self::UnsupportedTensorType {
+                tensor,
+                type_id,
+                type_name,
+            } => (
+                "unsupported_type",
+                format!("name={tensor} type_id={type_id} type={type_name}"),
+            ),
+            Self::InvalidFormat { context, detail } => (
+                "invalid_format",
+                format!("context={context} detail={detail}"),
+            ),
+            Self::MissingMetadata(key) => ("missing_metadata", format!("key={key}")),
+            Self::MetadataTypeMismatch {
+                key,
+                expected,
+                found,
+            } => (
+                "metadata_type_mismatch",
+                format!("key={key} expected={expected} found={found}"),
+            ),
+        };
+        crate::diag::error(event, &fields);
+    }
+}
+
 impl From<std::io::Error> for GgufError {
     fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
+        // The conversion is a construction path like any other:
+        // an io failure becomes a GgufError here, so it emits
+        // here, and the `?` that triggered the conversion does
+        // not emit a second time.
+        Self::Io(e).logged()
     }
 }

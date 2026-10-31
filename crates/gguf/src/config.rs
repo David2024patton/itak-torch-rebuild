@@ -70,9 +70,9 @@ impl ModelConfig {
         let head_count = match head_count {
             Some(v) => v,
             None => {
-                return Err(crate::error::GgufError::MissingMetadata(key(
-                    "attention.head_count",
-                )))
+                return Err(
+                    crate::error::GgufError::MissingMetadata(key("attention.head_count")).logged(),
+                )
             }
         };
         let (kv_scalar, head_count_kv_per_layer) =
@@ -194,5 +194,73 @@ impl GgufFile {
     /// Embedded tokenizer data, when the file carries a tokenizer.
     pub fn tokenizer(&self) -> Result<TokenizerInfo> {
         TokenizerInfo::from_file(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diag;
+    use crate::error::GgufError;
+
+    // A minimal in-memory GGUF: header plus the metadata entries
+    // pushed by the helpers below, no tensors. Just enough for
+    // from_file to walk its required keys in order.
+    fn push_u32(b: &mut Vec<u8>, v: u32) {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u64(b: &mut Vec<u8>, v: u64) {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_string(b: &mut Vec<u8>, s: &str) {
+        push_u64(b, s.len() as u64);
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    fn push_kv_string(b: &mut Vec<u8>, key: &str, value: &str) {
+        push_string(b, key);
+        push_u32(b, 8); // GGUF string value type
+        push_string(b, value);
+    }
+
+    fn push_kv_u32(b: &mut Vec<u8>, key: &str, value: u32) {
+        push_string(b, key);
+        push_u32(b, 4); // GGUF u32 value type
+        push_u32(b, value);
+    }
+
+    #[test]
+    fn missing_head_count_refusal_emits_its_diag_event() {
+        // A previously silent path: ModelConfig::from_file
+        // constructed its MissingMetadata for an absent head_count
+        // key with no diag call anywhere in this module. The file
+        // below carries the two required keys from_file reads
+        // before head_count, so the refusal is exactly that
+        // construction.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        push_u32(&mut bytes, 3); // version
+        push_u64(&mut bytes, 0); // tensor count
+        push_u64(&mut bytes, 3); // metadata kv count
+        push_kv_string(&mut bytes, "general.architecture", "lane-g-arch");
+        push_kv_u32(&mut bytes, "lane-g-arch.block_count", 2);
+        push_kv_u32(&mut bytes, "lane-g-arch.embedding_length", 8);
+        let file = GgufFile::from_bytes(bytes).expect("the synthetic file parses");
+
+        let err =
+            ModelConfig::from_file(&file).expect_err("no head_count key anywhere must refuse");
+        assert!(
+            matches!(&err, GgufError::MissingMetadata(k) if k == "lane-g-arch.attention.head_count"),
+            "error: {err}"
+        );
+        assert!(
+            diag::captured_errors().iter().any(|l| {
+                l.contains("event=missing_metadata")
+                    && l.contains("key=lane-g-arch.attention.head_count")
+            }),
+            "the config refusal must emit its diag event"
+        );
     }
 }

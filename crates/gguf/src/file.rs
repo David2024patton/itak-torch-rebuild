@@ -110,13 +110,11 @@ impl GgufFile {
         let magic = reader.read_bytes(4, "magic")?;
         if magic != GGUF_MAGIC {
             let found = [magic[0], magic[1], magic[2], magic[3]];
-            diag::error("bad_magic", &format!("found={found:?}"));
-            return Err(GgufError::BadMagic { found });
+            return Err(GgufError::BadMagic { found }.logged());
         }
         let version = reader.read_u32("version")?;
         if version != SUPPORTED_VERSION {
-            diag::error("unsupported_version", &format!("version={version}"));
-            return Err(GgufError::UnsupportedVersion(version));
+            return Err(GgufError::UnsupportedVersion(version).logged());
         }
         let tensor_count = reader.read_u64("tensor_count")?;
         let metadata_count = reader.read_u64("metadata_kv_count")?;
@@ -142,15 +140,22 @@ impl GgufFile {
                 return Err(GgufError::InvalidFormat {
                     context: "tensor directory",
                     detail: format!("tensor {name}: dimension count {n_dims} outside 1..=4"),
-                });
+                }
+                .logged());
             }
             let mut dims = Vec::with_capacity(n_dims as usize);
             let mut elements: u64 = 1;
             for _ in 0..n_dims {
                 let d = reader.read_u64("tensor dimension")?;
                 dims.push(d);
-                elements = elements.checked_mul(d).ok_or(GgufError::LengthOverflow {
-                    context: "tensor element count",
+                // ok_or_else, not ok_or: the error must be
+                // constructed (and so emitted, via .logged()) only
+                // on the failure path, never for a product that fit.
+                elements = elements.checked_mul(d).ok_or_else(|| {
+                    GgufError::LengthOverflow {
+                        context: "tensor element count",
+                    }
+                    .logged()
                 })?;
             }
             let type_id = reader.read_u32("tensor type")?;
@@ -161,7 +166,8 @@ impl GgufFile {
                         tensor: name,
                         elements,
                         block_size: ty.block_size(),
-                    });
+                    }
+                    .logged());
                 }
             }
             diag::debug(
@@ -173,11 +179,11 @@ impl GgufFile {
             );
             let slot = tensors.len();
             if index.insert(name.clone(), slot).is_some() {
-                diag::error("duplicate_tensor", &format!("name={name}"));
                 return Err(GgufError::InvalidFormat {
                     context: "tensor directory",
                     detail: format!("duplicate tensor name {name}"),
-                });
+                }
+                .logged());
             }
             tensors.push(TensorInfo {
                 name,
@@ -198,35 +204,40 @@ impl GgufFile {
                 detail: format!(
                     "general.alignment {alignment} is not a power of two within 1..=1048576"
                 ),
-            });
+            }
+            .logged());
         }
         let header_len = reader.position() as u64;
         let data_start_u = align_up(header_len, u64::from(alignment));
-        let data_start = usize::try_from(data_start_u).map_err(|_| GgufError::LengthOverflow {
-            context: "tensor data offset",
+        let data_start = usize::try_from(data_start_u).map_err(|_| {
+            GgufError::LengthOverflow {
+                context: "tensor data offset",
+            }
+            .logged()
         })?;
 
         // Bounds-check every supported tensor's data range against the file.
         let file_len = bytes.len() as u64;
         for tensor in &tensors {
             if let Some(len) = tensor.byte_len() {
-                let offset = data_start_u.checked_add(tensor.rel_offset).ok_or(
+                // ok_or_else for the same reason as the element
+                // count above: construction (and emission) belongs
+                // to the failure path only.
+                let offset = data_start_u.checked_add(tensor.rel_offset).ok_or_else(|| {
                     GgufError::LengthOverflow {
                         context: "tensor data offset",
-                    },
-                )?;
+                    }
+                    .logged()
+                })?;
                 let in_bounds = offset.checked_add(len).is_some_and(|end| end <= file_len);
                 if !in_bounds {
-                    diag::error(
-                        "tensor_out_of_bounds",
-                        &format!("name={} offset={offset} len={len}", tensor.name),
-                    );
                     return Err(GgufError::TensorOutOfBounds {
                         tensor: tensor.name.clone(),
                         offset,
                         len,
                         file_len,
-                    });
+                    }
+                    .logged());
                 }
             }
         }
@@ -301,10 +312,7 @@ impl GgufFile {
     pub fn tensor_info(&self, name: &str) -> Result<&TensorInfo> {
         match self.index.get(name) {
             Some(&slot) => Ok(&self.tensors[slot]),
-            None => {
-                diag::error("missing_tensor", &format!("name={name}"));
-                Err(GgufError::MissingTensor(name.to_string()))
-            }
+            None => Err(GgufError::MissingTensor(name.to_string()).logged()),
         }
     }
 
@@ -323,15 +331,12 @@ impl GgufFile {
         let len = match info.byte_len() {
             Some(len) => len,
             None => {
-                diag::error(
-                    "unsupported_type",
-                    &format!("name={} type_id={}", info.name, info.type_id),
-                );
                 return Err(GgufError::UnsupportedTensorType {
                     tensor: info.name.clone(),
                     type_id: info.type_id,
                     type_name: type_name(info.type_id).to_string(),
-                });
+                }
+                .logged());
             }
         };
         let start = self.data_start + info.rel_offset as usize;
@@ -357,20 +362,20 @@ impl GgufFile {
         let ty = match info.ggml_type() {
             Some(ty) => ty,
             None => {
-                diag::error(
-                    "unsupported_type",
-                    &format!("name={} type_id={}", info.name, info.type_id),
-                );
                 return Err(GgufError::UnsupportedTensorType {
                     tensor: info.name.clone(),
                     type_id: info.type_id,
                     type_name: type_name(info.type_id).to_string(),
-                });
+                }
+                .logged());
             }
         };
         let raw = self.tensor_bytes_for(info)?;
-        let elements = usize::try_from(info.elements).map_err(|_| GgufError::LengthOverflow {
-            context: "tensor element count",
+        let elements = usize::try_from(info.elements).map_err(|_| {
+            GgufError::LengthOverflow {
+                context: "tensor element count",
+            }
+            .logged()
         })?;
         diag::debug(
             "tensor_load",
@@ -415,7 +420,8 @@ impl<'a> Reader<'a> {
                 offset: self.pos as u64,
                 needed: n as u64,
                 file_len: self.bytes.len() as u64,
-            });
+            }
+            .logged());
         }
         let out = &self.bytes[self.pos..self.pos + n];
         self.pos += n;
@@ -473,9 +479,10 @@ impl<'a> Reader<'a> {
 
     fn read_string(&mut self, context: &'static str) -> Result<String> {
         let len = self.read_u64("string length")?;
-        let len = usize::try_from(len).map_err(|_| GgufError::LengthOverflow { context })?;
+        let len =
+            usize::try_from(len).map_err(|_| GgufError::LengthOverflow { context }.logged())?;
         let raw = self.read_bytes(len, context)?;
-        String::from_utf8(raw.to_vec()).map_err(|_| GgufError::InvalidUtf8 { context })
+        String::from_utf8(raw.to_vec()).map_err(|_| GgufError::InvalidUtf8 { context }.logged())
     }
 }
 
@@ -503,7 +510,8 @@ fn read_metadata_value(reader: &mut Reader<'_>) -> Result<MetadataValue> {
                     offset: reader.position() as u64,
                     needed: len,
                     file_len: reader.bytes.len() as u64,
-                });
+                }
+                .logged());
             }
             let mut items = Vec::new();
             for _ in 0..len {
@@ -514,7 +522,7 @@ fn read_metadata_value(reader: &mut Reader<'_>) -> Result<MetadataValue> {
         10 => MetadataValue::UInt64(reader.read_u64("metadata u64")?),
         11 => MetadataValue::Int64(reader.read_i64("metadata i64")?),
         12 => MetadataValue::Float64(reader.read_f64("metadata f64")?),
-        other => return Err(GgufError::UnknownMetadataType(other)),
+        other => return Err(GgufError::UnknownMetadataType(other).logged()),
     };
     Ok(value)
 }
@@ -534,7 +542,7 @@ fn read_metadata_scalar(reader: &mut Reader<'_>, type_id: u32) -> Result<Metadat
         10 => MetadataValue::UInt64(reader.read_u64("array u64")?),
         11 => MetadataValue::Int64(reader.read_i64("array i64")?),
         12 => MetadataValue::Float64(reader.read_f64("array f64")?),
-        other => return Err(GgufError::UnknownMetadataType(other)),
+        other => return Err(GgufError::UnknownMetadataType(other).logged()),
     };
     Ok(value)
 }

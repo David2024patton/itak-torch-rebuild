@@ -152,18 +152,23 @@ impl Metadata {
     /// Raw lookup that fails loudly when the key is absent.
     pub fn require(&self, key: &str) -> Result<&MetadataValue> {
         self.get(key)
-            .ok_or_else(|| GgufError::MissingMetadata(key.to_string()))
+            .ok_or_else(|| GgufError::MissingMetadata(key.to_string()).logged())
     }
 
+    /// The typed getters' shared refusal: the key is absent, or it
+    /// holds a different type than the getter reads. This helper is
+    /// a construction seam of its own (every getter's mismatch
+    /// leaves through it), so the emission lives here, once.
     fn mismatch(&self, key: &str, expected: &'static str) -> GgufError {
-        match self.get(key) {
+        let err = match self.get(key) {
             None => GgufError::MissingMetadata(key.to_string()),
             Some(v) => GgufError::MetadataTypeMismatch {
                 key: key.to_string(),
                 expected,
                 found: v.type_name(),
             },
-        }
+        };
+        err.logged()
     }
 
     /// Integer read as u32. Accepts any integer type whose value fits.
@@ -267,7 +272,8 @@ impl Metadata {
                         key: key.to_string(),
                         expected: "array of string",
                         found: other.type_name(),
-                    })
+                    }
+                    .logged())
                 }
             }
         }
@@ -286,7 +292,8 @@ impl Metadata {
                         key: key.to_string(),
                         expected: "array of i32",
                         found: item.type_name(),
-                    })
+                    }
+                    .logged())
                 }
             }
         }
@@ -306,7 +313,8 @@ impl Metadata {
                         key: key.to_string(),
                         expected: "array of u32",
                         found: item.type_name(),
-                    })
+                    }
+                    .logged())
                 }
             }
         }
@@ -326,10 +334,60 @@ impl Metadata {
                         key: key.to_string(),
                         expected: "array of f32",
                         found: other.type_name(),
-                    })
+                    }
+                    .logged())
                 }
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diag;
+
+    #[test]
+    fn type_mismatch_refusal_emits_its_diag_event() {
+        // A previously silent path: the typed getters' mismatch
+        // helper constructed MetadataTypeMismatch with no diag
+        // call anywhere near it. The refusal must now be on the
+        // diagnostic channel, proven against the captured events,
+        // not against the source. The probe key is unique to this
+        // test, so no parallel test's events can satisfy the
+        // assertion.
+        let md = Metadata::from_entries(vec![(
+            "lane_g_probe.count".to_string(),
+            MetadataValue::String("not a number".to_string()),
+        )]);
+        let err = md
+            .get_u32("lane_g_probe.count")
+            .expect_err("a string value is not a u32");
+        assert!(
+            matches!(err, GgufError::MetadataTypeMismatch { .. }),
+            "error: {err}"
+        );
+        assert!(
+            diag::captured_errors().iter().any(|l| {
+                l.contains("event=metadata_type_mismatch") && l.contains("key=lane_g_probe.count")
+            }),
+            "the mismatch refusal must emit its diag event"
+        );
+    }
+
+    #[test]
+    fn missing_key_refusal_emits_its_diag_event() {
+        let md = Metadata::from_entries(vec![]);
+        let err = md
+            .require("lane_g_probe.absent")
+            .expect_err("an absent key refuses");
+        assert!(matches!(err, GgufError::MissingMetadata(_)), "error: {err}");
+        assert!(
+            diag::captured_errors().iter().any(|l| {
+                l.contains("event=missing_metadata") && l.contains("key=lane_g_probe.absent")
+            }),
+            "the missing-key refusal must emit its diag event"
+        );
     }
 }

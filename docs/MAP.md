@@ -28,32 +28,33 @@ RULES:
 -->
 # MAP: iTaK Torch Rebuild
 
-Nodes marked (planned) are designed in PLAN.md and not yet built. Nodes marked (skeleton) exist in part. Unmarked nodes exist today.
+Nodes marked (planned) are designed in PLAN.md and not yet built. Unmarked nodes exist today.
 
 ## The grid
 
 | Node | Kind | Owns |
 | :--- | :--- | :--- |
 | Client | external | Sends OpenAI-compatible requests; owns nothing here. |
-| Go platform | service | The front door, at scaffold-plus stage in platform/: diag registry, API-key auth, TTL response cache, priority scheduler, engine client seam, HTTP server and the torchd daemon. Batching policy, cluster and tenancy, model operations, and training orchestration are still landing. |
+| Go platform | service | The front door, in platform/: cmd/torchd plus internal packages auth (API-key middleware), cache (TTL response cache with entry cap and janitor), chattemplate (GGUF template renderer with render budgets), diag (diagnostics registry), engine (socket client), scheduler (priority lanes with queue caps), server (HTTP routes and SSE), supervisor (engine lifecycle and restart budget). |
+| The seam | module | The NDJSON-over-unix-socket protocol, defined once in crates/itak-engine/src/protocol.rs: six ops (hello, ping, debug, generate, embed, chat_template), streamed token frames, named errors. The socket is owner-only (0600) with hello enforcement and a peer uid check. Platform side: internal/engine (client) and internal/supervisor (process lifecycle). |
+| itak-engine | service | The Rust engine binary: owns one loaded model on a worker thread and serves the seam protocol with generation slots and a bounded queue. Depends on gguf, tokenizer, itak-loader, muse-glimmer, and cpu-compute. |
+| gguf | module | Strict GGUF v3 loader: header, metadata, tensor directory, and dequantization with fail-loud named errors. |
+| tokenizer | module | Byte-level BPE and SentencePiece BPE over the model's own GGUF vocabulary, merges, and scores: encode, decode, round-trip, named errors on malformed input. |
+| torch-math | module | Reference f32 math core: RMSNorm, RoPE, gated FFN activations, logit softcap and scale, matmul and matvec. Every constant (eps, RoPE base, softcap) is a parameter, never compiled in. |
+| attention | module | The KV cache (global layers plus sliding-window ring layers) and grouped-query attention with causal and window masks. The advanced pools from PLAN (paged, INT8, compressed, offloaded, prefix sharing) are not built. |
+| muse-glimmer | module | The Muse Glimmer architecture: config parsed from GGUF metadata, the measured weight layout (14 tensors per layer), and the structured forward for the 52-layer hybrid (39 sliding-window + 13 global). Compute and KV storage sit behind traits it owns. |
+| arch-llama | module | Generic dense architecture for the llama and qwen2 families (pre-norm, RoPE, GQA with KV cache, SwiGLU), config and weights from the file's own GGUF metadata. Depends on gguf, attention, torch-math. |
+| itak-loader | module | The loader bridge: implements the muse-glimmer module's Metadata and TensorSource traits over the gguf crate, and verifies a file's tensor inventory against the architecture's expected names (the coverage gate). |
+| cpu-compute | module | The CPU reference Compute backend: real f32 arithmetic via torch-math, dequantization via gguf, KV storage via attention. This is the backend the serving engine runs today. |
+| wgpu-compute | module | The wgpu (Vulkan) Compute backend: kernels K1 through K14 and the device-resident forward session. Proven against the golden as a bench (bench/gpu-resident-2026-10-30.md); not yet wired into the itak-engine binary. |
+| dflash | module | The DFlash draft architecture: config from the draft file's own metadata, conditioning fused from named target layer inputs, non-causal block forward producing per-position draft logits. |
+| itak-spec | module | The speculative decoding loop: DFlash block drafting against the target, exact-output verification, KV checkpoint and rewind, rejection sampling. Proven token-identical on CPU (bench/spec-loop-2026-10-30.md); not yet in the serving path. |
 | itak-core (planned) | module | The shared Go contracts: types, health, event, debug, registry. Published and versioned. |
-| The seam (skeleton) | module | Control over a local socket; tokens and tensors over shared memory. The platform-side engine client with named errors and a unix socket skeleton exists; the shared-memory path and the Rust side are not built. Engine restart never takes the platform down. |
-| Rust engine (planned) | service | The token loop process: owns generation end to end once a request crosses the seam. No engine binary crate exists yet; the five crates below are its standalone libraries, not yet wired together. |
-| itak-types (planned) | module | Rust mirror of the shared contracts, with version fields. |
-| itak-diag (planned) | module | Engine-side structured logs, health, events. |
-| gguf | module | Strict GGUF v3 loader: header, metadata, tensor directory, and f32 dequantization with fail-loud named errors. PLAN.md and TODO.md call this module itak-loader; the built crate is named gguf, and the name reconciliation is open (see STATUS.md). |
-| tokenizer | module | Real byte-level BPE over the model's own GGUF vocabulary: encode, decode, round-trip, named errors on malformed input. |
-| torch-math | module | Reference f32 math core: matmul and matvec, RMSNorm, RoPE, logit softcap and scale, activations. Every constant (eps, RoPE base, softcap) is a parameter, never compiled in. |
-| attention | module | The KV cache (global layers plus sliding-window ring layers) and grouped-query attention with causal and window masks. The advanced pools from PLAN (paged, INT8, compressed, offloaded, prefix sharing) are not yet built. |
-| muse-glimmer | module | The Muse Glimmer architecture: config parsed from GGUF metadata, the measured weight layout (14 tensors per layer), and the structured forward for the 52-layer hybrid (39 sliding-window + 13 global). Skeleton stage: compute and KV storage sit behind traits it owns; no sibling crate is wired in yet. |
-| itak-kernels (planned) | module | Production quantized matmul and dequant kernels that graduate from torch-math's reference implementations. |
 | itak-ssm (planned) | module | The state space scan: three-term recurrence, rotation on B and C, MIMO rank. |
 | itak-moe (planned) | module | MoE routing, expert cache, expert streaming from disk. |
-| itak-spec (planned) | module | Speculative decoding: n-gram, Medusa, MTP, rejection sampling. Design: docs/specs/SPEC-itak-spec.md (DFlash verify loop, ring rollback semantics, T-P.1 sweep protocol, Medusa verdict). |
-| itak-backend (planned) | module | Backend trait: CPU SIMD, wgpu/Vulkan, others behind the seam. |
-| itak-train (planned) | module | Training compute: autograd, optimizers, trainers, LoRA. |
-| itak-dissect (planned) | tool | Weight statistics, measured heat maps, .itf conversion, quant planning. |
-| Mojo lab | external | David's existing Mojo engines and the Latent Engine research. Prototypes graduate into the crates. |
+| itak-train (planned) | module | Training compute: autograd, optimizers, trainers, LoRA (Phase 7). |
+| itak-dissect (planned) | tool | Weight statistics, measured heat maps, .itf conversion, quant planning (Phase 8). |
+| Mojo lab | external | Existing Mojo engines and the Latent Engine research. Prototypes graduate into the crates. |
 | Original Torch repos | external | iTaKTorchQ4 and itak-torch on GitHub: the reference implementation and feature specification. |
 | GOAgent repo | external | Hosts the surviving pkg/debug and pkg/eventbus ancestors that itak-core ports from. |
 | llama.cpp | external | The reference implementation to benchmark against. Never the product. |
@@ -67,33 +68,41 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Nodes marked (
 | Client | Go platform | calls (HTTPS API) | Go platform returns responses and streams tokens to Client |
 | Go platform | itak-core | reads (contracts, health, events) | itak-core is imported by Go platform |
 | Go platform | The seam | writes (requests, control) | The seam returns tokens and engine health to Go platform |
-| The seam | Rust engine | hosts (the connection both processes share) | Rust engine connects back through The seam |
-| Rust engine | itak-types | reads (contracts) | itak-types is imported by Rust engine |
-| Rust engine | itak-diag | emits (logs, health, events) | itak-diag reports Rust engine state to the platform via The seam |
-| Rust engine | gguf | calls (load model) | gguf hands weights to Rust engine |
-| Rust engine | tokenizer | calls (encode and decode) | tokenizer tokenizes for Rust engine |
-| tokenizer | gguf | reads (vocabulary from GGUF metadata) | gguf supplies the vocabulary the tokenizer builds from |
-| Rust engine | muse-glimmer | calls (architecture forward) | muse-glimmer returns logits to Rust engine |
-| muse-glimmer | gguf | reads (metadata and tensors via its TensorSource trait) | gguf is the trait's implementation target for muse-glimmer |
-| muse-glimmer | torch-math | calls (compute trait; reference f32 implementations) | torch-math returns activations to muse-glimmer |
-| muse-glimmer | attention | reads and writes (cache trait) | attention holds cache state for muse-glimmer |
-| Rust engine | torch-math | calls (tensor math) | torch-math returns tensors to Rust engine |
-| Rust engine | attention | reads and writes (cache state) | attention holds state for Rust engine |
-| Rust engine | itak-kernels | calls (production kernels) | itak-kernels returns tensors to Rust engine |
-| Rust engine | itak-ssm | calls (SSM layers) | itak-ssm returns layer outputs to Rust engine |
-| Rust engine | itak-moe | calls (expert layers) | itak-moe returns layer outputs to Rust engine |
-| Rust engine | itak-spec | calls (draft and verify) | itak-spec returns accepted tokens to Rust engine |
-| itak-kernels | itak-backend | calls (device execution) | itak-backend executes for itak-kernels |
-| itak-backend | RX 7900 XTX server | runs on (Vulkan via wgpu) | RX 7900 XTX server hosts itak-backend |
-| itak-train | Rust engine | writes (trained heads, adapters) | Rust engine loads artifacts written by itak-train |
+| The seam | itak-engine | hosts (the connection both processes share) | itak-engine connects back through The seam |
+| Go platform | itak-engine | hosts (supervision: start, restart within budget) | itak-engine reports lifecycle state to Go platform via /debug |
+| itak-engine | gguf | calls (parse and dequantize) | gguf hands parsed files to itak-engine |
+| itak-engine | tokenizer | calls (encode and decode) | tokenizer tokenizes for itak-engine |
+| tokenizer | gguf | reads (vocabulary and merges from GGUF metadata) | gguf supplies the vocabulary the tokenizer builds from |
+| itak-engine | itak-loader | calls (load model behind the coverage gate) | itak-loader loads models for itak-engine |
+| itak-loader | gguf | reads (implements traits over the parsed file) | gguf is the file layer itak-loader bridges from |
+| itak-loader | muse-glimmer | writes (implements its Metadata and TensorSource traits) | muse-glimmer receives its metadata and tensors through itak-loader |
+| itak-loader | dflash | reads (draft file census and conditioning inputs) | dflash files are inventoried through itak-loader |
+| itak-engine | muse-glimmer | calls (architecture forward) | muse-glimmer returns logits to itak-engine |
+| itak-engine | cpu-compute | calls (Compute backend) | cpu-compute executes the forward for itak-engine |
+| cpu-compute | muse-glimmer | reads (implements its Compute trait) | muse-glimmer runs on cpu-compute |
+| cpu-compute | torch-math | calls (reference f32 arithmetic) | torch-math returns activations to cpu-compute |
+| cpu-compute | gguf | calls (dequantization) | gguf dequantizes for cpu-compute |
+| cpu-compute | attention | reads and writes (KV storage) | attention holds cache state for cpu-compute |
+| wgpu-compute | muse-glimmer | reads (implements its Compute trait) | muse-glimmer can run on wgpu-compute (bench path today) |
+| wgpu-compute | gguf | calls (dequantization and upload) | gguf supplies weights to wgpu-compute |
+| wgpu-compute | attention | reads (KV shapes and masks) | attention defines the cache layout wgpu-compute mirrors on device |
+| wgpu-compute | RX 7900 XTX server | runs on (Vulkan via wgpu) | RX 7900 XTX server hosts wgpu-compute |
+| arch-llama | gguf | reads (metadata and tensors) | gguf supplies arch-llama |
+| arch-llama | attention | reads and writes (KV cache) | attention holds cache state for arch-llama |
+| arch-llama | torch-math | calls (reference f32 arithmetic) | torch-math returns activations to arch-llama |
+| dflash | torch-math | calls (reference f32 arithmetic) | torch-math returns activations to dflash |
+| itak-spec | dflash | calls (block drafting) | dflash drafts blocks for itak-spec |
+| itak-spec | muse-glimmer | calls (target forward for verification) | muse-glimmer verifies drafts for itak-spec |
+| itak-spec | cpu-compute | calls (Compute backend) | cpu-compute executes for itak-spec |
+| itak-train | itak-engine | writes (trained heads, adapters) | itak-engine loads artifacts written by itak-train |
 | Go platform | itak-train | calls (training API) | itak-train reports progress to Go platform |
 | itak-dissect | gguf | writes (.itf files the loader reads) | gguf reads what itak-dissect writes |
 | Go platform | Model registries | reads (model pulls) | Model registries serve pulls to Go platform |
 | Mojo lab | itak-ssm | informs (algorithms graduate) | itak-ssm is where Mojo lab results land |
-| Mojo lab | itak-spec | informs (n-gram and drafting algorithms) | itak-spec is where Mojo lab results land |
-| Original Torch repos | Go platform | informs (code reattached module by module) | Go platform is the successor of Original Torch repos |
+| Mojo lab | itak-spec | informs (drafting algorithms) | itak-spec is where Mojo lab results land |
+| Original Torch repos | Go platform | informs (successor scope and audit record) | Go platform is the successor of Original Torch repos |
 | GOAgent repo | itak-core | informs (debug and event ports) | itak-core descends from GOAgent repo |
-| Rust engine | llama.cpp | compared against (benchmarks) | none |
+| itak-engine | llama.cpp | compared against (benchmarks and goldens) | none |
 | Go platform | RX 7900 XTX server | hosts on | RX 7900 XTX server hosts Go platform |
 
 ## Diagram
@@ -102,30 +111,38 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Nodes marked (
 flowchart TD
   C[Client] --> P[Go platform]
   P --> CORE[itak-core - planned]
-  P --> SEAM[The seam - skeleton]
-  SEAM --> ENG[Rust engine - planned]
-  ENG --> TYPES[itak-types - planned]
-  ENG --> DIAG[itak-diag - planned]
-  ENG --> LOAD[gguf]
+  P --> SEAM[The seam]
+  SEAM --> ENG[itak-engine]
+  P -. supervises .-> ENG
+  ENG --> LOAD[itak-loader]
+  LOAD --> GG[gguf]
+  LOAD --> GLIM[muse-glimmer]
+  LOAD --> DF[dflash]
+  ENG --> GG
   ENG --> TOK[tokenizer]
-  TOK --> LOAD
-  ENG --> GLIM[muse-glimmer]
-  GLIM --> LOAD
-  GLIM --> MATH[torch-math]
-  GLIM --> ATT[attention]
-  ENG --> MATH
-  ENG --> ATT
-  ENG --> KERN[itak-kernels - planned]
-  ENG --> SSM[itak-ssm - planned]
-  ENG --> MOE[itak-moe - planned]
-  ENG --> SPEC[itak-spec - planned]
-  KERN --> BACK[itak-backend - planned]
-  BACK --> GPU[RX 7900 XTX server]
+  TOK --> GG
+  ENG --> GLIM
+  ENG --> CPU[cpu-compute]
+  CPU --> GLIM
+  CPU --> MATH[torch-math]
+  CPU --> GG
+  CPU --> ATT[attention]
+  WGPU[wgpu-compute] --> GLIM
+  WGPU --> GG
+  WGPU --> ATT
+  WGPU --> GPU[RX 7900 XTX server]
+  ARCH[arch-llama] --> GG
+  ARCH --> ATT
+  ARCH --> MATH
+  DF --> MATH
+  SPEC[itak-spec] --> DF
+  SPEC --> GLIM
+  SPEC --> CPU
   P --> TRAIN[itak-train - planned]
   TRAIN --> ENG
-  DIS[itak-dissect - planned] --> LOAD
+  DIS[itak-dissect - planned] --> GG
   P --> REG[Model registries]
-  LAB[Mojo lab] -.-> SSM
+  LAB[Mojo lab] -.-> SSM[itak-ssm - planned]
   LAB -.-> SPEC
   ORIG[Original Torch repos] -.-> P
   GOA[GOAgent repo] -.-> CORE
@@ -135,6 +152,6 @@ flowchart TD
 
 ## Flows
 
-1. **A chat request.** The client calls the Go platform. The platform authenticates, applies rate limits and token budgets, checks the request caches, and schedules the request. It crosses the seam: control over the socket, then the engine runs the token loop (gguf-supplied weights, tokenizer on the model's own vocabulary, torch-math reference kernels on the backend, attention crate KV or SSM state per layer, MoE experts streamed as needed, speculation drafting and verifying). Tokens return through shared memory and stream back to the client. Every refusal along the way emits through the diag channel with its reason.
-2. **A training run.** The client calls the platform's training API. The platform validates and queues the job; itak-train runs it (SFT, LoRA, or a preference trainer; Medusa head training is a job type of its own). Artifacts land as versioned files. The engine picks them up by version: adapters serve, Medusa heads raise the speculative acceptance rate, and the eval harness measures the change.
-3. **A model arrives.** The platform pulls from HuggingFace or OCI, verifies integrity, registers the version, and warms it. If the model is larger than VRAM, itak-moe serves it by streaming experts from disk with its pin and LRU cache fed by itak-dissect's measured heat data once the .itf conversion exists.
+1. **A chat request.** The client calls the Go platform. The platform authenticates, checks the request cache, applies its generation caps, and schedules the request. The request crosses the seam as a generate op; the engine tokenizes with the model's own tokenizer, loads weights through itak-loader behind the coverage gate, and runs the muse-glimmer forward on cpu-compute (torch-math arithmetic, attention crate KV). Token frames stream back over the socket and out to the client as SSE. Chat requests are rendered first by the platform's chattemplate package from the model's own GGUF template. Every refusal along the way emits through the diag channel with its reason.
+2. **A speculative generation (bench path today).** The itak-spec runner loads the target and the DFlash draft through itak-loader. The draft proposes a block, conditioned on named target layer inputs; the target verifies the block in one forward; accepted tokens commit, the rest rewind the KV checkpoint, and rejection sampling corrects the distribution so the output stream is identical to plain greedy. Proven token-identical on CPU (bench/spec-loop-2026-10-30.md); wiring this loop into the serving engine is later work.
+3. **A model arrives.** The platform pulls from HuggingFace or OCI, verifies integrity, and registers the version (model operations are platform scope; the pull path is still landing). At engine start, itak-loader parses the file through gguf and the coverage gate refuses the model by name if any expected tensor is missing, so a model that does not load completely never serves.

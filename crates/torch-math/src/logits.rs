@@ -35,8 +35,9 @@ pub fn logit_softcap(logits: &[f32], cap: f32) -> Result<Vec<f32>> {
     Ok(logits.iter().map(|v| cap * (v / cap).tanh()).collect())
 }
 
-/// Multiply every logit by `scale`, the final head scale applied after
-/// softcapping in Glimmer-style heads.
+/// Multiply every logit by `scale`, the head scale applied before
+/// softcapping in Glimmer-style heads: the caller scales first, then
+/// softcaps, matching the reference implementation's order.
 ///
 /// An empty input yields an empty output.
 ///

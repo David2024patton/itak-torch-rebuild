@@ -161,6 +161,28 @@ fn construction_rejects_zero_dimensions_and_window() {
 }
 
 #[test]
+fn construction_refuses_sizes_that_overflow() {
+    // A window whose storage size (window times row) overflows usize
+    // is refused by name, not wrapped into a small allocation and
+    // not attempted as an unrepresentable one.
+    assert_eq!(
+        KvCache::new(&[LayerKind::Windowed { window: usize::MAX }], 2, 128).unwrap_err(),
+        AttentionError::SizeOverflow {
+            what: "windowed layer storage"
+        }
+    );
+    // The KV row product itself overflowing is refused the same way,
+    // even on a global layer, which allocates no ring storage: the
+    // row length is checked before any storage decision.
+    assert_eq!(
+        KvCache::new(&[LayerKind::Global], usize::MAX, 2).unwrap_err(),
+        AttentionError::SizeOverflow {
+            what: "kv row length"
+        }
+    );
+}
+
+#[test]
 fn invalid_layer_is_an_error_not_a_panic() {
     let mut cache = KvCache::new(&[LayerKind::Global], 1, 1).unwrap();
     assert_eq!(

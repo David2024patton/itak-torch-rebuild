@@ -116,17 +116,30 @@ struct LayerCache {
 }
 
 impl LayerCache {
-    fn new(kind: LayerKind, num_kv_heads: usize, head_dim: usize) -> Self {
-        let row = num_kv_heads * head_dim;
+    /// Build one layer's storage. The row length and the windowed
+    /// storage size are computed with checked arithmetic: a caller
+    /// that hands in dimensions whose product overflows `usize`
+    /// gets a named [`AttentionError::SizeOverflow`] refusal here,
+    /// never a wrapped small allocation or an abort on an
+    /// unrepresentable `vec!`.
+    fn new(kind: LayerKind, num_kv_heads: usize, head_dim: usize) -> Result<Self, AttentionError> {
+        let row = num_kv_heads
+            .checked_mul(head_dim)
+            .ok_or(AttentionError::SizeOverflow {
+                what: "kv row length",
+            })?;
         let (keys, values, slot_position) = match kind {
             LayerKind::Global => (Vec::new(), Vec::new(), Vec::new()),
-            LayerKind::Windowed { window } => (
-                vec![0.0; window * row],
-                vec![0.0; window * row],
-                vec![None; window],
-            ),
+            LayerKind::Windowed { window } => {
+                let slots = window
+                    .checked_mul(row)
+                    .ok_or(AttentionError::SizeOverflow {
+                        what: "windowed layer storage",
+                    })?;
+                (vec![0.0; slots], vec![0.0; slots], vec![None; window])
+            }
         };
-        Self {
+        Ok(Self {
             kind,
             num_kv_heads,
             head_dim,
@@ -134,7 +147,7 @@ impl LayerCache {
             values,
             slot_position,
             appended: 0,
-        }
+        })
     }
 
     /// Positions currently stored and visible.
@@ -339,7 +352,7 @@ impl KvCache {
         let layers = pattern
             .iter()
             .map(|&kind| LayerCache::new(kind, num_kv_heads, head_dim))
-            .collect();
+            .collect::<Result<Vec<_>, AttentionError>>()?;
         crate::diag!(
             "kv cache built layers={} kv_heads={} head_dim={}",
             pattern.len(),

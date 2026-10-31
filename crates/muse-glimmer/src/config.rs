@@ -20,6 +20,14 @@ use crate::metadata::Metadata;
 /// The one architecture string this module serves.
 pub const ARCHITECTURE: &str = "muse-glimmer";
 
+/// The largest layer count a config may name. The real file has 52
+/// layers; this ceiling leaves generous headroom for larger future
+/// files while keeping a corrupt or hostile `block_count` from
+/// sizing allocations (the layer pattern vector, per-layer caches)
+/// before anything can refuse it. It is a plausibility bound, not a
+/// model limit: no transformer ships anywhere near it.
+pub const MAX_BLOCK_COUNT: u32 = 4096;
+
 // Metadata keys, spelled exactly as they appear in the real file.
 pub(crate) const KEY_ARCHITECTURE: &str = "general.architecture";
 pub(crate) const KEY_NAME: &str = "general.name";
@@ -108,10 +116,27 @@ impl GlimmerConfig {
         }
 
         let block_count = required_u32(meta, KEY_BLOCK_COUNT)?;
+        let context_length = required_u32(meta, KEY_CONTEXT_LENGTH)?;
         let q_heads = required_u32(meta, KEY_Q_HEADS)?;
         let kv_heads = required_u32(meta, KEY_KV_HEADS)?;
+        let key_length = required_u32(meta, KEY_KEY_LENGTH)?;
+        let value_length = required_u32(meta, KEY_VALUE_LENGTH)?;
         if block_count == 0 {
             return Err(invalid(KEY_BLOCK_COUNT, "block_count is zero"));
+        }
+        if block_count > MAX_BLOCK_COUNT {
+            return Err(invalid(
+                KEY_BLOCK_COUNT,
+                &format!(
+                    "block_count {block_count} exceeds the plausible layer ceiling of {MAX_BLOCK_COUNT}"
+                ),
+            ));
+        }
+        if block_count > context_length {
+            return Err(invalid(
+                KEY_BLOCK_COUNT,
+                "block_count exceeds the context length; the pair cannot describe a real model",
+            ));
         }
         if q_heads == 0 || kv_heads == 0 {
             return Err(invalid(KEY_KV_HEADS, "head counts must be at least 1"));
@@ -122,9 +147,38 @@ impl GlimmerConfig {
                 "query head count is not a whole multiple of the KV head count, so grouped-query grouping is impossible",
             ));
         }
+        // The head-count times head-dim products are the row widths
+        // that size KV cache rows and projection buffers downstream.
+        // They are computed checked here so a pair whose product
+        // overflows u32 is refused by name at parse, instead of
+        // wrapping at first use in code that multiplies them plainly.
+        if kv_heads.checked_mul(key_length).is_none() {
+            return Err(invalid(
+                KEY_KV_HEADS,
+                "KV head count times key length overflows u32, so the key row width is unrepresentable",
+            ));
+        }
+        if kv_heads.checked_mul(value_length).is_none() {
+            return Err(invalid(
+                KEY_KV_HEADS,
+                "KV head count times value length overflows u32, so the value row width is unrepresentable",
+            ));
+        }
+        if q_heads.checked_mul(key_length).is_none() {
+            return Err(invalid(
+                KEY_Q_HEADS,
+                "query head count times key length overflows u32, so the query row width is unrepresentable",
+            ));
+        }
         let sliding_window = required_u32(meta, KEY_SLIDING_WINDOW)?;
         if sliding_window == 0 {
             return Err(invalid(KEY_SLIDING_WINDOW, "sliding window is zero"));
+        }
+        if sliding_window > context_length {
+            return Err(invalid(
+                KEY_SLIDING_WINDOW,
+                "sliding window exceeds the context length; the window sizes per-layer cache allocations, so a window past the context is a corrupt or hostile value",
+            ));
         }
 
         let pattern_text = meta.get_string(SWA_PATTERN_KEY);
@@ -141,13 +195,13 @@ impl GlimmerConfig {
         Ok(GlimmerConfig {
             name: meta.get_string(KEY_NAME),
             block_count,
-            context_length: required_u32(meta, KEY_CONTEXT_LENGTH)?,
+            context_length,
             hidden: required_u32(meta, KEY_HIDDEN)?,
             ffn_hidden: required_u32(meta, KEY_FFN_HIDDEN)?,
             q_heads,
             kv_heads,
-            key_length: required_u32(meta, KEY_KEY_LENGTH)?,
-            value_length: required_u32(meta, KEY_VALUE_LENGTH)?,
+            key_length,
+            value_length,
             rope_freq_base,
             rope_freq_base_swa: meta
                 .get_f32(KEY_ROPE_FREQ_BASE_SWA)
@@ -334,6 +388,75 @@ mod tests {
         meta.insert_u32(KEY_KV_HEADS, 2);
         let err = GlimmerConfig::from_metadata(&meta).expect_err("5 over 2 cannot group");
         assert!(matches!(err, GlimmerError::InvalidMetadata { .. }));
+    }
+
+    #[test]
+    fn sliding_window_u32_max_is_refused_by_name() {
+        // The panel's attack input: a file carrying the real tensors
+        // but a window of u32::MAX would size a roughly 4.4 TB cache
+        // allocation. It is refused at parse, as InvalidMetadata
+        // naming the sliding window key.
+        let mut meta = real_glimmer_metadata();
+        meta.insert_u32(KEY_SLIDING_WINDOW, u32::MAX);
+        let err = GlimmerConfig::from_metadata(&meta).expect_err("absurd window must fail");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => {
+                assert_eq!(key, KEY_SLIDING_WINDOW)
+            }
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sliding_window_one_above_context_is_refused_by_name() {
+        let mut meta = real_glimmer_metadata();
+        meta.insert_u32(KEY_SLIDING_WINDOW, 131_073);
+        let err = GlimmerConfig::from_metadata(&meta).expect_err("window past context must fail");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => {
+                assert_eq!(key, KEY_SLIDING_WINDOW)
+            }
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_count_above_the_ceiling_is_refused_by_name() {
+        let mut meta = real_glimmer_metadata();
+        meta.insert_u32(KEY_BLOCK_COUNT, MAX_BLOCK_COUNT + 1);
+        let err = GlimmerConfig::from_metadata(&meta).expect_err("absurd depth must fail");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, KEY_BLOCK_COUNT),
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn block_count_above_context_is_refused_by_name() {
+        // 200 layers is under the ceiling but over the tiny model's
+        // 128-position context, so the cross-check is what refuses.
+        let mut meta = tiny_metadata();
+        meta.insert_u32(KEY_BLOCK_COUNT, 200);
+        let err = GlimmerConfig::from_metadata(&meta).expect_err("depth past context must fail");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, KEY_BLOCK_COUNT),
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_row_product_overflow_is_refused_by_name() {
+        // q and kv both at u32::MAX keep the grouping check satisfied
+        // (max % max == 0), so the refusal must come from the checked
+        // row product: u32::MAX KV heads times a 128-wide key.
+        let mut meta = real_glimmer_metadata();
+        meta.insert_u32(KEY_Q_HEADS, u32::MAX);
+        meta.insert_u32(KEY_KV_HEADS, u32::MAX);
+        let err = GlimmerConfig::from_metadata(&meta).expect_err("overflowing row must fail");
+        match err {
+            GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, KEY_KV_HEADS),
+            other => panic!("expected InvalidMetadata, got {other:?}"),
+        }
     }
 
     #[test]

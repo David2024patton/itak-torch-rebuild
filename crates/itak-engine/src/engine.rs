@@ -357,13 +357,7 @@ fn embed_batch(loaded: &Loaded, inputs: &[String]) -> Result<Vec<Vec<f32>>, (Str
             .tokenizer
             .encode(input)
             .map_err(|e| ("bad_request".to_string(), format!("tokenize input: {e}")))?;
-        let mut ids: Vec<u32> = Vec::new();
-        if loaded.add_bos {
-            if let Some(bos) = loaded.tokenizer.bos_id() {
-                ids.push(bos);
-            }
-        }
-        ids.extend_from_slice(&body);
+        let ids = assemble_prompt_ids(&body, loaded.add_bos, loaded.tokenizer.bos_id());
         if ids.is_empty() {
             return Err((
                 "bad_request".to_string(),
@@ -412,6 +406,28 @@ fn l2_normalize(v: &[f32]) -> Option<Vec<f32>> {
     Some(v.iter().map(|x| x / norm).collect())
 }
 
+/// Assemble the id sequence a job runs on: the tokenized body,
+/// with the BOS id prepended when the file's metadata asks for
+/// one AND the body does not already begin with it. A rendered
+/// chat template starts with the bos_token text, which tokenizes
+/// to the BOS id itself; prepending again would put two BOS ids
+/// at the head of every chat prompt, where llama.cpp's tokenizer
+/// drops the duplicate (TODO T-9.16, found live by the T-9.17
+/// proof run: the engine logged [200000, 200000, ...] for the
+/// Glimmer file's own template).
+fn assemble_prompt_ids(body: &[u32], add_bos: bool, bos: Option<u32>) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::with_capacity(body.len() + 1);
+    if add_bos {
+        if let Some(bos) = bos {
+            if body.first() != Some(&bos) {
+                ids.push(bos);
+            }
+        }
+    }
+    ids.extend_from_slice(body);
+    ids
+}
+
 fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize, job: Job) {
     let Job {
         prompt,
@@ -440,18 +456,17 @@ fn run_job(loaded: &Loaded, stats: &Arc<Mutex<Stats>>, default_max_tokens: usize
 
     // Tokenize: the engine owns the tokenizer, so the prompt the
     // model sees is the prompt the conformance proofs cover. BOS is
-    // added exactly when the file's metadata says the family does.
+    // added exactly when the file's metadata says the family does,
+    // and never twice: a prompt that already begins with the BOS
+    // token (a chat template rendering its bos_token, TODO T-9.16)
+    // keeps the one it carries, the same dedupe llama.cpp's
+    // tokenizer performs (llama-vocab.cpp: add_bos with the first
+    // real token already BOS drops the duplicate).
     let body = match loaded.tokenizer.encode(&prompt) {
         Ok(ids) => ids,
         Err(e) => return fail("bad_request", format!("tokenize prompt: {e}")),
     };
-    let mut ids: Vec<u32> = Vec::new();
-    if loaded.add_bos {
-        if let Some(bos) = loaded.tokenizer.bos_id() {
-            ids.push(bos);
-        }
-    }
-    ids.extend_from_slice(&body);
+    let ids = assemble_prompt_ids(&body, loaded.add_bos, loaded.tokenizer.bos_id());
     if ids.is_empty() {
         return fail("bad_request", "prompt produced no tokens".to_string());
     }
@@ -673,6 +688,27 @@ fn flush(reply: &Sender<GenEvent>, streamer: &mut Streamer, last_token: u32) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_ids_prepend_bos_once_and_only_when_asked() {
+        // Plain body: BOS goes on the front.
+        assert_eq!(
+            assemble_prompt_ids(&[954, 7963], true, Some(200000)),
+            vec![200000, 954, 7963]
+        );
+        // A body already starting with BOS (a rendered chat
+        // template) keeps exactly one.
+        assert_eq!(
+            assemble_prompt_ids(&[200000, 200022, 15651], true, Some(200000)),
+            vec![200000, 200022, 15651]
+        );
+        // The family does not add BOS: the body stands as-is.
+        assert_eq!(assemble_prompt_ids(&[954], false, Some(200000)), vec![954]);
+        // No BOS id known: nothing to prepend.
+        assert_eq!(assemble_prompt_ids(&[954], true, None), vec![954]);
+        // Empty body with BOS asked: the lone BOS is the prompt.
+        assert_eq!(assemble_prompt_ids(&[], true, Some(200000)), vec![200000]);
+    }
 
     #[test]
     fn mean_pool_averages_rows() {

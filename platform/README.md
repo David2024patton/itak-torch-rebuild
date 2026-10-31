@@ -1,31 +1,33 @@
 # Torch Platform (Go)
 
 The Go half of the iTaK Torch rebuild. Go owns the platform: API,
-scheduling, caches, and (later) cluster and training orchestration. The
-Rust engine owns the hot token loop. The two meet at one seam,
-`internal/engine.Client`, over a Unix socket with a JSON control
-protocol; tensors will move over shared memory when the Rust side lands.
+scheduling, caches, engine supervision, and (later) cluster and
+training orchestration. The Rust engine owns the hot token loop. The
+two meet at one seam, `internal/engine.Client`, over a Unix socket
+with an NDJSON control protocol (six ops: hello, ping, debug,
+generate, embed, chat_template). The shared-memory data plane in
+ARCHITECTURE.md is a later design, not this seam.
 
 This platform is built clean from the old platform's audit lessons:
 interfaces and wiring are real, the engine sits behind the client
 interface, and nothing fakes success. An unconfigured engine answers
-with a named `engine_unavailable` error; an unimplemented engine
-operation answers `not_implemented`. Generation over the socket is
-real (streamed token events from the Rust engine); embeddings are
-the operation still answered `not_implemented`, because the socket
-protocol has no embedding operation yet. Serving the pair end to
-end is documented in the repo's SERVING.md.
+with a named `engine_unavailable` error. Generation and embeddings
+over the socket are real and proven live on the real model file
+(repo bench/t917-proof-2026-10-30.md). Serving the pair end to end
+is documented in the repo's SERVING.md.
 
 ## Module map (the grid)
 
 | Module | Job |
 | --- | --- |
 | `cmd/torchd` | Daemon entrypoint: flags, env, signals, wiring |
-| `internal/server` | HTTP routes, validation, SSE streaming, error mapping |
-| `internal/auth` | The one API-key middleware (constant-time, fails closed) |
-| `internal/engine` | Client interface, named errors, Unix-socket client (handshake, ping, debug self-report, streamed generate) |
-| `internal/scheduler` | Priority-lane concurrency gate; both lanes provably drain |
-| `internal/cache` | Exact-match response cache with TTL and injectable clock |
+| `internal/server` | HTTP routes, validation, SSE streaming, error mapping, generation caps |
+| `internal/auth` | The one API-key middleware (constant-time, fails closed, repeated failures throttled per source) |
+| `internal/engine` | Client interface, named errors, Unix-socket client (handshake, ping, debug self-report, streamed generate, embed, chat template) with bounded frame reads |
+| `internal/scheduler` | Priority-lane concurrency gate; lanes are server-side only, queue-capped, and provably drain |
+| `internal/cache` | Exact-match response cache with TTL, an entry cap with expiry-first eviction, a purge janitor, and an injectable clock |
+| `internal/chattemplate` | Renderer for the model's own GGUF chat template (a bounded Jinja subset), with render budgets so a hostile template refuses by name instead of hanging or blowing the stack |
+| `internal/supervisor` | Engine process lifecycle: start, health wait, restart within a budget, an allowlisted child environment (PATH plus ITAK_ENGINE_* only) |
 | `internal/diag` | Diagnostics registry behind `/debug` (debugging from birth) |
 
 ## Run
@@ -37,21 +39,25 @@ go run ./cmd/torchd -engine-socket /run/torch/engine.sock -models glimmer
 ```
 
 With `-engine-socket`, start the Rust engine first (see the repo's
-SERVING.md); the daemon logs whether the engine connected, and
-`/healthz` reports the engine's state either way.
+SERVING.md), or let torchd supervise it with `-engine-bin` and
+`-engine-model`. The daemon logs whether the engine connected, and
+`/healthz` reports a coarse state either way.
 
-The daemon refuses to start without `TORCH_API_KEY` unless
-`TORCH_ALLOW_NO_AUTH=1` is set deliberately. The bind is loopback by
-default; widening it is an explicit `-addr` decision.
+The daemon refuses to start without `TORCH_API_KEY` (minimum 16
+characters) unless `TORCH_ALLOW_NO_AUTH=1` is set deliberately. The
+bind is loopback by default; widening it is an explicit `-addr`
+decision. Every serving limit (generation cap, deadline, body size,
+timeouts, queue and cache caps) is a flag with the default recorded
+in `torchd -h`.
 
 ## Routes
 
 | Route | Auth | Notes |
 | --- | --- | --- |
-| `GET /healthz` | no | Platform liveness + engine health detail |
+| `GET /healthz` | no | Coarse state only: `ok`, `unavailable`, or `down`. Engine error detail stays behind the authenticated `/debug` |
 | `GET /v1/models` | yes | Configured model list |
-| `POST /v1/chat/completions` | yes | Validated; scheduler-gated; cached when not streaming; SSE with `stream: true`. Priority via `X-Torch-Priority: high` |
-| `POST /v1/embeddings` | yes | String or string-array input |
+| `POST /v1/chat/completions` | yes | Validated; scheduler-gated; cached when not streaming; SSE with `stream: true`. A silent mid-stream engine death ends with a named error frame, never a clean `[DONE]` |
+| `POST /v1/embeddings` | yes | String or string-array input; mean-pooled token embeddings from the engine, L2-normalized |
 | `GET /debug` | yes | Diag counters, scheduler depths, cache stats, engine self-report when the client offers one |
 
 ## Gates
@@ -60,6 +66,7 @@ default; widening it is an explicit `-addr` decision.
 go build ./...
 go vet ./...
 go test ./...
+govulncheck ./...
 golangci-lint run ./...   # config: .golangci.yml, must run clean
 ```
 

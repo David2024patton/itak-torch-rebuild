@@ -36,6 +36,7 @@ mod streamer;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, sync_channel, SyncSender, TrySendError};
@@ -271,6 +272,47 @@ fn parse_args() -> Result<CliConfig, i32> {
     })
 }
 
+/// The uid of the process on the other end of a connected Unix
+/// stream, from the kernel (SO_PEERCRED): not a claim the peer
+/// makes, so it cannot be spoofed by anything the peer sends.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    // SAFETY: cred is writable storage of exactly the size passed
+    // in len; getsockopt with SO_PEERCRED on a Unix stream socket
+    // fills it and reports failure by return code, checked here.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Some(cred.uid)
+    } else {
+        None
+    }
+}
+
+/// Refuse a connection whose peer runs under a different uid than
+/// the engine itself. The platform and the engine run as the same
+/// user in every supported deployment; a peer under any other uid
+/// is not the platform, whatever frames it sends. This is the
+/// second half of the socket's access control, behind the 0600
+/// file mode from bind_socket.
+fn check_peer(stream: &UnixStream) -> Result<(), String> {
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let own = unsafe { libc::geteuid() };
+    match peer_uid(stream) {
+        Some(uid) if uid == own => Ok(()),
+        Some(uid) => Err(format!("peer uid {uid} is not the engine's uid {own}")),
+        None => Err("cannot read the peer's credentials".to_string()),
+    }
+}
+
 fn handle_conn(
     stream: UnixStream,
     jobs: SyncSender<Work>,
@@ -286,6 +328,11 @@ fn handle_conn(
             return;
         }
     };
+    if let Err(msg) = check_peer(&stream) {
+        log_line(&format!("connection refused: {msg}"));
+        let _ = send(&mut writer, &protocol::error_frame("peer_refused", &msg));
+        return;
+    }
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     // The handshake is a gate, not a convention: until a hello with
@@ -781,6 +828,18 @@ mod tests {
         let mut line = String::new();
         let n = client.read_line(&mut line).expect("read after refusal");
         assert_eq!(n, 0, "the connection must close after the refusal");
+    }
+
+    #[test]
+    fn peer_check_accepts_the_same_uid() {
+        // Both ends of a stream pair are this process, so the peer
+        // uid is the engine's own: the check passes. A peer under a
+        // different uid cannot be produced inside one test process;
+        // that half is the kernel's SO_PEERCRED answer, exercised
+        // here only in its accepting direction.
+        let (a, _b) = UnixStream::pair().expect("stream pair");
+        check_peer(&a).expect("same-uid peer is accepted");
+        assert_eq!(peer_uid(&a), Some(unsafe { libc::geteuid() }));
     }
 
     #[test]

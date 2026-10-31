@@ -59,7 +59,13 @@
 //!   `forward_failed`, `detokenize_failed`, `engine_died`,
 //!   `unknown_op`, `bad_frame`, `internal`. And `engine_busy` maps
 //!   to 503: every slot is running and the bounded job queue is
-//!   full (TODO T-9.14).
+//!   full (TODO T-9.14). One code is not an op refusal at all:
+//!   `peer_refused` is sent once, before the handshake, when the
+//!   connecting process runs under a different uid than the engine
+//!   (the kernel reports the peer's credentials, SO_PEERCRED), and
+//!   the connection closes immediately; a correct deployment, where
+//!   the platform and the engine run as the same user, never sees
+//!   it.
 
 use crate::json::{obj, Value};
 

@@ -14,8 +14,11 @@
 //     tests (is defined / none / string / boolean / mapping /
 //     iterable), inline conditionals (a if cond else b), method
 //     calls dict.get / str.split / dict.items, macro calls, the
-//     namespace() builtin, and the filters trim, lower, replace
-//     and join;
+//     namespace() builtin, the strftime_now(format) builtin the
+//     reference template environment provides from the host clock
+//     (llama.cpp's renderer defines it; templates test it with
+//     `is defined` before calling it), and the filters trim,
+//     lower, replace and join;
 //   - {% for x in expr %} ... {% endfor %} over lists, with the
 //     loop variable bound per iteration and loop.index / index0 /
 //     first / last / length available; tuple targets (for k, v in
@@ -44,6 +47,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ErrUnsupported names a template construct outside the rendered
@@ -63,6 +67,10 @@ type Params struct {
 	BOSToken            string
 	EOSToken            string
 	AddGenerationPrompt bool
+	// Now is the clock the strftime_now builtin reads. The zero
+	// value means the current time; tests pin it so a template
+	// that prints the date renders byte-exact expectations.
+	Now time.Time
 }
 
 // Render builds the prompt. It is a pure function of its inputs.
@@ -87,7 +95,19 @@ func Render(template string, messages []Message, p Params) (string, error) {
 		})
 	}
 	global.vars["messages"] = listValue(msgVals)
-	env := &env{global: global, cur: global, macros: map[string]*macroNode{}}
+	// The reference environment (llama.cpp's minja runtime)
+	// defines strftime_now as a global function; templates like
+	// this model's own test `strftime_now is defined` and call it
+	// to print the current date. Registering it is what makes our
+	// render of the Glimmer template carry the same "Current
+	// date" line llama.cpp produces (TODO T-9.16; the omission
+	// was caught by the T-9.17 prompt-id comparison).
+	global.vars["strftime_now"] = builtinValue("strftime_now")
+	now := p.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	env := &env{global: global, cur: global, macros: map[string]*macroNode{}, now: now}
 	var sb strings.Builder
 	if err := renderNodes(nodes, env, &sb); err != nil {
 		return "", err
@@ -491,6 +511,7 @@ const (
 	vStr
 	vList
 	vDict
+	vBuiltin
 )
 
 // value is a Jinja value at render time. An undefined name resolves
@@ -513,6 +534,7 @@ func numValue(n float64) value           { return value{kind: vNum, n: n} }
 func listValue(l []value) value          { return value{kind: vList, list: l} }
 func dictValue(d map[string]value) value { return value{kind: vDict, dict: d} }
 func undefValue(name string) value       { return value{kind: vUndef, name: name} }
+func builtinValue(name string) value     { return value{kind: vBuiltin, s: name} }
 
 func (v value) truthy() bool {
 	switch v.kind {
@@ -528,6 +550,8 @@ func (v value) truthy() bool {
 		return len(v.list) > 0
 	case vDict:
 		return len(v.dict) > 0
+	case vBuiltin:
+		return true
 	}
 	return false
 }
@@ -547,6 +571,8 @@ func (v value) stringify() (string, error) {
 		return "", fmt.Errorf("%w: cannot print none", ErrUnsupported)
 	case vBool:
 		return "", fmt.Errorf("%w: cannot print a boolean", ErrUnsupported)
+	case vBuiltin:
+		return "", fmt.Errorf("%w: cannot print the builtin function %q", ErrUnsupported, v.s)
 	default:
 		return "", fmt.Errorf("%w: cannot print a list or mapping", ErrUnsupported)
 	}
@@ -1114,10 +1140,11 @@ type env struct {
 	global *scope
 	cur    *scope
 	macros map[string]*macroNode
+	now    time.Time
 }
 
 func (e *env) child(vars map[string]value) *env {
-	return &env{global: e.global, cur: &scope{vars: vars, parent: e.cur}, macros: e.macros}
+	return &env{global: e.global, cur: &scope{vars: vars, parent: e.cur}, macros: e.macros, now: e.now}
 }
 
 func renderNodes(nodes []node, e *env, sb *strings.Builder) error {
@@ -1598,6 +1625,11 @@ func evalCall(x *vExpr, e *env) (value, error) {
 		}
 		return dictValue(d), nil
 	}
+	if _, isMacro := e.macros[x.s]; !isMacro {
+		if v, ok := e.cur.lookup(x.s); ok && v.kind == vBuiltin {
+			return evalBuiltin(v.s, x, e)
+		}
+	}
 	m, ok := e.macros[x.s]
 	if !ok {
 		// raise_exception and every other unknown call refuse by
@@ -1625,10 +1657,75 @@ func evalCall(x *vExpr, e *env) (value, error) {
 	}
 	// Macros see the global scope plus their parameters, as in
 	// Jinja; the caller's locals do not leak in.
-	macroEnv := &env{global: e.global, cur: &scope{vars: vars, parent: e.global}, macros: e.macros}
+	macroEnv := &env{global: e.global, cur: &scope{vars: vars, parent: e.global}, macros: e.macros, now: e.now}
 	var sb strings.Builder
 	if err := renderNodes(m.body, macroEnv, &sb); err != nil {
 		return value{}, err
 	}
 	return strValue(sb.String()), nil
+}
+
+// evalBuiltin runs a call to a builtin function value. The only
+// builtin is strftime_now(format), the host-clock function the
+// reference template environment defines; it exists so templates
+// that print the current date (guarded by `is defined`, as the
+// Glimmer ATEM template does) render the same text llama.cpp
+// renders. The format language is the strftime subset chat
+// templates use; an unknown specifier refuses by name.
+func evalBuiltin(name string, x *vExpr, e *env) (value, error) {
+	if name != "strftime_now" {
+		return value{}, fmt.Errorf("%w: function call %s(...)", ErrUnsupported, name)
+	}
+	if len(x.args) != 1 || len(x.kw) > 0 {
+		return value{}, fmt.Errorf("%w: strftime_now takes one format argument", ErrUnsupported)
+	}
+	fv, err := eval(x.args[0], e)
+	if err != nil {
+		return value{}, err
+	}
+	if fv.kind != vStr {
+		return value{}, fmt.Errorf("%w: strftime_now format is not a string", ErrUnsupported)
+	}
+	out, err := formatStrftime(e.now, fv.s)
+	if err != nil {
+		return value{}, err
+	}
+	return strValue(out), nil
+}
+
+func formatStrftime(t time.Time, format string) (string, error) {
+	var sb strings.Builder
+	for i := 0; i < len(format); i++ {
+		if format[i] != '%' {
+			sb.WriteByte(format[i])
+			continue
+		}
+		i++
+		if i >= len(format) {
+			return "", fmt.Errorf("%w: strftime format ends with a lone %%", ErrUnsupported)
+		}
+		switch format[i] {
+		case '%':
+			sb.WriteByte('%')
+		case 'Y':
+			fmt.Fprintf(&sb, "%04d", t.Year())
+		case 'y':
+			fmt.Fprintf(&sb, "%02d", t.Year()%100)
+		case 'm':
+			fmt.Fprintf(&sb, "%02d", int(t.Month()))
+		case 'd':
+			fmt.Fprintf(&sb, "%02d", t.Day())
+		case 'H':
+			fmt.Fprintf(&sb, "%02d", t.Hour())
+		case 'M':
+			fmt.Fprintf(&sb, "%02d", t.Minute())
+		case 'S':
+			fmt.Fprintf(&sb, "%02d", t.Second())
+		case 'j':
+			fmt.Fprintf(&sb, "%03d", t.YearDay())
+		default:
+			return "", fmt.Errorf("%w: strftime specifier %%%c", ErrUnsupported, format[i])
+		}
+	}
+	return sb.String(), nil
 }

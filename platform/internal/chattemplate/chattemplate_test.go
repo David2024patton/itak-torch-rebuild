@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/David2024patton/itak-torch-rebuild/platform/internal/chattemplate"
 )
@@ -206,25 +207,50 @@ var glimmerParams = chattemplate.Params{
 	BOSToken:            "<|begin_of_text|>",
 	EOSToken:            "<|end_of_text|>",
 	AddGenerationPrompt: true,
+	// Pinned so the template's strftime_now branch renders a
+	// byte-exact date line (the branch llama.cpp takes through
+	// its own environment's host-clock function; T-9.17 caught
+	// the missing builtin by prompt-id comparison).
+	Now: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC),
 }
 
 // The file's real template, one user message: the default system
-// block renders (no system message given), with the cutoff and
-// reasoning lines the template synthesizes and the valid
-// recipients list joined from namespace state.
+// block renders (no system message given), with the cutoff, the
+// current-date line the template synthesizes from strftime_now,
+// and the reasoning line, plus the valid recipients list joined
+// from namespace state.
 func TestGlimmerATEMTemplateUserOnly(t *testing.T) {
 	got := render(t, glimmerTemplate(t), []chattemplate.Message{
 		{Role: "user", Content: "Capital of France? One word."},
 	}, glimmerParams)
 	want := "<|begin_of_text|>" +
 		"<|start|>system<|message|>You are a helpful AI assistant.\n" +
-		"Knowledge cutoff: 2026-01-04.\n\n" +
+		"Knowledge cutoff: 2026-01-04.\n" +
+		"Current date: 2026-10-31.\n\n" +
 		"Reasoning strength: high.\n\n" +
 		"# Valid recipients: \"self\", \"user\".<|eot|>" +
 		"<|start|>user<|message|>Capital of France? One word.<|eot|>" +
 		"<|start|>assistant"
 	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The strftime_now builtin: formats the pinned clock, answers
+// the defined test, and refuses an unknown specifier by name.
+func TestStrftimeNowBuiltin(t *testing.T) {
+	p := chattemplate.Params{Now: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)}
+	got := render(t, `{% if strftime_now is defined %}{{ strftime_now('%Y-%m-%d %H:%M') }}{% endif %}`, nil, p)
+	if want := "2026-10-31 12:00"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	_, err := chattemplate.Render(`{{ strftime_now('%Q') }}`, nil, p)
+	if !errors.Is(err, chattemplate.ErrUnsupported) {
+		t.Fatalf("unknown specifier err = %v, want ErrUnsupported", err)
+	}
+	_, err = chattemplate.Render(`{{ strftime_now }}`, nil, p)
+	if !errors.Is(err, chattemplate.ErrUnsupported) {
+		t.Fatalf("printing the builtin err = %v, want ErrUnsupported", err)
 	}
 }
 

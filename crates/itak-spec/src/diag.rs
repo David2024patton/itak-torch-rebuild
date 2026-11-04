@@ -15,6 +15,12 @@
 //! - `spec.fallback.latched`: a verify refusal latched speculation off;
 //!   carries the reason and the round.
 //! - `spec.refused`: a creation or round refusal, with the error text.
+//! - `spec.sweep.begin` / `spec.sweep.end`: a depth sweep's lifecycle,
+//!   with the candidate set and (at the end) the chosen default depth.
+//! - `spec.sweep.row`: one measured depth: proposed, accepted,
+//!   acceptance rate, effective tokens per second.
+//! - `spec.sweep.refused`: the sweep stopped, with the depth it stopped
+//!   at and the refusal text.
 
 /// One sink for the loop's structured diagnostic events.
 pub trait Diag: Send + Sync {

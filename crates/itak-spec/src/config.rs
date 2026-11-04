@@ -100,6 +100,9 @@ pub struct SpecConfig {
     /// Maximum draft tokens proposed per round. Default: 6, the operating
     /// point from the 2026-10-30 sweep. Must be at least 1 and at most the
     /// draft's block size; creation refuses out-of-range depths by name.
+    /// The T-9.7 sweep that re-measures this default on this stack lives
+    /// in [`crate::sweep`]; its candidate set is configuration there
+    /// ([`crate::SweepConfig`]), never a constant compiled into the loop.
     pub depth: usize,
     /// Per-round token bound handed to the KV checkpoint: a round touches
     /// at most this many positions past its base. Must hold `depth + 1`

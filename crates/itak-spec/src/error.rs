@@ -134,6 +134,14 @@ pub enum SpecError {
         /// What was wrong with the inputs.
         detail: String,
     },
+    /// The depth sweep's configuration is unusable: an empty candidate
+    /// set, a zero or duplicated candidate depth, an unparsable depth
+    /// list, or a zero per-depth token budget. The sweep refuses by name
+    /// instead of measuring nothing and calling it a table (T-9.7).
+    SweepConfigInvalid {
+        /// What was wrong with the sweep configuration.
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for SpecError {
@@ -211,6 +219,9 @@ impl std::fmt::Display for SpecError {
             SpecError::SessionState { detail } => write!(f, "session state error: {detail}"),
             SpecError::SamplerContract { entry, detail } => {
                 write!(f, "sampler contract refused at {entry}: {detail}")
+            }
+            SpecError::SweepConfigInvalid { detail } => {
+                write!(f, "sweep configuration invalid: {detail}")
             }
         }
     }

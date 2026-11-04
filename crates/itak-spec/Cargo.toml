@@ -10,6 +10,7 @@ description = "The speculative decoding loop of the iTaK Torch Rust engine (ARCH
 cpu-compute = { path = "../cpu-compute" }
 dflash = { path = "../dflash" }
 muse-glimmer = { path = "../muse-glimmer" }
+wgpu-compute = { path = "../wgpu-compute" }
 
 [dev-dependencies]
 gguf = { path = "../gguf" }

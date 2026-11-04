@@ -249,8 +249,7 @@ fn run(
         ..SpecConfig::default()
     };
     let mut session = SpecSession::new(
-        target,
-        compute,
+        itak_spec::CpuTarget::new(target, compute),
         Some(speculator),
         config,
         Arc::new(StderrDiag),

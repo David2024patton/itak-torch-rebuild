@@ -1,9 +1,11 @@
 //! Session configuration (SPEC-itak-spec Section 6.3). Every operational
 //! limit here is configuration with a default, never a compiled-in
-//! constant: the depth default is the operating point the llama.cpp sweep
-//! measured on 2026-10-30 (`bench/gpu-proof-2026-10-30.md`, depth 6 at
-//! 107.39 tok/s against 41.64 plain), and T-9.7 re-measures it on this
-//! stack.
+//! constant: the depth default is the winner of this stack's own T-9.7
+//! sweep, measured on the resident GPU loop on 2026-11-04
+//! (`bench/spec-sweep-gpu-fixed-2026-11-04.md`, depth 1 at 16.86 tok/s
+//! with acceptance 0.615, picked by SPEC 9.4's smallest-depth-within-2%
+//! rule). It supersedes the llama.cpp operating point (depth 6) this
+//! default carried before the sweep ran.
 
 /// Which drafting machinery a session runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,8 +99,10 @@ pub struct SpecConfig {
     /// Default: CPU, the reference implementation; the GPU
     /// arm is the resident draft session in wgpu-compute.
     pub draft_backend: DraftBackend,
-    /// Maximum draft tokens proposed per round. Default: 6, the operating
-    /// point from the 2026-10-30 sweep. Must be at least 1 and at most the
+    /// Maximum draft tokens proposed per round. Default: 1, the winner
+    /// of this stack's T-9.7 sweep on 2026-11-04 (acceptance 0.615,
+    /// 16.86 tok/s; see `bench/spec-sweep-gpu-fixed-2026-11-04.md`).
+    /// Must be at least 1 and at most the
     /// draft's block size; creation refuses out-of-range depths by name.
     /// The T-9.7 sweep that re-measures this default on this stack lives
     /// in [`crate::sweep`]; its candidate set is configuration there
@@ -142,7 +146,7 @@ impl Default for SpecConfig {
         SpecConfig {
             mode: SpecMode::Dflash,
             draft_backend: DraftBackend::Cpu,
-            depth: 6,
+            depth: 1,
             max_round_tokens: 17,
             temperature: 0.0,
             top_p: 1.0,

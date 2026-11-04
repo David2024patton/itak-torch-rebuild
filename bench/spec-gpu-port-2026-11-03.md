@@ -221,3 +221,26 @@ and with no accepted drafts the loop pays verify cost for nothing.
 Per-round cost with a working draft is fine (62 rounds in about
 13.2 s of generate). T-9.6 stays OPEN: correctness is proven on
 both arms; the speed half waits on the draft parity fix.
+
+## Draft parity fix and re-verdict (2026-11-04, RX 7900 XTX)
+
+The divergence is found and fixed. Root cause: BlockPlan cached a
+single attention-call index, overwritten per layer, so only the
+LAST draft layer's attention call received the per-block runtime
+values (block start, committed count). Every earlier layer
+attended over zero committed positions at block start 0; the
+committed KV was written correctly, the earlier layers never
+looked at it. Bisection proof: the fixture passes in full at 1
+layer and fails at 2. The fix stores every layer's attention index
+and rewrites all of them per block (dflash_session.rs, one file).
+
+After the fix: the dflash_session parity gate is 4 of 4 green on
+the card, and on the real files the GPU draft's bookkeeping equals
+the CPU draft's exactly (32 rounds, 180 proposed, 31 accepted,
+acceptance 0.172 in both arms). IDENTITY PASS, GOLDEN PASS.
+Effective speed 9.22 tok/s: SPEED STILL FAILS the 88.6 bar. With
+a correct draft the blocker is economics, not correctness: at
+depth 6 acceptance 0.172 yields 1.97 tokens per round against a
+full target verify forward per round, and the loop trails plain
+decode (35.45 tok/s the same night). T-9.6 stays OPEN on its
+speed half: acceptance economics and verify cost are the work now.

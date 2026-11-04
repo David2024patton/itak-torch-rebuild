@@ -146,7 +146,7 @@ impl<D: TargetDriver> SpecSession<D> {
             let spec = draft
                 .as_ref()
                 .ok_or_else(|| refuse(SpecError::DraftNotLoaded))?;
-            let dcfg = spec.model().config();
+            let dcfg = spec.config();
             let tcfg = driver.config();
             if dcfg.vocab_size != tcfg.vocab_size {
                 return Err(refuse(SpecError::DraftTargetMismatch {

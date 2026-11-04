@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 attention = { path = "../attention" }
+dflash = { path = "../dflash" }
 gguf = { path = "../gguf" }
 muse-glimmer = { path = "../muse-glimmer" }
 pollster = "0.4"

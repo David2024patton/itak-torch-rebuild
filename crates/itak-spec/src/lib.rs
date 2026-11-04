@@ -46,7 +46,7 @@ pub mod speculator;
 #[cfg(test)]
 mod testkit;
 
-pub use config::{OnVerifyError, SpecConfig, SpecMode};
+pub use config::{DraftBackend, OnVerifyError, SpecConfig, SpecMode};
 pub use diag::{Diag, NullDiag, StderrDiag};
 pub use driver::{CpuTarget, TargetDriver};
 pub use error::{Result, SpecError};

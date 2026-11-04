@@ -12,11 +12,12 @@
 use std::rc::Rc;
 
 use cpu_compute::{Checkpoint, CpuCompute};
-use dflash::{DflashCache, DflashModel, TargetTensors, TensorData};
+use dflash::{DflashCache, DflashConfig, DflashModel, TargetTensors, TensorData};
 use muse_glimmer::{
     AttentionRequest, Cache, Compute, GlimmerConfig, GlimmerError, LayerInputCapture, LayerWeights,
     Result as GlimmerResult, TensorView,
 };
+use wgpu_compute::DflashSession;
 
 use crate::error::{Result, SpecError};
 use crate::sampler;
@@ -164,9 +165,44 @@ pub struct Proposal {
     pub dists: Vec<Vec<f32>>,
 }
 
-/// The DFlash speculator: a loaded draft model, its private cache, the
-/// target tensors it borrows (embedding table and LM head), and the
-/// staging area for captured conditioning rows.
+/// The draft's execution arm: the same semantics on two
+/// device paths. Every piece of loop bookkeeping (capture
+/// staging, commit consumption, proposal slicing) lives on
+/// [`DflashSpeculator`] itself and is shared; the arm only
+/// answers the two passes (inject, forward block) and the
+/// committed length.
+/// The CPU arm's payload, boxed inside the enum so the
+/// two arms' sizes stay comparable.
+struct CpuDraft {
+    /// The loaded draft model.
+    model: DflashModel,
+    /// The draft's private KV cache.
+    cache: DflashCache,
+    /// The borrowed target embedding table.
+    embedding: TensorData,
+    /// The borrowed target output head.
+    output: TensorData,
+}
+
+enum DraftBackendImpl {
+    /// The CPU reference implementation, with its private
+    /// cache and the borrowed target tensors as f32 data.
+    Cpu(Box<CpuDraft>),
+    /// The device-resident GPU session. The session borrows
+    /// its backend at `'static`: the runner leaks the
+    /// backend for the process lifetime, the same
+    /// discipline it already applies to the target's
+    /// resident session. Boxed, like the CPU payload, so
+    /// the arms' sizes stay comparable.
+    Gpu {
+        /// The resident draft session.
+        session: Box<DflashSession<'static>>,
+    },
+}
+
+/// The DFlash speculator: a draft execution arm, the draft
+/// config and conditioning geometry both arms agree on,
+/// and the staging area for captured conditioning rows.
 ///
 /// Draft sync contract (Section 4, step 7, and Section 10 Q1/Q2 as
 /// settled): the draft's cache holds exactly the committed positions
@@ -178,10 +214,15 @@ pub struct Proposal {
 /// rollback story, and it is exact because a position's conditioning row
 /// depends only on the committed prefix that produced it.
 pub struct DflashSpeculator {
-    model: DflashModel,
-    cache: DflashCache,
-    embedding: TensorData,
-    output: TensorData,
+    backend: DraftBackendImpl,
+    /// The draft config (identical for both arms; the CPU
+    /// arm's model and the GPU arm's session were both
+    /// built from it).
+    config: DflashConfig,
+    /// Conditioning row width, from the loaded `fc`.
+    conditioning_width: usize,
+    /// Target hidden size, derived from `fc` at load.
+    target_hidden: usize,
     /// Staged conditioning rows: `(absolute position, fused row)` pairs in
     /// increasing position order, plus the position the stage starts at.
     staged: Vec<(usize, Vec<f32>)>,
@@ -193,15 +234,24 @@ pub struct DflashSpeculator {
 
 impl DflashSpeculator {
     /// Assemble a speculator from a loaded draft model and the target
-    /// tensors it borrows. The caller (session creation) validates the
-    /// draft against the target; this constructor only takes ownership.
+    /// tensors it borrows (the CPU arm). The caller (session creation)
+    /// validates the draft against the target; this constructor only
+    /// takes ownership.
     pub fn new(model: DflashModel, embedding: TensorData, output: TensorData) -> Self {
+        let config = model.config().clone();
+        let conditioning_width = model.weights().conditioning_width();
+        let target_hidden = model.weights().target_hidden as usize;
         let cache = DflashCache::new(model.config());
         DflashSpeculator {
-            model,
-            cache,
-            embedding,
-            output,
+            backend: DraftBackendImpl::Cpu(Box::new(CpuDraft {
+                model,
+                cache,
+                embedding,
+                output,
+            })),
+            config,
+            conditioning_width,
+            target_hidden,
             staged: Vec::new(),
             staged_from: None,
             last_tokens: Vec::new(),
@@ -209,15 +259,104 @@ impl DflashSpeculator {
         }
     }
 
-    /// The draft model this speculator drives.
-    pub fn model(&self) -> &DflashModel {
-        &self.model
+    /// Assemble a speculator over a device-resident draft
+    /// session (the GPU arm, selected by
+    /// [`crate::DraftBackend::Gpu`]). The session was built
+    /// from the same draft config and weights the CPU arm
+    /// would load; every loop-visible behavior (staging,
+    /// commit, proposal slicing, refusals) is the shared
+    /// code above the arm.
+    pub fn gpu(session: DflashSession<'static>) -> Self {
+        let config = session.config().clone();
+        let conditioning_width = session.conditioning_width();
+        let target_hidden = session.target_hidden() as usize;
+        DflashSpeculator {
+            backend: DraftBackendImpl::Gpu {
+                session: Box::new(session),
+            },
+            config,
+            conditioning_width,
+            target_hidden,
+            staged: Vec::new(),
+            staged_from: None,
+            last_tokens: Vec::new(),
+            last_probs: Vec::new(),
+        }
+    }
+
+    /// The draft config this speculator serves (either arm).
+    pub fn config(&self) -> &DflashConfig {
+        &self.config
+    }
+
+    /// The draft model of the CPU arm. The GPU arm has no
+    /// `DflashModel` to hand back; session creation reads
+    /// [`DflashSpeculator::config`] instead, which both
+    /// arms answer.
+    pub fn model(&self) -> Option<&DflashModel> {
+        match &self.backend {
+            DraftBackendImpl::Cpu(cpu) => Some(&cpu.model),
+            DraftBackendImpl::Gpu { .. } => None,
+        }
+    }
+
+    /// Run the noise block for `pending` on the active
+    /// arm and return the full block logits.
+    fn forward_block_logits(&mut self, pending: u32) -> Result<Vec<f32>> {
+        let block = {
+            let mut block = vec![self.config.mask_token_id; self.config.block_size as usize];
+            block[0] = pending;
+            block
+        };
+        let start = self.committed_len();
+        match &mut self.backend {
+            DraftBackendImpl::Cpu(cpu) => {
+                let borrowed = TargetTensors {
+                    embedding: Some(&cpu.embedding),
+                    output: Some(&cpu.output),
+                };
+                cpu.model
+                    .forward_block(&cpu.cache, &block, start, &borrowed)
+                    .map_err(|e| SpecError::DraftRefused {
+                        source: Box::new(e),
+                    })
+            }
+            DraftBackendImpl::Gpu { session } => {
+                session
+                    .forward_block(&block, start)
+                    .map_err(|e| SpecError::DraftRefused {
+                        source: Box::new(e),
+                    })
+            }
+        }
+    }
+
+    /// Inject fused conditioning rows on the active arm.
+    fn inject(&mut self, features: &[f32], positions: &[usize]) -> Result<()> {
+        match &mut self.backend {
+            DraftBackendImpl::Cpu(cpu) => cpu
+                .model
+                .inject(&mut cpu.cache, features, positions)
+                .map_err(|e| SpecError::DraftRefused {
+                    source: Box::new(e),
+                }),
+            DraftBackendImpl::Gpu { session } => {
+                session
+                    .inject(features, positions)
+                    .map_err(|e| SpecError::DraftRefused {
+                        source: Box::new(e),
+                    })
+            }
+        }
     }
 
     /// How many committed positions the draft's cache currently holds.
     /// At every round boundary this equals the target's cache position.
     pub fn committed_len(&self) -> usize {
-        self.cache.len()
+        match &self.backend {
+            DraftBackendImpl::Cpu(cpu) => cpu.cache.len(),
+            DraftBackendImpl::Gpu { session } => session.committed_len(),
+        }
     }
 
     /// Run one full noise block after `pending` and return up to `n`
@@ -235,20 +374,9 @@ impl DflashSpeculator {
         arm: DraftArm,
         rng: &mut dyn FnMut() -> f64,
     ) -> Result<Proposal> {
-        let block = self.model.noise_block(pending);
-        let start = self.cache.len();
-        let borrowed = TargetTensors {
-            embedding: Some(&self.embedding),
-            output: Some(&self.output),
-        };
-        let logits = self
-            .model
-            .forward_block(&self.cache, &block, start, &borrowed)
-            .map_err(|e| SpecError::DraftRefused {
-                source: Box::new(e),
-            })?;
-        let vocab = self.model.config().vocab_size as usize;
-        let want = n.min(self.model.config().max_drafts() as usize);
+        let logits = self.forward_block_logits(pending)?;
+        let vocab = self.config.vocab_size as usize;
+        let want = n.min(self.config.max_drafts() as usize);
         let mut tokens = Vec::with_capacity(want);
         let mut dists: Vec<Vec<f32>> = Vec::new();
         for k in 0..want {
@@ -287,7 +415,7 @@ impl Speculator for DflashSpeculator {
     }
 
     fn max_depth(&self) -> usize {
-        self.model.config().max_drafts() as usize
+        self.config.max_drafts() as usize
     }
 
     fn propose(&mut self, pending: u32, n: usize) -> Result<BlockProposal<'_>> {
@@ -306,7 +434,7 @@ impl Speculator for DflashSpeculator {
     }
 
     fn commit(&mut self, tokens: &[u32]) -> Result<()> {
-        let from = self.cache.len();
+        let from = self.committed_len();
         if tokens.is_empty() {
             self.staged.clear();
             self.staged_from = None;
@@ -328,7 +456,7 @@ impl Speculator for DflashSpeculator {
                 ),
             });
         }
-        let width = self.model.weights().conditioning_width();
+        let width = self.conditioning_width;
         let mut features = Vec::with_capacity(tokens.len() * width);
         let mut positions = Vec::with_capacity(tokens.len());
         for i in 0..tokens.len() {
@@ -350,11 +478,7 @@ impl Speculator for DflashSpeculator {
         // than retrying against stale rows.
         self.staged.clear();
         self.staged_from = None;
-        self.model
-            .inject(&mut self.cache, &features, &positions)
-            .map_err(|e| SpecError::DraftRefused {
-                source: Box::new(e),
-            })?;
+        self.inject(&features, &positions)?;
         Ok(())
     }
 
@@ -373,8 +497,8 @@ impl Speculator for DflashSpeculator {
         }
         // Concatenate each position's per-layer rows in target_layers
         // order: exactly the flat conditioning layout inject consumes.
-        let target_hidden = self.model.weights().target_hidden as usize;
-        let width = self.model.weights().conditioning_width();
+        let target_hidden = self.target_hidden;
+        let width = self.conditioning_width;
         let rows = captures[0].rows.len() / target_hidden;
         let mut staged = Vec::with_capacity(rows);
         for i in 0..rows {
@@ -479,6 +603,177 @@ mod tests {
             view_tokens, block.tokens,
             "trait view and block proposal diverge (pending {pending}, n {n})"
         );
+    }
+
+    /// The GPU arm's shared bookkeeping: a speculator built
+    /// over a resident draft session stages, commits, and
+    /// proposes through exactly the code the CPU arm uses,
+    /// and its committed length tracks the GPU session's.
+    /// Adapter-guarded like every GPU test in the workspace:
+    /// skips with a printed reason where no adapter
+    /// qualifies. The fixture is the smallest draft the
+    /// GEMV kernels accept (every projection input a whole
+    /// number of Q4_K blocks).
+    #[test]
+    fn gpu_arm_shares_the_speculator_bookkeeping() {
+        use muse_glimmer::{Dtype, GlimmerError, TensorSource as GlimmerSource, TensorView};
+        use std::collections::HashMap;
+        use std::sync::Arc as StdArc;
+        use wgpu_compute::{
+            DflashRawWeights, DflashSession, DflashSessionConfig, WgpuCompute, WgpuError,
+        };
+
+        let backend = match WgpuCompute::new() {
+            Ok(b) => b,
+            Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+                eprintln!(
+                    "skipping gpu arm speculator test: no suitable adapter (enumerated: [{}])",
+                    seen.join("; ")
+                );
+                return;
+            }
+            Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+        };
+        let backend: &'static WgpuCompute = Box::leak(Box::new(backend));
+
+        // Deterministic small-magnitude Q4_K / F32 tensors,
+        // the parity fixture's by-construction style.
+        fn q4k(name: &str, inn: usize, out: usize, seed: u8) -> TensorView {
+            let blocks = inn * out / 256;
+            let mut data = Vec::with_capacity(blocks * 144);
+            for b in 0..blocks {
+                data.extend_from_slice(
+                    &wgpu_compute::kernels::k1_q4k_gemv::f32_to_f16_bits(0.005).to_le_bytes(),
+                );
+                data.extend_from_slice(
+                    &wgpu_compute::kernels::k1_q4k_gemv::f32_to_f16_bits(0.002).to_le_bytes(),
+                );
+                for i in 0..12 {
+                    data.push(seed.wrapping_add(i as u8) & 0x07);
+                }
+                for i in 0..128 {
+                    data.push(seed.wrapping_add((b + i) as u8));
+                }
+            }
+            TensorView {
+                name: name.to_string(),
+                dtype: Dtype::Q4K,
+                shape: vec![inn as u64, out as u64],
+                data: StdArc::from(data.into_boxed_slice()),
+            }
+        }
+        fn f32t(name: &str, n: usize, center: f32) -> TensorView {
+            let data: Vec<u8> = (0..n)
+                .flat_map(|i| (center + (i % 5) as f32 * 0.01).to_le_bytes())
+                .collect();
+            TensorView {
+                name: name.to_string(),
+                dtype: Dtype::F32,
+                shape: vec![n as u64],
+                data: StdArc::from(data.into_boxed_slice()),
+            }
+        }
+        struct MapSource {
+            tensors: HashMap<String, TensorView>,
+        }
+        impl GlimmerSource for MapSource {
+            fn tensor(&self, name: &str) -> muse_glimmer::Result<TensorView> {
+                self.tensors
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| GlimmerError::MissingTensor {
+                        name: name.to_string(),
+                    })
+            }
+        }
+
+        let cfg = dflash::DflashConfig {
+            name: None,
+            block_count: 2,
+            context_length: 64,
+            hidden: 256,
+            ffn_hidden: 256,
+            q_heads: 2,
+            kv_heads: 1,
+            key_length: 128,
+            value_length: 128,
+            rope_freq_base: 10_000.0,
+            rms_eps: 1e-5,
+            block_size: 2,
+            target_layers: vec![0, 1],
+            sliding_window: 2048,
+            sliding_pattern: vec![false, false],
+            causal_attention: false,
+            mask_token_id: 255,
+            vocab_size: 256,
+        };
+        let mut tensors: HashMap<String, TensorView> = HashMap::new();
+        let mut put = |v: TensorView| {
+            tensors.insert(v.name.clone(), v);
+        };
+        put(q4k("fc.weight", 512, 256, 1));
+        put(f32t("enc.output_norm.weight", 256, 1.0));
+        put(f32t("output_norm.weight", 256, 1.0));
+        for layer in 0..2 {
+            let p = |s: &str| format!("blk.{layer}.{s}");
+            put(f32t(&p("attn_norm.weight"), 256, 1.0));
+            put(q4k(&p("attn_q.weight"), 256, 256, 2));
+            put(q4k(&p("attn_k.weight"), 256, 128, 3));
+            put(q4k(&p("attn_v.weight"), 256, 128, 4));
+            put(f32t(&p("attn_q_norm.weight"), 128, 1.0));
+            put(f32t(&p("attn_k_norm.weight"), 128, 1.0));
+            put(q4k(&p("attn_output.weight"), 256, 256, 5));
+            put(f32t(&p("ffn_norm.weight"), 256, 1.0));
+            put(q4k(&p("ffn_gate.weight"), 256, 256, 6));
+            put(q4k(&p("ffn_up.weight"), 256, 256, 7));
+            put(q4k(&p("ffn_down.weight"), 256, 256, 8));
+        }
+        let raw = DflashRawWeights::load(&MapSource { tensors }, &cfg).expect("raw loads");
+        let embedding = q4k("token_embd.weight", 256, 256, 9);
+        let output = q4k("output.weight", 256, 256, 10);
+        let session = DflashSession::new(
+            backend,
+            &cfg,
+            &raw,
+            Some(&embedding),
+            Some(&output),
+            DflashSessionConfig { kv_capacity: 32 },
+        )
+        .expect("draft session builds");
+        let mut spec = DflashSpeculator::gpu(session);
+        assert_eq!(spec.config().block_size, 2);
+        assert!(spec.model().is_none(), "the GPU arm has no CPU model");
+        assert_eq!(spec.committed_len(), 0);
+
+        // Commit with nothing staged refuses, arm-independent.
+        assert!(matches!(
+            spec.commit(&[1]),
+            Err(SpecError::SessionState { .. })
+        ));
+
+        // Stage three positions of two-layer captures and
+        // commit them: the GPU session's held set advances
+        // through the shared staging code.
+        let caps: Vec<LayerInputCapture> = [0usize, 1]
+            .iter()
+            .map(|&layer| LayerInputCapture {
+                layer,
+                rows: (0..3 * 256).map(|i| (i % 7) as f32 * 0.01).collect(),
+            })
+            .collect();
+        spec.note_captures(0, &caps).expect("stage");
+        spec.commit(&[10, 11, 12]).expect("gpu commit");
+        assert_eq!(spec.committed_len(), 3);
+
+        // A proposal runs the GPU forward and returns
+        // in-vocabulary tokens at the requested depth.
+        let mut no_draws = || 0.0f64;
+        let proposal = spec
+            .propose_block(12, 1, DraftArm::Greedy, &mut no_draws)
+            .expect("gpu propose");
+        assert_eq!(proposal.tokens.len(), 1);
+        assert!(proposal.tokens[0] < cfg.vocab_size);
+        assert_eq!(spec.committed_len(), 3, "proposing commits nothing");
     }
 
     /// The trait's borrowed proposal view agrees with the owned block

@@ -95,6 +95,7 @@ use crate::kernels::k13_q4k_mmq::K13Call;
 use crate::kernels::k14_q6k_mmq::K14Call;
 use crate::kernels::k15_q4k_mmq_wide::K15Call;
 use crate::kernels::k16_q6k_mmq_wide::K16Call;
+use crate::kernels::k18_small_batch::K18Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
@@ -346,6 +347,27 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K16Call,
     },
+    /// K12 quantize + K18 (Q4_K small-batch) dispatches.
+    SmallQ4K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K18Call,
+    },
+    /// K12 quantize + K18 (Q6_K small-batch) dispatches.
+    SmallQ6K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K18Call,
+    },
+    /// K12 quantize + K18 (Q5_K small-batch) dispatches.
+    SmallQ5K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K18Call,
+    },
 }
 
 impl ProjCall {
@@ -381,21 +403,36 @@ impl ProjCall {
                 }
                 mmq.encode_into(pass);
             }
+            ProjCall::SmallQ4K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+            ProjCall::SmallQ6K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+            ProjCall::SmallQ5K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
         }
     }
 
     /// Compute dispatches this projection records into the
-    /// open pass: one for every form but the MMQ pair, whose
-    /// quantize is a dispatch of its own. An MMQ form riding
-    /// its layer's shared quantize records one: the shared
-    /// dispatch is counted once on the layer plan, not once
-    /// per member.
+    /// open pass: one for every form but the quantized
+    /// forms, whose quantize is a dispatch of its own. An
+    /// MMQ form riding its layer's shared quantize records
+    /// one: the shared dispatch is counted once on the
+    /// layer plan, not once per member. The K18 small
+    /// forms always prepare their own quantize (they
+    /// never ride the share), so they record two.
     fn dispatches(&self) -> u64 {
         match self {
             ProjCall::MmqQ4K { quant, .. }
             | ProjCall::MmqQ6K { quant, .. }
             | ProjCall::MmqWideQ4K { quant, .. }
             | ProjCall::MmqWideQ6K { quant, .. } => 1 + u64::from(quant.is_some()),
+            ProjCall::SmallQ4K { .. } | ProjCall::SmallQ6K { .. } | ProjCall::SmallQ5K { .. } => 2,
             _ => 1,
         }
     }
@@ -755,19 +792,147 @@ fn try_mmq_q6k(
     mmq_product_q6k(backend, weights, q8_qs, q8_ds, output, batch, Some(quant))
 }
 
+/// Whether `batch` sits in the small-batch band the
+/// backend's config enables: 2 rows up to the resolved
+/// `small_batch_max_rows` threshold (default 1, which
+/// enables nothing). The kernel's own cap
+/// ([`crate::kernels::k18_small_batch::SMALL_MAX_BATCH`])
+/// bounds the band from above at prepare.
+fn small_batch_applies(backend: &WgpuCompute, batch: u32) -> bool {
+    batch >= 2 && batch <= backend.small_batch_max_rows()
+}
+
+/// Try the K18 small-batch form of a plain Q4_K
+/// projection: the K12 plain quantize of `input`
+/// feeding the K18 product. `None` when the batch is
+/// outside the configured band, the device built no
+/// K18 Q4_K pipeline, or a prepare refuses the shape
+/// (logged by name): the caller then takes the GEMV
+/// form. This is the fallback ladder's composition
+/// step, at plan-build time; it never substitutes
+/// inside a dispatch.
+fn try_small_q4k(
+    backend: &WgpuCompute,
+    weights: &K1Weights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !small_batch_applies(backend, batch) {
+        return None;
+    }
+    let small = backend.k18_q4k()?;
+    let ctx = backend.context();
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!("small q4k refused at the quantize prepare: {e}; the gemv form serves it");
+            return None;
+        }
+    };
+    match small.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::SmallQ4K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("small q4k refused at the product prepare: {e}; the gemv form serves it");
+            None
+        }
+    }
+}
+
+/// Try the K18 small-batch form of a plain Q6_K
+/// projection. See [`try_small_q4k`] for the contract.
+fn try_small_q6k(
+    backend: &WgpuCompute,
+    weights: &K2Weights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !small_batch_applies(backend, batch) {
+        return None;
+    }
+    let small = backend.k18_q6k()?;
+    let ctx = backend.context();
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!("small q6k refused at the quantize prepare: {e}; the gemv form serves it");
+            return None;
+        }
+    };
+    match small.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::SmallQ6K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("small q6k refused at the product prepare: {e}; the gemv form serves it");
+            None
+        }
+    }
+}
+
+/// Try the K18 small-batch form of a plain Q5_K
+/// projection. See [`try_small_q4k`] for the contract.
+fn try_small_q5k(
+    backend: &WgpuCompute,
+    weights: &K3Weights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !small_batch_applies(backend, batch) {
+        return None;
+    }
+    let small = backend.k18_q5k()?;
+    let ctx = backend.context();
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!("small q5k refused at the quantize prepare: {e}; the gemv form serves it");
+            return None;
+        }
+    };
+    match small.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::SmallQ5K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("small q5k refused at the product prepare: {e}; the gemv form serves it");
+            None
+        }
+    }
+}
+
 /// Prepare one projection dispatch over resident buffers.
 /// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
 /// families dispatch through the matrix-matrix forms: the
 /// MMQ pair when the backend built it, the GEMM kernels
 /// (K10/K11) behind them when it built those; below the
 /// threshold, and for Q5_K (the one-row head) at any size,
-/// the GEMV kernels run. Every form consumes the same
-/// resident buffers, so the choice never changes the
-/// chain's data layout. `share` is the layer stage's shared
-/// `h` quantize (see [`HShare`]) when this projection reads
-/// the layer's `h`, and `None` for every other input: the
-/// GEMV and GEMM forms never consult it, since they
-/// quantize nothing.
+/// the GEMV kernels run. One rung sits between those: in
+/// the small-batch band (2 rows up to the backend's
+/// configured `small_batch_max_rows`, shipped off), the
+/// K18 small-batch products serve all three families
+/// when the backend built them. Every form consumes the
+/// same resident buffers, so the choice never changes
+/// the chain's data layout. `share` is the layer stage's
+/// shared `h` quantize (see [`HShare`]) when this
+/// projection reads the layer's `h`, and `None` for every
+/// other input: the GEMV and GEMM forms never consult
+/// it, since they quantize nothing, and neither do the
+/// K18 forms, which prepare their own quantize exactly
+/// as the MMQ forms did before the share existed.
 #[allow(clippy::too_many_arguments)]
 fn prepare_proj(
     backend: &WgpuCompute,
@@ -797,6 +962,9 @@ fn prepare_proj(
                         .map_err(|e| we(e, step));
                 }
             }
+            if let Some(c) = try_small_q4k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                return Ok(c);
+            }
             backend
                 .k1()
                 .prepare(ctx, w, input, output, batch)
@@ -816,17 +984,25 @@ fn prepare_proj(
                         .map_err(|e| we(e, step));
                 }
             }
+            if let Some(c) = try_small_q6k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                return Ok(c);
+            }
             backend
                 .k2()
                 .prepare(ctx, w, input, output, batch)
                 .map(ProjCall::Q6K)
                 .map_err(|e| we(e, step))
         }
-        ProjWeights::Q5K(w) => backend
-            .k3()
-            .prepare(ctx, w, input, output, batch)
-            .map(ProjCall::Q5K)
-            .map_err(|e| we(e, step)),
+        ProjWeights::Q5K(w) => {
+            if let Some(c) = try_small_q5k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                return Ok(c);
+            }
+            backend
+                .k3()
+                .prepare(ctx, w, input, output, batch)
+                .map(ProjCall::Q5K)
+                .map_err(|e| we(e, step))
+        }
     }
 }
 

@@ -472,8 +472,7 @@ mod tests {
         let fixture = testkit::build_target(Box::new(SharedCompute(compute.clone())));
         let speculator = testkit::build_speculator(&fixture, 16);
         SpecSession::new(
-            fixture.model,
-            compute,
+            crate::driver::CpuTarget::new(fixture.model, compute),
             Some(speculator),
             config.clone(),
             Arc::new(NullDiag),

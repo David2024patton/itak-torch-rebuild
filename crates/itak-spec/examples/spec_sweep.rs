@@ -37,7 +37,8 @@ use std::sync::Arc;
 use cpu_compute::CpuCompute;
 use dflash::{DflashModel, StderrDiag as DflashStderrDiag, TensorSource as _};
 use itak_spec::{
-    run_sweep, DflashSpeculator, SharedCompute, SpecConfig, SpecSession, StderrDiag, SweepConfig,
+    run_sweep, CpuTarget, DflashSpeculator, SharedCompute, SpecConfig, SpecSession, StderrDiag,
+    SweepConfig,
 };
 use muse_glimmer::GlimmerModel;
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
@@ -131,8 +132,7 @@ fn build_session(
     let mut config = config.clone();
     config.eos_tokens = eos.to_vec();
     SpecSession::new(
-        target,
-        compute,
+        CpuTarget::new(target, compute),
         Some(speculator),
         config,
         Arc::new(StderrDiag),

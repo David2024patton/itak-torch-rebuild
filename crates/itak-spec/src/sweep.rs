@@ -31,6 +31,7 @@ use std::time::Instant;
 
 use crate::config::SpecConfig;
 use crate::diag::Diag;
+use crate::driver::TargetDriver;
 use crate::error::{Result, SpecError};
 use crate::session::{SpecSession, SpecStats};
 
@@ -325,7 +326,7 @@ impl From<SpecError> for SweepError {
 /// Every step emits through `diag` (`spec.sweep.begin`, one
 /// `spec.sweep.row` per depth, `spec.sweep.end`, and `spec.sweep.
 /// refused` on the way out).
-pub fn run_sweep<F>(
+pub fn run_sweep<D, F>(
     sweep: &SweepConfig,
     base: &SpecConfig,
     prompt: &[u32],
@@ -333,7 +334,8 @@ pub fn run_sweep<F>(
     diag: &dyn Diag,
 ) -> std::result::Result<SweepReport, SweepError>
 where
-    F: FnMut(&SpecConfig) -> std::result::Result<SpecSession, String>,
+    D: TargetDriver,
+    F: FnMut(&SpecConfig) -> std::result::Result<SpecSession<D>, String>,
 {
     if let Err(err) = sweep.validate() {
         diag.event("spec.sweep.refused", &format!("error={err}"));
@@ -397,14 +399,15 @@ where
 
 /// Build, run, and account one depth. Split from [`run_sweep`] so the
 /// per-depth failure handling reads as one named refusal path.
-fn measure_depth<F>(
+fn measure_depth<D, F>(
     factory: &mut F,
     config: &SpecConfig,
     prompt: &[u32],
     tokens: usize,
 ) -> std::result::Result<DepthRow, SweepError>
 where
-    F: FnMut(&SpecConfig) -> std::result::Result<SpecSession, String>,
+    D: TargetDriver,
+    F: FnMut(&SpecConfig) -> std::result::Result<SpecSession<D>, String>,
 {
     let mut session = factory(config).map_err(|detail| SweepError::Build {
         depth: config.depth,
@@ -744,7 +747,9 @@ mod tests {
             &sweep,
             &SpecConfig::default(),
             PROMPT,
-            |_| Err("no backend in this test".to_string()),
+            |_| -> std::result::Result<SpecSession, String> {
+                Err("no backend in this test".to_string())
+            },
             &diag,
         )
         .expect_err("a factory failure stops the sweep");

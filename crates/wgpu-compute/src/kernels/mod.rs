@@ -33,13 +33,23 @@
 //! with. The session prefers the MMQ form over the GEMM form
 //! per projection when the device built it; the GEMM stays
 //! as the named fallback for devices and shapes the MMQ
-//! refuses.
+//! refuses. K15 (Q4_K) and K16 (Q6_K) are the wide-tile
+//! double-buffered MMQ forms: a 128-class output tile, a
+//! 4x8 per-thread sub-tile, and half-super-block staging
+//! steps pipelined through two workgroup buffer sets, so
+//! staging and compute overlap instead of alternating
+//! across two barriers per super-block. The session tries
+//! the wide form first at chunk row counts past its
+//! threshold, then the standard MMQ, then the GEMM: one
+//! ladder, every refusal named.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
 pub mod k12_q8_quant;
 pub mod k13_q4k_mmq;
 pub mod k14_q6k_mmq;
+pub mod k15_q4k_mmq_wide;
+pub mod k16_q6k_mmq_wide;
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;

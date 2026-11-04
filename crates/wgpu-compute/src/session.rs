@@ -76,6 +76,8 @@ use crate::kernels::k11_q6k_gemm::K11Call;
 use crate::kernels::k12_q8_quant::K12QuantCall;
 use crate::kernels::k13_q4k_mmq::K13Call;
 use crate::kernels::k14_q6k_mmq::K14Call;
+use crate::kernels::k15_q4k_mmq_wide::K15Call;
+use crate::kernels::k16_q6k_mmq_wide::K16Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
@@ -245,6 +247,22 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K14Call,
     },
+    /// K12 quantize + K15 (Q4_K wide-tile double-buffered
+    /// MMQ) dispatches.
+    MmqWideQ4K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K15Call,
+    },
+    /// K12 quantize + K16 (Q6_K wide-tile double-buffered
+    /// MMQ) dispatches.
+    MmqWideQ6K {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K16Call,
+    },
 }
 
 impl ProjCall {
@@ -264,6 +282,14 @@ impl ProjCall {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
             }
+            ProjCall::MmqWideQ4K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+            ProjCall::MmqWideQ6K { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
         }
     }
 
@@ -272,7 +298,10 @@ impl ProjCall {
     /// quantize is a dispatch of its own.
     fn dispatches(&self) -> u64 {
         match self {
-            ProjCall::MmqQ4K { .. } | ProjCall::MmqQ6K { .. } => 2,
+            ProjCall::MmqQ4K { .. }
+            | ProjCall::MmqQ6K { .. }
+            | ProjCall::MmqWideQ4K { .. }
+            | ProjCall::MmqWideQ6K { .. } => 2,
             _ => 1,
         }
     }
@@ -324,12 +353,96 @@ fn upload_proj(
     }
 }
 
+/// Choose the Q4_K MMQ product for an already-prepared
+/// K12 quantize call: the wide product (K15) first when
+/// the batch is at or past the backend's wide row
+/// threshold, the standard product (K13) behind it.
+/// `None` when neither pipeline exists or both prepares
+/// refuse: the caller then takes the GEMM form. Every
+/// refusal is logged by name; the choice is made here, at
+/// plan-build time, and never substitutes inside a
+/// dispatch. All the MMQ projection forms (plain, gated,
+/// SwiGLU) share this product choice: the activation
+/// transform lives in the quantize call they hand over,
+/// upstream of the product, so the ladder is one code
+/// path per family.
+fn mmq_product_q4k(
+    backend: &WgpuCompute,
+    weights: &K1Weights,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+    quant: K12QuantCall,
+) -> Option<ProjCall> {
+    let ctx = backend.context();
+    if batch >= backend.wide_min_rows() {
+        if let Some(wide) = backend.k15() {
+            match wide.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+                Ok(mmq) => return Some(ProjCall::MmqWideQ4K { quant, mmq }),
+                Err(e) => {
+                    dbg_log!(
+                        "mmq wide q4k refused at the product prepare: {e}; \
+                         the standard mmq form serves it"
+                    );
+                }
+            }
+        }
+    }
+    let mmq = backend.k13()?;
+    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::MmqQ4K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("mmq q4k refused at the product prepare: {e}; the gemm form serves it");
+            None
+        }
+    }
+}
+
+/// Choose the Q6_K MMQ product for an already-prepared
+/// K12 quantize call: the wide product (K16) first past
+/// the wide row threshold, the standard product (K14)
+/// behind it. See [`mmq_product_q4k`] for the contract.
+fn mmq_product_q6k(
+    backend: &WgpuCompute,
+    weights: &K2Weights,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+    quant: K12QuantCall,
+) -> Option<ProjCall> {
+    let ctx = backend.context();
+    if batch >= backend.wide_min_rows() {
+        if let Some(wide) = backend.k16() {
+            match wide.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+                Ok(mmq) => return Some(ProjCall::MmqWideQ6K { quant, mmq }),
+                Err(e) => {
+                    dbg_log!(
+                        "mmq wide q6k refused at the product prepare: {e}; \
+                         the standard mmq form serves it"
+                    );
+                }
+            }
+        }
+    }
+    let mmq = backend.k14()?;
+    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+        Ok(mmq) => Some(ProjCall::MmqQ6K { quant, mmq }),
+        Err(e) => {
+            dbg_log!("mmq q6k refused at the product prepare: {e}; the gemm form serves it");
+            None
+        }
+    }
+}
+
 /// Try the MMQ form of a plain Q4_K projection: the K12
-/// plain quantize of `input` feeding the K13 product. `None`
-/// (with the refusal logged by name) when the device built
-/// no K13 pipeline or a prepare refuses the shape: the
-/// caller then takes the GEMM form. This is the fallback
-/// ladder's composition step, at plan-build time; it never
+/// plain quantize of `input` feeding the product
+/// [`mmq_product_q4k`] chooses. `None` (with the refusal
+/// logged by name) when the device built no MMQ pipeline
+/// or a prepare refuses the shape: the caller then takes
+/// the GEMM form. This is the fallback ladder's
+/// composition step, at plan-build time; it never
 /// substitutes inside a dispatch.
 fn try_mmq_q4k(
     backend: &WgpuCompute,
@@ -340,8 +453,10 @@ fn try_mmq_q4k(
     output: &wgpu::Buffer,
     batch: u32,
 ) -> Option<ProjCall> {
+    if backend.k13().is_none() && backend.k15().is_none() {
+        return None;
+    }
     let ctx = backend.context();
-    let mmq = backend.k13()?;
     let quant = match backend
         .k12()
         .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
@@ -352,18 +467,13 @@ fn try_mmq_q4k(
             return None;
         }
     };
-    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
-        Ok(mmq) => Some(ProjCall::MmqQ4K { quant, mmq }),
-        Err(e) => {
-            dbg_log!("mmq q4k refused at the product prepare: {e}; the gemm form serves it");
-            None
-        }
-    }
+    mmq_product_q4k(backend, weights, q8_qs, q8_ds, output, batch, quant)
 }
 
 /// Try the MMQ form of a plain Q6_K projection (K12 plain
-/// quantize feeding K14). See [`try_mmq_q4k`] for the
-/// fallback contract.
+/// quantize feeding the product [`mmq_product_q6k`]
+/// chooses). See [`try_mmq_q4k`] for the fallback
+/// contract.
 fn try_mmq_q6k(
     backend: &WgpuCompute,
     weights: &K2Weights,
@@ -373,8 +483,10 @@ fn try_mmq_q6k(
     output: &wgpu::Buffer,
     batch: u32,
 ) -> Option<ProjCall> {
+    if backend.k14().is_none() && backend.k16().is_none() {
+        return None;
+    }
     let ctx = backend.context();
-    let mmq = backend.k14()?;
     let quant = match backend
         .k12()
         .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
@@ -385,13 +497,7 @@ fn try_mmq_q6k(
             return None;
         }
     };
-    match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
-        Ok(mmq) => Some(ProjCall::MmqQ6K { quant, mmq }),
-        Err(e) => {
-            dbg_log!("mmq q6k refused at the product prepare: {e}; the gemm form serves it");
-            None
-        }
-    }
+    mmq_product_q6k(backend, weights, q8_qs, q8_ds, output, batch, quant)
 }
 
 /// Prepare one projection dispatch over resident buffers.
@@ -465,10 +571,12 @@ fn prepare_proj(
 /// Prepare the gated output projection (a Q4_K projection
 /// whose activation is the attention rows gated by a second
 /// stream): on chunk plans past [`GEMM_MIN_ROWS`], the MMQ
-/// form (the gated K12 quantize feeding K13) when the
-/// backend built it, the GEMM's gated form behind it, K1's
-/// gated form otherwise. The geometry contract is the same
-/// [`K1ActGeom`] in every form.
+/// form (the gated K12 quantize feeding the product
+/// [`mmq_product_q4k`] chooses: the wide K15 form past the
+/// wide row threshold, the standard K13 form behind it)
+/// when the backend built it, the GEMM's gated form behind
+/// it, K1's gated form otherwise. The geometry contract is
+/// the same [`K1ActGeom`] in every form.
 #[allow(clippy::too_many_arguments)]
 fn prepare_gated_proj(
     backend: &WgpuCompute,
@@ -484,7 +592,7 @@ fn prepare_gated_proj(
 ) -> Result<ProjCall> {
     let ctx = backend.context();
     if batch >= GEMM_MIN_ROWS {
-        if let Some(mmq) = backend.k13() {
+        if backend.k13().is_some() || backend.k15().is_some() {
             let quant = backend.k12_gated().prepare_act(
                 ctx,
                 input_a,
@@ -496,15 +604,13 @@ fn prepare_gated_proj(
                 geom,
             );
             match quant {
-                Ok(quant) => match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch as u32) {
-                    Ok(mmq) => return Ok(ProjCall::MmqQ4K { quant, mmq }),
-                    Err(e) => {
-                        dbg_log!(
-                            "mmq gated q4k refused at the product prepare: {e}; \
-                                 the gemm form serves it"
-                        );
+                Ok(quant) => {
+                    if let Some(c) =
+                        mmq_product_q4k(backend, weights, q8_qs, q8_ds, output, batch as u32, quant)
+                    {
+                        return Ok(c);
                     }
-                },
+                }
                 Err(e) => {
                     dbg_log!(
                         "mmq gated q4k refused at the quantize prepare: {e}; \
@@ -551,7 +657,7 @@ fn prepare_swiglu_proj(
     match weights {
         ProjWeights::Q4K(w) => {
             if matrix {
-                if let Some(mmq) = backend.k13() {
+                if backend.k13().is_some() || backend.k15().is_some() {
                     let quant = backend.k12_swiglu().prepare_act(
                         ctx,
                         input_a,
@@ -564,14 +670,16 @@ fn prepare_swiglu_proj(
                     );
                     match quant {
                         Ok(quant) => {
-                            match mmq.prepare(ctx, w, q8_qs, q8_ds, output, batch as u32) {
-                                Ok(mmq) => return Ok(ProjCall::MmqQ4K { quant, mmq }),
-                                Err(e) => {
-                                    dbg_log!(
-                                        "mmq swiglu q4k refused at the product prepare: {e}; \
-                                         the gemm form serves it"
-                                    );
-                                }
+                            if let Some(c) = mmq_product_q4k(
+                                backend,
+                                w,
+                                q8_qs,
+                                q8_ds,
+                                output,
+                                batch as u32,
+                                quant,
+                            ) {
+                                return Ok(c);
                             }
                         }
                         Err(e) => {
@@ -597,7 +705,7 @@ fn prepare_swiglu_proj(
         }
         ProjWeights::Q6K(w) => {
             if matrix {
-                if let Some(mmq) = backend.k14() {
+                if backend.k14().is_some() || backend.k16().is_some() {
                     let quant = backend.k12_swiglu().prepare_act(
                         ctx,
                         input_a,
@@ -610,14 +718,16 @@ fn prepare_swiglu_proj(
                     );
                     match quant {
                         Ok(quant) => {
-                            match mmq.prepare(ctx, w, q8_qs, q8_ds, output, batch as u32) {
-                                Ok(mmq) => return Ok(ProjCall::MmqQ6K { quant, mmq }),
-                                Err(e) => {
-                                    dbg_log!(
-                                        "mmq swiglu q6k refused at the product prepare: {e}; \
-                                         the gemm form serves it"
-                                    );
-                                }
+                            if let Some(c) = mmq_product_q6k(
+                                backend,
+                                w,
+                                q8_qs,
+                                q8_ds,
+                                output,
+                                batch as u32,
+                                quant,
+                            ) {
+                                return Ok(c);
                             }
                         }
                         Err(e) => {

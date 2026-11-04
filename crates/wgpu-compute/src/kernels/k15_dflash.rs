@@ -258,7 +258,9 @@ fn check_rotate(rows: usize, heads: usize, head_dim: usize) -> Result<()> {
     if rows == 0 || heads == 0 {
         return Err(WgpuError::InvalidTensor {
             name: "k15 rotate".to_string(),
-            detail: format!("rotate needs at least one row and head, got rows {rows}, heads {heads}"),
+            detail: format!(
+                "rotate needs at least one row and head, got rows {rows}, heads {heads}"
+            ),
         });
     }
     if head_dim < 2 || head_dim % 2 != 0 {

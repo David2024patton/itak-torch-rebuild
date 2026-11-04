@@ -66,6 +66,7 @@
 pub mod compute;
 pub mod detect;
 pub mod device;
+pub mod dflash_session;
 pub mod diag;
 pub mod error;
 pub mod kernels;
@@ -74,6 +75,9 @@ pub mod session;
 pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
 pub use device::GpuContext;
+pub use dflash_session::{
+    DflashRawLayer, DflashRawWeights, DflashSession, DflashSessionConfig, DflashSessionStats,
+};
 pub use error::{Result, WgpuError};
 pub use kernels::k10_q4k_gemm::{GemmShape, K10Call, K10Pipeline, GEMM_MAX_BATCH};
 pub use kernels::k11_q6k_gemm::{K11Call, K11Pipeline};

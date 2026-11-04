@@ -1035,6 +1035,7 @@ version = "0.1.0"
 dependencies = [
  "attention",
  "cpu-compute",
+ "dflash",
  "gguf",
  "muse-glimmer",
  "pollster",

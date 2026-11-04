@@ -68,13 +68,16 @@ use crate::diag::dbg_log;
 pub const WIDE_MIN_ROWS_ENV: &str = "WGPU_COMPUTE_MMQ_WIDE_MIN_ROWS";
 
 /// The wide-MMQ row threshold when the environment does
-/// not override it: half the chunk cap. At 32 or more
-/// rows the wide tile's staging pipeline is fed well
-/// enough to be the first try; below it the standard
-/// MMQ's single deep tile keeps the better shape. The
-/// server bench record that confirms or moves this value
-/// belongs to bench/mmq-wide-tile-2026-11-03.md.
-pub const DEFAULT_WIDE_MIN_ROWS: u32 = 32;
+/// not override it: past the chunk cap, so the wide form
+/// is OUT of the ladder by default. The server proof of
+/// 2026-11-04 (bench/mmq-wide-tile-2026-11-03.md) found
+/// the wide kernels numerically correct but about 3.5x
+/// slower per tensor than the standard MMQ, and the wide
+/// ladder hung the real session outright (GPU context
+/// lost). The standard MMQ is the shipping position; the
+/// wide form stays in the tree for future work and can be
+/// opted into with the env override.
+pub const DEFAULT_WIDE_MIN_ROWS: u32 = 65;
 
 /// Resolve the wide-MMQ row threshold from the raw
 /// environment value: a plain u32, or the default when

@@ -11,15 +11,12 @@
 //! heads group contiguously over KV heads (`kv_head = q_head /
 //! (q_heads / kv_heads)`); softmax is max-subtracted.
 //!
-//! Two kernels:
+//! Three kernels, two forms of the same math:
 //!
 //! - **Scores**: one thread per (query row, Q head, stored key):
 //!   the full dot product over the head dim, masked to negative
 //!   infinity where the mask hides the key, written to a scratch
-//!   buffer. This is the straightforward form the task allows for
-//!   the multi-row (prefill) path, and it is also the decode
-//!   path: at one row it is `q_heads * stored` threads, each
-//!   reading one key.
+//!   buffer.
 //! - **Reduce**: one workgroup per (query row, Q head), one lane
 //!   per head-dim channel, running an online (streaming) softmax
 //!   over the stored keys in oldest-first order while
@@ -29,6 +26,14 @@
 //!   noise, disclosed here the same way K4 and K5 disclose
 //!   theirs. Decode leanness: a single query row launches
 //!   `q_heads` workgroups and reads each value row exactly once.
+//!   Scores + reduce are the two-pass form; the trait path
+//!   (`compute.rs`, one row per step) runs them.
+//! - **Flash**: the fused form (see the flash shader below):
+//!   scores, online softmax, and the value-weighted reduce in
+//!   one dispatch, with no scores buffer at all. The resident
+//!   session runs it at every shape, decode rows and prefill
+//!   chunks alike (the chunk-plan switch is recorded in
+//!   bench/flash-chunk-2026-11-04.md).
 //!
 //! KV state: like `cpu-compute`, this backend owns its KV
 //! storage, because the `Cache` trait the forward hands over is
@@ -203,7 +208,7 @@ fn reduce_main(@builtin(workgroup_id) wid: vec3<u32>,
 
 /// The flash shader: scores, online softmax, and the
 /// value-weighted reduce fused into one kernel, one workgroup
-/// of 256 lanes per (query row, Q head), for the decode-shaped
+/// of 256 lanes per (query row, Q head), for the session
 /// calls where the two-pass form's scores buffer and second
 /// dispatch are pure overhead. The math is the two-pass math,
 /// operation for operation: the score phase computes each
@@ -217,9 +222,13 @@ fn reduce_main(@builtin(workgroup_id) wid: vec3<u32>,
 /// two-pass sequence, so the outputs agree with it to the bit
 /// in exact arithmetic and to reassociation noise in floats
 /// (the scores are computed identically; only their storage
-/// differs). The two-pass path stays for multi-row chunks,
-/// whose scores grids amortize the extra dispatch over many
-/// rows; the session selects by row count.
+/// differs). The kernel is shape-generic: one workgroup per
+/// (query row, Q head) at any row count, the causal position
+/// taken per row (`start_pos + row`), keys slotted modulo the
+/// ring exactly as in the scores kernel, so the sliding mask
+/// and the chunked ring carry over unchanged. The resident
+/// session runs this form for decode rows and prefill chunks
+/// alike; the two-pass form remains for the trait path.
 const FLASH_SHADER: &str = r#"
 struct FlashParams {
     rows: u32,
@@ -766,7 +775,7 @@ impl K6ReduceCall {
 }
 
 /// One prepared flash dispatch: the fused scores + online
-/// softmax + reduce for decode-shaped calls. The position
+/// softmax + reduce for session calls of any shape. The position
 /// part of its geometry rewrites through
 /// [`K6FlashCall::set_geometry`]; its grid (one workgroup per
 /// query row and head) is position-independent, like the
@@ -1065,9 +1074,9 @@ impl K6Pipeline {
     /// q_width]`) against the layer's resident keys and
     /// values, writing the attention output `[rows, q_width]`
     /// into the caller's `out` buffer in the one fused kernel
-    /// (see [`FLASH_SHADER`]). The caller picks this form for
-    /// decode-shaped calls (the session: one row) and the
-    /// two-pass form for chunk shapes.
+    /// (see [`FLASH_SHADER`]). The resident session picks this
+    /// form at every shape; the two-pass form remains for the
+    /// trait path's step-at-a-time calls.
     ///
     /// # Errors
     ///

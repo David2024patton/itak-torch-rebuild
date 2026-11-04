@@ -11,17 +11,19 @@
 //! emitted stream is token-identical to non-speculative greedy generation;
 //! that identity is the crate's standing proof obligation and is tested on
 //! synthetic configs and on the real Glimmer files.
+//!
+//! The target sits behind the [`crate::driver::TargetDriver`] seam:
+//! the session is generic over the driver, defaulting to the CPU
+//! driver ([`crate::CpuTarget`]) the loop was proven on, so the
+//! GPU-resident driver runs the identical loop (TODO T-9.6).
 
 use std::collections::HashSet;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use cpu_compute::CpuCompute;
-use muse_glimmer::{Cache, GlimmerModel, PositionCache};
-
 use crate::config::{OnVerifyError, SpecConfig, SpecMode};
 use crate::diag::Diag;
+use crate::driver::{CpuTarget, TargetDriver};
 use crate::error::{Result, SpecError};
 use crate::rng::Rng;
 use crate::sampler;
@@ -89,11 +91,11 @@ pub struct RoundOutcome {
     pub stopped: bool,
 }
 
-/// A speculative decoding session over one target model.
-pub struct SpecSession {
-    target: GlimmerModel,
-    compute: Rc<CpuCompute>,
-    cache: PositionCache,
+/// A speculative decoding session over one target model, driven
+/// through the [`TargetDriver`] seam. The default driver is the
+/// CPU target path ([`CpuTarget`]).
+pub struct SpecSession<D: TargetDriver = CpuTarget> {
+    driver: D,
     speculator: Option<DflashSpeculator>,
     capture_layers: Vec<usize>,
     config: SpecConfig,
@@ -107,7 +109,7 @@ pub struct SpecSession {
     stats: SpecStats,
 }
 
-impl SpecSession {
+impl<D: TargetDriver> SpecSession<D> {
     /// Create a session, validating everything up front (SPEC-itak-spec
     /// Section 6.1): mode availability, draft presence and agreement with
     /// the target, depth against the draft block and the round bound, and
@@ -115,12 +117,11 @@ impl SpecSession {
     /// the named error; a session that exists is a session whose rounds
     /// can run.
     ///
-    /// `compute` must be the same [`CpuCompute`] the target model forwards
-    /// through (see [`crate::SharedCompute`]): the loop drives its
-    /// checkpoint machinery directly.
+    /// `driver` is the target behind the [`TargetDriver`] seam: for
+    /// the CPU path, a [`CpuTarget`] wrapping the model and the
+    /// compute it forwards through (see [`crate::SharedCompute`]).
     pub fn new(
-        target: GlimmerModel,
-        compute: Rc<CpuCompute>,
+        driver: D,
         draft: Option<DflashSpeculator>,
         config: SpecConfig,
         diag: Arc<dyn Diag>,
@@ -146,7 +147,7 @@ impl SpecSession {
                 .as_ref()
                 .ok_or_else(|| refuse(SpecError::DraftNotLoaded))?;
             let dcfg = spec.model().config();
-            let tcfg = target.config();
+            let tcfg = driver.config();
             if dcfg.vocab_size != tcfg.vocab_size {
                 return Err(refuse(SpecError::DraftTargetMismatch {
                     field: "vocab_size",
@@ -186,9 +187,7 @@ impl SpecSession {
         }
         let rng = Rng::new(config.seed);
         let session = SpecSession {
-            target,
-            compute,
-            cache: PositionCache::new(),
+            driver,
             speculator: draft,
             capture_layers,
             config,
@@ -229,6 +228,17 @@ impl SpecSession {
         &self.config
     }
 
+    /// The target driver behind the seam (a resident driver's
+    /// session counters are the serving numbers a bench reads).
+    pub fn driver(&self) -> &D {
+        &self.driver
+    }
+
+    /// The target driver behind the seam, mutably.
+    pub fn driver_mut(&mut self) -> &mut D {
+        &mut self.driver
+    }
+
     /// Cumulative statistics so far.
     pub fn stats(&self) -> SpecStats {
         self.stats
@@ -252,7 +262,7 @@ impl SpecSession {
 
     /// The target cache's committed position.
     pub fn cache_position(&self) -> usize {
-        self.cache.position()
+        self.driver.position()
     }
 
     /// Prefill the prompt and draw the first token. Returns the pending
@@ -268,8 +278,8 @@ impl SpecSession {
         let logits = match self.speculator.as_mut() {
             Some(spec) if self.config.mode == SpecMode::Dflash => {
                 let (logits, captures) = self
-                    .target
-                    .forward_capturing(prompt, &mut self.cache, &self.capture_layers)
+                    .driver
+                    .forward_capturing(prompt, &self.capture_layers)
                     .map_err(|e| SpecError::TargetRefused {
                         source: Box::new(e),
                     })?;
@@ -277,11 +287,12 @@ impl SpecSession {
                 spec.commit(prompt)?;
                 logits
             }
-            _ => self.target.forward(prompt, &mut self.cache).map_err(|e| {
-                SpecError::TargetRefused {
+            _ => self
+                .driver
+                .forward(prompt)
+                .map_err(|e| SpecError::TargetRefused {
                     source: Box::new(e),
-                }
-            })?,
+                })?,
         };
         self.pending = self.draw(&logits)?;
         self.begun = true;
@@ -370,7 +381,7 @@ impl SpecSession {
         }
         self.stats.rounds += 1;
         let round_no = self.stats.rounds;
-        let base = self.cache.position();
+        let base = self.driver.position();
         self.diag.event(
             "spec.round.begin",
             &format!("round={round_no} base={base} pending={}", self.pending),
@@ -394,8 +405,8 @@ impl SpecSession {
     ) -> Result<RoundOutcome> {
         let pending = self.pending;
         let logits = self
-            .target
-            .forward(&[pending], &mut self.cache)
+            .driver
+            .forward(&[pending])
             .map_err(|e| SpecError::TargetRefused {
                 source: Box::new(e),
             })?;
@@ -433,18 +444,13 @@ impl SpecSession {
     /// Roll the target cache back to `to` and release the checkpoint.
     /// Any failure here poisons the session: cache state is no longer
     /// provably the committed prefix.
-    fn rewind_and_release(
-        &mut self,
-        checkpoint: &crate::speculator::TargetCheckpoint,
-        to: usize,
-    ) -> Result<()> {
-        if let Err(e) = self.compute.cache_rewind(checkpoint, to) {
+    fn rewind_and_release(&mut self, checkpoint: &D::Checkpoint, to: usize) -> Result<()> {
+        if let Err(e) = self.driver.rewind(checkpoint, to) {
             let err = cache_refused("rewind", e);
             self.poisoned = Some(err.to_string());
             return Err(err);
         }
-        self.cache.rewind_to(to);
-        if let Err(e) = self.compute.cache_release(checkpoint) {
+        if let Err(e) = self.driver.release(checkpoint) {
             let err = cache_refused("release", e);
             self.poisoned = Some(err.to_string());
             return Err(err);
@@ -502,18 +508,16 @@ impl SpecSession {
         // Step 3: checkpoint, then one block forward over
         // [pending, drafts...] with the conditioning layers captured.
         let checkpoint = self
-            .compute
-            .cache_checkpoint(n + 1)
+            .driver
+            .checkpoint(n + 1)
             .map_err(|e| cache_refused("checkpoint", e))?;
         let mut verify_tokens = Vec::with_capacity(n + 1);
         verify_tokens.push(pending);
         verify_tokens.extend_from_slice(&proposal.tokens);
         let t0 = Instant::now();
-        let verified = self.target.forward_block_capturing(
-            &verify_tokens,
-            &mut self.cache,
-            &self.capture_layers,
-        );
+        let verified = self
+            .driver
+            .forward_block_capturing(&verify_tokens, &self.capture_layers);
         let verify_ms = t0.elapsed().as_millis();
         let (logits, captures) = match verified {
             Ok(pair) => pair,
@@ -565,7 +569,7 @@ impl SpecSession {
         }
 
         // Step 4: the correction walk over finished distributions.
-        let vocab = self.target.config().vocab_size as usize;
+        let vocab = self.driver.config().vocab_size as usize;
         let walk = if greedy {
             let p_argmax: Vec<u32> = logits.chunks_exact(vocab).map(sampler::argmax).collect();
             sampler::correct_greedy(&p_argmax, &proposal.tokens)?
@@ -594,10 +598,10 @@ impl SpecSession {
             "spec.cache.commit",
             &format!("round={round_no} position={keep}"),
         );
-        if self.cache.position() != keep {
+        if self.driver.position() != keep {
             let err = SpecError::CacheOutOfSync {
                 expected: keep,
-                actual: self.cache.position(),
+                actual: self.driver.position(),
             };
             self.poisoned = Some(err.to_string());
             self.diag
@@ -826,9 +830,13 @@ mod tests {
             mode: SpecMode::Off,
             ..SpecConfig::default()
         };
-        let mut session =
-            SpecSession::new(fixture.model, compute, None, config, Arc::new(NullDiag))
-                .expect("mode-off session builds");
+        let mut session = SpecSession::new(
+            CpuTarget::new(fixture.model, compute),
+            None,
+            config,
+            Arc::new(NullDiag),
+        )
+        .expect("mode-off session builds");
         session.begin(PROMPT_A).expect("begin");
         let stream = session.generate(16, &[]).expect("generate");
         assert_eq!(stream, testkit::plain_greedy(PROMPT_A, 16));
@@ -838,7 +846,12 @@ mod tests {
     fn try_new(config: SpecConfig, draft: Option<DflashSpeculator>) -> Result<SpecSession> {
         let compute = Rc::new(CpuCompute::new());
         let fixture = testkit::build_target(Box::new(SharedCompute(compute.clone())));
-        SpecSession::new(fixture.model, compute, draft, config, Arc::new(NullDiag))
+        SpecSession::new(
+            CpuTarget::new(fixture.model, compute),
+            draft,
+            config,
+            Arc::new(NullDiag),
+        )
     }
 
     fn fixture_draft(block_size: u32) -> DflashSpeculator {

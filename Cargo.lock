@@ -423,6 +423,7 @@ dependencies = [
  "itak-loader",
  "muse-glimmer",
  "tokenizer",
+ "wgpu-compute",
 ]
 
 [[package]]

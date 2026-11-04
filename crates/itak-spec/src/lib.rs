@@ -21,15 +21,23 @@
 //!
 //! Known gaps, named rather than papered over: N-gram and Medusa drafting
 //! refuse with `ModeUnavailable` (their machinery is not in this crate);
-//! grammar-constrained speculation refuses with `GrammarConflict`; the
-//! loop drives the CPU target path, so it proves the mechanism, not the
-//! serving speed (TODO T-9.6's speed half belongs to the GPU path).
+//! grammar-constrained speculation refuses with `GrammarConflict`. The
+//! loop drives its target through the [`driver::TargetDriver`] seam:
+//! the CPU driver ([`CpuTarget`]) proves the mechanism, and the
+//! GPU-resident driver ([`ResidentTarget`], TODO T-9.6) runs the
+//! identical loop against the resident GPU forward. The draft model
+//! has no GPU path in this workspace, so drafting runs on the CPU
+//! stack behind the same `Speculator` seam on both drivers (the
+//! bench note `bench/spec-gpu-port-2026-11-03.md` records what that
+//! costs the speed bar).
 
 #![forbid(unsafe_code)]
 
 pub mod config;
 pub mod diag;
+pub mod driver;
 pub mod error;
+pub mod resident;
 pub mod rng;
 pub mod sampler;
 pub mod session;
@@ -40,7 +48,9 @@ mod testkit;
 
 pub use config::{OnVerifyError, SpecConfig, SpecMode};
 pub use diag::{Diag, NullDiag, StderrDiag};
+pub use driver::{CpuTarget, TargetDriver};
 pub use error::{Result, SpecError};
+pub use resident::ResidentTarget;
 pub use rng::Rng;
 pub use session::{RoundOutcome, SpecSession, SpecStats};
 pub use speculator::{

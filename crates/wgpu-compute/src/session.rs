@@ -48,6 +48,22 @@
 //! (the winning index and logit, the host sampler's greedy
 //! pick) for callers on the greedy path.
 //!
+//! Two more shapes serve the speculative loop (TODO T-9.6).
+//! The block tail runs the same final norm and head over
+//! EVERY row of the chunk and reads back `[rows][vocab]`
+//! logits: a verify block's per-position distributions, from
+//! the one chain, never a second forward. The capturing
+//! forwards additionally copy each named layer's input rows
+//! (the residual stream A at that layer's entry, exactly what
+//! `GlimmerModel::forward_rows` captures) into a readback
+//! staging at the layer boundary: the chain's single pass
+//! splits into one pass per layer range so the encoder-level
+//! copies can sit between them. And [`ResidentSession::
+//! rewind_to`] restores an earlier position: KV slots are
+//! addressed by absolute position, views derive from the
+//! position, and the ring headroom bounds how far back a
+//! rewind may reach (see the method's own contract).
+//!
 //! Buffer discipline: activations ping-pong between two
 //! stream buffers, one chunk of rows at a time. The fused
 //! post-norm entry (K4) is what closes each half-layer: it
@@ -64,7 +80,8 @@ use std::collections::HashMap;
 
 use gguf::ggml::GgmlType;
 use muse_glimmer::{
-    Dtype, GlimmerConfig, GlimmerError, LayerKind, LayerWeights, Result, TensorView, Weights,
+    Dtype, GlimmerConfig, GlimmerError, LayerInputCapture, LayerKind, LayerWeights, Result,
+    TensorView, Weights,
 };
 
 use crate::compute::WgpuCompute;
@@ -141,6 +158,20 @@ fn we(error: WgpuError, step: &'static str) -> GlimmerError {
     GlimmerError::StepFailed {
         step,
         detail: error.to_string(),
+    }
+}
+
+/// Fold one chunk's captures into a forward's accumulated
+/// captures: each layer's rows concatenate in chunk order
+/// (chunks run in position order), and layers stay in
+/// ascending order because every chunk reports the same
+/// ascending list.
+fn merge_captures(acc: &mut Vec<LayerInputCapture>, chunk: Vec<LayerInputCapture>) {
+    for capture in chunk {
+        match acc.iter_mut().find(|c| c.layer == capture.layer) {
+            Some(existing) => existing.rows.extend_from_slice(&capture.rows),
+            None => acc.push(capture),
+        }
     }
 }
 
@@ -1015,6 +1046,17 @@ struct Scratch {
     /// MAP_READ`: the eight bytes an argmax-tail chunk returns
     /// instead of the logits vector.
     argmax_staging: wgpu::Buffer,
+    /// The final-normed hidden rows for the block tail,
+    /// `[rows][hidden]`: the standalone final norm over every
+    /// row of stream A, where the standard head consumes only
+    /// the last row (through `head_in`).
+    block_head_in: wgpu::Buffer,
+    /// Finished logits for every row, `[rows][vocab]`: the
+    /// block tail's output, read back by verify rounds.
+    block_logits: wgpu::Buffer,
+    /// Block logits readback staging, `[rows][vocab]`,
+    /// `COPY_DST | MAP_READ`.
+    block_staging: wgpu::Buffer,
 }
 
 impl Scratch {
@@ -1074,6 +1116,14 @@ impl Scratch {
             argmax_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("session argmax staging"),
                 size: 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            block_head_in: act("session block head in", rows * hidden),
+            block_logits: act("session block logits", rows * vocab),
+            block_staging: ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("session block logits staging"),
+                size: (rows * vocab * 4) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }),
@@ -1303,6 +1353,24 @@ struct ChunkPlan {
     /// dispatches to the head segment and reads back eight
     /// bytes instead of the logits vector).
     argmax: K8ArgmaxCall,
+    /// Block tail, first dispatch: the final norm over every
+    /// row of stream A into the block head input. The chain
+    /// leaves every row's final residual in stream A (the last
+    /// layer's close writes it for all rows even though it
+    /// emits the standard head input for the last row only),
+    /// so this reproduces the head input per row.
+    block_final_norm: K4Call,
+    /// Block tail head projection, block head input to block
+    /// logits, at the chunk's full batch.
+    block_head: ProjCall,
+    /// Block tail finishing over the block logits, in place
+    /// (absent when the head is Q5_K, exactly as the standard
+    /// head's `finish`).
+    block_finish: Option<K8FinishCall>,
+    /// Compute dispatches one block-tail chunk records in its
+    /// head segment (the block final norm, the head, and the
+    /// finishing when separate).
+    block_dispatch_count: u64,
     /// Compute dispatches one chunk of this plan records.
     dispatch_count: u64,
 }
@@ -2054,6 +2122,93 @@ impl ChunkPlan {
                 &scratch.argmax_result,
             )
             .map_err(|e| we(e, "lm_head"))?;
+        // The block head segment: the standard head's family
+        // split at the chunk's full batch. A Q5_K head takes
+        // its fused finishing at any batch (K3's contract is
+        // [batch, out]); the other families take their GEMV
+        // form directly rather than prepare_proj's matrix
+        // forms, because the head is a GEMV-shaped projection
+        // at every size the standard head runs (one row), and
+        // the block tail must not change the head's arithmetic
+        // family as the batch grows.
+        let block_final_norm = backend.k4().prepare_rms_norm(
+            ctx,
+            &scratch.stream_a,
+            final_norm_w,
+            &scratch.block_head_in,
+            rows,
+            hidden,
+            eps,
+        );
+        let (block_head, block_finish) = if let ProjWeights::Q5K(w) = output {
+            let mode = if cfg.logit_softcap > 0.0 {
+                crate::kernels::k3_q5k_gemv::FINISH_SOFTCAP
+            } else {
+                crate::kernels::k3_q5k_gemv::FINISH_SCALE
+            };
+            let head = backend
+                .k3()
+                .prepare_with_finish(
+                    ctx,
+                    w,
+                    &scratch.block_head_in,
+                    &scratch.block_logits,
+                    rows as u32,
+                    mode,
+                    cfg.logit_scale,
+                    cfg.logit_softcap,
+                )
+                .map(ProjCall::Q5K)
+                .map_err(|e| we(e, "lm_head"))?;
+            (head, None)
+        } else {
+            let head = match output {
+                ProjWeights::Q4K(w) => backend
+                    .k1()
+                    .prepare(
+                        ctx,
+                        w,
+                        &scratch.block_head_in,
+                        &scratch.block_logits,
+                        rows as u32,
+                    )
+                    .map(ProjCall::Q4K)
+                    .map_err(|e| we(e, "lm_head"))?,
+                ProjWeights::Q6K(w) => backend
+                    .k2()
+                    .prepare(
+                        ctx,
+                        w,
+                        &scratch.block_head_in,
+                        &scratch.block_logits,
+                        rows as u32,
+                    )
+                    .map(ProjCall::Q6K)
+                    .map_err(|e| we(e, "lm_head"))?,
+                ProjWeights::Q5K(_) => unreachable!("the Q5_K head is handled above"),
+            };
+            let finish = if cfg.logit_softcap > 0.0 {
+                backend
+                    .k8()
+                    .prepare_finish(
+                        ctx,
+                        &scratch.block_logits,
+                        rows * cfg.vocab_size as usize,
+                        cfg.logit_scale,
+                        cfg.logit_softcap,
+                    )
+                    .map_err(|e| we(e, "lm_head"))?
+            } else {
+                backend.k8().prepare_scale(
+                    ctx,
+                    &scratch.block_logits,
+                    rows * cfg.vocab_size as usize,
+                    cfg.logit_scale,
+                )
+            };
+            (head, Some(finish))
+        };
+        let block_dispatch_count = 1 + block_head.dispatches() + u64::from(block_finish.is_some());
         let dispatch_count = 1
             + u64::from(embed_norm.is_some())
             + layer_plans
@@ -2075,6 +2230,10 @@ impl ChunkPlan {
             head,
             finish,
             argmax,
+            block_final_norm,
+            block_head,
+            block_finish,
+            block_dispatch_count,
             dispatch_count,
         })
     }
@@ -2113,15 +2272,56 @@ impl ChunkPlan {
     /// between dispatches and nothing else is paid per
     /// dispatch but the launch.
     fn encode_chain(&self, pass: &mut wgpu::ComputePass<'_>) {
+        self.encode_open(pass);
+        self.encode_layers(pass, 0..self.layers.len());
+    }
+
+    /// Record the chain's opening into the open compute
+    /// `pass`: the embedding gather and the weightless
+    /// embedding norm. Split from [`Self::encode_layers`] so
+    /// a capturing chunk can stop the chain at a layer
+    /// boundary (an encoder copy of stream A) and resume it
+    /// in a fresh pass.
+    fn encode_open(&self, pass: &mut wgpu::ComputePass<'_>) {
         self.gather.encode_into(pass);
         if let Some(n) = &self.embed_norm {
             n.encode_into(pass);
         }
-        for plan in &self.layers {
+    }
+
+    /// Record one contiguous range of layers into the open
+    /// compute `pass`, in forward order.
+    fn encode_layers(&self, pass: &mut wgpu::ComputePass<'_>, range: std::ops::Range<usize>) {
+        for plan in &self.layers[range] {
             plan.encode_pre_attention(pass);
             plan.encode_attention(pass);
             plan.encode_post_attention(pass);
         }
+    }
+
+    /// Record the block head segment into the open compute
+    /// `pass`: the block final norm, the block head
+    /// projection, and its finishing, in place over the
+    /// block logits buffer.
+    fn encode_block_head(&self, pass: &mut wgpu::ComputePass<'_>) {
+        self.block_final_norm.encode_into(pass);
+        self.block_head.encode_into(pass);
+        if let Some(f) = &self.block_finish {
+            f.encode_into(pass);
+        }
+    }
+
+    /// Copy the finished block logits into their readback
+    /// staging (an encoder-level operation, recorded last on
+    /// a block-tail chunk).
+    fn copy_block_logits(&self, encoder: &mut wgpu::CommandEncoder, cfg: &GlimmerConfig) {
+        encoder.copy_buffer_to_buffer(
+            &self.scratch.block_logits,
+            0,
+            &self.scratch.block_staging,
+            0,
+            (self.rows * cfg.vocab_size as usize * 4) as u64,
+        );
     }
 
     /// Copy the stream's last row into the head's input
@@ -2379,9 +2579,11 @@ impl<'a> ResidentSession<'a> {
         let mut logits = Vec::new();
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
-            match self.forward_chunk(&rest[..rows], ChunkTail::Logits)? {
+            match self.forward_chunk(&rest[..rows], ChunkTail::Logits, &[])?.0 {
                 ChunkOutcome::Logits(chunk_logits) => logits = chunk_logits,
-                ChunkOutcome::Argmax(..) => unreachable!("logits tail yields logits"),
+                ChunkOutcome::Argmax(..) | ChunkOutcome::Block(..) => {
+                    unreachable!("logits tail yields logits")
+                }
             }
             rest = &rest[rows..];
         }
@@ -2416,13 +2618,185 @@ impl<'a> ResidentSession<'a> {
         let mut winner = (0, f32::NEG_INFINITY);
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
-            match self.forward_chunk(&rest[..rows], ChunkTail::Argmax)? {
+            match self.forward_chunk(&rest[..rows], ChunkTail::Argmax, &[])?.0 {
                 ChunkOutcome::Argmax(id, logit) => winner = (id, logit),
-                ChunkOutcome::Logits(_) => unreachable!("argmax tail yields argmax"),
+                ChunkOutcome::Logits(_) | ChunkOutcome::Block(_) => {
+                    unreachable!("argmax tail yields argmax")
+                }
             }
             rest = &rest[rows..];
         }
         Ok(winner)
+    }
+
+    /// Run one forward over `tokens` and return the finished
+    /// logits of the last token plus, for each layer index in
+    /// `capture_layers`, the residual rows that entered that
+    /// layer ([`LayerInputCapture`], ascending layer order):
+    /// the resident counterpart of
+    /// `GlimmerModel::forward_capturing`, with the same
+    /// additive-capture contract. Captures span the whole
+    /// forward: a prompt that splits into chunks yields one
+    /// capture per layer with the chunks' rows concatenated
+    /// in position order.
+    ///
+    /// # Errors
+    ///
+    /// The same validation and step failures as
+    /// [`ResidentSession::forward`], plus
+    /// [`GlimmerError::CaptureLayerOutOfRange`] for a capture
+    /// index at or past the layer count, refused before any
+    /// chunk runs (the model's own rule).
+    pub fn forward_capturing(
+        &mut self,
+        tokens: &[u32],
+        capture_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<LayerInputCapture>)> {
+        self.validate_tokens(tokens)?;
+        let layers = self.validate_capture(capture_layers)?;
+        self.stats.forwards += 1;
+        self.stats.tokens += tokens.len() as u64;
+        let mut rest = tokens;
+        let mut logits = Vec::new();
+        let mut captures: Vec<LayerInputCapture> = Vec::new();
+        while !rest.is_empty() {
+            let rows = self.chunk_rows(rest.len());
+            let (outcome, chunk_captures) =
+                self.forward_chunk(&rest[..rows], ChunkTail::Logits, &layers)?;
+            match outcome {
+                ChunkOutcome::Logits(chunk_logits) => logits = chunk_logits,
+                ChunkOutcome::Argmax(..) | ChunkOutcome::Block(..) => {
+                    unreachable!("logits tail yields logits")
+                }
+            }
+            merge_captures(&mut captures, chunk_captures);
+            rest = &rest[rows..];
+        }
+        Ok((logits, captures))
+    }
+
+    /// Run one forward over `tokens` and return the finished
+    /// logits of EVERY token in the block, row-major
+    /// `[tokens][vocab]`, plus the layer-input captures
+    /// `capture_layers` names (possibly none): the resident
+    /// counterpart of `GlimmerModel::forward_block_capturing`,
+    /// and the verify-round forward of the speculative loop.
+    /// Each row is finished exactly as [`ResidentSession::
+    /// forward`] finishes its single row (the same final norm
+    /// and head, run at the block's batch through the block
+    /// tail), so row `i` is the distribution for the token
+    /// following the prefix extended by `tokens[..=i]`.
+    ///
+    /// # Errors
+    ///
+    /// The same validation and step failures as
+    /// [`ResidentSession::forward_capturing`].
+    pub fn forward_block_capturing(
+        &mut self,
+        tokens: &[u32],
+        capture_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<LayerInputCapture>)> {
+        self.validate_tokens(tokens)?;
+        let layers = self.validate_capture(capture_layers)?;
+        self.stats.forwards += 1;
+        self.stats.tokens += tokens.len() as u64;
+        let mut rest = tokens;
+        let mut logits: Vec<f32> = Vec::new();
+        let mut captures: Vec<LayerInputCapture> = Vec::new();
+        while !rest.is_empty() {
+            let rows = self.chunk_rows(rest.len());
+            let (outcome, chunk_captures) =
+                self.forward_chunk(&rest[..rows], ChunkTail::BlockLogits, &layers)?;
+            match outcome {
+                ChunkOutcome::Block(chunk_logits) => logits.extend_from_slice(&chunk_logits),
+                ChunkOutcome::Logits(_) | ChunkOutcome::Argmax(..) => {
+                    unreachable!("block tail yields block logits")
+                }
+            }
+            merge_captures(&mut captures, chunk_captures);
+            rest = &rest[rows..];
+        }
+        Ok((logits, captures))
+    }
+
+    /// Rewind the session to an earlier `position`: the KV
+    /// entries at positions `position..` are abandoned, and
+    /// the next forward continues at `position`, overwriting
+    /// them positionally.
+    ///
+    /// Soundness: KV slots are addressed by absolute position
+    /// (global layers) or by `position % ring` (windowed
+    /// layers), every attention view derives from the position
+    /// a chunk ends at, and a chunk's appends land before its
+    /// queries attend. The one hazard is the windowed ring: a
+    /// discarded write can alias a committed key a full ring
+    /// away. The ring spans `window + MAX_CHUNK_ROWS - 1`
+    /// positions, so an alias lands inside a later query's
+    /// window only when the discarded span exceeds
+    /// `MAX_CHUNK_ROWS` positions (the algebra is the ring
+    /// capacity comment's own). This method therefore refuses
+    /// a rewind discarding more than `MAX_CHUNK_ROWS`
+    /// positions; [`ResidentSession::reset`] is the path for
+    /// a full rewind. A speculative round discards at most
+    /// its block (depth + 1 positions), far inside the bound.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under the `session` step
+    /// when `position` is ahead of the current position or
+    /// the discarded span exceeds the bound above.
+    pub fn rewind_to(&mut self, position: usize) -> Result<()> {
+        if position > self.position {
+            return Err(GlimmerError::StepFailed {
+                step: "session",
+                detail: format!(
+                    "rewind to {position} is ahead of the current position {}",
+                    self.position
+                ),
+            });
+        }
+        let span = self.position - position;
+        if span > MAX_CHUNK_ROWS {
+            return Err(GlimmerError::StepFailed {
+                step: "session",
+                detail: format!(
+                    "rewind from {} to {position} discards {span} positions, past the \
+                     {MAX_CHUNK_ROWS}-position ring headroom; reset the session instead",
+                    self.position
+                ),
+            });
+        }
+        if span > 0 {
+            dbg_log!(
+                "session rewind: position {} -> {position} (span {span}); entries past the \
+                 target are never read (views derive from position) and are overwritten \
+                 positionally by the next forward",
+                self.position
+            );
+            self.position = position;
+        }
+        Ok(())
+    }
+
+    /// Validate a capture layer list the model's way (an
+    /// index at or past the layer count refuses with
+    /// [`GlimmerError::CaptureLayerOutOfRange`]) and return
+    /// it sorted ascending with duplicates removed: the
+    /// chain segments and the returned captures both walk
+    /// layers in ascending order.
+    fn validate_capture(&self, capture_layers: &[usize]) -> Result<Vec<usize>> {
+        let mut layers: Vec<usize> = capture_layers.to_vec();
+        for &layer in &layers {
+            if layer >= self.cfg.block_count as usize {
+                return Err(GlimmerError::CaptureLayerOutOfRange {
+                    layer,
+                    block_count: self.cfg.block_count,
+                });
+            }
+        }
+        layers.sort_unstable();
+        layers.dedup();
+        Ok(layers)
     }
 
     /// The input validation both forward entry points share,
@@ -2473,9 +2847,19 @@ impl<'a> ResidentSession<'a> {
     /// Run one chunk: ensure KV, refresh the plan's positions,
     /// upload the token ids, encode the whole chain into one
     /// command buffer, submit once, and read back per `tail`:
-    /// the finished logits, or the on-device argmax reduction
-    /// over them (eight bytes).
-    fn forward_chunk(&mut self, tokens: &[u32], tail: ChunkTail) -> Result<ChunkOutcome> {
+    /// the finished logits, the on-device argmax reduction
+    /// over them (eight bytes), or every row's finished
+    /// logits. When `capture_layers` is non-empty the chain
+    /// encodes as one pass per layer range, with an encoder
+    /// copy of stream A into the capture staging at each
+    /// named layer's entry; the copies are not dispatches and
+    /// the stats count none.
+    fn forward_chunk(
+        &mut self,
+        tokens: &[u32],
+        tail: ChunkTail,
+        capture_layers: &[usize],
+    ) -> Result<(ChunkOutcome, Vec<LayerInputCapture>)> {
         let ctx = self.backend.context();
         let rows = tokens.len();
         let start = self.position;
@@ -2556,12 +2940,62 @@ impl<'a> ResidentSession<'a> {
         let token_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         ctx.queue
             .write_buffer(&plan.scratch.tokens, 0, &token_bytes);
+        let hidden = self.cfg.hidden as usize;
+        // Capture staging for this chunk only: one
+        // [rows][hidden] slab per named layer, created when a
+        // capturing forward asked for it (a plain forward
+        // never allocates it).
+        let capture_staging: Option<wgpu::Buffer> = if capture_layers.is_empty() {
+            None
+        } else {
+            Some(ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("session capture staging"),
+                size: (capture_layers.len() * rows * hidden * 4) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }))
+        };
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("resident forward"),
             });
-        {
+        if let Some(staging_buf) = &capture_staging {
+            // Segmented chain: after the layers before a named
+            // layer have run, stream A holds that layer's input
+            // rows; copy them out, then resume the chain in a
+            // fresh pass. The first segment also carries the
+            // chain's opening (gather and embedding norm), so a
+            // capture of layer 0 reads the post-norm stream.
+            let mut from = 0usize;
+            for (slot, &layer) in capture_layers.iter().enumerate() {
+                {
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("resident forward chain"),
+                        timestamp_writes: None,
+                    });
+                    if slot == 0 {
+                        plan.encode_open(&mut pass);
+                    }
+                    plan.encode_layers(&mut pass, from..layer);
+                }
+                encoder.copy_buffer_to_buffer(
+                    &plan.scratch.stream_a,
+                    0,
+                    staging_buf,
+                    (slot * rows * hidden * 4) as u64,
+                    (rows * hidden * 4) as u64,
+                );
+                from = layer;
+            }
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("resident forward chain"),
+                    timestamp_writes: None,
+                });
+                plan.encode_layers(&mut pass, from..plan.layers.len());
+            }
+        } else {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("resident forward chain"),
                 timestamp_writes: None,
@@ -2569,8 +3003,10 @@ impl<'a> ResidentSession<'a> {
             plan.encode_chain(&mut pass);
         }
         // The last-row copy feeds the standalone final norm;
-        // a folded close already emitted the head input.
-        if plan.final_norm.is_some() {
+        // a folded close already emitted the head input. A
+        // block-tail chunk does not need it: its final norm
+        // reads stream A directly.
+        if tail != ChunkTail::BlockLogits && plan.final_norm.is_some() {
             plan.copy_last_row(&mut encoder, &self.cfg);
         }
         {
@@ -2578,18 +3014,35 @@ impl<'a> ResidentSession<'a> {
                 label: Some("resident forward head"),
                 timestamp_writes: None,
             });
-            plan.encode_head(&mut pass);
-            if tail == ChunkTail::Argmax {
-                plan.encode_argmax(&mut pass);
+            match tail {
+                ChunkTail::BlockLogits => plan.encode_block_head(&mut pass),
+                _ => {
+                    plan.encode_head(&mut pass);
+                    if tail == ChunkTail::Argmax {
+                        plan.encode_argmax(&mut pass);
+                    }
+                }
             }
         }
         match tail {
             ChunkTail::Logits => plan.copy_logits(&mut encoder, &self.cfg),
             ChunkTail::Argmax => plan.copy_argmax(&mut encoder),
+            ChunkTail::BlockLogits => plan.copy_block_logits(&mut encoder, &self.cfg),
         }
-        let dispatches = plan.dispatch_count + u64::from(tail == ChunkTail::Argmax) * 2;
+        let dispatches = match tail {
+            ChunkTail::Logits => plan.dispatch_count,
+            ChunkTail::Argmax => plan.dispatch_count + 2,
+            ChunkTail::BlockLogits => {
+                plan.dispatch_count
+                    - 1
+                    - u64::from(plan.final_norm.is_some())
+                    - u64::from(plan.finish.is_some())
+                    + plan.block_dispatch_count
+            }
+        };
         let staging = plan.scratch.staging.clone();
         let argmax_staging = plan.scratch.argmax_staging.clone();
+        let block_staging = plan.scratch.block_staging.clone();
         ctx.queue.submit([encoder.finish()]);
         self.stats.submissions += 1;
         self.stats.chunks += 1;
@@ -2612,6 +3065,29 @@ impl<'a> ResidentSession<'a> {
                 self.stats.argmax_readbacks += 1;
                 ChunkOutcome::Argmax(words[0].to_bits(), words[1])
             }
+            ChunkTail::BlockLogits => {
+                let logits = ctx
+                    .map_staging(&block_staging, rows * self.cfg.vocab_size as usize)
+                    .map_err(|e| we(e, "lm_head"))?;
+                self.stats.readbacks += 1;
+                ChunkOutcome::Block(logits)
+            }
+        };
+        let captures = match &capture_staging {
+            Some(staging_buf) => {
+                let flat = ctx
+                    .map_staging(staging_buf, capture_layers.len() * rows * hidden)
+                    .map_err(|e| we(e, "capture"))?;
+                capture_layers
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &layer)| LayerInputCapture {
+                        layer,
+                        rows: flat[slot * rows * hidden..(slot + 1) * rows * hidden].to_vec(),
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
         };
         self.position = end;
         dbg_log!(
@@ -2619,13 +3095,13 @@ impl<'a> ResidentSession<'a> {
              submissions={}",
             self.stats.submissions
         );
-        Ok(outcome)
+        Ok((outcome, captures))
     }
 }
 
 /// What a forward chunk's head segment returns to the host:
-/// the finished logits vector, or the on-device argmax
-/// reduction over it.
+/// the finished logits vector, the on-device argmax
+/// reduction over it, or every row's finished logits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChunkTail {
     /// Read back the finished logits (`forward`).
@@ -2633,6 +3109,9 @@ enum ChunkTail {
     /// Reduce the finished logits on the device and read
     /// back the winner (`forward_argmax`).
     Argmax,
+    /// Read back every row's finished logits through the
+    /// block head segment (`forward_block_capturing`).
+    BlockLogits,
 }
 
 /// A forward chunk's result, per its [`ChunkTail`].
@@ -2641,4 +3120,6 @@ enum ChunkOutcome {
     Logits(Vec<f32>),
     /// The winning token id and its finished logit.
     Argmax(u32, f32),
+    /// Every row's finished logits, row-major `[rows][vocab]`.
+    Block(Vec<f32>),
 }

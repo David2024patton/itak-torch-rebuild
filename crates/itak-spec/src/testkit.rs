@@ -22,6 +22,7 @@ use muse_glimmer::{
 };
 
 use crate::diag::NullDiag;
+use crate::driver::CpuTarget;
 use crate::sampler;
 use crate::session::SpecSession;
 use crate::speculator::{DflashSpeculator, SharedCompute};
@@ -401,8 +402,7 @@ pub fn build_session(config: SpecConfig, block_size: u32) -> SpecSession {
     let fixture = build_target(Box::new(SharedCompute(compute.clone())));
     let speculator = build_speculator(&fixture, block_size);
     SpecSession::new(
-        fixture.model,
-        compute,
+        CpuTarget::new(fixture.model, compute),
         Some(speculator),
         config,
         Arc::new(NullDiag),
@@ -498,8 +498,7 @@ pub fn build_sabotage_session(config: SpecConfig) -> (SpecSession, Rc<Cell<bool>
     let fixture = build_target(Box::new(sabotage));
     let speculator = build_speculator(&fixture, 5);
     let session = SpecSession::new(
-        fixture.model,
-        compute,
+        CpuTarget::new(fixture.model, compute),
         Some(speculator),
         config,
         Arc::new(NullDiag),

@@ -26,7 +26,7 @@
 //!   table and run through the draft layers; attention
 //!   reads the committed positions plus the block's own
 //!   rows under the config's causal flag and per-layer
-//!   sliding window (K15); the final RMSNorm and the
+//!   sliding window (K17); the final RMSNorm and the
 //!   (borrowed) output head produce the logits. No logit
 //!   scale or softcap: the draft applies none. The pass
 //!   never writes the resident KV, exactly like the CPU
@@ -38,7 +38,7 @@
 //! activation quantization the MMQ prefill forms carry),
 //! K4 for every norm and residual add (per-head norms fold
 //! heads into rows), K7 SwiGLU, K8 embedding gather, and
-//! K15 for the two primitives no Glimmer kernel provides
+//! K17 for the two primitives no Glimmer kernel provides
 //! (NEOX rotate, two-source draft attention).
 //!
 //! Refusals speak draft vocabulary: every backend failure
@@ -66,7 +66,7 @@ use muse_glimmer::{Dtype, GlimmerError, TensorSource, TensorView};
 use crate::compute::WgpuCompute;
 use crate::diag::dbg_log;
 use crate::error::WgpuError;
-use crate::kernels::k15_dflash::{K15AttendCall, K15RotateCall};
+use crate::kernels::k17_dflash::{K17AttendCall, K17RotateCall};
 use crate::kernels::k1_q4k_gemv::K1Call;
 use crate::kernels::k2_q6k_gemv::K2Call;
 use crate::kernels::k3_q5k_gemv::K3Call;
@@ -423,10 +423,10 @@ enum DevCall {
     Swiglu(K7Call),
     /// K8 embedding gather.
     Gather(K8GatherRowsCall),
-    /// K15 NEOX rotate.
-    Rotate(K15RotateCall),
-    /// K15 draft attention.
-    Attend(K15AttendCall),
+    /// K17 NEOX rotate.
+    Rotate(K17RotateCall),
+    /// K17 draft attention.
+    Attend(K17AttendCall),
 }
 
 impl DevCall {
@@ -948,7 +948,7 @@ impl<'a> DflashSession<'a> {
         }
         let inv_freq =
             backend
-                .k15()
+                .k17()
                 .upload_inv_freq(ctx, cfg.key_length as usize, cfg.rope_freq_base);
         let scratch = Scratch::new(
             backend,
@@ -1114,7 +1114,7 @@ impl<'a> DflashSession<'a> {
             };
             // Attention sub-block: pre-norm, Q/K/V, per-head
             // norms (heads folded into rows), NEOX rotates,
-            // K15 attention over committed + block, output
+            // K17 attention over committed + block, output
             // projection, close.
             calls.push(DevCall::Norm(backend.k4().prepare_rms_norm(
                 ctx,
@@ -1169,7 +1169,7 @@ impl<'a> DflashSession<'a> {
             )));
             calls.push(DevCall::Rotate(
                 backend
-                    .k15()
+                    .k17()
                     .prepare_rotate(
                         ctx,
                         &s.qn,
@@ -1183,7 +1183,7 @@ impl<'a> DflashSession<'a> {
             ));
             calls.push(DevCall::Rotate(
                 backend
-                    .k15()
+                    .k17()
                     .prepare_rotate(
                         ctx,
                         &s.kn,
@@ -1203,7 +1203,7 @@ impl<'a> DflashSession<'a> {
             };
             calls.push(DevCall::Attend(
                 backend
-                    .k15()
+                    .k17()
                     .prepare_attend(
                         ctx,
                         &s.qn,
@@ -1365,7 +1365,7 @@ impl<'a> DflashSession<'a> {
                 )),
                 DevCall::Rotate(
                     backend
-                        .k15()
+                        .k17()
                         .prepare_rotate(
                             ctx,
                             &s.ikn,

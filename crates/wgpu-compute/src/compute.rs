@@ -40,7 +40,9 @@ use crate::kernels::k11_q6k_gemm::K11Pipeline;
 use crate::kernels::k12_q8_quant::K12QuantPipeline;
 use crate::kernels::k13_q4k_mmq::K13Pipeline;
 use crate::kernels::k14_q6k_mmq::K14Pipeline;
-use crate::kernels::k15_dflash::K15Pipeline;
+use crate::kernels::k15_q4k_mmq_wide::K15Pipeline;
+use crate::kernels::k16_q6k_mmq_wide::K16Pipeline;
+use crate::kernels::k17_dflash::K17Pipeline;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
@@ -52,6 +54,37 @@ use crate::kernels::k8_head::K8Pipeline;
 use crate::kernels::k9_attn_prep::K9Pipeline;
 
 use crate::diag::dbg_log;
+
+/// Environment variable naming the wide-MMQ row threshold
+/// override: the chunk row count at or past which the
+/// session prefers the wide-tile double-buffered MMQ
+/// products (K15/K16) over the standard ones (K13/K14).
+/// Operational config, not a compiled constant: set it
+/// past the batch cap (64) to take the wide form out of
+/// the ladder entirely (the A/B control position the
+/// prefill bench script uses), or lower it to widen the
+/// wide form's reach. An unparsable value falls back to
+/// [`DEFAULT_WIDE_MIN_ROWS`], with the fallback logged.
+pub const WIDE_MIN_ROWS_ENV: &str = "WGPU_COMPUTE_MMQ_WIDE_MIN_ROWS";
+
+/// The wide-MMQ row threshold when the environment does
+/// not override it: half the chunk cap. At 32 or more
+/// rows the wide tile's staging pipeline is fed well
+/// enough to be the first try; below it the standard
+/// MMQ's single deep tile keeps the better shape. The
+/// server bench record that confirms or moves this value
+/// belongs to bench/mmq-wide-tile-2026-11-03.md.
+pub const DEFAULT_WIDE_MIN_ROWS: u32 = 32;
+
+/// Resolve the wide-MMQ row threshold from the raw
+/// environment value: a plain u32, or the default when
+/// unset or unparsable.
+fn resolve_wide_min_rows(raw: Option<&str>) -> u32 {
+    match raw {
+        Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_WIDE_MIN_ROWS),
+        None => DEFAULT_WIDE_MIN_ROWS,
+    }
+}
 
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
@@ -149,7 +182,10 @@ pub struct WgpuCompute {
     k12_swiglu: K12QuantPipeline,
     k13: Option<K13Pipeline>,
     k14: Option<K14Pipeline>,
-    k15: K15Pipeline,
+    k15: Option<K15Pipeline>,
+    k16: Option<K16Pipeline>,
+    wide_min_rows: u32,
+    k17: K17Pipeline,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -232,7 +268,24 @@ impl WgpuCompute {
         let k12_swiglu = K12QuantPipeline::new(&ctx.device, ACT_SWIGLU)?;
         let k13 = K13Pipeline::for_device(&ctx.device)?;
         let k14 = K14Pipeline::for_device(&ctx.device)?;
-        let k15 = K15Pipeline::new(&ctx.device)?;
+        let k17 = K17Pipeline::new(&ctx.device)?;
+        // The wide-tile double-buffered MMQ set (K15/K16):
+        // optional on the same terms as the standard MMQ
+        // set (a device granting too little workgroup
+        // storage for the double-buffered staging sets gets
+        // `None`, and the session keeps its standard MMQ
+        // form there). The row threshold at which the
+        // session starts preferring them is config, read
+        // here (see WIDE_MIN_ROWS_ENV).
+        let k15 = K15Pipeline::for_device(&ctx.device)?;
+        let k16 = K16Pipeline::for_device(&ctx.device)?;
+        let wide_min_rows = resolve_wide_min_rows(std::env::var(WIDE_MIN_ROWS_ENV).ok().as_deref());
+        dbg_log!(
+            "mmq wide config: min_rows={wide_min_rows} (env {WIDE_MIN_ROWS_ENV}, \
+             default {DEFAULT_WIDE_MIN_ROWS}); k15={} k16={}",
+            k15.is_some(),
+            k16.is_some()
+        );
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -259,6 +312,9 @@ impl WgpuCompute {
             k13,
             k14,
             k15,
+            k16,
+            wide_min_rows,
+            k17,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -411,11 +467,35 @@ impl WgpuCompute {
         self.k14.as_ref()
     }
 
-    /// The K15 (DFlash NEOX rotate + draft attention)
+    /// The K17 (DFlash NEOX rotate + draft attention)
     /// pipeline. Crate-internal: the draft session
     /// ([`crate::dflash_session`]) composes it.
-    pub(crate) fn k15(&self) -> &K15Pipeline {
-        &self.k15
+    pub(crate) fn k17(&self) -> &K17Pipeline {
+        &self.k17
+    }
+
+    /// The K15 (Q4_K wide-tile double-buffered MMQ)
+    /// pipeline, when this device grants the workgroup
+    /// storage its double-buffered staging set needs. See
+    /// [`WgpuCompute::k13`] for the fallback contract.
+    pub(crate) fn k15(&self) -> Option<&K15Pipeline> {
+        self.k15.as_ref()
+    }
+
+    /// The K16 (Q6_K wide-tile double-buffered MMQ)
+    /// pipeline, when this device grants the workgroup
+    /// storage. See [`WgpuCompute::k15`].
+    pub(crate) fn k16(&self) -> Option<&K16Pipeline> {
+        self.k16.as_ref()
+    }
+
+    /// The chunk row count at or past which the resident
+    /// session prefers the wide MMQ products (K15/K16)
+    /// over the standard ones (K13/K14): config resolved
+    /// at construction from [`WIDE_MIN_ROWS_ENV`], never a
+    /// constant compiled into the selection seam.
+    pub(crate) fn wide_min_rows(&self) -> u32 {
+        self.wide_min_rows
     }
 
     /// Drop all stored KV state, device buffers and host mirror.
@@ -902,5 +982,28 @@ impl Compute for WgpuCompute {
             ));
         }
         self.proj_impl(x, head, 1, step)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_min_rows_resolution() {
+        // Unset: the default.
+        assert_eq!(resolve_wide_min_rows(None), DEFAULT_WIDE_MIN_ROWS);
+        // Plain values pass through, including the two
+        // bench positions: 1 (wide everywhere the matrix
+        // path runs) and 65 (past the batch cap: wide out
+        // of the ladder, the A/B control).
+        assert_eq!(resolve_wide_min_rows(Some("1")), 1);
+        assert_eq!(resolve_wide_min_rows(Some("65")), 65);
+        assert_eq!(resolve_wide_min_rows(Some(" 48 ")), 48);
+        // Unparsable values fall back to the default rather
+        // than failing backend construction.
+        assert_eq!(resolve_wide_min_rows(Some("wide")), DEFAULT_WIDE_MIN_ROWS);
+        assert_eq!(resolve_wide_min_rows(Some("")), DEFAULT_WIDE_MIN_ROWS);
+        assert_eq!(resolve_wide_min_rows(Some("-3")), DEFAULT_WIDE_MIN_ROWS);
     }
 }

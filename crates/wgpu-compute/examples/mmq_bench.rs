@@ -8,6 +8,14 @@
 //! batch 1 doubles as the window canary (~816 GB/s Q4_K,
 //! ~832 GB/s Q6_K in a healthy window).
 //!
+//! The wide-tile double-buffered MMQ (K15 for Q4_K, K16 for
+//! Q6_K) runs in the same per-tensor table at every tile
+//! candidate the device can build, labeled `mmq wide w<N>`:
+//! the per-tensor half of the wide-tile proof, whose
+//! session-level half (marginal and gross prefill tok/s at
+//! 1,024 tokens, old ladder vs wide ladder) runs through
+//! `bench/mmq-wide-bench.sh`.
+//!
 //! Usage:
 //!   mmq_bench [--model PATH] [--batch N] [--iters N]
 //!             [--warmup N] [--budget-mib N]
@@ -22,6 +30,10 @@ use wgpu_compute::kernels::k11_q6k_gemm::{K11Call, K11Pipeline};
 use wgpu_compute::kernels::k12_q8_quant::{K12QuantCall, K12QuantPipeline};
 use wgpu_compute::kernels::k13_q4k_mmq::{K13Call, K13Pipeline, MmqShape};
 use wgpu_compute::kernels::k14_q6k_mmq::{K14Call, K14Pipeline};
+use wgpu_compute::kernels::k15_q4k_mmq_wide::{
+    K15Call, K15Pipeline, WideMmqShape, WIDE_TILE_CANDIDATES,
+};
+use wgpu_compute::kernels::k16_q6k_mmq_wide::{K16Call, K16Pipeline};
 use wgpu_compute::kernels::k1_q4k_gemv::{K1Call, K1Pipeline, K1Weights, ACT_NONE};
 use wgpu_compute::kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Weights};
 use wgpu_compute::{DetectPolicy, WgpuCompute, WgpuError};
@@ -52,6 +64,8 @@ enum BenchCall {
     K12(K12QuantCall),
     K13(K13Call),
     K14(K14Call),
+    K15(K15Call),
+    K16(K16Call),
 }
 
 impl BenchCall {
@@ -64,6 +78,8 @@ impl BenchCall {
             BenchCall::K12(c) => c.encode_into(pass),
             BenchCall::K13(c) => c.encode_into(pass),
             BenchCall::K14(c) => c.encode_into(pass),
+            BenchCall::K15(c) => c.encode_into(pass),
+            BenchCall::K16(c) => c.encode_into(pass),
         }
     }
 }
@@ -208,6 +224,24 @@ fn main() -> ExitCode {
             Err(e) => println!("k14 {} unavailable: {e}", shape.name()),
         }
     }
+    // The wide set: every candidate the device can build,
+    // widest first (the shipped shape is the first entry on
+    // a device whose grant sorts the same way; on the
+    // 64 KiB server card that is w128 for K15 and w112 for
+    // K16, whose w128 staging set is 512 bytes over).
+    let mut wide4: Vec<(WideMmqShape, K15Pipeline)> = Vec::new();
+    let mut wide6: Vec<(WideMmqShape, K16Pipeline)> = Vec::new();
+    for cand in WIDE_TILE_CANDIDATES {
+        let shape = WideMmqShape::new(cand);
+        match K15Pipeline::with_shape(&ctx.device, shape) {
+            Ok(p) => wide4.push((shape, p)),
+            Err(e) => println!("k15 {} unavailable: {e}", shape.name()),
+        }
+        match K16Pipeline::with_shape(&ctx.device, shape) {
+            Ok(p) => wide6.push((shape, p)),
+            Err(e) => println!("k16 {} unavailable: {e}", shape.name()),
+        }
+    }
 
     let mut keep_q4: Vec<K1Weights> = Vec::new();
     let mut keep_q6: Vec<K2Weights> = Vec::new();
@@ -277,6 +311,27 @@ fn main() -> ExitCode {
                     let total_s = time_calls(ctx, &total, warmup, iters);
                     report(&format!("mmq {} + quantize", shape.name()), total_s);
                 }
+                for (shape, wide) in &wide4 {
+                    let prod = [BenchCall::K15(
+                        wide.prepare(ctx, &w, &qs_buf, &ds_buf, &out_buf, batch)
+                            .expect("k15 prepare"),
+                    )];
+                    let prod_s = time_calls(ctx, &prod, warmup, iters);
+                    report(&format!("mmq wide {} product", shape.name()), prod_s);
+                    let quant2 = BenchCall::K12(
+                        k12.prepare(ctx, &in_buf, &qs_buf, &ds_buf, batch, *inn)
+                            .expect("k12 prepare"),
+                    );
+                    let total = [
+                        quant2,
+                        BenchCall::K15(
+                            wide.prepare(ctx, &w, &qs_buf, &ds_buf, &out_buf, batch)
+                                .expect("k15 prepare"),
+                        ),
+                    ];
+                    let total_s = time_calls(ctx, &total, warmup, iters);
+                    report(&format!("mmq wide {} + quantize", shape.name()), total_s);
+                }
                 keep_q4.push(w);
             }
             GgmlType::Q6K => {
@@ -312,6 +367,27 @@ fn main() -> ExitCode {
                     ];
                     let total_s = time_calls(ctx, &total, warmup, iters);
                     report(&format!("mmq {} + quantize", shape.name()), total_s);
+                }
+                for (shape, wide) in &wide6 {
+                    let prod = [BenchCall::K16(
+                        wide.prepare(ctx, &w, &qs_buf, &ds_buf, &out_buf, batch)
+                            .expect("k16 prepare"),
+                    )];
+                    let prod_s = time_calls(ctx, &prod, warmup, iters);
+                    report(&format!("mmq wide {} product", shape.name()), prod_s);
+                    let quant2 = BenchCall::K12(
+                        k12.prepare(ctx, &in_buf, &qs_buf, &ds_buf, batch, *inn)
+                            .expect("k12 prepare"),
+                    );
+                    let total = [
+                        quant2,
+                        BenchCall::K16(
+                            wide.prepare(ctx, &w, &qs_buf, &ds_buf, &out_buf, batch)
+                                .expect("k16 prepare"),
+                        ),
+                    ];
+                    let total_s = time_calls(ctx, &total, warmup, iters);
+                    report(&format!("mmq wide {} + quantize", shape.name()), total_s);
                 }
                 keep_q6.push(w);
             }

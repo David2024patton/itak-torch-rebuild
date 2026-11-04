@@ -317,29 +317,146 @@ fn k10_k11_gemm_shaders_compile_on_any_available_adapter() {
 }
 
 #[test]
-fn k15_dflash_shaders_compile_on_any_available_adapter() {
+fn k17_dflash_shaders_compile_on_any_available_adapter() {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()
     });
     let adapters = instance.enumerate_adapters(wgpu::Backends::all());
     let Some(adapter) = adapters.into_iter().next() else {
-        eprintln!("skipping K15 shader compile test: wgpu enumerates no adapters here");
+        eprintln!("skipping K17 shader compile test: wgpu enumerates no adapters here");
         return;
     };
     let info = adapter.get_info();
     let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
     let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-        label: Some("wgpu-compute K15 shader compile test"),
+        label: Some("wgpu-compute K17 shader compile test"),
         required_features: wanted,
         required_limits: wgpu::Limits::default(),
         ..Default::default()
     }))
-    .expect("device for K15 shader compile test");
-    let _pipeline = wgpu_compute::K15Pipeline::new(&device)
-        .unwrap_or_else(|e| panic!("K15 pipelines must build on {}: {e}", info.name));
+    .expect("device for K17 shader compile test");
+    let _pipeline = wgpu_compute::K17Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K17 pipelines must build on {}: {e}", info.name));
     eprintln!(
-        "K15 shipped shaders compiled on {} ({:?})",
+        "K17 shipped shaders compiled on {} ({:?})",
         info.name, info.backend
     );
+}
+
+#[test]
+fn k15_k16_mmq_wide_shaders_compile_on_any_available_adapter() {
+    use wgpu_compute::kernels::k15_q4k_mmq_wide::{
+        q4k_wide_staging_bytes, shipped_wide_shape as shipped_q4k, K15Pipeline, WideMmqShape,
+        WIDE_TILE_CANDIDATES,
+    };
+    use wgpu_compute::kernels::k16_q6k_mmq_wide::{
+        q6k_wide_staging_bytes, shipped_wide_shape as shipped_q6k, K16Pipeline,
+    };
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping k15-k16 compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    // First device: wgpu's default limits (16 KiB of
+    // workgroup storage). No wide candidate's
+    // double-buffered staging set fits there, so both
+    // constructors must report absence (for_device) or
+    // refuse by name (with_shape), never panic or degrade.
+    let (capped, _q1) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k15-k16 capped test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("capped device for k15-k16 test");
+    match K15Pipeline::for_device(&capped) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("k15 under default limits must be Ok(None), got a pipeline"),
+        Err(e) => panic!("k15 under default limits must be Ok(None), got error: {e}"),
+    }
+    match K16Pipeline::for_device(&capped) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("k16 under default limits must be Ok(None), got a pipeline"),
+        Err(e) => panic!("k16 under default limits must be Ok(None), got error: {e}"),
+    }
+    let err = match K15Pipeline::with_shape(&capped, WideMmqShape::new(64)) {
+        Ok(_) => panic!("k15 w64 must refuse a 16 KiB storage grant by name"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("workgroup memory"),
+        "refusal names the binding limit: {err}"
+    );
+    // A tile width outside the candidate set refuses by
+    // name on any device.
+    let err = match K15Pipeline::with_shape(&capped, WideMmqShape::new(100)) {
+        Ok(_) => panic!("k15 must refuse a non-candidate tile width by name"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("not a wide tile candidate"),
+        "refusal names the candidate set: {err}"
+    );
+    // Second device: the adapter's own limits. Every
+    // candidate whose staging the grant covers must
+    // compile: this is the leg that validates the wide
+    // shaders (the parity-unrolled pipeline, the parity
+    // buffer sets) on whatever stack runs the test,
+    // including this repo's build VM.
+    let (full, _q2) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k15-k16 full test"),
+        required_features: wanted,
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("full-limits device for k15-k16 test");
+    let granted = full.limits().max_compute_workgroup_storage_size;
+    for cand in WIDE_TILE_CANDIDATES {
+        let shape = WideMmqShape::new(cand);
+        if granted >= q4k_wide_staging_bytes(&shape) {
+            K15Pipeline::with_shape(&full, shape).unwrap_or_else(|e| {
+                panic!(
+                    "k15 {} must build on {} (grant {granted}): {e}",
+                    shape.name(),
+                    info.name
+                )
+            });
+            eprintln!("k15 {} compiled on {}", shape.name(), info.name);
+        }
+        if granted >= q6k_wide_staging_bytes(&shape) {
+            K16Pipeline::with_shape(&full, shape).unwrap_or_else(|e| {
+                panic!(
+                    "k16 {} must build on {} (grant {granted}): {e}",
+                    shape.name(),
+                    info.name
+                )
+            });
+            eprintln!("k16 {} compiled on {}", shape.name(), info.name);
+        }
+    }
+    // for_device picks exactly the shipped shape the
+    // limits arithmetic names, on both families.
+    match (shipped_q4k(&full.limits()), K15Pipeline::for_device(&full)) {
+        (Some(want), Ok(Some(p))) => assert_eq!(p.shape(), want),
+        (None, Ok(None)) => {}
+        (want, got) => panic!(
+            "k15 for_device disagrees with the shipped shape: want {want:?}, got {:?}",
+            got.map(|o| o.map(|p| p.shape()))
+        ),
+    }
+    match (shipped_q6k(&full.limits()), K16Pipeline::for_device(&full)) {
+        (Some(want), Ok(Some(p))) => assert_eq!(p.shape(), want),
+        (None, Ok(None)) => {}
+        (want, got) => panic!(
+            "k16 for_device disagrees with the shipped shape: want {want:?}, got {:?}",
+            got.map(|o| o.map(|p| p.shape()))
+        ),
+    }
 }

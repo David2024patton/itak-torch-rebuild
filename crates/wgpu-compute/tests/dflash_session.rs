@@ -650,16 +650,16 @@ fn dflash_session_construction_refusals() {
     );
 }
 
-/// The K15 rotate against `torch_math::rope` directly:
+/// The K17 rotate against `torch_math::rope` directly:
 /// NEOX pairing, per-row positions from the array,
 /// in place.
 #[test]
-fn k15_rotate_matches_torch_math() {
+fn k17_rotate_matches_torch_math() {
     let Some(backend) = backend_or_skip("k15 rotate test") else {
         return;
     };
     let ctx = backend.context();
-    let pipeline = wgpu_compute::K15Pipeline::new(&ctx.device).expect("k15 pipelines build");
+    let pipeline = wgpu_compute::K17Pipeline::new(&ctx.device).expect("k15 pipelines build");
     let (rows, heads, head_dim) = (3usize, 2usize, 8usize);
     let positions = [0usize, 5, 127];
     let mut rng = Rng(0x207a7e);

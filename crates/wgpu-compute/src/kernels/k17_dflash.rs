@@ -1,4 +1,4 @@
-//! K15: the two device primitives the DFlash draft forward
+//! K17: the two device primitives the DFlash draft forward
 //! needs that no existing kernel provides.
 //!
 //! - **NEOX rotate.** K5's rotate is the interleaved
@@ -257,7 +257,7 @@ fn attend_main(
 fn check_rotate(rows: usize, heads: usize, head_dim: usize) -> Result<()> {
     if rows == 0 || heads == 0 {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 rotate".to_string(),
+            name: "k17 rotate".to_string(),
             detail: format!(
                 "rotate needs at least one row and head, got rows {rows}, heads {heads}"
             ),
@@ -265,7 +265,7 @@ fn check_rotate(rows: usize, heads: usize, head_dim: usize) -> Result<()> {
     }
     if head_dim < 2 || head_dim % 2 != 0 {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 rotate".to_string(),
+            name: "k17 rotate".to_string(),
             detail: format!("head_dim {head_dim} must be even and at least 2 for the NEOX pairing"),
         });
     }
@@ -285,7 +285,7 @@ fn check_attend(
 ) -> Result<()> {
     if rows == 0 || block_rows == 0 {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 attend".to_string(),
+            name: "k17 attend".to_string(),
             detail: format!(
                 "attention needs at least one query row and one block row, got rows {rows}, block_rows {block_rows}"
             ),
@@ -293,7 +293,7 @@ fn check_attend(
     }
     if q_heads == 0 || kv_heads == 0 || q_heads % kv_heads != 0 {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 attend".to_string(),
+            name: "k17 attend".to_string(),
             detail: format!(
                 "q_heads {q_heads} must be a whole multiple of kv_heads {kv_heads}, both non-zero"
             ),
@@ -301,13 +301,13 @@ fn check_attend(
     }
     if key_len == 0 {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 attend".to_string(),
+            name: "k17 attend".to_string(),
             detail: "key_len is zero".to_string(),
         });
     }
     if value_len == 0 || value_len > (ATTEND_WORKGROUP * MAX_VALUE_STRIDES) as usize {
         return Err(WgpuError::InvalidTensor {
-            name: "k15 attend".to_string(),
+            name: "k17 attend".to_string(),
             detail: format!(
                 "value_len {value_len} outside the kernel's supported range 1..={}",
                 ATTEND_WORKGROUP * MAX_VALUE_STRIDES
@@ -321,13 +321,13 @@ fn check_attend(
 /// (`rows x heads x head_dim`), one position per row read
 /// from the positions array bound at prepare time.
 #[derive(Debug)]
-pub struct K15RotateCall {
+pub struct K17RotateCall {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
 }
 
-impl K15RotateCall {
+impl K17RotateCall {
     /// Record this call's dispatch into `encoder` as its
     /// own compute pass.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -351,10 +351,10 @@ impl K15RotateCall {
 /// count and the block start position are runtime values
 /// (they change per block while the geometry does not), so
 /// they live in the params buffer and are rewritten
-/// through [`K15AttendCall::set_runtime`] between prepares
+/// through [`K17AttendCall::set_runtime`] between prepares
 /// and submission, the K5 `set_start_position` pattern.
 #[derive(Debug)]
-pub struct K15AttendCall {
+pub struct K17AttendCall {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
@@ -368,7 +368,7 @@ const ATTEND_BLOCK_START_OFFSET: u64 = 7 * 4;
 /// params block.
 const ATTEND_COMMITTED_OFFSET: u64 = 8 * 4;
 
-impl K15AttendCall {
+impl K17AttendCall {
     /// Record this call's dispatch into `encoder` as its
     /// own compute pass.
     pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
@@ -405,16 +405,16 @@ impl K15AttendCall {
     }
 }
 
-/// The compiled K15 pipelines (NEOX rotate, draft
+/// The compiled K17 pipelines (NEOX rotate, draft
 /// attention).
 #[derive(Debug)]
-pub struct K15Pipeline {
+pub struct K17Pipeline {
     rotate: wgpu::ComputePipeline,
     attend: wgpu::ComputePipeline,
 }
 
-impl K15Pipeline {
-    /// Compile both K15 pipelines on `device`.
+impl K17Pipeline {
+    /// Compile both K17 pipelines on `device`.
     ///
     /// # Errors
     ///
@@ -439,7 +439,7 @@ impl K15Pipeline {
         let rotate = build("rotate_main", "k15 rotate pipeline");
         let attend = build("attend_main", "k15 attend pipeline");
         dbg_log!("k15 pipelines built");
-        Ok(K15Pipeline { rotate, attend })
+        Ok(K17Pipeline { rotate, attend })
     }
 
     /// Prepare an in-place NEOX rotate over `x`
@@ -447,7 +447,7 @@ impl K15Pipeline {
     /// positions from `positions` (at least `rows` u32
     /// entries) and the inverse frequencies for `base`
     /// from `inv_freq` (uploaded once per head geometry
-    /// through [`K15Pipeline::upload_inv_freq`]).
+    /// through [`K17Pipeline::upload_inv_freq`]).
     ///
     /// # Errors
     ///
@@ -463,7 +463,7 @@ impl K15Pipeline {
         rows: usize,
         heads: usize,
         head_dim: usize,
-    ) -> Result<K15RotateCall> {
+    ) -> Result<K17RotateCall> {
         check_rotate(rows, heads, head_dim)?;
         let total = (rows * heads * (head_dim / 2)) as u64;
         let grid = grid_dims(total.div_ceil(u64::from(ROTATE_WORKGROUP)));
@@ -493,7 +493,7 @@ impl K15Pipeline {
             ],
         });
         dbg_log!("k15 rotate prepared rows={rows} heads={heads} head_dim={head_dim}");
-        Ok(K15RotateCall {
+        Ok(K17RotateCall {
             pipeline: self.rotate.clone(),
             bind_group,
             grid,
@@ -529,7 +529,7 @@ impl K15Pipeline {
     /// The committed count and block start bound into the
     /// params here are the prepare-time values; rewrite
     /// them per block through
-    /// [`K15AttendCall::set_runtime`].
+    /// [`K17AttendCall::set_runtime`].
     ///
     /// # Errors
     ///
@@ -559,7 +559,7 @@ impl K15Pipeline {
         causal: bool,
         sliding: Option<u32>,
         scale: f32,
-    ) -> Result<K15AttendCall> {
+    ) -> Result<K17AttendCall> {
         check_attend(rows, q_heads, kv_heads, key_len, value_len, block_rows)?;
         let group = q_heads / kv_heads;
         let (sliding_flag, window) = match sliding {
@@ -628,7 +628,7 @@ impl K15Pipeline {
             "k15 attend prepared rows={rows} q_heads={q_heads} kv_heads={kv_heads} \
              block_rows={block_rows} committed={committed} causal={causal} sliding={sliding:?}"
         );
-        Ok(K15AttendCall {
+        Ok(K17AttendCall {
             pipeline: self.attend.clone(),
             bind_group,
             grid: ((rows * q_heads) as u32, 1),

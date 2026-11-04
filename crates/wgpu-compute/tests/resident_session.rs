@@ -101,6 +101,33 @@ fn q5k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
     }
 }
 
+/// A Q6_K tensor of shape [inn, out]: 210-byte blocks
+/// (128 low-bit bytes, 64 high-bit bytes, 16 scale bytes, the
+/// f16 scale), deterministic payload with a small scale, the
+/// construction the fused-kernel fixtures use.
+fn q6k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
+    let blocks = inn * out / 256;
+    let mut data = Vec::with_capacity(blocks * 210);
+    for _ in 0..blocks {
+        for _ in 0..128 {
+            data.push(rng.next_u8());
+        }
+        for _ in 0..64 {
+            data.push(rng.next_u8());
+        }
+        for _ in 0..16 {
+            data.push(rng.next_u8() & 0x03);
+        }
+        data.extend_from_slice(&f32_to_f16_bits(0.01).to_le_bytes());
+    }
+    TensorView {
+        name: name.to_string(),
+        dtype: Dtype::Q6K,
+        shape: vec![inn as u64, out as u64],
+        data: Arc::from(data.into_boxed_slice()),
+    }
+}
+
 /// An F32 tensor whose values cluster around `center`.
 fn f32_tensor(rng: &mut Rng, name: &str, shape: &[u64], center: f32) -> TensorView {
     let count: u64 = shape.iter().product();
@@ -151,6 +178,23 @@ fn cross_cfg() -> GlimmerConfig {
 /// names `Weights::load` will ask for (the cross-backend
 /// fixture's rules, tensor for tensor).
 fn cross_weights(cfg: &GlimmerConfig) -> Weights {
+    build_weights(cfg, false)
+}
+
+/// The mixed fixture: like [`cross_weights`], but the value
+/// projection and the FFN up projection are Q6_K on every
+/// layer. The value projection then cannot join the Q4_K
+/// batch (a partial batch: Q, K, gate batched, V separate)
+/// and the FFN pair cannot form (gate and up separate), so
+/// at MMQ row counts the attention stage holds two
+/// projections over `h` and the FFN stage holds two: the
+/// layer classes whose duplicate quantizes quantize-once
+/// removes.
+fn cross_weights_mixed(cfg: &GlimmerConfig) -> Weights {
+    build_weights(cfg, true)
+}
+
+fn build_weights(cfg: &GlimmerConfig, mixed: bool) -> Weights {
     struct MapSource {
         tensors: HashMap<String, TensorView>,
     }
@@ -191,12 +235,24 @@ fn cross_weights(cfg: &GlimmerConfig) -> Weights {
             f32_tensor(&mut rng, &name, &[hidden as u64], 1.0)
         } else if name.ends_with("attn_q.weight") || name.ends_with("attn_gate.weight") {
             q4k_tensor(&mut rng, &name, hidden, q_width)
-        } else if name.ends_with("attn_k.weight") || name.ends_with("attn_v.weight") {
+        } else if name.ends_with("attn_k.weight") {
             q4k_tensor(&mut rng, &name, hidden, kv_width)
+        } else if name.ends_with("attn_v.weight") {
+            if mixed {
+                q6k_tensor(&mut rng, &name, hidden, kv_width)
+            } else {
+                q4k_tensor(&mut rng, &name, hidden, kv_width)
+            }
         } else if name.ends_with("attn_output.weight") {
             q4k_tensor(&mut rng, &name, q_width, hidden)
-        } else if name.ends_with("ffn_gate.weight") || name.ends_with("ffn_up.weight") {
+        } else if name.ends_with("ffn_gate.weight") {
             q4k_tensor(&mut rng, &name, hidden, ffn)
+        } else if name.ends_with("ffn_up.weight") {
+            if mixed {
+                q6k_tensor(&mut rng, &name, hidden, ffn)
+            } else {
+                q4k_tensor(&mut rng, &name, hidden, ffn)
+            }
         } else if name.ends_with("ffn_down.weight") {
             q4k_tensor(&mut rng, &name, ffn, hidden)
         } else {
@@ -483,4 +539,125 @@ fn resident_session_argmax_tail_matches_logits() {
     }
     assert_eq!(argmax_session.stats().argmax_readbacks, 14);
     assert_eq!(argmax_session.position(), logits_session.position());
+}
+
+/// Quantize-once, proven end to end: the mixed fixture
+/// (Q6_K value projections and FFN ups, so every layer is a
+/// partial batch with an unpaired FFN) through a 20-token
+/// prompt. Twenty rows is past the matrix-form threshold,
+/// so on a backend that built the MMQ set the chunk's
+/// projections take their MMQ forms and each layer stage's
+/// two `h` projections ride ONE shared K12 quantize; the
+/// resident stream must still agree with the CPU reference
+/// and the trait path at the cross-backend bar, which is
+/// the byte-identity proof at the only level that matters:
+/// if a member product read anything but the shared
+/// quantize's bytes (stale, clobbered, or a neighbor's),
+/// the logits would drift off the reference.
+///
+/// The dispatch pin carries the arithmetic. Per layer
+/// (partial batch, gate fused into the output projection,
+/// unpaired FFN, chained norms): 16 at the unfused base,
+/// less the batch's 2, the fused gate's 1, and the chains'
+/// 1 (plus layer 0's own attention norm in place of the
+/// boundary ride). The gated output and the SwiGLU-shaped
+/// down keep their own quantizes (+1 each). Before
+/// quantize-once the batch, V, gate, and up products each
+/// carried a quantize too: layer 0 recorded 18, later
+/// layers 17, and the chunk 105. With the shares (one per
+/// stage per layer), the products record 1 and the layer
+/// adds 2: layer 0 records 16, later layers 15, and the
+/// chunk 1 (gather) + 16 + 5 x 15 + 1 (the Q5_K head, its
+/// finishing fused) = 93. On a backend with no MMQ set the
+/// GEMM forms serve instead: no quantize legs exist at
+/// all, every projection records 1, and the chunk is 69.
+/// Decode rows quantize nothing on any backend (the GEMV
+/// forms read `h` directly), so three decode chunks add
+/// exactly 3 x 69 under either serving form: the decode
+/// count the mixed layers record with no shares anywhere.
+#[test]
+fn resident_session_partial_batch_chunk_shares_one_quantize_per_stage() {
+    let trait_backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping partial-batch resident test: no suitable adapter (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    let cfg = cross_cfg();
+    let weights = cross_weights_mixed(&cfg);
+    let cpu_model = GlimmerModel::new(cfg.clone(), weights.clone(), Box::new(CpuCompute::new()));
+    let gpu_model = GlimmerModel::new(cfg.clone(), weights.clone(), Box::new(trait_backend));
+    let session_backend = WgpuCompute::new().expect("second backend instance builds");
+    let mut session =
+        ResidentSession::new(&session_backend, &cfg, &weights).expect("resident session builds");
+
+    let mut cpu_cache = PositionCache::new();
+    let mut gpu_cache = PositionCache::new();
+
+    // The 20-token prompt: one resident chunk at MMQ row
+    // counts. The trait path is fed token by token (its
+    // proven regime, as in the phase-2 comparison above);
+    // the CPU reference takes the prompt whole.
+    let prompt: Vec<u32> = (0..20).map(|i| (i * 53 % 1024) as u32).collect();
+    let cpu_logits = cpu_model
+        .forward(&prompt, &mut cpu_cache)
+        .expect("cpu forward");
+    let mut gpu_logits = Vec::new();
+    for token in &prompt {
+        gpu_logits = gpu_model
+            .forward(&[*token], &mut gpu_cache)
+            .expect("gpu forward");
+    }
+    let resident_logits = session.forward(&prompt).expect("resident chunked forward");
+    let mut next = vec![assert_step_agrees(
+        20,
+        &cpu_logits,
+        &gpu_logits,
+        &resident_logits,
+    )];
+    assert_eq!(session.position(), 20);
+    let stats = session.stats();
+    assert_eq!(stats.chunks, 1, "the prompt is one chunk: {stats:?}");
+    assert_eq!(stats.submissions, 1);
+    let form = match stats.dispatches {
+        93 => "mmq forms with one shared quantize per stage",
+        69 => "gemm/gemv forms (no MMQ set on this adapter)",
+        other => panic!(
+            "chunk dispatch count {other} matches neither the shared-MMQ count (93) \
+             nor the no-MMQ count (69): {stats:?}"
+        ),
+    };
+    eprintln!("partial-batch chunk served by {form}: {stats:?}");
+
+    // Three greedy decode steps on the same drivers: parity
+    // holds and the dispatch delta is the decode count,
+    // which carries no quantize legs on any backend.
+    let before = session.stats().dispatches;
+    for step in 0..3 {
+        let cpu_logits = cpu_model
+            .forward(&next, &mut cpu_cache)
+            .expect("cpu decode");
+        let gpu_logits = gpu_model
+            .forward(&next, &mut gpu_cache)
+            .expect("gpu decode");
+        let resident_logits = session.forward(&next).expect("resident decode");
+        next = vec![assert_step_agrees(
+            21 + step,
+            &cpu_logits,
+            &gpu_logits,
+            &resident_logits,
+        )];
+    }
+    assert_eq!(session.position(), 23);
+    assert_eq!(
+        session.stats().dispatches - before,
+        3 * 69,
+        "decode chunks carry no quantize legs: {:?}",
+        session.stats()
+    );
 }

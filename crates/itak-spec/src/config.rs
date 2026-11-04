@@ -33,6 +33,45 @@ impl SpecMode {
     }
 }
 
+/// Which device path the DFlash draft model runs on. The
+/// two arms are the same semantics behind the same
+/// [`crate::Speculator`] seam (the CPU implementation in
+/// the `dflash` crate is the reference; the GPU arm is
+/// wgpu-compute's resident draft session, held to it by
+/// the cross-backend parity tests); the choice is config
+/// with a default, never a compiled constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DraftBackend {
+    /// The CPU reference implementation (`dflash::DflashModel`).
+    #[default]
+    Cpu,
+    /// The device-resident GPU session
+    /// (`wgpu_compute::DflashSession`).
+    Gpu,
+}
+
+impl DraftBackend {
+    /// The backend name as it appears in configuration,
+    /// runner flags, and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            DraftBackend::Cpu => "cpu",
+            DraftBackend::Gpu => "gpu",
+        }
+    }
+
+    /// Parse a backend name (`cpu` or `gpu`), the runner
+    /// flag's vocabulary. Anything else is `None`, and the
+    /// caller refuses by name rather than guessing.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "cpu" => Some(DraftBackend::Cpu),
+            "gpu" => Some(DraftBackend::Gpu),
+            _ => None,
+        }
+    }
+}
+
 /// What a round does when the target's verify forward refuses
 /// (SPEC-itak-spec Section 4, step 8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,6 +90,13 @@ pub enum OnVerifyError {
 pub struct SpecConfig {
     /// Drafting mode. Default: DFlash.
     pub mode: SpecMode,
+    /// Which device path the DFlash draft runs on. This is
+    /// a construction-time selection (it decides which
+    /// speculator the caller builds), recorded in the
+    /// session config so a run's provenance states it.
+    /// Default: CPU, the reference implementation; the GPU
+    /// arm is the resident draft session in wgpu-compute.
+    pub draft_backend: DraftBackend,
     /// Maximum draft tokens proposed per round. Default: 6, the operating
     /// point from the 2026-10-30 sweep. Must be at least 1 and at most the
     /// draft's block size; creation refuses out-of-range depths by name.
@@ -92,6 +138,7 @@ impl Default for SpecConfig {
     fn default() -> Self {
         SpecConfig {
             mode: SpecMode::Dflash,
+            draft_backend: DraftBackend::Cpu,
             depth: 6,
             max_round_tokens: 17,
             temperature: 0.0,
@@ -102,5 +149,24 @@ impl Default for SpecConfig {
             eos_tokens: Vec::new(),
             seed: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn draft_backend_default_is_cpu_and_parses_by_name() {
+        // The library default stays the CPU reference; the
+        // GPU arm is always an explicit selection.
+        assert_eq!(SpecConfig::default().draft_backend, DraftBackend::Cpu);
+        assert_eq!(DraftBackend::default(), DraftBackend::Cpu);
+        assert_eq!(DraftBackend::parse("cpu"), Some(DraftBackend::Cpu));
+        assert_eq!(DraftBackend::parse("gpu"), Some(DraftBackend::Gpu));
+        assert_eq!(DraftBackend::parse("GPU"), None);
+        assert_eq!(DraftBackend::parse(""), None);
+        assert_eq!(DraftBackend::Cpu.name(), "cpu");
+        assert_eq!(DraftBackend::Gpu.name(), "gpu");
     }
 }

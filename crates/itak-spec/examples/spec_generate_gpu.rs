@@ -4,7 +4,7 @@
 //! session, checked against a plain greedy run of the same
 //! resident session in the same process.
 //!
-//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>]`
+//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>] [--draft=<gpu|cpu>]`
 //!
 //! `mode` is `both` (default), `plain` (run only phase A and write
 //! the stream to `stream_file`), or `spec` (run only phase B,
@@ -16,10 +16,15 @@
 //! Phase A runs the plain greedy baseline on the resident
 //! session (prefill plus single-token forwards). Phase B runs a
 //! [`SpecSession`] over the resident driver at temperature 0 with
-//! the DFlash draft attached. The draft has no GPU path in this
-//! workspace, so it drafts on the CPU stack behind the same
-//! `Speculator` seam (see `bench/spec-gpu-port-2026-11-03.md`);
-//! the verify side is the resident GPU forward throughout.
+//! the DFlash draft attached. The draft's device path is the
+//! `--draft` selection (a [`SpecConfig`] field with the library
+//! default CPU): `gpu` (this runner's default, since the runner
+//! exists to prove the GPU stack) drives wgpu-compute's resident
+//! draft session on the same leaked backend as the target's
+//! resident session; `cpu` drives the reference implementation
+//! behind the same `Speculator` seam, for A/B runs. The verify
+//! side is the resident GPU forward throughout. See
+//! `bench/dflash-gpu-2026-11-03.md` for the draft GPU design.
 //!
 //! The T-9.6 bar, printed as verdicts: the speculative stream is
 //! token-identical to the plain GPU stream at temperature 0
@@ -45,9 +50,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dflash::{DflashModel, StderrDiag as DflashStderrDiag, TensorSource as _};
-use itak_spec::{sampler, DflashSpeculator, ResidentTarget, SpecConfig, SpecSession, StderrDiag};
+use itak_spec::{
+    sampler, DflashSpeculator, DraftBackend, ResidentTarget, SpecConfig, SpecSession, StderrDiag,
+};
+use muse_glimmer::TensorSource as GlimmerTensorSource;
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
-use wgpu_compute::{ResidentSession, WgpuCompute};
+use wgpu_compute::{
+    DflashRawWeights, DflashSession, DflashSessionConfig, ResidentSession, WgpuCompute,
+};
 
 /// The verified greedy continuation of the Stage 1 prompt
 /// (bench/gpu-proof-2026-10-30.md): " Paris. It is the most populous".
@@ -85,6 +95,19 @@ fn main() -> ExitCode {
         .map_or(DEFAULT_BAR_TOK_S, |v| {
             v.parse().unwrap_or(DEFAULT_BAR_TOK_S)
         });
+    // The draft device path: config with a default (gpu on
+    // this runner), never a compiled constant. An unknown
+    // value refuses by name instead of guessing.
+    let draft_backend = match args.iter().find_map(|a| a.strip_prefix("--draft=")) {
+        None => DraftBackend::Gpu,
+        Some(text) => match DraftBackend::parse(text) {
+            Some(parsed) => parsed,
+            None => {
+                eprintln!("FAIL: --draft={text} is not a draft backend (expected gpu or cpu)");
+                return ExitCode::from(2);
+            }
+        },
+    };
     match run(
         target_path,
         draft_path,
@@ -94,6 +117,7 @@ fn main() -> ExitCode {
         mode,
         &stream_file,
         bar,
+        draft_backend,
     ) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -144,6 +168,18 @@ fn resident_session(
 ) -> Result<ResidentSession<'static>, String> {
     let backend: &'static WgpuCompute =
         Box::leak(Box::new(WgpuCompute::new().map_err(|e| e.to_string())?));
+    resident_session_on(backend, target_file, gcfg)
+}
+
+/// A resident session over a caller-supplied backend: phase
+/// B shares one leaked backend between the target's resident
+/// session and the draft's, so both device residents live on
+/// the same device and queue.
+fn resident_session_on(
+    backend: &'static WgpuCompute,
+    target_file: &gguf::GgufFile,
+    gcfg: &muse_glimmer::GlimmerConfig,
+) -> Result<ResidentSession<'static>, String> {
     let report = itak_loader::coverage(target_file, gcfg);
     println!(
         "target coverage: expected={} found={} missing={}",
@@ -166,10 +202,15 @@ fn run(
     mode: &str,
     stream_file: &str,
     bar: f64,
+    draft_backend: DraftBackend,
 ) -> Result<bool, String> {
     let total = Instant::now();
 
-    // Load the draft (coverage gate enforced) and the target config.
+    // Load the draft config (coverage gate enforced) and the
+    // target config. The draft WEIGHTS load inside phase B, in
+    // the selected arm's own form (f32 for the CPU arm, raw
+    // views for the GPU arm), so a GPU run never pays the CPU
+    // dequantization and a CPU run never uploads.
     let t = Instant::now();
     let draft_file = gguf::GgufFile::open(Path::new(draft_path)).map_err(|e| e.to_string())?;
     let dcfg = itak_loader::load_dflash_config(&draft_file).map_err(|e| e.to_string())?;
@@ -181,9 +222,6 @@ fn run(
         report.missing().len()
     );
     report.require_complete().map_err(|e| e.to_string())?;
-    let dweights =
-        itak_loader::load_dflash_weights(&draft_file, &dcfg).map_err(|e| e.to_string())?;
-    let draft = DflashModel::with_diag(dcfg.clone(), dweights, Arc::new(DflashStderrDiag));
 
     let target_file = gguf::GgufFile::open(Path::new(target_path)).map_err(|e| e.to_string())?;
     let gcfg = itak_loader::load_config(&target_file).map_err(|e| e.to_string())?;
@@ -278,18 +316,58 @@ fn run(
     }
 
     // ---- Phase B: the speculative session over the resident driver,
-    // temperature 0, the CPU draft behind the Speculator seam.
+    // temperature 0, the draft on the selected device path behind
+    // the Speculator seam.
     let t = Instant::now();
     let spec_stream = {
-        let source = itak_loader::DflashTensorSource::new(&target_file);
-        let embedding = source
-            .tensor("token_embd.weight")
-            .map_err(|e| e.to_string())?;
-        let output_head = source.tensor("output.weight").map_err(|e| e.to_string())?;
-        let session = resident_session(&target_file, &gcfg)?;
-        let speculator = DflashSpeculator::new(draft, embedding, output_head);
+        // One leaked backend serves both residents (the
+        // runner's memory discipline, as in phase A).
+        let backend: &'static WgpuCompute =
+            Box::leak(Box::new(WgpuCompute::new().map_err(|e| e.to_string())?));
+        let speculator = match draft_backend {
+            DraftBackend::Cpu => {
+                let dweights = itak_loader::load_dflash_weights(&draft_file, &dcfg)
+                    .map_err(|e| e.to_string())?;
+                let draft =
+                    DflashModel::with_diag(dcfg.clone(), dweights, Arc::new(DflashStderrDiag));
+                let source = itak_loader::DflashTensorSource::new(&target_file);
+                let embedding = source
+                    .tensor("token_embd.weight")
+                    .map_err(|e| e.to_string())?;
+                let output_head = source.tensor("output.weight").map_err(|e| e.to_string())?;
+                println!("draft backend: cpu (reference implementation)");
+                DflashSpeculator::new(draft, embedding, output_head)
+            }
+            DraftBackend::Gpu => {
+                let draft_source = itak_loader::GgufTensorSource::new(&draft_file);
+                let raw =
+                    DflashRawWeights::load(&draft_source, &dcfg).map_err(|e| e.to_string())?;
+                let target_source = itak_loader::GgufTensorSource::new(&target_file);
+                let embedding = GlimmerTensorSource::tensor(&target_source, "token_embd.weight")
+                    .map_err(|e| e.to_string())?;
+                let output_head = GlimmerTensorSource::tensor(&target_source, "output.weight")
+                    .map_err(|e| e.to_string())?;
+                let draft_session = DflashSession::with_diag(
+                    backend,
+                    &dcfg,
+                    &raw,
+                    Some(&embedding),
+                    Some(&output_head),
+                    DflashSessionConfig::default(),
+                    Arc::new(DflashStderrDiag),
+                )
+                .map_err(|e| e.to_string())?;
+                println!(
+                    "draft backend: gpu (resident draft session, kv_capacity={})",
+                    DflashSessionConfig::default().kv_capacity
+                );
+                DflashSpeculator::gpu(draft_session)
+            }
+        };
+        let session = resident_session_on(backend, &target_file, &gcfg)?;
         let config = SpecConfig {
             depth,
+            draft_backend,
             eos_tokens: eos,
             ..SpecConfig::default()
         };
@@ -394,8 +472,8 @@ fn run(
         if identity && golden && speed {
             "PASS (identity, golden, and speed bars all met)"
         } else if identity && golden {
-            "CORRECTNESS PASS, SPEED FAIL (see bench/spec-gpu-port-2026-11-03.md for the \
-             draft-side blocker)"
+            "CORRECTNESS PASS, SPEED FAIL (see the SPEED line above and \
+             bench/dflash-gpu-2026-11-03.md)"
         } else {
             "FAIL (correctness bar missed; see the verdicts above)"
         }

@@ -741,6 +741,7 @@ pub struct DflashSession<'a> {
     backend: &'a WgpuCompute,
     cfg: DflashConfig,
     conditioning_width: usize,
+    target_hidden: u32,
     fc: ProjWeights,
     enc_output_norm: wgpu::Buffer,
     output_norm: wgpu::Buffer,
@@ -975,6 +976,7 @@ impl<'a> DflashSession<'a> {
             backend,
             cfg: cfg.clone(),
             conditioning_width: weights.conditioning_width(),
+            target_hidden: weights.target_hidden,
             fc,
             enc_output_norm,
             output_norm,
@@ -1001,6 +1003,14 @@ impl<'a> DflashSession<'a> {
     /// The conditioning row width (from the loaded `fc`).
     pub fn conditioning_width(&self) -> usize {
         self.conditioning_width
+    }
+
+    /// The target hidden size derived from `fc` at load:
+    /// each position's conditioning row is
+    /// `target_layers.len()` rows of this width,
+    /// concatenated (the layout capture staging assembles).
+    pub fn target_hidden(&self) -> u32 {
+        self.target_hidden
     }
 
     /// Positions currently held in the resident KV: the

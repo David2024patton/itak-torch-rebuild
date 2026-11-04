@@ -244,3 +244,33 @@ depth 6 acceptance 0.172 yields 1.97 tokens per round against a
 full target verify forward per round, and the loop trails plain
 decode (35.45 tok/s the same night). T-9.6 stays OPEN on its
 speed half: acceptance economics and verify cost are the work now.
+
+## Round economics (2026-11-04, RX 7900 XTX, main 72a4b9d)
+
+The round is now fully accounted for. Per round at depth 6, from
+the loop's own diag: draft 62.1 ms, verify 151.0 ms, residual
+about 4 ms (checkpoint, correction walk, rewind, emission).
+Submissions, readbacks, captures and rollback are all cleared
+with numbers; the 5.66 MB block-logits readback is about 1 ms.
+
+The cost is the projection form. Below GEMM_MIN_ROWS (16),
+projections run GEMV: one full weight stream per row. The probe
+fits rows x 16 GB at about 815 GB/s exactly (1 row 30 ms, 2 rows
+47 ms, 7 rows 140 ms), so a 7-row verify pays seven streams. The
+draft's 16-row block has the same disease at smaller scale
+(57.3 ms). Lowering the threshold to 2 was tested and killed with
+data: 7-row forwards got slower (140 to 253 ms) and the MMQ
+dispatch count roughly doubled, because the existing GEMM tiles
+are built for 32 and 64 rows. What is missing is a purpose-built
+small-batch matrix kernel that streams the weights once for
+2 to 16 rows; that is also the prefill chain's missing piece.
+
+One real cut landed: the greedy propose path built vocab-width
+one-hot vectors for every proposed token on every round (5.66 MB
+of zeros, 2.04 ms of host time) to back a trait view the loop
+never reads. The greedy arm now stores no distributions
+(speculator.rs). Re-verdict after the cut: depth 6 effective
+9.21 tok/s, depth 1 effective 14.60 tok/s, IDENTITY and GOLDEN
+PASS on both. SPEED STILL FAILS the 88.6 bar, with the blocker
+now precise: about 150 ms verify plus about 58 ms draft per
+round, both small-batch projection cost.

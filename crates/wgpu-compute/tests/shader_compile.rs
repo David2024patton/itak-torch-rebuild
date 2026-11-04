@@ -401,7 +401,7 @@ fn k15_k16_mmq_wide_shaders_compile_on_any_available_adapter() {
         Err(e) => e,
     };
     assert!(
-        err.to_string().contains("not a wide tile candidate"),
+        err.to_string().contains("is not one of"),
         "refusal names the candidate set: {err}"
     );
     // Second device: the adapter's own limits. Every

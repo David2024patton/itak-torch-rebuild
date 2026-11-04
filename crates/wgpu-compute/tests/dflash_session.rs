@@ -122,7 +122,7 @@ fn q6k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
             data.push(rng.next_u8());
         }
         for _ in 0..16 {
-            data.push((rng.next_u8() % 5) as u8);
+            data.push(rng.next_u8() % 5);
         }
         data.extend_from_slice(&f32_to_f16_bits(0.01).to_le_bytes());
     }

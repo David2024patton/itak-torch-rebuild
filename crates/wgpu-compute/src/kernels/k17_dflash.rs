@@ -223,7 +223,6 @@ fn attend_main(
             var vv: f32;
             if (from_block) {
                 vv = att_block_v[v_off + d];
-        }
             } else {
                 vv = att_committed_v[v_off + d];
             }

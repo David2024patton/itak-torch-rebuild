@@ -34,11 +34,21 @@ use crate::diag::Diag;
 use crate::error::{Result, SpecError};
 use crate::session::{SpecSession, SpecStats};
 
-/// The default candidate depths, ascending: a spread from the floor to
-/// the real draft's block size (16), including 6, the standing default
-/// from the 2026-10-30 llama.cpp sweep. A default, not a constant: any
-/// caller can replace the set wholesale through [`SweepConfig`].
-pub const DEFAULT_CANDIDATE_DEPTHS: &[usize] = &[1, 2, 4, 6, 8, 12, 16];
+/// The default candidate depths, ascending: exactly the set the
+/// 2026-10-30 llama.cpp sweep measured (`bench/gpu-proof-2026-10-30.
+/// md`), from the floor to the real draft's block size (16) and
+/// including 6, the standing default that sweep picked. Keeping the
+/// set identical makes the two tables comparable cell for cell. A
+/// default, not a constant: any caller can replace the set wholesale
+/// through [`SweepConfig`].
+pub const DEFAULT_CANDIDATE_DEPTHS: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16];
+
+/// The default winner band: the recorded operating-point rule (SPEC
+/// 9.4, applied in `bench/gpu-proof-2026-10-30.md`) picks the smallest
+/// depth within 2% of the best measured speed, because the speed curve
+/// is flat near its peak and the shallower round is the cheaper one to
+/// be wrong about.
+pub const DEFAULT_WINNER_BAND: f64 = 0.02;
 
 /// The default generation budget per depth: enough rounds at every
 /// candidate depth for the acceptance rate to settle, small enough for
@@ -49,7 +59,7 @@ pub const DEFAULT_TOKENS_PER_DEPTH: usize = 128;
 /// generation budget. Validated before anything runs
 /// ([`SweepConfig::validate`]); an unusable configuration refuses by
 /// name instead of producing an empty table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SweepConfig {
     /// Candidate draft depths, in the order they are measured. Each
     /// must be at least 1 and appear at most once. A depth beyond the
@@ -60,6 +70,10 @@ pub struct SweepConfig {
     /// Tokens generated per depth (the `generate` budget handed to
     /// each session). Must be at least 1.
     pub tokens_per_depth: usize,
+    /// The winner band, as a fraction in `[0, 1)`: the chosen default
+    /// is the smallest depth whose effective tok/s is within this
+    /// fraction of the best depth's. Default: 0.02 (SPEC 9.4's rule).
+    pub winner_band: f64,
 }
 
 impl Default for SweepConfig {
@@ -67,6 +81,7 @@ impl Default for SweepConfig {
         SweepConfig {
             depths: DEFAULT_CANDIDATE_DEPTHS.to_vec(),
             tokens_per_depth: DEFAULT_TOKENS_PER_DEPTH,
+            winner_band: DEFAULT_WINNER_BAND,
         }
     }
 }
@@ -90,7 +105,7 @@ impl SweepConfig {
         }
         let config = SweepConfig {
             depths,
-            tokens_per_depth: DEFAULT_TOKENS_PER_DEPTH,
+            ..SweepConfig::default()
         };
         config.validate()?;
         Ok(config.depths)
@@ -105,6 +120,12 @@ impl SweepConfig {
         }
         if self.tokens_per_depth == 0 {
             return Err(invalid("tokens_per_depth is zero".to_string()));
+        }
+        if !(0.0..1.0).contains(&self.winner_band) {
+            return Err(invalid(format!(
+                "winner_band {} is outside [0, 1)",
+                self.winner_band
+            )));
         }
         for (i, &depth) in self.depths.iter().enumerate() {
             if depth == 0 {
@@ -172,27 +193,44 @@ impl DepthRow {
 }
 
 /// The outcome of a sweep: one row per measured depth, in the order
-/// they were measured.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// they were measured, plus the winner band they were judged under
+/// (carried from the [`SweepConfig`] that ran, so a filed report can
+/// be re-judged by hand).
+#[derive(Debug, Clone, PartialEq)]
 pub struct SweepReport {
     /// The measured rows.
     pub rows: Vec<DepthRow>,
+    /// The winner band fraction the chosen default is picked under.
+    pub winner_band: f64,
 }
 
-/// Speeds and rates closer than this are a tie for winner selection:
-/// measured walls jitter, and a tie must fall through to the acceptance
-/// rate rather than to whichever row the clock happened to flatter.
-const TIE_EPS: f64 = 1e-9;
+impl Default for SweepReport {
+    fn default() -> Self {
+        SweepReport {
+            rows: Vec::new(),
+            winner_band: DEFAULT_WINNER_BAND,
+        }
+    }
+}
 
 impl SweepReport {
-    /// The winning depth's row, by the recorded rule: highest effective
-    /// tok/s; ties broken by higher acceptance rate, then by the
-    /// shallower depth (the cheaper round wins what it did not lose).
+    /// The winning depth's row, by the recorded operating-point rule
+    /// (SPEC 9.4): the smallest depth whose effective tok/s is within
+    /// `winner_band` of the best depth's. The speed curve is flat near
+    /// its peak, so the band keeps clock jitter from crowning a deep,
+    /// expensive round over a shallow one that measured the same.
     /// `None` when no depth was measured.
     pub fn winner(&self) -> Option<&DepthRow> {
+        let best = self
+            .rows
+            .iter()
+            .map(|row| row.tok_per_sec)
+            .fold(0.0_f64, f64::max);
+        let floor = best * (1.0 - self.winner_band);
         self.rows
             .iter()
-            .reduce(|best, row| if row_beats(row, best) { row } else { best })
+            .filter(|row| row.tok_per_sec >= floor)
+            .min_by_key(|row| row.depth)
     }
 
     /// The winning depth, if any depth was measured.
@@ -237,23 +275,6 @@ impl SweepReport {
         }
         out
     }
-}
-
-/// Whether `a` takes the win from `b` under the winner rule.
-fn row_beats(a: &DepthRow, b: &DepthRow) -> bool {
-    if a.tok_per_sec > b.tok_per_sec + TIE_EPS {
-        return true;
-    }
-    if b.tok_per_sec > a.tok_per_sec + TIE_EPS {
-        return false;
-    }
-    if a.acceptance_rate > b.acceptance_rate + TIE_EPS {
-        return true;
-    }
-    if b.acceptance_rate > a.acceptance_rate + TIE_EPS {
-        return false;
-    }
-    a.depth < b.depth
 }
 
 /// Why a sweep stopped, named. The loop's own refusals keep their
@@ -357,7 +378,10 @@ where
             }
         }
     }
-    let report = SweepReport { rows };
+    let report = SweepReport {
+        rows,
+        winner_band: sweep.winner_band,
+    };
     match report.winner() {
         Some(w) => diag.event(
             "spec.sweep.end",
@@ -520,18 +544,27 @@ mod tests {
             SweepConfig {
                 depths: vec![],
                 tokens_per_depth: 8,
+                winner_band: DEFAULT_WINNER_BAND,
             },
             SweepConfig {
                 depths: vec![0],
                 tokens_per_depth: 8,
+                winner_band: DEFAULT_WINNER_BAND,
             },
             SweepConfig {
                 depths: vec![2, 2],
                 tokens_per_depth: 8,
+                winner_band: DEFAULT_WINNER_BAND,
             },
             SweepConfig {
                 depths: vec![2],
                 tokens_per_depth: 0,
+                winner_band: DEFAULT_WINNER_BAND,
+            },
+            SweepConfig {
+                depths: vec![2],
+                tokens_per_depth: 8,
+                winner_band: 1.0,
             },
         ];
         for config in cases {
@@ -564,35 +597,42 @@ mod tests {
     }
 
     #[test]
-    fn winner_prefers_speed_then_acceptance_then_shallower() {
-        let fast = fabricated_row(16, 60.0, 0.10);
-        let slow = fabricated_row(2, 50.0, 0.90);
+    fn winner_follows_the_spec_9_4_band_rule() {
+        // Outright speed: depth 2 sits outside the 2% band under the
+        // best (60 * 0.98 = 58.8), so the fast deep row wins despite
+        // its poor acceptance.
         let report = SweepReport {
-            rows: vec![slow.clone(), fast],
-        };
-        assert_eq!(report.chosen_depth(), Some(16), "speed wins first");
-
-        let keen = fabricated_row(8, 50.0, 0.90);
-        let dull = fabricated_row(4, 50.0, 0.80);
-        let report = SweepReport {
-            rows: vec![dull, keen],
+            rows: vec![
+                fabricated_row(2, 50.0, 0.90),
+                fabricated_row(16, 60.0, 0.10),
+            ],
+            winner_band: DEFAULT_WINNER_BAND,
         };
         assert_eq!(
             report.chosen_depth(),
-            Some(8),
-            "acceptance breaks a speed tie"
+            Some(16),
+            "outside the band, best speed wins"
         );
 
-        let deep = fabricated_row(8, 50.0, 0.90);
-        let shallow = fabricated_row(4, 50.0, 0.90);
+        // Inside the band: 49.5 is within 2% of 50 (floor 49.0), so
+        // the smallest depth in the band is the pick.
         let report = SweepReport {
-            rows: vec![deep, shallow],
+            rows: vec![fabricated_row(8, 50.0, 0.90), fabricated_row(4, 49.5, 0.80)],
+            winner_band: DEFAULT_WINNER_BAND,
         };
         assert_eq!(
             report.chosen_depth(),
             Some(4),
-            "the shallower depth wins a full tie"
+            "inside the band, the smallest depth wins"
         );
+
+        // Just outside the band: 48.0 < 49.0, so depth 4 does not
+        // qualify and the best row stands.
+        let report = SweepReport {
+            rows: vec![fabricated_row(8, 50.0, 0.90), fabricated_row(4, 48.0, 0.95)],
+            winner_band: DEFAULT_WINNER_BAND,
+        };
+        assert_eq!(report.chosen_depth(), Some(8), "outside the band, no steal");
 
         assert_eq!(SweepReport::default().chosen_depth(), None);
     }
@@ -601,6 +641,7 @@ mod tests {
     fn table_rendering_has_the_bench_note_shape() {
         let report = SweepReport {
             rows: vec![fabricated_row(4, 50.0, 0.9), fabricated_row(6, 60.0, 0.5)],
+            winner_band: DEFAULT_WINNER_BAND,
         };
         let table = report.render_table();
         assert!(table.contains("| Depth | Rounds | Proposed | Accepted |"));
@@ -622,6 +663,7 @@ mod tests {
         let sweep = SweepConfig {
             depths: vec![1, 2],
             tokens_per_depth: 12,
+            winner_band: DEFAULT_WINNER_BAND,
         };
         let base = SpecConfig::default();
         let diag = RecDiag::default();
@@ -667,6 +709,7 @@ mod tests {
         let sweep = SweepConfig {
             depths: vec![99],
             tokens_per_depth: 4,
+            winner_band: DEFAULT_WINNER_BAND,
         };
         let diag = RecDiag::default();
         let err = run_sweep(
@@ -695,6 +738,7 @@ mod tests {
         let sweep = SweepConfig {
             depths: vec![3],
             tokens_per_depth: 4,
+            winner_band: DEFAULT_WINNER_BAND,
         };
         let diag = RecDiag::default();
         let err = run_sweep(

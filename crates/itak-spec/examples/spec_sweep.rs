@@ -177,6 +177,7 @@ fn run(
     let sweep = SweepConfig {
         depths,
         tokens_per_depth: n_tokens,
+        ..SweepConfig::default()
     };
     let base = SpecConfig::default();
     let factory = |config: &SpecConfig| build_session(target_path, draft_path, &eos, config);

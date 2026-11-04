@@ -3623,4 +3623,120 @@ mod tests {
         cfg.sliding_window = 4;
         assert_eq!(ring_capacity(&cfg, 64), 67);
     }
+
+    /// The resident fixture's layer shape: full QKV+gate
+    /// batch, fused gate, paired FFN, chained norms.
+    fn fixture_shape(first: bool) -> LayerFusionShape {
+        LayerFusionShape {
+            batched: true,
+            full_batch_gate: true,
+            gate_fused: true,
+            ffn_paired: true,
+            chained: true,
+            first,
+        }
+    }
+
+    #[test]
+    fn dispatch_count_fixture_layers_match_the_resident_pin() {
+        // Every projection at one dispatch (the GEMV and
+        // GEMM forms quantize nothing, so no stage has a
+        // share): layer 0 records 9 and each later layer 8,
+        // the per-layer counts the resident session test's
+        // 51-per-chunk pin is built from (gather + 9 + 5 x 8
+        // + head).
+        let one = [1; 8];
+        assert_eq!(layer_dispatch_count(fixture_shape(true), one, 0), 9);
+        assert_eq!(layer_dispatch_count(fixture_shape(false), one, 0), 8);
+    }
+
+    #[test]
+    fn dispatch_count_sharing_is_neutral_on_full_batch_layers() {
+        // A full-batch paired layer at MMQ rows: the batch
+        // is the attention stage's only h projection and
+        // the pair is the FFN stage's only one, so each
+        // stage already had exactly one quantize. Sharing
+        // moves those two quantizes off the products and
+        // onto the layer (products 1, shared 1 per stage)
+        // and the total does not move: quantize-once costs
+        // nothing where there was no duplication.
+        // Slots: Q(batch), K, V, gate, output (gated, own
+        // quantize), FFN gate (pair), FFN up, FFN down
+        // (SwiGLU, own quantize).
+        let own = [2, 1, 1, 1, 2, 2, 1, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(fixture_shape(true), own, 0), 13);
+        assert_eq!(layer_dispatch_count(fixture_shape(true), shared, 2), 13);
+        assert_eq!(layer_dispatch_count(fixture_shape(false), shared, 2), 12);
+    }
+
+    #[test]
+    fn dispatch_count_partial_batch_layer_drops_the_v_quantize() {
+        // A partial batch (Q6_K V, the real model's other
+        // layer class): the batch and the separate V both
+        // quantized the attention stage's h. Sharing drops
+        // exactly one dispatch per layer.
+        let shape = LayerFusionShape {
+            batched: true,
+            full_batch_gate: false,
+            gate_fused: true,
+            ffn_paired: true,
+            chained: true,
+            first: true,
+        };
+        // Slots: batch, K (absent), V, gate (absent, rides
+        // the batch), output, pair, up (absent), down.
+        let own = [2, 1, 2, 1, 2, 2, 1, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 15);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 14);
+    }
+
+    #[test]
+    fn dispatch_count_mixed_layer_shares_both_stages() {
+        // Partial batch and an unpaired FFN (Q6_K up): the
+        // attention stage shares across batch + V and the
+        // FFN stage across gate + up, one dispatch saved
+        // per stage. These are the per-layer counts the
+        // mixed resident test's chunk pin (93) is built
+        // from: 16 for layer 0, 15 for each later layer.
+        let shape = LayerFusionShape {
+            batched: true,
+            full_batch_gate: false,
+            gate_fused: true,
+            ffn_paired: false,
+            chained: true,
+            first: true,
+        };
+        let own = [2, 1, 2, 1, 2, 2, 2, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 18);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 16);
+        let later = LayerFusionShape {
+            first: false,
+            ..shape
+        };
+        assert_eq!(layer_dispatch_count(later, shared, 2), 15);
+    }
+
+    #[test]
+    fn dispatch_count_unbatched_layer_shares_across_qkv_and_gate() {
+        // No batch at all: Q, K, V, and the separate gate
+        // projection all read the attention stage's h, and
+        // an unpaired FFN reads the FFN stage's h twice.
+        // Sharing drops three dispatches in the attention
+        // stage and one in the FFN stage.
+        let shape = LayerFusionShape {
+            batched: false,
+            full_batch_gate: false,
+            gate_fused: false,
+            ffn_paired: false,
+            chained: true,
+            first: true,
+        };
+        let own = [2, 2, 2, 2, 2, 2, 2, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 23);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 19);
+    }
 }

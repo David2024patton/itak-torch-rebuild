@@ -221,3 +221,24 @@ this one.
   (staging the Q6_K half sums only, not the vec4) to buy a
   second resident workgroup, and that trade belongs in a
   follow-up note with this run's numbers attached.
+
+## Server A/B verdict (2026-11-04, RX 7900 XTX, main 864dffd)
+
+The wide kernels are numerically correct (parity gate green on the
+adapter, quantization bands 0.0036 Q4_K and 0.0042 Q6_K at batch 64)
+and they FAIL their purpose:
+
+- Per tensor they are about 3.5x SLOWER than the standard MMQ:
+  Q6_K m64 product 2.567 ms against wide w112 9.003 ms; Q4_K m64
+  1.556 ms against wide w128 5.350 ms.
+- In the real session the wide ladder HANGS: RADV reports the
+  context lost with a hard recovery, and no prefill line is ever
+  produced, at both bench lengths. The card recovered on its own.
+- The old ladder in the same window: gross 123.1 tok/s at 1,022
+  tokens, marginal 139.6 tok/s (252 to 1,022).
+
+Verdict: the standard MMQ (K13/K14) stays the shipping position.
+DEFAULT_WIDE_MIN_ROWS is now 65 in compute.rs, which takes the
+wide form out of the ladder by default; it remains in the tree,
+opt-in by env, for whoever wants to chase the occupancy question
+with these numbers attached.

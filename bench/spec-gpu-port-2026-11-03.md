@@ -199,3 +199,25 @@ the proven bound, so this should be last).
   dependency edge.
 - `crates/itak-spec/examples/spec_generate_gpu.rs`: the server
   proof runner.
+
+## Server verdict (2026-11-04, RX 7900 XTX, main 864dffd + the K17 brace fix)
+
+Ran on the real card against the real files, greedy, 64 tokens,
+Stage 1 prompt. Plain arm: first 8 tokens
+[13796, 26, 1573, 373, 290, 2167, 26899, 1212], 35.66 tok/s decode.
+
+- CPU-draft arm: IDENTITY PASS, GOLDEN PASS. Acceptance 0.172
+  through the shared conditioning path.
+- GPU-draft arm: IDENTITY PASS, GOLDEN PASS. Effective 4.79 tok/s.
+- SPEED: FAIL. 4.79 against the 88.6 bar.
+
+Root cause is one defect, caught independently by the
+dflash_session parity gate: the GPU draft's block forward diverges
+from the CPU reference (fixture parity fails at block row 0,
+argmax 4 vs 248; the fuse stage passes the drift bar and the inject
+bookkeeping matches, so the divergence sits in the per-layer chain
+or the K17 attention). Acceptance collapses to 0.003 (1 of 351),
+and with no accepted drafts the loop pays verify cost for nothing.
+Per-round cost with a working draft is fine (62 rounds in about
+13.2 s of generate). T-9.6 stays OPEN: correctness is proven on
+both arms; the speed half waits on the draft parity fix.

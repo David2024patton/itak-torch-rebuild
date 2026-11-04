@@ -315,3 +315,31 @@ fn k10_k11_gemm_shaders_compile_on_any_available_adapter() {
         info.name, info.backend
     );
 }
+
+#[test]
+fn k15_dflash_shaders_compile_on_any_available_adapter() {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping K15 shader compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute K15 shader compile test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("device for K15 shader compile test");
+    let _pipeline = wgpu_compute::K15Pipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K15 pipelines must build on {}: {e}", info.name));
+    eprintln!(
+        "K15 shipped shaders compiled on {} ({:?})",
+        info.name, info.backend
+    );
+}

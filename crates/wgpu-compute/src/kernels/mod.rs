@@ -34,12 +34,20 @@
 //! per projection when the device built it; the GEMM stays
 //! as the named fallback for devices and shapes the MMQ
 //! refuses.
+//!
+//! K15 is the DFlash draft set: the NEOX (half-split)
+//! rotate and the draft's non-causal, two-source
+//! (committed plus block) sliding-window attention, the
+//! two primitives the draft forward needs that the
+//! Glimmer kernels do not provide; the rest of the draft
+//! forward composes K1/K2/K3/K4/K7/K8 unchanged.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
 pub mod k12_q8_quant;
 pub mod k13_q4k_mmq;
 pub mod k14_q6k_mmq;
+pub mod k15_dflash;
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;

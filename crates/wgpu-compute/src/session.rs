@@ -211,7 +211,7 @@ pub struct SessionStats {
 /// else refused by name), so the two paths accept and refuse
 /// the same files.
 #[derive(Debug)]
-enum ProjWeights {
+pub(crate) enum ProjWeights {
     /// Q4_K weights for K1.
     Q4K(K1Weights),
     /// Q6_K weights for K2.
@@ -313,7 +313,7 @@ impl ProjCall {
 /// refusal text matches the trait path's projection entry, so
 /// a dtype with no GEMV family fails the same way on both
 /// paths.
-fn upload_proj(
+pub(crate) fn upload_proj(
     backend: &WgpuCompute,
     view: &TensorView,
     step: &'static str,
@@ -683,7 +683,7 @@ fn prepare_swiglu_proj(
 /// once. The dtype acceptance mirrors the trait path's
 /// `rms_norm` conversion exactly: F32, F16, BF16, Q8_0, Q4_K,
 /// Q5_K, Q6_K dequantize; anything else refuses by name.
-fn upload_norm(
+pub(crate) fn upload_norm(
     backend: &WgpuCompute,
     view: &TensorView,
     step: &'static str,

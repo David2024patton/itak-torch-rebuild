@@ -40,6 +40,7 @@ use crate::kernels::k11_q6k_gemm::K11Pipeline;
 use crate::kernels::k12_q8_quant::K12QuantPipeline;
 use crate::kernels::k13_q4k_mmq::K13Pipeline;
 use crate::kernels::k14_q6k_mmq::K14Pipeline;
+use crate::kernels::k15_dflash::K15Pipeline;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
@@ -148,6 +149,7 @@ pub struct WgpuCompute {
     k12_swiglu: K12QuantPipeline,
     k13: Option<K13Pipeline>,
     k14: Option<K14Pipeline>,
+    k15: K15Pipeline,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -230,6 +232,7 @@ impl WgpuCompute {
         let k12_swiglu = K12QuantPipeline::new(&ctx.device, ACT_SWIGLU)?;
         let k13 = K13Pipeline::for_device(&ctx.device)?;
         let k14 = K14Pipeline::for_device(&ctx.device)?;
+        let k15 = K15Pipeline::new(&ctx.device)?;
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -255,6 +258,7 @@ impl WgpuCompute {
             k12_swiglu,
             k13,
             k14,
+            k15,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -405,6 +409,13 @@ impl WgpuCompute {
     /// the workgroup storage. See [`WgpuCompute::k13`].
     pub(crate) fn k14(&self) -> Option<&K14Pipeline> {
         self.k14.as_ref()
+    }
+
+    /// The K15 (DFlash NEOX rotate + draft attention)
+    /// pipeline. Crate-internal: the draft session
+    /// ([`crate::dflash_session`]) composes it.
+    pub(crate) fn k15(&self) -> &K15Pipeline {
+        &self.k15
     }
 
     /// Drop all stored KV state, device buffers and host mirror.

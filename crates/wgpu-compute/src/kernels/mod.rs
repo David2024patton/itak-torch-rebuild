@@ -49,6 +49,14 @@
 //! two primitives the draft forward needs that the
 //! Glimmer kernels do not provide; the rest of the draft
 //! forward composes K1/K2/K3/K4/K7/K8 unchanged.
+//!
+//! K18 is the small-batch product set: K13/K14's MMQ
+//! math at a 16-row batch cap, one weight stream per
+//! dispatch for the 2..=16 row band the speculative
+//! loop runs at, in all three quant families (Q4_K,
+//! Q5_K, Q6_K). The session routes to it only under
+//! its env-set threshold, which defaults off; see the
+//! module's own docs for the reasoning.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -58,6 +66,7 @@ pub mod k14_q6k_mmq;
 pub mod k15_q4k_mmq_wide;
 pub mod k16_q6k_mmq_wide;
 pub mod k17_dflash;
+pub mod k18_small_batch;
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;

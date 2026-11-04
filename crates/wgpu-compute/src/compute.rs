@@ -43,6 +43,7 @@ use crate::kernels::k14_q6k_mmq::K14Pipeline;
 use crate::kernels::k15_q4k_mmq_wide::K15Pipeline;
 use crate::kernels::k16_q6k_mmq_wide::K16Pipeline;
 use crate::kernels::k17_dflash::K17Pipeline;
+use crate::kernels::k18_small_batch::{K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline};
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
@@ -86,6 +87,43 @@ fn resolve_wide_min_rows(raw: Option<&str>) -> u32 {
     match raw {
         Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_WIDE_MIN_ROWS),
         None => DEFAULT_WIDE_MIN_ROWS,
+    }
+}
+
+/// Environment variable naming the small-batch product
+/// threshold override: the largest batch row count at
+/// which the session prefers the small-batch products
+/// (K18) over the GEMV forms, inside the band from 2
+/// rows up. Operational config, not a compiled
+/// constant: set it to 15 or 16 to enable K18 across
+/// its measured band (the kernel itself refuses past
+/// [`crate::kernels::k18_small_batch::SMALL_MAX_BATCH`]),
+/// or leave it at the default to keep K18 out of the
+/// ladder entirely. An unparsable value falls back to
+/// [`DEFAULT_SMALL_BATCH_MAX_ROWS`], with the fallback
+/// logged at construction.
+pub const SMALL_BATCH_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_SMALL_BATCH_MAX_ROWS";
+
+/// The small-batch row threshold when the environment
+/// does not override it: 1, which is OFF, since the
+/// ladder only routes batches of 2 or more rows to
+/// K18. The shipped default follows the wide-MMQ
+/// precedent: an unproven kernel does not enter the
+/// ladder by default. The server proof that can move
+/// this value is sequenced in
+/// bench/small-batch-2026-11-04.md.
+pub const DEFAULT_SMALL_BATCH_MAX_ROWS: u32 = 1;
+
+/// Resolve the small-batch row threshold from the raw
+/// environment value: a plain u32, or the default when
+/// unset or unparsable.
+fn resolve_small_batch_max_rows(raw: Option<&str>) -> u32 {
+    match raw {
+        Some(s) => s
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(DEFAULT_SMALL_BATCH_MAX_ROWS),
+        None => DEFAULT_SMALL_BATCH_MAX_ROWS,
     }
 }
 
@@ -189,6 +227,10 @@ pub struct WgpuCompute {
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
     k17: K17Pipeline,
+    k18_q4k: Option<K18Q4KPipeline>,
+    k18_q6k: Option<K18Q6KPipeline>,
+    k18_q5k: Option<K18Q5KPipeline>,
+    small_batch_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -289,6 +331,29 @@ impl WgpuCompute {
             k15.is_some(),
             k16.is_some()
         );
+        // The small-batch product set (K18): optional on
+        // the same terms as the MMQ sets (a device
+        // granting too little workgroup storage for a
+        // family's staging set gets `None` for it, and
+        // the session keeps that family's GEMV form
+        // there). The row threshold at which the session
+        // starts preferring them is config, read here
+        // (see SMALL_BATCH_MAX_ROWS_ENV); the default
+        // keeps them out of the ladder until the server
+        // proof moves it.
+        let k18_q4k = K18Q4KPipeline::for_device(&ctx.device)?;
+        let k18_q6k = K18Q6KPipeline::for_device(&ctx.device)?;
+        let k18_q5k = K18Q5KPipeline::for_device(&ctx.device)?;
+        let small_batch_max_rows =
+            resolve_small_batch_max_rows(std::env::var(SMALL_BATCH_MAX_ROWS_ENV).ok().as_deref());
+        dbg_log!(
+            "small batch config: max_rows={small_batch_max_rows} (env \
+             {SMALL_BATCH_MAX_ROWS_ENV}, default {DEFAULT_SMALL_BATCH_MAX_ROWS}); \
+             k18 q4k={} q6k={} q5k={}",
+            k18_q4k.is_some(),
+            k18_q6k.is_some(),
+            k18_q5k.is_some()
+        );
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -318,6 +383,10 @@ impl WgpuCompute {
             k16,
             wide_min_rows,
             k17,
+            k18_q4k,
+            k18_q6k,
+            k18_q5k,
+            small_batch_max_rows,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -499,6 +568,39 @@ impl WgpuCompute {
     /// constant compiled into the selection seam.
     pub(crate) fn wide_min_rows(&self) -> u32 {
         self.wide_min_rows
+    }
+
+    /// The K18 (Q4_K small-batch) pipeline, when this
+    /// device grants the workgroup storage its staging
+    /// set needs. See [`WgpuCompute::k13`] for the
+    /// fallback contract.
+    pub(crate) fn k18_q4k(&self) -> Option<&K18Q4KPipeline> {
+        self.k18_q4k.as_ref()
+    }
+
+    /// The K18 (Q6_K small-batch) pipeline, when this
+    /// device grants the workgroup storage. See
+    /// [`WgpuCompute::k18_q4k`].
+    pub(crate) fn k18_q6k(&self) -> Option<&K18Q6KPipeline> {
+        self.k18_q6k.as_ref()
+    }
+
+    /// The K18 (Q5_K small-batch) pipeline, when this
+    /// device grants the workgroup storage. See
+    /// [`WgpuCompute::k18_q4k`].
+    pub(crate) fn k18_q5k(&self) -> Option<&K18Q5KPipeline> {
+        self.k18_q5k.as_ref()
+    }
+
+    /// The largest batch row count at which the resident
+    /// session prefers the small-batch products (K18)
+    /// over the GEMV forms, inside the band from 2 rows
+    /// up: config resolved at construction from
+    /// [`SMALL_BATCH_MAX_ROWS_ENV`], never a constant
+    /// compiled into the selection seam. The shipped
+    /// default (1) routes nothing.
+    pub(crate) fn small_batch_max_rows(&self) -> u32 {
+        self.small_batch_max_rows
     }
 
     /// Drop all stored KV state, device buffers and host mirror.
@@ -1008,5 +1110,37 @@ mod tests {
         assert_eq!(resolve_wide_min_rows(Some("wide")), DEFAULT_WIDE_MIN_ROWS);
         assert_eq!(resolve_wide_min_rows(Some("")), DEFAULT_WIDE_MIN_ROWS);
         assert_eq!(resolve_wide_min_rows(Some("-3")), DEFAULT_WIDE_MIN_ROWS);
+    }
+
+    #[test]
+    fn small_batch_max_rows_resolution() {
+        // Unset: the default, which is off (1 routes
+        // nothing, since the ladder's band starts at 2).
+        assert_eq!(
+            resolve_small_batch_max_rows(None),
+            DEFAULT_SMALL_BATCH_MAX_ROWS
+        );
+        assert_eq!(DEFAULT_SMALL_BATCH_MAX_ROWS, 1);
+        // Plain values pass through, including the
+        // proof positions: 15 (the routed band under
+        // GEMM_MIN_ROWS) and 16 (the kernel's full
+        // band).
+        assert_eq!(resolve_small_batch_max_rows(Some("15")), 15);
+        assert_eq!(resolve_small_batch_max_rows(Some("16")), 16);
+        assert_eq!(resolve_small_batch_max_rows(Some(" 0 ")), 0);
+        // Unparsable values fall back to the default
+        // rather than failing backend construction.
+        assert_eq!(
+            resolve_small_batch_max_rows(Some("small")),
+            DEFAULT_SMALL_BATCH_MAX_ROWS
+        );
+        assert_eq!(
+            resolve_small_batch_max_rows(Some("")),
+            DEFAULT_SMALL_BATCH_MAX_ROWS
+        );
+        assert_eq!(
+            resolve_small_batch_max_rows(Some("-2")),
+            DEFAULT_SMALL_BATCH_MAX_ROWS
+        );
     }
 }

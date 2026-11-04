@@ -87,6 +87,9 @@ pub use kernels::k14_q6k_mmq::{K14Call, K14Pipeline};
 pub use kernels::k15_q4k_mmq_wide::{K15Call, K15Pipeline, WideMmqShape};
 pub use kernels::k16_q6k_mmq_wide::{K16Call, K16Pipeline};
 pub use kernels::k17_dflash::{K17AttendCall, K17Pipeline, K17RotateCall};
+pub use kernels::k18_small_batch::{
+    K18Call, K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline, SmallShape, SMALL_MAX_BATCH,
+};
 pub use kernels::k1_q4k_gemv::{
     K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
 };

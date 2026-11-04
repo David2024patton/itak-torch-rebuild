@@ -436,6 +436,15 @@ pub struct K3Weights {
     buffer: wgpu::Buffer,
 }
 
+impl K3Weights {
+    /// The device buffer holding the tensor's blocks,
+    /// for the sibling kernel forms (K18) that bind the
+    /// same upload.
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
 /// One prepared K3 dispatch set: a bind group plus grid
 /// dimensions, built once for a (weights, input, output, batch)
 /// combination and encodable any number of times. The bench

@@ -186,3 +186,15 @@ Acceptance:
 - cargo clippy -p wgpu-compute --all-targets: no warnings
 - cargo deny check: advisories ok, bans ok, licenses ok,
   sources ok
+
+## Server proof (2026-11-04, RX 7900 XTX, main ef6ca5d)
+
+The owed GPU leg executed: resident_session_partial_batch_chunk_
+shares_one_quantize_per_stage ran on the card inside the
+resident_session suite (3 passed, 0 failed), three-driver parity
+with top-1 agreement at every printed step and max abs diffs at
+most 1.03e-2 against the 0.5 bar. The share is proven on real
+hardware; the dispatch accounting (26 legs removed per 64-row
+chunk) stands as the measured-on-paper figure from the plan
+builder, with end-to-end prefill timing left inside run noise as
+the note predicted.

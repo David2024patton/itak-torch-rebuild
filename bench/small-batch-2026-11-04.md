@@ -172,3 +172,31 @@ tip, one heavy job at a time:
    exists; 16 only extends K18's reach to devices
    without it) and records the measured rows table
    and verdict numbers in this note.
+
+## Server proof verdict (2026-11-04, RX 7900 XTX, main ef6ca5d)
+
+Correctness: perfect. The k18_small_batch parity gate executed on
+the card (worst vs-GEMV band diff 0.0045, argmax full at every
+batch), the shader compile leg passed, and all four verdict runs
+printed IDENTITY PASS and GOLDEN PASS with no hang and no lost
+context.
+
+Performance: a loss, and the default stays OFF.
+- Depth 6: control 9.19 tok/s (verify 149.8 ms) against K18 on
+  8.13 tok/s (verify 178.0 ms, up 28.2).
+- Depth 1: control 14.22 tok/s (verify 55.3 ms) against K18 on
+  8.90 tok/s (verify 125.1 ms, up 69.8).
+- draft_ms unchanged in the on position, as designed (the draft
+  session is not wired to K18).
+
+Mechanism, measured: K18 does stream the weights once (its
+per-tensor time is flat in rows), but at about 70 to 130 GB/s,
+where GEMV streams the same tensors at up to 676 GB/s. The
+one-stream saving only overtakes GEMV's per-row restreaming at
+rows 12 and up on the largest tensors, outside the verify band of
+2 to 7 rows. The design's staging through workgroup memory is
+the rate ceiling. K18 stays in the tree, opt-in by env, with this
+table as the baseline any second attempt must beat. The blocker
+for T-9.6's speed half is now named at the last level: a shared
+weight kernel that streams at GEMV's rate, which neither the
+wide MMQ nor K18 achieved.

@@ -99,7 +99,7 @@ use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
-use crate::kernels::k6_attention::{AttendGeom, DeviceKv, K6FlashCall, K6ReduceCall, K6ScoresCall};
+use crate::kernels::k6_attention::{AttendGeom, DeviceKv, K6FlashCall};
 use crate::kernels::k7_swiglu::K7Call;
 use crate::kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, ARGMAX_GROUPS, GATHER_NORM_MAX_WIDTH,
@@ -114,10 +114,50 @@ use crate::kernels::k9_attn_prep::{K9PrepCall, PrepArgs};
 /// and the gate fails.
 const POST_NORM_EPS: f32 = 1e-8;
 
-/// Most rows one forward chunk processes. Decode forwards one
-/// row; prefill chunks the prompt under this cap and the
-/// scores budget below.
+/// The structural ceiling on rows one forward chunk
+/// processes: the ring headroom algebra (window plus cap
+/// minus one), the rewind bound, and the scratch design are
+/// all built around chunks no larger than this. The
+/// operational cap a session actually runs resolves from
+/// config at construction ([`CHUNK_ROWS_ENV`]) and never
+/// exceeds this ceiling.
 const MAX_CHUNK_ROWS: usize = 64;
+
+/// Environment variable naming the chunk row cap override:
+/// the most rows one prefill chunk processes. Operational
+/// config, not a compiled constant (house law): lower it to
+/// shrink per-chunk scratch and the KV ring headroom with
+/// it. An unparsable or out-of-range value falls back to
+/// [`DEFAULT_CHUNK_ROWS`], with the fallback logged at
+/// session construction.
+pub const CHUNK_ROWS_ENV: &str = "WGPU_COMPUTE_CHUNK_ROWS";
+
+/// The chunk row cap when the environment does not override
+/// it: the structural ceiling, and the value every recorded
+/// bench ran at.
+pub const DEFAULT_CHUNK_ROWS: usize = 64;
+
+/// Resolve the chunk row cap from the raw environment value:
+/// a plain count inside `1..=MAX_CHUNK_ROWS`, or the default
+/// when unset, unparsable, or out of range. Pure, so the
+/// sizing law is unit-testable without a device.
+fn resolve_chunk_rows(raw: Option<&str>) -> usize {
+    match raw.and_then(|s| s.trim().parse::<usize>().ok()) {
+        Some(n) if (1..=MAX_CHUNK_ROWS).contains(&n) => n,
+        _ => DEFAULT_CHUNK_ROWS,
+    }
+}
+
+/// Rows for a chunk of an `n`-token remainder under cap
+/// `cap`: the remainder, capped. Pure sizing math, unit
+/// tested; the session's `chunk_rows` is this over its
+/// resolved cap. Before the flash switch this also shrank
+/// under a scores-buffer budget; flash materializes no
+/// scores, so the budget is gone and chunks hold the cap at
+/// any context length.
+fn chunk_rows_for(cap: usize, n: usize) -> usize {
+    n.min(cap)
+}
 
 /// Chunk row count at which a plan's projections switch from
 /// the GEMV kernels to the matrix-matrix kernels: the MMQ
@@ -132,14 +172,9 @@ const MAX_CHUNK_ROWS: usize = 64;
 /// is in bench/gpu-resident-2026-10-30.md.
 const GEMM_MIN_ROWS: usize = 16;
 
-/// Cap on the attention scores scratch, in elements
-/// (rows x query heads x stored positions): 2^24 f32 values,
-/// 64 MiB. The chunk row count shrinks under long contexts so
-/// the scores buffer never outgrows this.
-const SCORES_BUDGET_ELEMS: usize = 1 << 24;
-
 /// The windowed layers' ring capacity in a session:
-/// `sliding_window + MAX_CHUNK_ROWS - 1`. The headroom is a
+/// `sliding_window + chunk_cap - 1`, where `chunk_cap` is the
+/// session's resolved chunk row cap. The headroom is a
 /// correctness requirement, not tuning. A chunk appends all
 /// its rows before its attention runs, so the oldest query in
 /// the chunk (at `start`) still needs its whole window
@@ -149,8 +184,8 @@ const SCORES_BUDGET_ELEMS: usize = 1 << 24;
 /// evict keys the chunk's own early queries attend to (and a
 /// fully-masked query row reduces to 0/0). The mask window
 /// stays the config's window; only the storage ring grows.
-fn ring_capacity(cfg: &GlimmerConfig) -> usize {
-    cfg.sliding_window as usize + MAX_CHUNK_ROWS - 1
+fn ring_capacity(cfg: &GlimmerConfig, chunk_cap: usize) -> usize {
+    cfg.sliding_window as usize + chunk_cap - 1
 }
 
 /// Wrap a backend failure in the model's step-failure shape,
@@ -1104,7 +1139,7 @@ struct Scratch {
     /// (K9) writes here from the raw projection rows (a buffer
     /// may not be bound read-only and read-write in one
     /// dispatch, so no step in this design aliases its input),
-    /// and the scores pass reads it. Keys need no such buffer:
+    /// and the flash attention reads it. Keys need no such buffer:
     /// K9 writes the prepared keys straight into the KV store.
     q_normed: wgpu::Buffer,
     /// Key rows as projected, `[rows][kv_width]`.
@@ -1123,8 +1158,6 @@ struct Scratch {
     ffn_up: wgpu::Buffer,
     /// FFN activated rows, `[rows][ffn]`.
     ffn_act: wgpu::Buffer,
-    /// Attention scores, `[rows][q_heads][scores_cap]`.
-    scores: wgpu::Buffer,
     /// K12's quantized activations: the packed int8 words,
     /// `[rows][blocks][8]` u32, blocks counted at the widest
     /// projection input a plan quantizes (hidden, attention,
@@ -1170,18 +1203,14 @@ struct Scratch {
 }
 
 impl Scratch {
-    /// Allocate the scratch for `rows` chunk rows with a
-    /// scores capacity of `scores_cap` stored positions.
+    /// Allocate the scratch for `rows` chunk rows. There is
+    /// deliberately no attention scores buffer: flash
+    /// attention never materializes scores, so no scratch
+    /// here grows with the stored position count.
     /// `qkv_width` is the widest batched-QKV row among the
     /// layers (0 when no layer batches; the buffer then takes
     /// a token element and is never bound).
-    fn new(
-        ctx: &GpuContext,
-        cfg: &GlimmerConfig,
-        rows: usize,
-        scores_cap: usize,
-        qkv_width: usize,
-    ) -> Self {
+    fn new(ctx: &GpuContext, cfg: &GlimmerConfig, rows: usize, qkv_width: usize) -> Self {
         let act = |label: &str, elems: usize| ctx.scratch_buffer(label, (elems * 4) as u64);
         let hidden = cfg.hidden as usize;
         let q_width = cfg.q_width() as usize;
@@ -1209,7 +1238,6 @@ impl Scratch {
             ffn_gate: act("session ffn gate", rows * ffn),
             ffn_up: act("session ffn up", rows * ffn),
             ffn_act: act("session ffn act", rows * ffn),
-            scores: act("session scores", rows * cfg.q_heads as usize * scores_cap),
             q8_qs: act("session q8 qs", rows * q8_blocks * 8),
             q8_ds: act("session q8 ds", rows * q8_blocks * 4),
             last_row: act("session last row", hidden),
@@ -1242,8 +1270,8 @@ impl Scratch {
 }
 
 /// One layer's prepared dispatches within a chunk plan, in
-/// forward order. The position-dependent calls (prep, scores,
-/// reduce) are refreshed per chunk through their setters
+/// forward order. The position-dependent calls (prep, flash)
+/// are refreshed per chunk through their setters
 /// before encoding; everything else is fixed at plan build.
 #[derive(Debug)]
 struct LayerPlan {
@@ -1263,16 +1291,13 @@ struct LayerPlan {
     /// norms, the sliding layers' RoPE, and the KV append in
     /// one dispatch.
     prep: K9PrepCall,
-    /// Attention scores over the resident KV (two-pass form,
-    /// absent on decode plans).
-    scores: Option<K6ScoresCall>,
-    /// Attention reduce over the resident KV (two-pass form,
-    /// absent on decode plans).
-    reduce: Option<K6ReduceCall>,
-    /// The fused flash attention (decode plans: one row,
-    /// where the two-pass form's scores buffer and second
-    /// dispatch are pure overhead; chunk plans keep two-pass).
-    flash: Option<K6FlashCall>,
+    /// The fused flash attention over the resident KV: the
+    /// only attention form a session plan runs, at every row
+    /// count (decode rows and prefill chunks alike). The
+    /// two-pass scores + reduce form stays with the trait
+    /// path, which steps one row at a time through the K6
+    /// one-shot entry points.
+    flash: K6FlashCall,
     /// Gate projection, h to gate (absent when the gate rides
     /// the QKV batch; present beside a fused output projection
     /// when the gate uploads separately).
@@ -1329,15 +1354,7 @@ impl LayerPlan {
     /// position `start` onward.
     fn set_geometry(&mut self, ctx: &GpuContext, stored: usize, first_pos: usize, start: usize) {
         self.prep.set_start_position(ctx, start);
-        if let Some(flash) = &mut self.flash {
-            flash.set_geometry(ctx, stored, first_pos, start);
-        }
-        if let Some(scores) = &mut self.scores {
-            scores.set_geometry(ctx, stored, first_pos, start);
-        }
-        if let Some(reduce) = &mut self.reduce {
-            reduce.set_geometry(ctx, stored, first_pos);
-        }
+        self.flash.set_geometry(ctx, stored, first_pos, start);
     }
 
     /// Record the pre-attention dispatches: the attention
@@ -1359,19 +1376,11 @@ impl LayerPlan {
 
     /// Record the attention dispatches proper: the fused
     /// preparation (norms, rotation, append), then the fused
-    /// flash on decode plans or scores + reduce on chunk
-    /// plans.
+    /// flash attention, the plan's one attention dispatch at
+    /// every row count.
     fn encode_attention(&self, pass: &mut wgpu::ComputePass<'_>) {
         self.prep.encode_into(pass);
-        if let Some(flash) = &self.flash {
-            flash.encode_into(pass);
-        }
-        if let Some(scores) = &self.scores {
-            scores.encode_into(pass);
-        }
-        if let Some(reduce) = &self.reduce {
-            reduce.encode_into(pass);
-        }
+        self.flash.encode_into(pass);
     }
 
     /// Record the post-attention dispatches: the gate
@@ -1433,8 +1442,6 @@ impl LayerPlan {
 struct ChunkPlan {
     /// Chunk row count this plan serves.
     rows: usize,
-    /// Scores capacity this plan's scratch was built with.
-    scores_cap: usize,
     /// KV capacities per layer at build time.
     kv_caps: Vec<usize>,
     /// The chunk's activation scratch.
@@ -1503,7 +1510,7 @@ impl ChunkPlan {
         embedding_dtype: Dtype,
         kv: &DeviceKv,
         rows: usize,
-        scores_cap: usize,
+        ring_cap: usize,
     ) -> Result<Self> {
         let ctx = backend.context();
         let qkv_width = layers
@@ -1511,7 +1518,7 @@ impl ChunkPlan {
             .filter_map(|l| l.attn_batch.as_ref().map(ProjWeights::out_rows))
             .max()
             .unwrap_or(0);
-        let scratch = Scratch::new(ctx, cfg, rows, scores_cap, qkv_width);
+        let scratch = Scratch::new(ctx, cfg, rows, qkv_width);
         let hidden = cfg.hidden as usize;
         let head_dim = cfg.key_length;
         let q_width = cfg.q_width() as usize;
@@ -1573,7 +1580,7 @@ impl ChunkPlan {
                 LayerKind::SlidingWindow => Some(cfg.sliding_window as usize),
                 LayerKind::Global => None,
             };
-            let ring = window.map(|_| ring_capacity(cfg));
+            let ring = window.map(|_| ring_cap);
             // The norm chains (K4's two-stage form) run when
             // the hidden width fits their register residency;
             // wider models keep the separate norm dispatches.
@@ -1742,27 +1749,18 @@ impl ChunkPlan {
                 window,
                 ring,
             };
-            // Decode plans (one row) run the fused flash
-            // attention; chunk plans keep the two-pass form,
-            // whose scores grid amortizes the extra dispatch
-            // over the chunk's rows.
-            let (scores, reduce, flash) = if rows == 1 {
-                let flash = backend
-                    .k6()
-                    .prepare_flash(ctx, &scratch.q_normed, kv_layer, &scratch.attn, &geom)
-                    .map_err(|e| we(e, "attention"))?;
-                (None, None, Some(flash))
-            } else {
-                let scores = backend
-                    .k6()
-                    .prepare_scores(ctx, &scratch.q_normed, kv_layer, &scratch.scores, &geom)
-                    .map_err(|e| we(e, "attention"))?;
-                let reduce = backend
-                    .k6()
-                    .prepare_reduce(ctx, &scratch.scores, kv_layer, &scratch.attn, &geom)
-                    .map_err(|e| we(e, "attention"))?;
-                (Some(scores), Some(reduce), None)
-            };
+            // Every plan runs the fused flash attention:
+            // decode rows and prefill chunks alike. The
+            // kernel is shape-generic (one workgroup per
+            // query row and head, the causal position taken
+            // per row, keys slotted modulo the ring), so the
+            // sliding mask and the chunked ring carry over
+            // unchanged, and no scores buffer is materialized
+            // at any context length.
+            let flash = backend
+                .k6()
+                .prepare_flash(ctx, &scratch.q_normed, kv_layer, &scratch.attn, &geom)
+                .map_err(|e| we(e, "attention"))?;
             // The gate and the output projection. When the
             // output weights are Q4_K, the gate multiply fuses
             // into the output projection's activation stage
@@ -2072,17 +2070,14 @@ impl ChunkPlan {
                 (None, None, Some(post_ffw))
             };
             // Dispatch accounting, from the unfused layer's
-            // 17: the QKV batch removes the K and V
+            // 17, less one because the flash attention is a
+            // single K6 dispatch where the two-pass form was
+            // two: the QKV batch removes the K and V
             // projections (and the gate projection when the
             // gate rides the batch), the fused gate removes
-            // the K7 multiply, the FFN pair removes the up
-            // projection and the K7 SwiGLU, and the flash
-            // attention removes one of the two K6 dispatches
-            // on decode plans.
-            let mut dispatch_count: u64 = 17;
-            if rows == 1 {
-                dispatch_count -= 1;
-            }
+            // the K7 multiply, and the FFN pair removes the up
+            // projection and the K7 SwiGLU.
+            let mut dispatch_count: u64 = 16;
             if layer.attn_batch.is_some() {
                 // A full batch removes the K and V
                 // projections; a partial batch removes K and
@@ -2127,8 +2122,6 @@ impl ChunkPlan {
                 proj_k,
                 proj_v,
                 prep,
-                scores,
-                reduce,
                 flash,
                 proj_gate,
                 gate_mul,
@@ -2330,7 +2323,6 @@ impl ChunkPlan {
             + u64::from(finish.is_some());
         Ok(ChunkPlan {
             rows,
-            scores_cap,
             kv_caps,
             scratch,
             gather,
@@ -2349,11 +2341,11 @@ impl ChunkPlan {
     }
 
     /// Whether the plan still binds the session's current KV
-    /// buffers (capacities unchanged since build) and its
-    /// scores scratch covers `needed_cap` stored positions.
-    fn is_current(&self, kv: &DeviceKv, needed_cap: usize) -> bool {
-        self.scores_cap >= needed_cap
-            && self.kv_caps.len() == kv.layer_count()
+    /// buffers (capacities unchanged since build). Flash
+    /// attention keeps no position-sized scratch, so KV
+    /// currency is the only condition.
+    fn is_current(&self, kv: &DeviceKv) -> bool {
+        self.kv_caps.len() == kv.layer_count()
             && self
                 .kv_caps
                 .iter()
@@ -2520,6 +2512,11 @@ pub struct ResidentSession<'a> {
     layers: Vec<ResidentLayer>,
     /// Per-layer resident KV storage.
     kv: DeviceKv,
+    /// The chunk row cap resolved from config at construction
+    /// ([`CHUNK_ROWS_ENV`]): prefill chunks never exceed it,
+    /// and the windowed layers' ring headroom is sized from
+    /// it (window plus cap minus one).
+    chunk_cap: usize,
     /// Tokens forwarded so far (the KV's next position).
     position: usize,
     /// Cached chunk plans by row count.
@@ -2606,6 +2603,11 @@ impl<'a> ResidentSession<'a> {
                 },
             })
             .collect();
+        let chunk_cap = resolve_chunk_rows(std::env::var(CHUNK_ROWS_ENV).ok().as_deref());
+        dbg_log!(
+            "session chunk config: cap={chunk_cap} rows (env {CHUNK_ROWS_ENV}, \
+             default {DEFAULT_CHUNK_ROWS}, ceiling {MAX_CHUNK_ROWS})"
+        );
         dbg_log!(
             "session built: layers={} resident weight bytes={} vocab={} hidden={}",
             layers.len(),
@@ -2621,7 +2623,8 @@ impl<'a> ResidentSession<'a> {
             final_norm,
             output,
             layers,
-            kv: DeviceKv::new(&pattern, ring_capacity(cfg)),
+            kv: DeviceKv::new(&pattern, ring_capacity(cfg, chunk_cap)),
+            chunk_cap,
             position: 0,
             plans: HashMap::new(),
             stats: SessionStats::default(),
@@ -2661,7 +2664,7 @@ impl<'a> ResidentSession<'a> {
                 },
             })
             .collect();
-        self.kv = DeviceKv::new(&pattern, ring_capacity(&self.cfg));
+        self.kv = DeviceKv::new(&pattern, ring_capacity(&self.cfg, self.chunk_cap));
         self.plans.clear();
         self.position = 0;
         dbg_log!("session reset: kv cleared, position 0");
@@ -2840,12 +2843,12 @@ impl<'a> ResidentSession<'a> {
     /// a chunk ends at, and a chunk's appends land before its
     /// queries attend. The one hazard is the windowed ring: a
     /// discarded write can alias a committed key a full ring
-    /// away. The ring spans `window + MAX_CHUNK_ROWS - 1`
+    /// away. The ring spans `window + chunk_cap - 1`
     /// positions, so an alias lands inside a later query's
-    /// window only when the discarded span exceeds
-    /// `MAX_CHUNK_ROWS` positions (the algebra is the ring
+    /// window only when the discarded span exceeds the
+    /// session's chunk cap (the algebra is the ring
     /// capacity comment's own). This method therefore refuses
-    /// a rewind discarding more than `MAX_CHUNK_ROWS`
+    /// a rewind discarding more than `chunk_cap`
     /// positions; [`ResidentSession::reset`] is the path for
     /// a full rewind. A speculative round discards at most
     /// its block (depth + 1 positions), far inside the bound.
@@ -2866,13 +2869,13 @@ impl<'a> ResidentSession<'a> {
             });
         }
         let span = self.position - position;
-        if span > MAX_CHUNK_ROWS {
+        if span > self.chunk_cap {
             return Err(GlimmerError::StepFailed {
                 step: "session",
                 detail: format!(
                     "rewind from {} to {position} discards {span} positions, past the \
-                     {MAX_CHUNK_ROWS}-position ring headroom; reset the session instead",
-                    self.position
+                     {}-position ring headroom; reset the session instead",
+                    self.position, self.chunk_cap
                 ),
             });
         }
@@ -2929,13 +2932,13 @@ impl<'a> ResidentSession<'a> {
     }
 
     /// Rows for the next chunk of an `n`-token remainder: the
-    /// chunk cap, shrunk so the scores scratch
-    /// (rows x query heads x stored-after-chunk) stays under
-    /// the budget at the deepest position this chunk reaches.
+    /// remainder under the session's resolved chunk cap.
+    /// Flash attention materializes no scores, so no budget
+    /// shrinks the chunk at long context (the two-pass form's
+    /// scores scratch did, and chunks decayed to a handful of
+    /// rows at full context; that decay is gone with it).
     fn chunk_rows(&self, n: usize) -> usize {
-        let stored_max = (self.position + n).max(1);
-        let by_budget = (SCORES_BUDGET_ELEMS / (self.cfg.q_heads as usize * stored_max)).max(1);
-        n.min(MAX_CHUNK_ROWS).min(by_budget)
+        chunk_rows_for(self.chunk_cap, n)
     }
 
     /// Stored entries and first stored position for layer
@@ -2948,7 +2951,7 @@ impl<'a> ResidentSession<'a> {
         match kind {
             LayerKind::Global => (end, 0),
             LayerKind::SlidingWindow => {
-                let stored = end.min(ring_capacity(&self.cfg));
+                let stored = end.min(ring_capacity(&self.cfg, self.chunk_cap));
                 (stored, end - stored)
             }
         }
@@ -2991,33 +2994,13 @@ impl<'a> ResidentSession<'a> {
             self.stats.aux_submissions += 1;
         }
 
-        // The scores scratch must cover the deepest layer view
-        // after this chunk: the full end position when any
-        // layer is global, else the window.
-        let any_global = self.cfg.layers.contains(&LayerKind::Global);
-        let needed_cap = if any_global {
-            end
-        } else {
-            end.min(ring_capacity(&self.cfg))
-        };
-        let current = self
-            .plans
-            .get(&rows)
-            .is_some_and(|p| p.is_current(&self.kv, needed_cap));
+        // A plan stays current while it binds the session's
+        // current KV buffers; flash attention keeps no scores
+        // scratch, so no coverage condition rides along (the
+        // two-pass form rebuilt plans as the scores capacity
+        // grew with position).
+        let current = self.plans.get(&rows).is_some_and(|p| p.is_current(&self.kv));
         if !current {
-            let cap = if needed_cap <= 1024 {
-                1024
-            } else {
-                needed_cap
-                    .max(
-                        self.plans
-                            .get(&rows)
-                            .map_or(0, |p| p.scores_cap.saturating_mul(2)),
-                    )
-                    .next_power_of_two()
-            }
-            .min(self.cfg.context_length as usize)
-            .max(needed_cap);
             let plan = ChunkPlan::build(
                 self.backend,
                 &self.cfg,
@@ -3028,7 +3011,7 @@ impl<'a> ResidentSession<'a> {
                 self.embedding_dtype,
                 &self.kv,
                 rows,
-                cap,
+                ring_capacity(&self.cfg, self.chunk_cap),
             )?;
             self.plans.insert(rows, plan);
         }
@@ -3232,4 +3215,80 @@ enum ChunkOutcome {
     Argmax(u32, f32),
     /// Every row's finished logits, row-major `[rows][vocab]`.
     Block(Vec<f32>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use muse_glimmer::PatternSource;
+
+    #[test]
+    fn chunk_cap_resolution_takes_valid_counts() {
+        assert_eq!(resolve_chunk_rows(None), DEFAULT_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some("1")), 1);
+        assert_eq!(resolve_chunk_rows(Some("32")), 32);
+        assert_eq!(resolve_chunk_rows(Some("64")), MAX_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some(" 16 ")), 16);
+    }
+
+    #[test]
+    fn chunk_cap_resolution_falls_back_by_name() {
+        // Unparsable, empty, zero, and past the structural
+        // ceiling all land on the default, never on a cap the
+        // ring algebra was not built around.
+        assert_eq!(resolve_chunk_rows(Some("abc")), DEFAULT_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some("")), DEFAULT_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some("0")), DEFAULT_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some("65")), DEFAULT_CHUNK_ROWS);
+        assert_eq!(resolve_chunk_rows(Some("-4")), DEFAULT_CHUNK_ROWS);
+    }
+
+    #[test]
+    fn chunk_rows_hold_the_cap_at_any_remainder() {
+        assert_eq!(chunk_rows_for(64, 200), 64);
+        assert_eq!(chunk_rows_for(64, 64), 64);
+        assert_eq!(chunk_rows_for(64, 6), 6);
+        assert_eq!(chunk_rows_for(64, 1), 1);
+        // A lowered cap is honored exactly, including the
+        // decode-shaped remainder of one.
+        assert_eq!(chunk_rows_for(32, 200), 32);
+        assert_eq!(chunk_rows_for(32, 1), 1);
+        // The cap is the only sizing input: no stored-count
+        // term exists anymore, so a chunk deep in a long
+        // context sizes exactly like the first chunk. (The
+        // two-pass budget this replaced shrank a 64-row chunk
+        // to 4 rows at the full 131,072 context.)
+        assert_eq!(chunk_rows_for(DEFAULT_CHUNK_ROWS, 1024), 64);
+    }
+
+    #[test]
+    fn ring_capacity_is_window_plus_cap_headroom() {
+        let mut cfg = GlimmerConfig {
+            name: None,
+            block_count: 1,
+            context_length: 131_072,
+            hidden: 6656,
+            ffn_hidden: 19_968,
+            q_heads: 32,
+            kv_heads: 2,
+            key_length: 128,
+            value_length: 128,
+            rope_freq_base: 500_000.0,
+            rope_freq_base_swa: 500_000.0,
+            rms_eps: 1e-5,
+            sliding_window: 2048,
+            logit_softcap: 20.0,
+            logit_scale: 0.196_116_13,
+            vocab_size: 202_048,
+            layers: vec![LayerKind::SlidingWindow],
+            pattern_source: PatternSource::MeasuredFallback,
+        };
+        // The recorded Glimmer geometry: window 2048, cap 64,
+        // ring 2111 (the profile note's ring figure).
+        assert_eq!(ring_capacity(&cfg, 64), 2111);
+        assert_eq!(ring_capacity(&cfg, 32), 2079);
+        assert_eq!(ring_capacity(&cfg, 1), 2048);
+        cfg.sliding_window = 4;
+        assert_eq!(ring_capacity(&cfg, 64), 67);
+    }
 }

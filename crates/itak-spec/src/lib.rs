@@ -10,6 +10,10 @@
 //! committed count; the draft is told exactly the newly committed tokens
 //! and receives their captured layer-input rows as conditioning.
 //!
+//! The T-9.7 depth sweep ([`sweep`]) re-measures the depth default on
+//! this stack: it drives sessions through a caller-supplied factory,
+//! so it runs against whatever backend the sessions were built on.
+//!
 //! The guarantee that matters: at temperature 0 the emitted sequence is
 //! token-identical to non-speculative greedy generation from the same
 //! target. The sampled arm implements the spec's rejection-sampling
@@ -34,6 +38,7 @@ pub mod rng;
 pub mod sampler;
 pub mod session;
 pub mod speculator;
+pub mod sweep;
 
 #[cfg(test)]
 mod testkit;
@@ -46,3 +51,4 @@ pub use session::{RoundOutcome, SpecSession, SpecStats};
 pub use speculator::{
     BlockProposal, DflashSpeculator, DraftArm, DraftDist, Proposal, SharedCompute, Speculator,
 };
+pub use sweep::{run_sweep, DepthRow, SweepConfig, SweepError, SweepReport};

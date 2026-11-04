@@ -4,7 +4,7 @@
 //! session, checked against a plain greedy run of the same
 //! resident session in the same process.
 //!
-//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>] [--draft=<gpu|cpu>]`
+//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>] [--draft=<gpu|cpu>] [--kv-capacity=<positions>]`
 //!
 //! `mode` is `both` (default), `plain` (run only phase A and write
 //! the stream to `stream_file`), or `spec` (run only phase B,
@@ -108,6 +108,17 @@ fn main() -> ExitCode {
             }
         },
     };
+    // The GPU draft's resident KV capacity, in positions:
+    // session config with the DflashSessionConfig default,
+    // raised here for runs whose committed length outgrows
+    // it (an injection past capacity refuses by name).
+    let kv_capacity: usize = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--kv-capacity="))
+        .map_or(DflashSessionConfig::default().kv_capacity, |v| {
+            v.parse()
+                .unwrap_or(DflashSessionConfig::default().kv_capacity)
+        });
     match run(
         target_path,
         draft_path,
@@ -118,6 +129,7 @@ fn main() -> ExitCode {
         &stream_file,
         bar,
         draft_backend,
+        kv_capacity,
     ) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
@@ -203,6 +215,7 @@ fn run(
     stream_file: &str,
     bar: f64,
     draft_backend: DraftBackend,
+    kv_capacity: usize,
 ) -> Result<bool, String> {
     let total = Instant::now();
 
@@ -353,14 +366,11 @@ fn run(
                     &raw,
                     Some(&embedding),
                     Some(&output_head),
-                    DflashSessionConfig::default(),
+                    DflashSessionConfig { kv_capacity },
                     Arc::new(DflashStderrDiag),
                 )
                 .map_err(|e| e.to_string())?;
-                println!(
-                    "draft backend: gpu (resident draft session, kv_capacity={})",
-                    DflashSessionConfig::default().kv_capacity
-                );
+                println!("draft backend: gpu (resident draft session, kv_capacity={kv_capacity})");
                 DflashSpeculator::gpu(draft_session)
             }
         };

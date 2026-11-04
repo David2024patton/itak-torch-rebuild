@@ -142,6 +142,20 @@ pub enum DflashError {
     },
     /// A torch-math primitive refused its inputs.
     Math(torch_math::MathError),
+    /// A step of a backend forward (the GPU session in
+    /// wgpu-compute) failed or refused its inputs: `step` names
+    /// the step in draft vocabulary, `detail` states the cause.
+    /// This is the draft-vocabulary mirror of
+    /// `muse_glimmer::GlimmerError::StepFailed`: backend failures
+    /// reach draft callers under a draft name, never as raw
+    /// backend errors.
+    StepFailed {
+        /// The step that failed, in draft vocabulary (for
+        /// example `"dflash session"`, `"dflash inject"`).
+        step: &'static str,
+        /// What went wrong, in plain terms.
+        detail: String,
+    },
 }
 
 impl fmt::Display for DflashError {
@@ -216,6 +230,9 @@ impl fmt::Display for DflashError {
                 "sequence would reach {total} tokens, past the model's context length of {context_length}"
             ),
             Self::Math(e) => write!(f, "math: {e}"),
+            Self::StepFailed { step, detail } => {
+                write!(f, "dflash step {step} failed: {detail}")
+            }
         }
     }
 }

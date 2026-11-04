@@ -547,6 +547,76 @@ fn k6_flash_matches_two_pass() {
         },
         35,
     );
+    // A full prefill chunk over a global layer: 64 rows, a
+    // stored count spanning four 256-key tiles, each row
+    // causally masked against the keys past its own position.
+    check_flash(
+        AttendGeom {
+            rows: 64,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            stored: 1024,
+            first_pos: 0,
+            start_pos: 960,
+            window: None,
+            ring: None,
+        },
+        37,
+    );
+    // A full chunk on a sliding layer: window 512, ring =
+    // window + 64 - 1 = 575 (the session's ring law at the
+    // default cap), the stored view is the whole ring, slots
+    // wrap it, and the window mask bites the oldest keys for
+    // the chunk's later rows while causality masks the
+    // newest for its early rows.
+    check_flash(
+        AttendGeom {
+            rows: 64,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            stored: 575,
+            first_pos: 1425,
+            start_pos: 1936,
+            window: Some(512),
+            ring: Some(575),
+        },
+        39,
+    );
+    // The full-context sliding geometry at the real model's
+    // window: 2048, ring 2111, stored spanning nine tiles,
+    // deep absolute positions.
+    check_flash(
+        AttendGeom {
+            rows: 64,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            stored: 2111,
+            first_pos: 128_961,
+            start_pos: 131_008,
+            window: Some(2048),
+            ring: Some(2111),
+        },
+        41,
+    );
+    // A partial chunk whose stored count crosses one tile
+    // boundary mid-chunk.
+    check_flash(
+        AttendGeom {
+            rows: 16,
+            q_heads: 4,
+            kv_heads: 2,
+            head_dim: 64,
+            stored: 300,
+            first_pos: 0,
+            start_pos: 284,
+            window: None,
+            ring: None,
+        },
+        43,
+    );
 }
 
 #[test]

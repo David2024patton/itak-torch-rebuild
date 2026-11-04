@@ -2999,7 +2999,10 @@ impl<'a> ResidentSession<'a> {
         // scratch, so no coverage condition rides along (the
         // two-pass form rebuilt plans as the scores capacity
         // grew with position).
-        let current = self.plans.get(&rows).is_some_and(|p| p.is_current(&self.kv));
+        let current = self
+            .plans
+            .get(&rows)
+            .is_some_and(|p| p.is_current(&self.kv));
         if !current {
             let plan = ChunkPlan::build(
                 self.backend,

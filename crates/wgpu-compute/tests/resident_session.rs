@@ -329,22 +329,21 @@ fn resident_session_matches_trait_and_cpu() {
     // at the fused count: the fixture's layers are all Q4_K,
     // so every layer batches QKV+gate and pairs gate+up, and
     // the norm chains fold the post norms into the next
-    // norms. On a chunk plan layer 0 records 10 dispatches
-    // (attn norm, batch, prep, scores, reduce, gated output,
-    // post chain, pair, fused down, boundary chain) and each
-    // later layer 9 (its attn norm rides the previous
-    // boundary chain); a chunk adds the gather, the embedding
-    // norm, the final norm, and the head (the fixture's head
-    // is Q5_K, so the finishing map is fused into it), and
-    // the embedding gather carries its norm fused, and the
-    // last layer's close folds the final norm in: 57 per
-    // chunk. Decode plans (one row) run the flash attention
-    // instead of scores + reduce, one fewer per layer: 51
-    // per chunk. Phase 1 is one 4-row prefill chunk and five
-    // decode chunks.
+    // norms. On every plan, chunk or decode, layer 0 records
+    // 9 dispatches (attn norm, batch, prep, flash, gated
+    // output, post chain, pair, fused down, boundary chain)
+    // and each later layer 8 (its attn norm rides the
+    // previous boundary chain); a chunk adds the gather and
+    // the head (the fixture's head is Q5_K, so the finishing
+    // map is fused into it), the embedding gather carries
+    // its norm fused, and the last layer's close folds the
+    // final norm in: 51 per chunk. (Chunk plans recorded 57
+    // before the flash switch, when their two-pass attention
+    // cost one extra dispatch per layer.) Phase 1 is one
+    // 4-row prefill chunk and five decode chunks.
     assert_eq!(
         stats.dispatches,
-        57 + 5 * 51,
+        6 * 51,
         "the chain is the whole graph at the fused count: {stats:?}"
     );
 

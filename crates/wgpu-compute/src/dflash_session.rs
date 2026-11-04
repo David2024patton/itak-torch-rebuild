@@ -612,14 +612,16 @@ impl Scratch {
 
 /// A prepared drafting chain for one block row count,
 /// cached across calls (the resident session's plan
-/// discipline). The attention call's runtime params
-/// (block start, committed count) are rewritten per call
-/// through its params buffer.
+/// discipline). Every layer's attention call carries its
+/// own params buffer, so the runtime params (block start,
+/// committed count) are rewritten per call on each of
+/// them through its params buffer.
 #[derive(Debug)]
 struct BlockPlan {
     calls: Vec<DevCall>,
-    /// Index of the attention call in `calls`.
-    attend: usize,
+    /// Indices of the attention calls in `calls`, one
+    /// per layer, in layer order.
+    attends: Vec<usize>,
     /// Block rows this plan serves.
     rows: usize,
     /// Vocabulary width of the logits readback.
@@ -636,8 +638,10 @@ impl BlockPlan {
         logits: &wgpu::Buffer,
         staging: &wgpu::Buffer,
     ) {
-        if let DevCall::Attend(call) = &self.calls[self.attend] {
-            call.set_runtime(ctx, block_start as u32, committed as u32);
+        for &attend in &self.attends {
+            if let DevCall::Attend(call) = &self.calls[attend] {
+                call.set_runtime(ctx, block_start as u32, committed as u32);
+            }
         }
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1090,7 +1094,7 @@ impl<'a> DflashSession<'a> {
         let eps = cfg.rms_eps;
         let scale = 1.0 / (key_len as f32).sqrt();
         let mut calls: Vec<DevCall> = Vec::new();
-        let mut attend_idx = 0usize;
+        let mut attends: Vec<usize> = Vec::new();
         calls.push(DevCall::Gather(
             backend
                 .k8()
@@ -1195,7 +1199,7 @@ impl<'a> DflashSession<'a> {
                     )
                     .map_err(|e| we(STEP_BLOCK, e))?,
             ));
-            attend_idx = calls.len();
+            attends.push(calls.len());
             let sliding = if cfg.is_sliding(li) == Some(true) {
                 Some(cfg.sliding_window)
             } else {
@@ -1320,7 +1324,7 @@ impl<'a> DflashSession<'a> {
         )?);
         Ok(BlockPlan {
             calls,
-            attend: attend_idx,
+            attends,
             rows,
             vocab: cfg.vocab_size as usize,
         })

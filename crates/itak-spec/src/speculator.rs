@@ -393,15 +393,15 @@ impl DflashSpeculator {
                 }
             }
         }
+        // The sampled arm's distributions back the trait's
+        // borrowed view, so they are kept. The greedy arm's
+        // one-hot view is NOT materialized here: at the real
+        // vocab it is megabytes of zeros per round on the
+        // loop's hot path (measured at about 2 ms of a
+        // 217 ms round), and the one consumer, the trait
+        // shim below, rebuilds it from the tokens on demand.
         self.last_probs = match arm {
-            DraftArm::Greedy => tokens
-                .iter()
-                .map(|&t| {
-                    let mut one_hot = vec![0.0f32; vocab];
-                    one_hot[t as usize] = 1.0;
-                    one_hot
-                })
-                .collect(),
+            DraftArm::Greedy => Vec::new(),
             DraftArm::Sampled { .. } => dists.clone(),
         };
         self.last_tokens.clone_from(&tokens);
@@ -422,6 +422,22 @@ impl Speculator for DflashSpeculator {
         let mut no_draws = || 0.0f64;
         let proposal = self.propose_block(pending, n, DraftArm::Greedy, &mut no_draws)?;
         let _ = proposal;
+        if self.last_probs.is_empty() {
+            // Greedy proposals carry no stored distributions
+            // (see propose_block); the trait's contract is a
+            // one-hot view of the proposed tokens, built here
+            // on the shim's cold path.
+            let vocab = self.config.vocab_size as usize;
+            self.last_probs = self
+                .last_tokens
+                .iter()
+                .map(|&t| {
+                    let mut one_hot = vec![0.0f32; vocab];
+                    one_hot[t as usize] = 1.0;
+                    one_hot
+                })
+                .collect();
+        }
         let dists = self
             .last_probs
             .iter()

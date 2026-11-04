@@ -287,6 +287,15 @@ impl ProjWeights {
 /// bind the same resident weight buffers and the same
 /// `[rows][width]` activation layout, so the choice is
 /// per-plan and invisible to the chain's step order.
+///
+/// An MMQ form whose activation is one stage of a layer's
+/// `h` may carry NO quantize of its own (`quant: None`):
+/// its quantize is the layer's shared one (see [`HShare`]),
+/// prepared once over `h` into the dedicated scratch pair
+/// and encoded by the layer plan ahead of every member
+/// product. The product binds the same buffers either way,
+/// so the bytes it reads are the per-call quantize's bytes,
+/// bit for bit.
 #[derive(Debug)]
 enum ProjCall {
     /// K1 dispatch.
@@ -301,31 +310,39 @@ enum ProjCall {
     GemmQ6K(K11Call),
     /// K12 quantize + K13 (Q4_K MMQ) dispatches.
     MmqQ4K {
-        /// The activation quantize dispatch.
-        quant: K12QuantCall,
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
         /// The integer product dispatch.
         mmq: K13Call,
     },
     /// K12 quantize + K14 (Q6_K MMQ) dispatches.
     MmqQ6K {
-        /// The activation quantize dispatch.
-        quant: K12QuantCall,
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
         /// The integer product dispatch.
         mmq: K14Call,
     },
     /// K12 quantize + K15 (Q4_K wide-tile double-buffered
     /// MMQ) dispatches.
     MmqWideQ4K {
-        /// The activation quantize dispatch.
-        quant: K12QuantCall,
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
         /// The integer product dispatch.
         mmq: K15Call,
     },
     /// K12 quantize + K16 (Q6_K wide-tile double-buffered
     /// MMQ) dispatches.
     MmqWideQ6K {
-        /// The activation quantize dispatch.
-        quant: K12QuantCall,
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
         /// The integer product dispatch.
         mmq: K16Call,
     },
@@ -341,19 +358,27 @@ impl ProjCall {
             ProjCall::GemmQ4K(c) => c.encode_into(pass),
             ProjCall::GemmQ6K(c) => c.encode_into(pass),
             ProjCall::MmqQ4K { quant, mmq } => {
-                quant.encode_into(pass);
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
                 mmq.encode_into(pass);
             }
             ProjCall::MmqQ6K { quant, mmq } => {
-                quant.encode_into(pass);
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
                 mmq.encode_into(pass);
             }
             ProjCall::MmqWideQ4K { quant, mmq } => {
-                quant.encode_into(pass);
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
                 mmq.encode_into(pass);
             }
             ProjCall::MmqWideQ6K { quant, mmq } => {
-                quant.encode_into(pass);
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
                 mmq.encode_into(pass);
             }
         }
@@ -361,13 +386,16 @@ impl ProjCall {
 
     /// Compute dispatches this projection records into the
     /// open pass: one for every form but the MMQ pair, whose
-    /// quantize is a dispatch of its own.
+    /// quantize is a dispatch of its own. An MMQ form riding
+    /// its layer's shared quantize records one: the shared
+    /// dispatch is counted once on the layer plan, not once
+    /// per member.
     fn dispatches(&self) -> u64 {
         match self {
-            ProjCall::MmqQ4K { .. }
-            | ProjCall::MmqQ6K { .. }
-            | ProjCall::MmqWideQ4K { .. }
-            | ProjCall::MmqWideQ6K { .. } => 2,
+            ProjCall::MmqQ4K { quant, .. }
+            | ProjCall::MmqQ6K { quant, .. }
+            | ProjCall::MmqWideQ4K { quant, .. }
+            | ProjCall::MmqWideQ6K { quant, .. } => 1 + u64::from(quant.is_some()),
             _ => 1,
         }
     }
@@ -439,7 +467,7 @@ fn mmq_product_q4k(
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: u32,
-    quant: K12QuantCall,
+    quant: Option<K12QuantCall>,
 ) -> Option<ProjCall> {
     let ctx = backend.context();
     if batch >= backend.wide_min_rows() {
@@ -476,7 +504,7 @@ fn mmq_product_q6k(
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: u32,
-    quant: K12QuantCall,
+    quant: Option<K12QuantCall>,
 ) -> Option<ProjCall> {
     let ctx = backend.context();
     if batch >= backend.wide_min_rows() {
@@ -502,6 +530,90 @@ fn mmq_product_q6k(
     }
 }
 
+/// One layer stage's shared K12 quantize of the layer's
+/// `h` activation, and the scratch pair it lands in.
+///
+/// A layer reads the same `h` content through several
+/// projections in one stage: the attention stage (the QKV
+/// batch, or Q, K, V separately, plus the separate V of a
+/// partial batch and a separate gate projection) all read
+/// the `h` the attention norm produced, and the FFN stage
+/// (the gate+up pair, or gate and up separately) reads the
+/// `h` the post-attention chain produced. Every one of
+/// those projections, in MMQ form, used to prepare its own
+/// K12 plain quantize of that identical buffer at the
+/// identical batch and width: the same kernel over the
+/// same bytes, so the outputs were the same bytes computed
+/// again. The share prepares the quantize ONCE per stage,
+/// into the plan's dedicated pair (`Scratch::q8h_qs` /
+/// `Scratch::q8h_ds`, kept apart from the general pair so
+/// no single-consumer quantize can clobber it mid-stage),
+/// and each member product binds that pair and carries no
+/// quantize of its own: byte-identical by construction,
+/// because the member products read exactly the bytes
+/// their own quantize dispatches would have written.
+///
+/// The two stages are two shares over two different `h`
+/// contents (the post-attention chain rewrites `h` between
+/// them); they reuse the one dedicated pair in turn, which
+/// is safe because every attention-stage product is encoded
+/// before the FFN stage's quantize (the gate projection,
+/// the attention stage's last consumer, opens the
+/// post-attention encode, ahead of the chain that produces
+/// the FFN stage's `h`).
+///
+/// A projection joins only when its input width matches
+/// the width the share was prepared at; a mismatched width
+/// keeps its own quantize over the general pair, exactly
+/// as before the share existed. The share's call is
+/// prepared lazily by its first member and installed only
+/// when that member's product also prepares: a member
+/// whose product refuses falls back to the GEMM form with
+/// the share untouched.
+#[derive(Debug)]
+struct HShare<'a> {
+    /// The shared quantized activations (the dedicated
+    /// pair's packed int8 words).
+    qs: &'a wgpu::Buffer,
+    /// The shared quantized scales, beside [`HShare::qs`].
+    ds: &'a wgpu::Buffer,
+    /// The shared quantize call, once the first member has
+    /// installed it.
+    call: Option<K12QuantCall>,
+    /// The input width the share quantizes at, set with
+    /// the call.
+    in_features: Option<usize>,
+    /// Projections riding the share (their products bind
+    /// the pair and record no quantize of their own).
+    members: usize,
+}
+
+impl<'a> HShare<'a> {
+    /// A fresh share over the plan's dedicated pair.
+    fn new(qs: &'a wgpu::Buffer, ds: &'a wgpu::Buffer) -> Self {
+        HShare {
+            qs,
+            ds,
+            call: None,
+            in_features: None,
+            members: 0,
+        }
+    }
+
+    /// Whether `in_features` may ride this share: the
+    /// width is unset (no member yet) or matches the width
+    /// the share quantizes at.
+    fn admits(&self, in_features: usize) -> bool {
+        self.in_features.is_none() || self.in_features == Some(in_features)
+    }
+
+    /// Dispatches the share contributes to the layer: one
+    /// when at least one member rides it, none otherwise.
+    fn dispatches(&self) -> u64 {
+        u64::from(self.call.is_some())
+    }
+}
+
 /// Try the MMQ form of a plain Q4_K projection: the K12
 /// plain quantize of `input` feeding the product
 /// [`mmq_product_q4k`] chooses. `None` (with the refusal
@@ -510,6 +622,7 @@ fn mmq_product_q6k(
 /// the GEMM form. This is the fallback ladder's
 /// composition step, at plan-build time; it never
 /// substitutes inside a dispatch.
+#[allow(clippy::too_many_arguments)]
 fn try_mmq_q4k(
     backend: &WgpuCompute,
     weights: &K1Weights,
@@ -518,11 +631,53 @@ fn try_mmq_q4k(
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: u32,
+    share: Option<&mut HShare<'_>>,
 ) -> Option<ProjCall> {
     if backend.k13().is_none() && backend.k15().is_none() {
         return None;
     }
     let ctx = backend.context();
+    if let Some(share) = share {
+        if share.admits(weights.in_features) {
+            // The shared form: the product binds the
+            // share's pair and carries no quantize; the
+            // share's quantize is prepared now if this is
+            // its first member, but installed only when
+            // the product prepares too, so a refusal here
+            // leaves the share exactly as it was and the
+            // caller takes the GEMM form.
+            let mut fresh = None;
+            if share.call.is_none() {
+                match backend.k12().prepare(
+                    ctx,
+                    input,
+                    share.qs,
+                    share.ds,
+                    batch,
+                    weights.in_features,
+                ) {
+                    Ok(q) => fresh = Some(q),
+                    Err(e) => {
+                        dbg_log!(
+                            "mmq q4k refused at the shared quantize prepare: {e}; \
+                             the gemm form serves it"
+                        );
+                        return None;
+                    }
+                }
+            }
+            let call = mmq_product_q4k(backend, weights, share.qs, share.ds, output, batch, None)?;
+            if share.call.is_none() {
+                share.call = fresh.take();
+                share.in_features = Some(weights.in_features);
+            }
+            share.members += 1;
+            return Some(call);
+        }
+        // A width the share does not quantize at never
+        // joins it: the projection keeps its own quantize
+        // over the general pair, below.
+    }
     let quant = match backend
         .k12()
         .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
@@ -533,13 +688,14 @@ fn try_mmq_q4k(
             return None;
         }
     };
-    mmq_product_q4k(backend, weights, q8_qs, q8_ds, output, batch, quant)
+    mmq_product_q4k(backend, weights, q8_qs, q8_ds, output, batch, Some(quant))
 }
 
 /// Try the MMQ form of a plain Q6_K projection (K12 plain
 /// quantize feeding the product [`mmq_product_q6k`]
 /// chooses). See [`try_mmq_q4k`] for the fallback
 /// contract.
+#[allow(clippy::too_many_arguments)]
 fn try_mmq_q6k(
     backend: &WgpuCompute,
     weights: &K2Weights,
@@ -548,11 +704,44 @@ fn try_mmq_q6k(
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     batch: u32,
+    share: Option<&mut HShare<'_>>,
 ) -> Option<ProjCall> {
     if backend.k14().is_none() && backend.k16().is_none() {
         return None;
     }
     let ctx = backend.context();
+    if let Some(share) = share {
+        if share.admits(weights.in_features) {
+            // The shared form, as in [`try_mmq_q4k`].
+            let mut fresh = None;
+            if share.call.is_none() {
+                match backend.k12().prepare(
+                    ctx,
+                    input,
+                    share.qs,
+                    share.ds,
+                    batch,
+                    weights.in_features,
+                ) {
+                    Ok(q) => fresh = Some(q),
+                    Err(e) => {
+                        dbg_log!(
+                            "mmq q6k refused at the shared quantize prepare: {e}; \
+                             the gemm form serves it"
+                        );
+                        return None;
+                    }
+                }
+            }
+            let call = mmq_product_q6k(backend, weights, share.qs, share.ds, output, batch, None)?;
+            if share.call.is_none() {
+                share.call = fresh.take();
+                share.in_features = Some(weights.in_features);
+            }
+            share.members += 1;
+            return Some(call);
+        }
+    }
     let quant = match backend
         .k12()
         .prepare(ctx, input, q8_qs, q8_ds, batch, weights.in_features)
@@ -563,7 +752,7 @@ fn try_mmq_q6k(
             return None;
         }
     };
-    mmq_product_q6k(backend, weights, q8_qs, q8_ds, output, batch, quant)
+    mmq_product_q6k(backend, weights, q8_qs, q8_ds, output, batch, Some(quant))
 }
 
 /// Prepare one projection dispatch over resident buffers.
@@ -574,7 +763,11 @@ fn try_mmq_q6k(
 /// threshold, and for Q5_K (the one-row head) at any size,
 /// the GEMV kernels run. Every form consumes the same
 /// resident buffers, so the choice never changes the
-/// chain's data layout.
+/// chain's data layout. `share` is the layer stage's shared
+/// `h` quantize (see [`HShare`]) when this projection reads
+/// the layer's `h`, and `None` for every other input: the
+/// GEMV and GEMM forms never consult it, since they
+/// quantize nothing.
 #[allow(clippy::too_many_arguments)]
 fn prepare_proj(
     backend: &WgpuCompute,
@@ -585,6 +778,7 @@ fn prepare_proj(
     output: &wgpu::Buffer,
     batch: usize,
     step: &'static str,
+    share: Option<&mut HShare<'_>>,
 ) -> Result<ProjCall> {
     let ctx = backend.context();
     let matrix = batch >= GEMM_MIN_ROWS;
@@ -592,7 +786,8 @@ fn prepare_proj(
     match weights {
         ProjWeights::Q4K(w) => {
             if matrix {
-                if let Some(c) = try_mmq_q4k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                if let Some(c) = try_mmq_q4k(backend, w, input, q8_qs, q8_ds, output, batch, share)
+                {
                     return Ok(c);
                 }
                 if let Some(g) = backend.k10() {
@@ -610,7 +805,8 @@ fn prepare_proj(
         }
         ProjWeights::Q6K(w) => {
             if matrix {
-                if let Some(c) = try_mmq_q6k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                if let Some(c) = try_mmq_q6k(backend, w, input, q8_qs, q8_ds, output, batch, share)
+                {
                     return Ok(c);
                 }
                 if let Some(g) = backend.k11() {
@@ -671,9 +867,15 @@ fn prepare_gated_proj(
             );
             match quant {
                 Ok(quant) => {
-                    if let Some(c) =
-                        mmq_product_q4k(backend, weights, q8_qs, q8_ds, output, batch as u32, quant)
-                    {
+                    if let Some(c) = mmq_product_q4k(
+                        backend,
+                        weights,
+                        q8_qs,
+                        q8_ds,
+                        output,
+                        batch as u32,
+                        Some(quant),
+                    ) {
                         return Ok(c);
                     }
                 }
@@ -743,7 +945,7 @@ fn prepare_swiglu_proj(
                                 q8_ds,
                                 output,
                                 batch as u32,
-                                quant,
+                                Some(quant),
                             ) {
                                 return Ok(c);
                             }
@@ -791,7 +993,7 @@ fn prepare_swiglu_proj(
                                 q8_ds,
                                 output,
                                 batch as u32,
-                                quant,
+                                Some(quant),
                             ) {
                                 return Ok(c);
                             }
@@ -1158,18 +1360,34 @@ struct Scratch {
     ffn_up: wgpu::Buffer,
     /// FFN activated rows, `[rows][ffn]`.
     ffn_act: wgpu::Buffer,
-    /// K12's quantized activations: the packed int8 words,
+    /// K12's quantized activations for the chain's
+    /// single-consumer quantizes: the packed int8 words,
     /// `[rows][blocks][8]` u32, blocks counted at the widest
     /// projection input a plan quantizes (hidden, attention,
-    /// or FFN width). One buffer serves every MMQ projection
-    /// in the chain: dispatches inside a pass are totally
-    /// ordered, each projection's quantize immediately
-    /// precedes its product, and no two quantized forms are
-    /// ever live at once.
+    /// or FFN width). One buffer serves them all: dispatches
+    /// inside a pass are totally ordered, each quantize
+    /// immediately precedes its product, and no two of these
+    /// quantized forms are ever live at once. The layers'
+    /// shared `h` quantizes do NOT land here; they have the
+    /// dedicated pair below, because their bytes must stay
+    /// live across a whole stage while this pair's forms
+    /// come and go.
     q8_qs: wgpu::Buffer,
     /// K12's quantized activation scales: one `vec4<f32>`
     /// per block, beside [`Scratch::q8_qs`].
     q8_ds: wgpu::Buffer,
+    /// The layers' shared `h` quantizes land here: the
+    /// packed int8 words of one stage's quantize of `h`,
+    /// bound by every member product of that stage (see
+    /// [`HShare`]). Sized exactly like the general pair: a
+    /// stage quantizes `h` at the hidden width, which the
+    /// general pair's block count already covers. The two
+    /// stages of a layer reuse this pair in turn; see
+    /// [`HShare`] for why that is safe.
+    q8h_qs: wgpu::Buffer,
+    /// The shared quantize's scales, beside
+    /// [`Scratch::q8h_qs`].
+    q8h_ds: wgpu::Buffer,
     /// The last row of stream A, copied out for the head,
     /// `[hidden]`.
     last_row: wgpu::Buffer,
@@ -1240,6 +1458,8 @@ impl Scratch {
             ffn_act: act("session ffn act", rows * ffn),
             q8_qs: act("session q8 qs", rows * q8_blocks * 8),
             q8_ds: act("session q8 ds", rows * q8_blocks * 4),
+            q8h_qs: act("session q8h qs", rows * q8_blocks * 8),
+            q8h_ds: act("session q8h ds", rows * q8_blocks * 4),
             last_row: act("session last row", hidden),
             head_in: act("session head in", hidden),
             logits: act("session logits", vocab),
@@ -1280,6 +1500,19 @@ struct LayerPlan {
     /// layer's boundary chain already produced this layer's
     /// `h`).
     attn_norm: Option<K4Call>,
+    /// The attention stage's shared K12 quantize of `h`
+    /// (absent when no attention-stage projection took an
+    /// MMQ form: decode plans and GEMM-served plans
+    /// quantize nothing). Encoded right after the attention
+    /// norm, ahead of every member product; the gate
+    /// projection, encoded in the post-attention half, is
+    /// its last reader.
+    quant_attn: Option<K12QuantCall>,
+    /// The FFN stage's shared K12 quantize of `h` (absent
+    /// on the same terms as [`LayerPlan::quant_attn`]).
+    /// Encoded after the post-attention chain produces the
+    /// FFN stage's `h`, ahead of the gate and up products.
+    quant_ffn: Option<K12QuantCall>,
     /// Q projection (or the whole batched QKV projection,
     /// when the layer batches), h to q (or to the qkv rows).
     proj_q: ProjCall,
@@ -1365,6 +1598,9 @@ impl LayerPlan {
         if let Some(n) = &self.attn_norm {
             n.encode_into(pass);
         }
+        if let Some(q) = &self.quant_attn {
+            q.encode_into(pass);
+        }
         self.proj_q.encode_into(pass);
         if let Some(k) = &self.proj_k {
             k.encode_into(pass);
@@ -1404,6 +1640,9 @@ impl LayerPlan {
         }
         if let Some(n) = &self.ffn_norm {
             n.encode_into(pass);
+        }
+        if let Some(q) = &self.quant_ffn {
+            q.encode_into(pass);
         }
         self.proj_fg.encode_into(pass);
         if let Some(u) = &self.proj_fu {
@@ -1490,6 +1729,89 @@ struct ChunkPlan {
     block_dispatch_count: u64,
     /// Compute dispatches one chunk of this plan records.
     dispatch_count: u64,
+}
+
+/// Which fusions a layer's weights qualified for: the
+/// shape half of the layer's dispatch accounting, kept
+/// apart from the prepared calls so the accounting is a
+/// pure function the unit tests can pin without a device.
+#[derive(Clone, Copy, Debug)]
+struct LayerFusionShape {
+    /// The QKV batch formed (the full Q, K, V batch or
+    /// the partial Q, K, gate batch).
+    batched: bool,
+    /// The batch carries both V and the gate (a full
+    /// batch with the gate riding): the separate gate
+    /// projection disappears as well.
+    full_batch_gate: bool,
+    /// The output projection consumes the gate fused, so
+    /// the K7 gate multiply disappears.
+    gate_fused: bool,
+    /// The FFN gate+up pair formed: the up projection and
+    /// the K7 SwiGLU disappear.
+    ffn_paired: bool,
+    /// The norm chains run (the hidden width fits their
+    /// register residency).
+    chained: bool,
+    /// The first layer: on chained plans its attention
+    /// norm is its own dispatch, where every later
+    /// layer's rides the previous layer's boundary chain.
+    first: bool,
+}
+
+/// Count one layer's dispatches in a chunk plan.
+///
+/// From the unfused layer's 17, less one because the
+/// flash attention is a single K6 dispatch where the
+/// two-pass form was two. The QKV batch removes two
+/// projections (K and V on a full batch; K and the gate
+/// projection on a partial batch, where V stays), and one
+/// more when a full batch also carries the gate. The
+/// fused gate removes the K7 multiply, the FFN pair
+/// removes the up projection and the K7 SwiGLU, and the
+/// chains remove one norm dispatch per layer plus the
+/// attention norm of every layer past the first (folded
+/// into the previous layer's boundary chain).
+///
+/// The base counts every projection as one dispatch.
+/// `proj_dispatches` carries each projection's real count
+/// in chain order (Q, K, V, gate, output, FFN gate, FFN
+/// up, FFN down), ONE for an absent projection, and the
+/// extras over one are added back: an MMQ projection with
+/// its own K12 quantize records two. A projection riding
+/// its stage's shared quantize records one (the product
+/// alone), and `shared_quantizes` adds the shared
+/// dispatches back, once per stage that gained a member:
+/// that is the whole arithmetic of quantize-once, one
+/// quantize per stage in place of one per member.
+fn layer_dispatch_count(
+    shape: LayerFusionShape,
+    proj_dispatches: [u64; 8],
+    shared_quantizes: u64,
+) -> u64 {
+    let mut count: u64 = 16;
+    if shape.batched {
+        count -= 2;
+        if shape.full_batch_gate {
+            count -= 1;
+        }
+    }
+    if shape.gate_fused {
+        count -= 1;
+    }
+    if shape.ffn_paired {
+        count -= 2;
+    }
+    if shape.chained {
+        count -= 1;
+        if !shape.first {
+            count -= 1;
+        }
+    }
+    for d in proj_dispatches {
+        count += d - 1;
+    }
+    count + shared_quantizes
 }
 
 impl ChunkPlan {
@@ -1601,6 +1923,15 @@ impl ChunkPlan {
                     eps,
                 ))
             };
+            // The layer's two shared `h` quantizes (see
+            // HShare): one for the attention stage's
+            // projections, one for the FFN stage's, both
+            // landing in the dedicated scratch pair.
+            // Members join as their projections are
+            // prepared below; the calls move onto the
+            // layer plan at its construction.
+            let mut share_attn = HShare::new(&scratch.q8h_qs, &scratch.q8h_ds);
+            let mut share_ffn = HShare::new(&scratch.q8h_qs, &scratch.q8h_ds);
             // The attention projections and the fused
             // preparation (K9: the Q/K norms, the sliding
             // layers' rotation, and the KV append in one
@@ -1625,6 +1956,7 @@ impl ChunkPlan {
                     &scratch.qkv,
                     rows,
                     "proj",
+                    Some(&mut share_attn),
                 )?;
                 let stride = batch.out_rows();
                 let (proj_v, v_in, v_stride, v_off) = if layer.batch_has_v {
@@ -1639,6 +1971,7 @@ impl ChunkPlan {
                         &scratch.v,
                         rows,
                         "proj",
+                        Some(&mut share_attn),
                     )?;
                     (Some(proj_v), &scratch.v, kv_width, 0)
                 };
@@ -1684,6 +2017,7 @@ impl ChunkPlan {
                     &scratch.q,
                     rows,
                     "proj",
+                    Some(&mut share_attn),
                 )?;
                 let proj_k = prepare_proj(
                     backend,
@@ -1694,6 +2028,7 @@ impl ChunkPlan {
                     &scratch.k,
                     rows,
                     "proj",
+                    Some(&mut share_attn),
                 )?;
                 let proj_v = prepare_proj(
                     backend,
@@ -1704,6 +2039,7 @@ impl ChunkPlan {
                     &scratch.v,
                     rows,
                     "proj",
+                    Some(&mut share_attn),
                 )?;
                 let prep = backend
                     .k9()
@@ -1811,6 +2147,7 @@ impl ChunkPlan {
                             &scratch.gate,
                             rows,
                             "proj",
+                            Some(&mut share_attn),
                         )?;
                         let call = prepare_gated_proj(
                             backend,
@@ -1839,6 +2176,7 @@ impl ChunkPlan {
                             &scratch.gate,
                             rows,
                             "proj",
+                            Some(&mut share_attn),
                         )?;
                         let gate_mul = backend.k7().prepare_gate(
                             ctx,
@@ -1856,6 +2194,7 @@ impl ChunkPlan {
                             &scratch.branch,
                             rows,
                             "proj",
+                            None,
                         )?;
                         (Some(proj_gate), Some(gate_mul), proj_o, false)
                     }
@@ -1869,6 +2208,7 @@ impl ChunkPlan {
                         &scratch.gate,
                         rows,
                         "proj",
+                        Some(&mut share_attn),
                     )?;
                     let gate_mul = backend.k7().prepare_gate(
                         ctx,
@@ -1886,6 +2226,7 @@ impl ChunkPlan {
                         &scratch.branch,
                         rows,
                         "proj",
+                        None,
                     )?;
                     (Some(proj_gate), Some(gate_mul), proj_o, false)
                 };
@@ -1953,6 +2294,7 @@ impl ChunkPlan {
                     &scratch.ffn_pair,
                     rows,
                     "swiglu_ffn",
+                    Some(&mut share_ffn),
                 )?;
                 let geom = K1ActGeom {
                     a_stride_elems: 2 * ffn,
@@ -1982,6 +2324,7 @@ impl ChunkPlan {
                     &scratch.ffn_gate,
                     rows,
                     "swiglu_ffn",
+                    Some(&mut share_ffn),
                 )?;
                 let proj_fu = prepare_proj(
                     backend,
@@ -1992,6 +2335,7 @@ impl ChunkPlan {
                     &scratch.ffn_up,
                     rows,
                     "swiglu_ffn",
+                    Some(&mut share_ffn),
                 )?;
                 let swiglu = backend.k7().prepare_swiglu(
                     ctx,
@@ -2009,6 +2353,7 @@ impl ChunkPlan {
                     &scratch.branch,
                     rows,
                     "swiglu_ffn",
+                    None,
                 )?;
                 (proj_fg, Some(proj_fu), Some(swiglu), proj_fd)
             };
@@ -2069,55 +2414,38 @@ impl ChunkPlan {
                 );
                 (None, None, Some(post_ffw))
             };
-            // Dispatch accounting, from the unfused layer's
-            // 17, less one because the flash attention is a
-            // single K6 dispatch where the two-pass form was
-            // two: the QKV batch removes the K and V
-            // projections (and the gate projection when the
-            // gate rides the batch), the fused gate removes
-            // the K7 multiply, and the FFN pair removes the up
-            // projection and the K7 SwiGLU.
-            let mut dispatch_count: u64 = 16;
-            if layer.attn_batch.is_some() {
-                // A full batch removes the K and V
-                // projections; a partial batch removes K and
-                // the gate projection instead (V stays).
-                dispatch_count -= 2;
-                if layer.batch_gate && layer.batch_has_v {
-                    dispatch_count -= 1;
-                }
-            }
-            if gate_fused {
-                dispatch_count -= 1;
-            }
-            if layer.ffn_pair.is_some() {
-                dispatch_count -= 2;
-            }
-            if chained {
-                // The post-attention chain removes one norm
-                // dispatch per layer, and the boundary chain
-                // removes the attention norm of every layer
-                // past the first (folded into the previous
-                // layer's close).
-                dispatch_count -= 1;
-                if i > 0 {
-                    dispatch_count -= 1;
-                }
-            }
-            // The matrix-form accounting above counts every
-            // projection as one dispatch; an MMQ projection
-            // records two (its K12 quantize is a dispatch of
-            // its own), so add the extras back per call.
-            dispatch_count += proj_q.dispatches() - 1;
-            dispatch_count += proj_k.as_ref().map_or(0, |c| c.dispatches() - 1);
-            dispatch_count += proj_v.as_ref().map_or(0, |c| c.dispatches() - 1);
-            dispatch_count += proj_gate.as_ref().map_or(0, |c| c.dispatches() - 1);
-            dispatch_count += proj_o.dispatches() - 1;
-            dispatch_count += proj_fg.dispatches() - 1;
-            dispatch_count += proj_fu.as_ref().map_or(0, |c| c.dispatches() - 1);
-            dispatch_count += proj_fd.dispatches() - 1;
+            // Dispatch accounting (layer_dispatch_count
+            // carries the arithmetic): the fusion shape
+            // from the layer's weights, the prepared
+            // projections' own counts (an absent projection
+            // counts one, contributing no extra), and one
+            // dispatch per shared quantize that gained a
+            // member.
+            let dispatch_count = layer_dispatch_count(
+                LayerFusionShape {
+                    batched: layer.attn_batch.is_some(),
+                    full_batch_gate: layer.batch_gate && layer.batch_has_v,
+                    gate_fused,
+                    ffn_paired: layer.ffn_pair.is_some(),
+                    chained,
+                    first: i == 0,
+                },
+                [
+                    proj_q.dispatches(),
+                    proj_k.as_ref().map_or(1, ProjCall::dispatches),
+                    proj_v.as_ref().map_or(1, ProjCall::dispatches),
+                    proj_gate.as_ref().map_or(1, ProjCall::dispatches),
+                    proj_o.dispatches(),
+                    proj_fg.dispatches(),
+                    proj_fu.as_ref().map_or(1, ProjCall::dispatches),
+                    proj_fd.dispatches(),
+                ],
+                share_attn.dispatches() + share_ffn.dispatches(),
+            );
             layer_plans.push(LayerPlan {
                 attn_norm,
+                quant_attn: share_attn.call,
+                quant_ffn: share_ffn.call,
                 proj_q,
                 proj_k,
                 proj_v,
@@ -2193,6 +2521,7 @@ impl ChunkPlan {
                 &scratch.logits,
                 1,
                 "lm_head",
+                None,
             )?;
             let finish = if cfg.logit_softcap > 0.0 {
                 backend
@@ -3293,5 +3622,121 @@ mod tests {
         assert_eq!(ring_capacity(&cfg, 1), 2048);
         cfg.sliding_window = 4;
         assert_eq!(ring_capacity(&cfg, 64), 67);
+    }
+
+    /// The resident fixture's layer shape: full QKV+gate
+    /// batch, fused gate, paired FFN, chained norms.
+    fn fixture_shape(first: bool) -> LayerFusionShape {
+        LayerFusionShape {
+            batched: true,
+            full_batch_gate: true,
+            gate_fused: true,
+            ffn_paired: true,
+            chained: true,
+            first,
+        }
+    }
+
+    #[test]
+    fn dispatch_count_fixture_layers_match_the_resident_pin() {
+        // Every projection at one dispatch (the GEMV and
+        // GEMM forms quantize nothing, so no stage has a
+        // share): layer 0 records 9 and each later layer 8,
+        // the per-layer counts the resident session test's
+        // 51-per-chunk pin is built from (gather + 9 + 5 x 8
+        // + head).
+        let one = [1; 8];
+        assert_eq!(layer_dispatch_count(fixture_shape(true), one, 0), 9);
+        assert_eq!(layer_dispatch_count(fixture_shape(false), one, 0), 8);
+    }
+
+    #[test]
+    fn dispatch_count_sharing_is_neutral_on_full_batch_layers() {
+        // A full-batch paired layer at MMQ rows: the batch
+        // is the attention stage's only h projection and
+        // the pair is the FFN stage's only one, so each
+        // stage already had exactly one quantize. Sharing
+        // moves those two quantizes off the products and
+        // onto the layer (products 1, shared 1 per stage)
+        // and the total does not move: quantize-once costs
+        // nothing where there was no duplication.
+        // Slots: Q(batch), K, V, gate, output (gated, own
+        // quantize), FFN gate (pair), FFN up, FFN down
+        // (SwiGLU, own quantize).
+        let own = [2, 1, 1, 1, 2, 2, 1, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(fixture_shape(true), own, 0), 13);
+        assert_eq!(layer_dispatch_count(fixture_shape(true), shared, 2), 13);
+        assert_eq!(layer_dispatch_count(fixture_shape(false), shared, 2), 12);
+    }
+
+    #[test]
+    fn dispatch_count_partial_batch_layer_drops_the_v_quantize() {
+        // A partial batch (Q6_K V, the real model's other
+        // layer class): the batch and the separate V both
+        // quantized the attention stage's h. Sharing drops
+        // exactly one dispatch per layer.
+        let shape = LayerFusionShape {
+            batched: true,
+            full_batch_gate: false,
+            gate_fused: true,
+            ffn_paired: true,
+            chained: true,
+            first: true,
+        };
+        // Slots: batch, K (absent), V, gate (absent, rides
+        // the batch), output, pair, up (absent), down.
+        let own = [2, 1, 2, 1, 2, 2, 1, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 15);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 14);
+    }
+
+    #[test]
+    fn dispatch_count_mixed_layer_shares_both_stages() {
+        // Partial batch and an unpaired FFN (Q6_K up): the
+        // attention stage shares across batch + V and the
+        // FFN stage across gate + up, one dispatch saved
+        // per stage. These are the per-layer counts the
+        // mixed resident test's chunk pin (93) is built
+        // from: 16 for layer 0, 15 for each later layer.
+        let shape = LayerFusionShape {
+            batched: true,
+            full_batch_gate: false,
+            gate_fused: true,
+            ffn_paired: false,
+            chained: true,
+            first: true,
+        };
+        let own = [2, 1, 2, 1, 2, 2, 2, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 18);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 16);
+        let later = LayerFusionShape {
+            first: false,
+            ..shape
+        };
+        assert_eq!(layer_dispatch_count(later, shared, 2), 15);
+    }
+
+    #[test]
+    fn dispatch_count_unbatched_layer_shares_across_qkv_and_gate() {
+        // No batch at all: Q, K, V, and the separate gate
+        // projection all read the attention stage's h, and
+        // an unpaired FFN reads the FFN stage's h twice.
+        // Sharing drops three dispatches in the attention
+        // stage and one in the FFN stage.
+        let shape = LayerFusionShape {
+            batched: false,
+            full_batch_gate: false,
+            gate_fused: false,
+            ffn_paired: false,
+            chained: true,
+            first: true,
+        };
+        let own = [2, 2, 2, 2, 2, 2, 2, 2];
+        let shared = [1, 1, 1, 1, 2, 1, 1, 2];
+        assert_eq!(layer_dispatch_count(shape, own, 0), 23);
+        assert_eq!(layer_dispatch_count(shape, shared, 2), 19);
     }
 }

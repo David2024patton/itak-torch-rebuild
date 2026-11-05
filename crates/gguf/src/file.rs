@@ -350,7 +350,8 @@ impl GgufFile {
     ///
     /// # Errors
     /// `MissingTensor` when absent, `UnsupportedTensorType` when the
-    /// stored type is not F32, F16, BF16, Q8_0, Q4_K, Q5_K, or Q6_K. No
+    /// stored type is not F32, F16, BF16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, or
+    /// Q6_K. No
     /// partial or placeholder data is ever returned.
     pub fn load_f32(&self, name: &str) -> Result<Vec<f32>> {
         let info = self.tensor_info(name)?;

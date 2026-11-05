@@ -4,7 +4,10 @@
 //! implementations on real model bytes.
 //!
 //! Usage: `cargo run --example probe -- <type> <file> <elements> [count]`
-//! where type is one of f32, f16, bf16, q8_0, q4_k, q5_k, q6_k.
+//! where type is one of f32, f16, bf16, q8_0, q2_k, q3_k, q4_k, q5_k,
+//! q6_k. Values print with Rust's shortest round-trip formatting, so a
+//! large `count` gives an exact text dump for diffing against a
+//! reference implementation.
 
 use std::process::ExitCode;
 
@@ -19,6 +22,8 @@ fn main() -> ExitCode {
         "f16" => gguf::GgmlType::F16,
         "bf16" => gguf::GgmlType::Bf16,
         "q8_0" => gguf::GgmlType::Q8_0,
+        "q2_k" => gguf::GgmlType::Q2K,
+        "q3_k" => gguf::GgmlType::Q3K,
         "q4_k" => gguf::GgmlType::Q4K,
         "q5_k" => gguf::GgmlType::Q5K,
         "q6_k" => gguf::GgmlType::Q6K,

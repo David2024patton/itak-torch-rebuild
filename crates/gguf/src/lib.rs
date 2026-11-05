@@ -5,9 +5,9 @@
 //! impossible:
 //!
 //! 1. **Missing dequantizers.** The Go loader had no Q3_K, Q5_K, or Q8_1
-//!    readers. Here the supported set (F32, F16, BF16, Q8_0, Q4_K, Q5_K,
-//!    Q6_K) dequantizes with ggml-exact math, and every other type is a
-//!    hard error naming the tensor and the type.
+//!    readers. Here the supported set (F32, F16, BF16, Q8_0, Q2_K, Q3_K,
+//!    Q4_K, Q5_K, Q6_K) dequantizes with ggml-exact math, and every other
+//!    type is a hard error naming the tensor and the type.
 //! 2. **A type-id collision.** The Go loader treated mainline ggml type
 //!    id 30 as I2_S; mainline id 30 is BF16. The id table in [`ggml`] is
 //!    mainline and pinned by tests.

@@ -6,9 +6,9 @@
 //! and are pinned by unit tests so the collision can never come back.
 //!
 //! Only the types this loader can dequantize to f32 are modeled as
-//! supported: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. Any other id is
-//! reported by name in a hard error (see [`type_name`]) instead of being
-//! silently skipped.
+//! supported: F32, F16, BF16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K. Any
+//! other id is reported by name in a hard error (see [`type_name`])
+//! instead of being silently skipped.
 
 /// A ggml tensor element type this loader supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub enum GgmlType {
     F16 = 1,
     /// 8-bit integer blocks of 32 with one f16 scale per block.
     Q8_0 = 8,
+    /// K-quant 2-bit, 256-element super-blocks.
+    Q2K = 10,
+    /// K-quant 3-bit, 256-element super-blocks.
+    Q3K = 11,
     /// K-quant 4-bit, 256-element super-blocks.
     Q4K = 12,
     /// K-quant 5-bit, 256-element super-blocks.
@@ -33,12 +37,14 @@ pub enum GgmlType {
 impl GgmlType {
     /// Look up a supported type by its mainline ggml id. Returns `None` for
     /// every other id, including ids that name real ggml types this loader
-    /// does not dequantize (Q3_K, Q8_1, and friends).
+    /// does not dequantize (Q8_1, IQ2_XXS, and friends).
     pub fn from_id(id: u32) -> Option<Self> {
         match id {
             0 => Some(Self::F32),
             1 => Some(Self::F16),
             8 => Some(Self::Q8_0),
+            10 => Some(Self::Q2K),
+            11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
@@ -57,7 +63,7 @@ impl GgmlType {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
             Self::Q8_0 => 32,
-            Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => 256,
         }
     }
 
@@ -68,6 +74,10 @@ impl GgmlType {
             Self::F16 | Self::Bf16 => 2,
             // f16 scale + 32 x i8
             Self::Q8_0 => 2 + 32,
+            // 16 packed scale/min bytes + 64 two-bit quant bytes + f16 d + f16 dmin
+            Self::Q2K => 16 + 64 + 2 + 2,
+            // 32 high-bit mask bytes + 64 two-bit quant bytes + 12 scale bytes + f16 d
+            Self::Q3K => 32 + 64 + 12 + 2,
             // f16 d + f16 dmin + 12 scale bytes + 128 nibble bytes
             Self::Q4K => 2 + 2 + 12 + 128,
             // f16 d + f16 dmin + 12 scale bytes + 32 high-bit bytes + 128 nibble bytes
@@ -143,15 +153,35 @@ mod tests {
         assert_eq!(GgmlType::Bf16.id(), 30);
         assert_eq!(type_name(30), "BF16");
         assert_eq!(GgmlType::from_id(30), Some(GgmlType::Bf16));
-        // The audit's missing readers must stay hard errors, not support.
-        assert_eq!(GgmlType::from_id(11), None); // Q3_K
-        assert_eq!(GgmlType::from_id(9), None); // Q8_1
+        // Q2_K and Q3_K gained readers on 2026-11-05 (cross-checked
+        // against ggml's reference row dequantizers; see
+        // bench/overnight-q2k-q3k-dequant-2026-11-05.md). This pin
+        // replaces the audit-era assertion that id 11 must stay
+        // unsupported: support is now deliberate, and the ids are pinned
+        // so they cannot drift.
+        assert_eq!(GgmlType::Q2K.id(), 10);
+        assert_eq!(GgmlType::Q3K.id(), 11);
+        assert_eq!(GgmlType::from_id(10), Some(GgmlType::Q2K));
+        assert_eq!(GgmlType::from_id(11), Some(GgmlType::Q3K));
+        assert_eq!(type_name(10), "Q2_K");
         assert_eq!(type_name(11), "Q3_K");
+        // Types still without readers must stay hard errors, not support.
+        assert_eq!(GgmlType::from_id(9), None); // Q8_1
         assert_eq!(type_name(9), "Q8_1");
     }
 
     #[test]
     fn block_geometry_matches_ggml() {
+        // Q2_K/Q3_K sizes are ggml's static_asserts on block_q2_K and
+        // block_q3_K in ggml-common.h (QK_K = 256): 84 and 110 bytes.
+        assert_eq!(GgmlType::Q2K.block_bytes(), 84);
+        assert_eq!(GgmlType::Q3K.block_bytes(), 110);
+        assert_eq!(GgmlType::Q2K.block_size(), 256);
+        assert_eq!(GgmlType::Q3K.block_size(), 256);
+        assert_eq!(GgmlType::Q2K.byte_len(256), Some(84));
+        assert_eq!(GgmlType::Q3K.byte_len(512), Some(220));
+        assert_eq!(GgmlType::Q2K.byte_len(255), None);
+        assert_eq!(GgmlType::Q3K.byte_len(128), None);
         assert_eq!(GgmlType::Q4K.block_bytes(), 144);
         assert_eq!(GgmlType::Q5K.block_bytes(), 176);
         assert_eq!(GgmlType::Q6K.block_bytes(), 210);

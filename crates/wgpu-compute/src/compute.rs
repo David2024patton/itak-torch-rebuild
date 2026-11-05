@@ -46,6 +46,7 @@ use crate::kernels::k17_dflash::K17Pipeline;
 use crate::kernels::k18_small_batch::{K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline};
 use crate::kernels::k19_q4k_mmv::K19Pipeline;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
+use crate::kernels::k21_q5k_mmv::K21Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -129,33 +130,33 @@ fn resolve_small_batch_max_rows(raw: Option<&str>) -> u32 {
 }
 
 /// Environment variable naming the register-streaming
-/// product threshold override: the largest batch row
-/// count at which the session prefers the
-/// register-streaming small-batch product (K19) over
-/// the GEMV form, inside the band from 2 rows up.
-/// Operational config, not a compiled constant: set it
-/// to 16 to enable K19 across its full band (the
-/// kernel itself refuses past
-/// [`crate::kernels::k19_q4k_mmv::MMV_MAX_BATCH`]), or
-/// leave it at the default to keep K19 out of the
-/// ladder entirely. An unparsable value falls back to
-/// [`DEFAULT_MMV_MAX_ROWS`], with the fallback logged
-/// at construction.
+/// small-batch (MMV) threshold override: the largest
+/// batch row count at which the session prefers the
+/// register-streaming products (K19 for Q4_K, K21 for
+/// Q5_K) over the K18 and GEMV forms, inside the band
+/// from 2 rows up. Operational config, not a compiled
+/// constant: set it to 16 to enable the MMV forms
+/// across their band (each kernel itself refuses past
+/// its cap), or leave it at the default to keep them
+/// out of the ladder entirely. An unparsable value
+/// falls back to [`DEFAULT_MMV_MAX_ROWS`], with the
+/// fallback logged at construction.
 pub const MMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_MMV_MAX_ROWS";
 
-/// The register-streaming row threshold when the
-/// environment does not override it: 1, which is OFF,
-/// since the ladder only routes batches of 2 or more
-/// rows to K19. The shipped default follows the
-/// wide-MMQ and K18 precedents: an unproven kernel
-/// does not enter the ladder by default. The server
-/// proof that can move this value is sequenced in
-/// bench/mmv-prototype-2026-11-05.md.
+/// The MMV row threshold when the environment does not
+/// override it: 1, which is OFF, since the ladder only
+/// routes batches of 2 or more rows to the MMV forms.
+/// The shipped default follows the wide-MMQ and K18
+/// precedent: an unproven kernel does not enter the
+/// ladder by default. The server proofs that can move
+/// this value are sequenced in
+/// bench/mmv-prototype-2026-11-05.md (Q4_K) and
+/// bench/mmv-q5k-2026-11-05.md (Q5_K).
 pub const DEFAULT_MMV_MAX_ROWS: u32 = 1;
 
-/// Resolve the register-streaming row threshold from
-/// the raw environment value: a plain u32, or the
-/// default when unset or unparsable.
+/// Resolve the MMV row threshold from the raw
+/// environment value: a plain u32, or the default when
+/// unset or unparsable.
 fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
     match raw {
         Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_MMV_MAX_ROWS),
@@ -306,6 +307,7 @@ pub struct WgpuCompute {
     k18_q5k: Option<K18Q5KPipeline>,
     small_batch_max_rows: u32,
     k19: K19Pipeline,
+    k21: K21Pipeline,
     mmv_max_rows: u32,
     chunked_gemv_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
@@ -431,21 +433,23 @@ impl WgpuCompute {
             k18_q6k.is_some(),
             k18_q5k.is_some()
         );
-        // The register-streaming product (K19): not
-        // optional like the staging sets (its only
-        // workgroup memory is its reduction partials, so
-        // no device class refuses it), and built
-        // unconditionally so a shader defect fails at
-        // construction like K1's. Only its routing is
-        // config (see MMV_MAX_ROWS_ENV); the default
-        // keeps it out of the ladder until the server
-        // proof moves it.
+        // The register-streaming products (K19 for
+        // Q4_K, K21 for Q5_K): not optional like the
+        // staging sets (their only workgroup memory is
+        // their reduction partials, so no device class
+        // refuses them), and built unconditionally so a
+        // shader defect fails at construction like
+        // K1's. Only their routing is config (see
+        // MMV_MAX_ROWS_ENV); the default keeps them out
+        // of the ladder until the server proof moves it.
         let k19 = K19Pipeline::new(&ctx.device)?;
+        let k21 = K21Pipeline::new(&ctx.device)?;
         let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
         dbg_log!(
             "mmv config: max_rows={mmv_max_rows} (env {MMV_MAX_ROWS_ENV}, \
-             default {DEFAULT_MMV_MAX_ROWS}); k19 shape {}",
-            k19.shape().name()
+             default {DEFAULT_MMV_MAX_ROWS}); k19 shape {}, k21 shape {}",
+            k19.shape().name(),
+            k21.shape().name()
         );
         // The chunked-GEMV dispatch shape: no pipelines
         // of its own (it re-dispatches the GEMV kernels
@@ -495,6 +499,7 @@ impl WgpuCompute {
             k18_q5k,
             small_batch_max_rows,
             k19,
+            k21,
             mmv_max_rows,
             chunked_gemv_max_rows,
             weights: RefCell::new(HashMap::new()),
@@ -723,9 +728,19 @@ impl WgpuCompute {
         &self.k19
     }
 
+    /// The K21 (Q5_K register-streaming small-batch)
+    /// pipeline. Unconditional: its only workgroup
+    /// memory is the reduction partials, so no device
+    /// class refuses it. See [`WgpuCompute::k18_q4k`]
+    /// for the staged sets' fallback contract.
+    pub(crate) fn k21(&self) -> &K21Pipeline {
+        &self.k21
+    }
+
     /// The largest batch row count at which the resident
-    /// session prefers the register-streaming product
-    /// (K19) over the GEMV form, inside the band from 2
+    /// session prefers the register-streaming products
+    /// (the MMV family: K19 for Q4_K, K21 for Q5_K) over
+    /// the K18 and GEMV forms, inside the band from 2
     /// rows up: config resolved at construction from
     /// [`MMV_MAX_ROWS_ENV`], never a constant compiled
     /// into the selection seam. The shipped default (1)
@@ -1295,7 +1310,7 @@ mod tests {
         assert_eq!(DEFAULT_MMV_MAX_ROWS, 1);
         // Plain values pass through, including the
         // proof positions: 15 (the routed band under
-        // GEMM_MIN_ROWS) and 16 (the kernel's full
+        // GEMM_MIN_ROWS) and 16 (the kernels' full
         // band).
         assert_eq!(resolve_mmv_max_rows(Some("15")), 15);
         assert_eq!(resolve_mmv_max_rows(Some("16")), 16);

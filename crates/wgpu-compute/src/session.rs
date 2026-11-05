@@ -98,6 +98,7 @@ use crate::kernels::k16_q6k_mmq_wide::K16Call;
 use crate::kernels::k18_small_batch::K18Call;
 use crate::kernels::k19_q4k_mmv::K19Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
+use crate::kernels::k21_q5k_mmv::K21Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
@@ -374,6 +375,10 @@ enum ProjCall {
     /// kernel consumes the f32 rows directly, so its
     /// dispatch count is the GEMV's).
     MmvQ4K(K19Call),
+    /// K21 (Q5_K register-streaming small-batch) dispatch:
+    /// one dispatch, no quantize (the MMV form reads the
+    /// f32 input directly, like the GEMV).
+    MmvQ5K(K21Call),
     /// K1 dispatches chunked at power-of-two row counts
     /// (the chunked GEMV form): one windowed GEMV call
     /// per chunk, in row order, covering the batch.
@@ -432,6 +437,7 @@ impl ProjCall {
                 mmq.encode_into(pass);
             }
             ProjCall::MmvQ4K(c) => c.encode_into(pass),
+            ProjCall::MmvQ5K(c) => c.encode_into(pass),
             ProjCall::ChunkedQ4K(calls) => {
                 for c in calls {
                     c.encode_into(pass);
@@ -1120,19 +1126,50 @@ fn try_chunked_q5k(
     Some(ProjCall::ChunkedQ5K(calls))
 }
 
+/// Try the K21 register-streaming form of a plain
+/// Q5_K projection: the f32 input feeds the product
+/// directly, no quantize dispatch. `None` when the
+/// batch is outside the configured band or the
+/// prepare refuses the shape (logged by name): the
+/// caller then continues down the ladder. This is the
+/// fallback ladder's composition step, at plan-build
+/// time; it never substitutes inside a dispatch.
+fn try_mmv_q5k(
+    backend: &WgpuCompute,
+    weights: &K3Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !mmv_applies(backend, batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    match backend.k21().prepare(ctx, weights, input, output, batch) {
+        Ok(c) => Some(ProjCall::MmvQ5K(c)),
+        Err(e) => {
+            dbg_log!("mmv q5k refused at the product prepare: {e}; the ladder continues");
+            None
+        }
+    }
+}
+
 /// Prepare one projection dispatch over resident buffers.
 /// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
 /// families dispatch through the matrix-matrix forms: the
 /// MMQ pair when the backend built it, the GEMM kernels
 /// (K10/K11) behind them when it built those; below the
 /// threshold, and for Q5_K (the one-row head) at any size,
-/// the GEMV kernels run. Two rungs sit between those: in
-/// the register-streaming band (2 rows up to the backend's
-/// configured `mmv_max_rows`, shipped off), the K19
-/// register-streaming product serves Q4_K, first in that
-/// family's ladder when its band is open (it is the
-/// band's structural challenger; see
-/// bench/mmv-prototype-2026-11-05.md); in the
+/// the GEMV kernels run. Three rungs sit between those:
+/// in the register-streaming band (2 rows up to the
+/// backend's configured `mmv_max_rows`, shipped off),
+/// the MMV register-streaming products serve their
+/// families first in that family's ladder when its band
+/// is open (K19 for Q4_K, K21 for Q5_K; the
+/// register-streaming form is the band's structural
+/// challenger, and the A/B should not be confounded; see
+/// bench/mmv-prototype-2026-11-05.md and
+/// bench/mmv-q5k-2026-11-05.md); behind them, in the
 /// small-batch band (2 rows up to the backend's
 /// configured `small_batch_max_rows`, shipped off), the
 /// K18 small-batch products serve all three families
@@ -1142,9 +1179,12 @@ fn try_chunked_q5k(
 /// kernels themselves serve the batch as several
 /// windowed dispatches at power-of-two row counts (the
 /// chunked GEMV form), tried after K18 and before the
-/// single whole-batch GEMV dispatch. Every form consumes
-/// the same resident buffers, so the choice never changes
-/// the chain's data layout. `share` is the layer stage's
+/// single whole-batch GEMV dispatch. So each family's
+/// ladder reads: MMV, then K18, then chunked, then the
+/// single whole-batch GEMV dispatch (Q6_K has no MMV
+/// arm yet, so its ladder starts at K18). Every form
+/// consumes the same resident buffers, so the choice
+/// never changes the chain's data layout. `share` is the layer stage's
 /// shared `h` quantize (see [`HShare`]) when this
 /// projection reads the layer's `h`, and `None` for every
 /// other input: the GEMV and GEMM forms never consult
@@ -1221,6 +1261,9 @@ fn prepare_proj(
                 .map_err(|e| we(e, step))
         }
         ProjWeights::Q5K(w) => {
+            if let Some(c) = try_mmv_q5k(backend, w, input, output, batch) {
+                return Ok(c);
+            }
             if let Some(c) = try_small_q5k(backend, w, input, q8_qs, q8_ds, output, batch) {
                 return Ok(c);
             }

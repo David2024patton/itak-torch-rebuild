@@ -484,9 +484,11 @@ fn missing_tensor_is_a_hard_error() {
 
 #[test]
 fn unsupported_types_are_hard_errors_that_name_the_type() {
-    // Q3_K (11) and Q8_1 (9): the readers the old Go loader lacked. They
-    // must fail loudly here, never decode as something else.
-    for (type_id, name) in [(11u32, "Q3_K"), (9, "Q8_1")] {
+    // Q4_0 (2) and Q8_1 (9): real ggml types this loader does not
+    // dequantize. They must fail loudly here, never decode as something
+    // else. (Q3_K stood in this list until 2026-11-05, when it gained a
+    // cross-checked reader; see q2_k_and_q3_k_tensors_load below.)
+    for (type_id, name) in [(2u32, "Q4_0"), (9, "Q8_1")] {
         let file = GgufFile::from_bytes(build(
             &[],
             &[tensor("w", &[256], type_id, vec![0u8; 64])],
@@ -513,6 +515,31 @@ fn unsupported_types_are_hard_errors_that_name_the_type() {
         GgufFile::from_bytes(build(&[], &[tensor("w", &[8], 99, vec![0u8; 32])], 32)).unwrap();
     let err = file.load_f32("w").unwrap_err();
     assert!(err.to_string().contains("99"));
+}
+
+#[test]
+fn q2_k_and_q3_k_tensors_load() {
+    // Q2_K (10): one 256-element block, 84 bytes. Scale bytes 0x01
+    // (scale 1, min 0), d = 1.0 at bytes 80..82, qs[0] = 3, so the first
+    // value is 3.0 and the rest of the block is 0.0.
+    let mut q2 = vec![0u8; 84];
+    q2[0..16].fill(0x01);
+    q2[16] = 3;
+    q2[80] = 0x00;
+    q2[81] = 0x3C;
+    let file = GgufFile::from_bytes(build(&[], &[tensor("w", &[256], 10, q2)], 32)).unwrap();
+    let out = file.load_f32("w").unwrap();
+    assert_eq!(out.len(), 256);
+    assert_eq!(out[0], 3.0);
+    assert!(out[1..].iter().all(|&v| v == 0.0));
+
+    // Q3_K (11): one 256-element block, 110 zero bytes. d = 0 forces
+    // every output to 0.0 regardless of quants and scales.
+    let file =
+        GgufFile::from_bytes(build(&[], &[tensor("w", &[256], 11, vec![0u8; 110])], 32)).unwrap();
+    let out = file.load_f32("w").unwrap();
+    assert_eq!(out.len(), 256);
+    assert!(out.iter().all(|&v| v == 0.0));
 }
 
 #[test]

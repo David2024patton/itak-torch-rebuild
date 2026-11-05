@@ -1,0 +1,58 @@
+=== overnight-golden run start: 2026-11-05T04:14:04+00:00 ===
+host: ubuntu-server
+--- llama.cpp build ---
+version: 0.7.0-dev (build 137, commit a7af149)
+built with GNU 15.2.0 for Linux x86_64
+--- staged file hash verification ---
+617aee4aa717eca3805e7ab6e11a8d3e86c7e8615c0f05843e3683a641be0074  gen_golden.py
+38d313aac2a85e3f820d48ddaaa8dc47f210a57053e9f601b37da212d126c3cb  gen_first_token_probs.py
+32a103b474dbd7c81a780a0b3e5b5d6d2c6c074b975b34d5596dd8b38e576873  prompts.jsonl
+29964b0785cd7d6dff11ca6a1c056c9c99a52e7ed17569fe8bd5fc06395ec58e  prompts-glimmer-subset.jsonl
+expected:
+617aee4aa717eca3805e7ab6e11a8d3e86c7e8615c0f05843e3683a641be0074  gen_golden.py
+38d313aac2a85e3f820d48ddaaa8dc47f210a57053e9f601b37da212d126c3cb  gen_first_token_probs.py
+32a103b474dbd7c81a780a0b3e5b5d6d2c6c074b975b34d5596dd8b38e576873  prompts.jsonl
+29964b0785cd7d6dff11ca6a1c056c9c99a52e7ed17569fe8bd5fc06395ec58e  prompts-glimmer-subset.jsonl
+--- step 1: TinyLlama regeneration x2 (determinism leg i) ---
+  accented_spanish: prompt 17 tokens, completion 64 tokens, eos=False
+  continuation_classic: prompt 10 tokens, completion 64 tokens, eos=False
+wrote /home/server/overnight-golden/out/tinyllama.regen1.jsonl (15 records)
+  accented_spanish: prompt 17 tokens, completion 64 tokens, eos=False
+  continuation_classic: prompt 10 tokens, completion 64 tokens, eos=False
+wrote /home/server/overnight-golden/out/tinyllama.regen2.jsonl (15 records)
+DETERMINISM-GEN-TINYLLAMA: BYTE-IDENTICAL
+DRIFT-TINYLLAMA: NONE (regen == committed fixture)
+--- step 2: Qwen2.5-1.5B regeneration (if model present) ---
+model: /home/server/torch-bench-2026-10-28/models/qwen2.5-1.5b-q4km.gguf
+  accented_spanish: prompt 13 tokens, completion 64 tokens, eos=False
+  continuation_classic: prompt 7 tokens, completion 64 tokens, eos=False
+wrote /home/server/overnight-golden/out/qwen15.regen.jsonl (15 records)
+DRIFT-QWEN15: NONE (regen == committed fixture)
+--- step 3: Qwen2.5-7B fixture (if model present) ---
+QWEN7-MODEL: MISSING on server (no Qwen2.5-7B GGUF in teardown or torch-bench models)
+--- step 4: Glimmer token-level fixture, factual subset (3 prompts x 64 tok, CPU) ---
+  factual_capital: prompt 6 tokens, completion 64 tokens, eos=False
+  factual_science: prompt 7 tokens, completion 64 tokens, eos=False
+  factual_history: prompt 10 tokens, completion 64 tokens, eos=False
+wrote /home/server/overnight-golden/out/glimmer-subset.golden.jsonl (3 records)
+GLIMMER-SUBSET done: 2026-11-05T04:16:40+00:00
+--- step 5: Glimmer first-token top-5 probabilities (15 prompts, CPU) ---
+Traceback (most recent call last):
+  File "/home/server/overnight-golden/src/golden/gen_first_token_probs.py", line 207, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/server/overnight-golden/src/golden/gen_first_token_probs.py", line 179, in main
+    for pr in steps[0]["probs"][:N_PROBS]]
+              ~~~~~~~~^^^^^^^^^
+KeyError: 'probs'
+GLIMMER-TOP5 done: 2026-11-05T04:16:54+00:00
+--- step 6: golden_run build + determinism leg ii (TinyLlama x2) ---
+   Compiling tokenizer v0.1.0 (/home/server/overnight-golden/src/crates/tokenizer)
+   Compiling arch-llama v0.1.0 (/home/server/overnight-golden/src/crates/arch-llama)
+    Finished `release` profile [optimized] target(s) in 2.81s
+continuation_classic: prompt 10 tokens, completion 64 tokens, eos=false, 50.2s
+done in 712.2s
+continuation_classic: prompt 10 tokens, completion 64 tokens, eos=false, 42.6s
+done in 728.0s
+DETERMINISM-ENGINE-TINYLLAMA: BYTE-IDENTICAL
+=== overnight-golden run end: 2026-11-05T04:40:57+00:00 ===

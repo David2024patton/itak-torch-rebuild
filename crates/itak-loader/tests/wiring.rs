@@ -247,13 +247,13 @@ fn missing_tensor_is_named_missing() {
 
 #[test]
 fn unsupported_type_is_unreadable_not_missing() {
-    // Q3_K (mainline id 11): present in the directory, but the gguf
+    // Q8_1 (mainline id 9): present in the directory, but the gguf
     // crate cannot size or read it. The seam must say unreadable, with
     // the type named, never missing and never placeholder bytes.
     let mut tensors = tiny_tensors();
     for t in &mut tensors {
         if t.name == "blk.0.attn_q.weight" {
-            t.type_id = 11;
+            t.type_id = 9;
             t.data = vec![0u8; 64];
         }
     }
@@ -264,7 +264,7 @@ fn unsupported_type_is_unreadable_not_missing() {
     match err {
         GlimmerError::TensorUnreadable { name, detail } => {
             assert_eq!(name, "blk.0.attn_q.weight");
-            assert!(detail.contains("Q3_K"), "detail names the type: {detail}");
+            assert!(detail.contains("Q8_1"), "detail names the type: {detail}");
         }
         other => panic!("expected TensorUnreadable, got {other:?}"),
     }

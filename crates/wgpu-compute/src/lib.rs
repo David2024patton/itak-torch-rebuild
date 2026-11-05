@@ -91,6 +91,7 @@ pub use kernels::k17_dflash::{K17AttendCall, K17Pipeline, K17RotateCall};
 pub use kernels::k18_small_batch::{
     K18Call, K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline, SmallShape, SMALL_MAX_BATCH,
 };
+pub use kernels::k19_q4k_mmv::{K19Call, K19Pipeline, MmvShape, MMV_MAX_BATCH, MMV_MIN_BATCH};
 pub use kernels::k1_q4k_gemv::{
     K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
 };

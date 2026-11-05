@@ -710,6 +710,9 @@ pub struct K18Call {
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
     label: &'static str,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K18Call {
@@ -727,9 +730,13 @@ impl K18Call {
     /// session uses to chain a whole forward into one
     /// pass.
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -923,6 +930,21 @@ fn prepare_call(
         bind_group,
         grid,
         label: call_label,
+        diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+            kernel: "k18_small_batch",
+            rows: out_rows as u64,
+            cols: in_features as u64,
+            quant: match tag {
+                "q4k" => "Q4_K",
+                "q5k" => "Q5_K",
+                "q6k" => "Q6_K",
+                _ => "",
+            },
+            // The bound buffer's own size: for Q6_K that is
+            // the padded device layout the kernel streams.
+            weight_bytes: weights_buffer.size(),
+            shape: format!("batch={batch} tag={tag} grid={}x{}", grid.0, grid.1),
+        }),
     })
 }
 

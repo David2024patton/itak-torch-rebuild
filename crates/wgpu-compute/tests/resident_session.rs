@@ -661,3 +661,83 @@ fn resident_session_partial_batch_chunk_shares_one_quantize_per_stage() {
         session.stats()
     );
 }
+
+/// The diag smoke collector (David's order, 2026-11-04: every
+/// kernel, every block, one full report from a smoke run).
+/// Opt-in: it runs only when `WGPU_COMPUTE_DIAG=timing` and
+/// `WGPU_COMPUTE_DIAG_OUT` names the report file, because the
+/// recorder it drains exists only in timing mode. It drives
+/// the resident session over the mixed fixture (Q4_K, Q6_K and
+/// Q5_K tensors) through a batched chunk and two decode steps,
+/// drains the timestamp recorder after each forward (one
+/// query window covers several forwards; draining per forward
+/// keeps it that way), and writes the per-kernel summary
+/// table: dispatch count, total ms, share of GPU time, weight
+/// bytes, and aggregate GB/s per kernel.
+#[test]
+fn resident_session_diag_smoke_report() {
+    use wgpu_compute::timestamps::{render_summary, DIAG_OUT_ENV};
+    use wgpu_compute::DiagMode;
+
+    let Some(out_path) = std::env::var_os(DIAG_OUT_ENV) else {
+        eprintln!("skipping diag smoke: {DIAG_OUT_ENV} is not set");
+        return;
+    };
+    if DiagMode::from_env() != DiagMode::Timing {
+        eprintln!("skipping diag smoke: WGPU_COMPUTE_DIAG is not `timing`");
+        return;
+    }
+    let backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping diag smoke: no suitable adapter (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    let Some(recorder) = backend.context().diag_recorder().cloned() else {
+        eprintln!(
+            "skipping diag smoke: timing requested but the device granted \
+             no timestamp features, so no recorder exists"
+        );
+        return;
+    };
+    let cfg = cross_cfg();
+    let weights = cross_weights_mixed(&cfg);
+    let mut session =
+        ResidentSession::new(&backend, &cfg, &weights).expect("resident session builds");
+    let ctx = backend.context();
+    for tokens in [&[3u32, 100, 57, 900][..], &[42][..], &[7][..]] {
+        session.forward(tokens).expect("diag smoke forward");
+        recorder
+            .drain(&ctx.device, &ctx.queue)
+            .expect("diag drain after forward");
+    }
+    let records = recorder.take_records();
+    assert!(
+        !records.is_empty(),
+        "diag smoke recorded no dispatches: the instrumentation is not reaching the session"
+    );
+    let distinct: std::collections::BTreeSet<&str> = records.iter().map(|r| r.kernel).collect();
+    assert!(
+        distinct.len() >= 5,
+        "diag smoke should cover the kernel family, saw only {distinct:?}"
+    );
+    assert!(
+        distinct.contains("k1_q4k_gemv"),
+        "decode forwards must stamp the Q4_K GEMV, saw {distinct:?}"
+    );
+    let table = render_summary(&records);
+    assert!(table.contains("TOTAL,"));
+    std::fs::write(&out_path, &table).expect("write diag smoke report");
+    eprintln!(
+        "diag smoke: {} dispatches across {} kernels, {} dropped, report written to {}",
+        records.len(),
+        distinct.len(),
+        recorder.dropped(),
+        std::path::Path::new(&out_path).display()
+    );
+}

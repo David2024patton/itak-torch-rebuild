@@ -657,6 +657,9 @@ pub struct K6ScoresCall {
     head_dim: usize,
     window: Option<usize>,
     ring: Option<usize>,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K6ScoresCall {
@@ -675,9 +678,13 @@ impl K6ScoresCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the scores at a new position window: `stored`
@@ -732,6 +739,9 @@ pub struct K6ReduceCall {
     head_dim: usize,
     window: Option<usize>,
     ring: Option<usize>,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K6ReduceCall {
@@ -750,9 +760,13 @@ impl K6ReduceCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the reduce at a new position window: `stored`
@@ -792,6 +806,9 @@ pub struct K6FlashCall {
     head_dim: usize,
     window: Option<usize>,
     ring: Option<usize>,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K6FlashCall {
@@ -810,9 +827,13 @@ impl K6FlashCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the flash at a new position window: `stored`
@@ -973,6 +994,17 @@ impl K6Pipeline {
             head_dim: geom.head_dim,
             window: geom.window,
             ring: geom.ring,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k6_attn_scores",
+                rows: geom.rows as u64,
+                cols: (geom.q_heads * geom.head_dim) as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!(
+                    "rows={} q_heads={} kv_heads={} head_dim={} window={:?}",
+                    geom.rows, geom.q_heads, geom.kv_heads, geom.head_dim, geom.window
+                ),
+            }),
         };
         call.set_geometry(ctx, geom.stored, geom.first_pos, geom.start_pos);
         Ok(call)
@@ -1065,6 +1097,17 @@ impl K6Pipeline {
             head_dim: geom.head_dim,
             window: geom.window,
             ring: geom.ring,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k6_attn_reduce",
+                rows: geom.rows as u64,
+                cols: (geom.q_heads * geom.head_dim) as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!(
+                    "q_heads={} kv_heads={} head_dim={} window={:?}",
+                    geom.q_heads, geom.kv_heads, geom.head_dim, geom.window
+                ),
+            }),
         };
         call.set_geometry(ctx, geom.stored, geom.first_pos);
         Ok(call)
@@ -1130,6 +1173,17 @@ impl K6Pipeline {
             head_dim: geom.head_dim,
             window: geom.window,
             ring: geom.ring,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k6_attn_flash",
+                rows: geom.rows as u64,
+                cols: (geom.q_heads * geom.head_dim) as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!(
+                    "rows={} q_heads={} kv_heads={} head_dim={} window={:?}",
+                    geom.rows, geom.q_heads, geom.kv_heads, geom.head_dim, geom.window
+                ),
+            }),
         };
         call.set_geometry(ctx, geom.stored, geom.first_pos, geom.start_pos);
         Ok(call)

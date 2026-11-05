@@ -298,6 +298,9 @@ pub struct K9PrepCall {
     bind_group: wgpu::BindGroup,
     params: wgpu::Buffer,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K9PrepCall {
@@ -316,9 +319,13 @@ impl K9PrepCall {
     /// (wgpu inserts the hazard barriers between dispatches
     /// inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the preparation at a new absolute start position
@@ -471,6 +478,22 @@ impl K9Pipeline {
             bind_group,
             params: params_buf,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k9_attn_prep",
+                rows: args.rows as u64,
+                cols: (args.q_heads * args.head_dim) as u64,
+                quant: "",
+                weight_bytes: args.q_w.size() + args.k_w.size(),
+                shape: format!(
+                    "rows={} q_heads={} kv_heads={} head_dim={} rotate={} start={}",
+                    args.rows,
+                    args.q_heads,
+                    args.kv_heads,
+                    args.head_dim,
+                    args.rotate,
+                    args.start_pos
+                ),
+            }),
         })
     }
 }

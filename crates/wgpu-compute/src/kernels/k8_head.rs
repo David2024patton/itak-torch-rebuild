@@ -685,6 +685,9 @@ pub struct K8GatherRowsCall {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K8GatherRowsCall {
@@ -703,9 +706,13 @@ impl K8GatherRowsCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -719,6 +726,9 @@ pub struct K8FinishCall {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K8FinishCall {
@@ -737,9 +747,13 @@ impl K8FinishCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -759,6 +773,9 @@ pub struct K8ArgmaxCall {
     stage_bind_group: wgpu::BindGroup,
     finish_pipeline: wgpu::ComputePipeline,
     finish_bind_group: wgpu::BindGroup,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K8ArgmaxCall {
@@ -778,12 +795,16 @@ impl K8ArgmaxCall {
     /// session uses to append the reduction to the head
     /// segment of a forward chunk.
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.stage_pipeline);
         pass.set_bind_group(0, &self.stage_bind_group, &[]);
         pass.dispatch_workgroups(ARGMAX_GROUPS as u32, 1, 1);
         pass.set_pipeline(&self.finish_pipeline);
         pass.set_bind_group(0, &self.finish_bind_group, &[]);
         pass.dispatch_workgroups(1, 1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -972,6 +993,14 @@ impl K8Pipeline {
             pipeline: pipeline.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k8_gather_rows",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("rows={rows} width={width} dtype={dtype:?}"),
+            }),
         })
     }
 
@@ -1062,6 +1091,14 @@ impl K8Pipeline {
             pipeline: pipeline.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k8_gather_norm",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("rows={rows} width={width} dtype={dtype:?}"),
+            }),
         })
     }
 
@@ -1138,6 +1175,14 @@ impl K8Pipeline {
             pipeline: pipeline.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k8_head_finish",
+                rows: n as u64,
+                cols: 1,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("n={n} scale={scale} cap={cap}"),
+            }),
         }
     }
 
@@ -1221,6 +1266,14 @@ impl K8Pipeline {
             stage_bind_group,
             finish_pipeline: self.argmax_finish.clone(),
             finish_bind_group,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k8_argmax",
+                rows: n as u64,
+                cols: 1,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("n={n} dispatches=2"),
+            }),
         })
     }
 

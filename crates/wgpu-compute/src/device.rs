@@ -13,8 +13,11 @@
 
 use crate::detect::AdapterFacts;
 use crate::error::{Result, WgpuError};
+use crate::timestamps::{DiagMode, DiagRecorder, DiagStamp, DispatchMeta};
 
 use crate::diag::dbg_log;
+
+use std::sync::Arc;
 
 /// Floor for `max_storage_buffer_binding_size`: the largest tensor
 /// any kernel binds whole is K3's output head at 924,571,648 bytes
@@ -54,6 +57,13 @@ pub struct GpuContext {
     /// pipeline construction; a shape whose feature is absent
     /// refuses by name there.
     pub features: wgpu::Features,
+    /// Per-dispatch GPU timestamp recorder, present only when
+    /// the diag mode is `timing` (env `WGPU_COMPUTE_DIAG`) and
+    /// the device granted the timestamp features. `None` in the
+    /// default world: no query set, no resolve buffers, and
+    /// every prepared call carries no stamp, so the encode path
+    /// is byte-identical to the uninstrumented one.
+    pub diag: Option<Arc<DiagRecorder>>,
 }
 
 impl GpuContext {
@@ -66,7 +76,15 @@ impl GpuContext {
         // the adapter has keeps device creation infallible on
         // lesser stacks; the kernels then fall back by name at
         // pipeline construction (see shipped_shape).
-        let wanted = wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16;
+        let diag_mode = DiagMode::from_env();
+        let mut wanted = wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16;
+        if diag_mode == DiagMode::Timing {
+            // Diagnosis runs ask for the timestamp features too;
+            // verdict runs (mode off) request exactly what they
+            // always have, so their device is unchanged.
+            wanted |=
+                wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        }
         let required_features = adapter.features() & wanted;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("wgpu-compute device"),
@@ -115,6 +133,26 @@ impl GpuContext {
                 granted: limits.max_buffer_size,
             });
         }
+        // The diag recorder exists only in timing mode on a
+        // device that granted both timestamp features. The
+        // conversion period is the queue's own, read here at
+        // runtime; no value is assumed. A timing request the
+        // device cannot serve is named in the diag log and the
+        // context simply carries no recorder.
+        let diag = if diag_mode.wants_recorder(features) {
+            let period = queue.get_timestamp_period();
+            dbg_log!("diag timing on: timestamp period {period} ns");
+            Some(Arc::new(DiagRecorder::new(&device, period)))
+        } else {
+            if diag_mode == DiagMode::Timing {
+                dbg_log!(
+                    "diag timing requested but the device did not grant \
+                     TIMESTAMP_QUERY + TIMESTAMP_QUERY_INSIDE_PASSES; \
+                     instrumentation off"
+                );
+            }
+            None
+        };
         Ok(GpuContext {
             adapter: facts,
             max_buffer_size: limits.max_buffer_size,
@@ -122,7 +160,26 @@ impl GpuContext {
             features,
             device,
             queue,
+            diag,
         })
+    }
+
+    /// The diag timestamp recorder, when this context carries
+    /// one (timing mode on a capable device).
+    #[must_use]
+    pub fn diag_recorder(&self) -> Option<&Arc<DiagRecorder>> {
+        self.diag.as_ref()
+    }
+
+    /// A timestamp stamp for one dispatch, when this context
+    /// carries a recorder; kernel `prepare` methods call this
+    /// so a prepared call stamps itself in `encode_into`.
+    /// `None` (no recorder) leaves the call uninstrumented.
+    #[must_use]
+    pub fn diag_stamp(&self, meta: DispatchMeta) -> Option<DiagStamp> {
+        self.diag
+            .as_ref()
+            .map(|rec| DiagStamp::new(Arc::clone(rec), meta))
     }
 
     /// Create a storage buffer of `size` bytes with copy access in

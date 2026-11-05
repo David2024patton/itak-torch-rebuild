@@ -454,6 +454,9 @@ pub struct K3Call {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K3Call {
@@ -472,9 +475,13 @@ impl K3Call {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -722,6 +729,17 @@ impl K3Pipeline {
             pipeline: self.pipeline.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k3_q5k_gemv",
+                rows: weights.out_rows as u64,
+                cols: weights.in_features as u64,
+                quant: "Q5_K",
+                weight_bytes: weights.byte_len,
+                shape: format!(
+                    "batch={batch} finish={finish_mode} grid={}x{}",
+                    grid.0, grid.1
+                ),
+            }),
         })
     }
 

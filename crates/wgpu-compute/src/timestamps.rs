@@ -32,13 +32,43 @@ pub const DIAG_ENV: &str = "WGPU_COMPUTE_DIAG";
 /// writes its per-kernel summary table to.
 pub const DIAG_OUT_ENV: &str = "WGPU_COMPUTE_DIAG_OUT";
 
+/// Hard wgpu cap on one query set: a `QuerySetDescriptor`
+/// count above this fails validation when the set is created
+/// (measured on the real card under RADV: an 8192-query set
+/// panicked before any dispatch was timed). Every query set
+/// this module creates is sized at or under it.
+pub const MAX_QUERIES_PER_SET: u32 = 4096;
+
 /// Dispatch capacity of one query window: the query set holds
-/// two timestamps per dispatch. One resident forward of the
-/// full model fires on the order of a thousand dispatches, so
-/// a window covers several forwards; the smoke collector
-/// drains between forwards. Overflow drops and counts, never
-/// wraps into another dispatch's slots.
-pub const MAX_DISPATCHES: u32 = 4096;
+/// two timestamps per dispatch, so one capped set yields
+/// `MAX_QUERIES_PER_SET / 2` dispatch windows. One resident
+/// forward of the full model fires on the order of a thousand
+/// dispatches, so a window covers about two forwards; the
+/// smoke collector drains between forwards. Overflow drops
+/// and counts, never wraps into another dispatch's slots.
+///
+/// One capped set, not several: the drain path resolves one
+/// contiguous range into one resolve/staging buffer pair, and
+/// a second set would add a second resolve range, a second
+/// copy, and per-set slot mapping for partial windows, all to
+/// buy capacity the per-forward drain cadence never reaches.
+pub const MAX_DISPATCHES: u32 = MAX_QUERIES_PER_SET / 2;
+
+// The sizing rule, pinned at compile time: the recorder's one
+// query set can never exceed the wgpu cap, and the window can
+// never shrink below the 2048-dispatch floor, whatever the
+// constants above are later edited to.
+const _: () = assert!(MAX_DISPATCHES * 2 <= MAX_QUERIES_PER_SET);
+const _: () = assert!(MAX_QUERIES_PER_SET <= 4096);
+const _: () = assert!(MAX_DISPATCHES >= 2048);
+
+/// Queries in the recorder's one query set: two per dispatch
+/// in the window, at or under [`MAX_QUERIES_PER_SET`] by the
+/// compile-time pin above. The resolve and staging buffers
+/// are sized off this same count.
+fn window_query_count() -> u32 {
+    MAX_DISPATCHES * 2
+}
 
 /// The instrumentation mode, parsed from [`DIAG_ENV`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,7 +359,7 @@ impl DiagRecorder {
     /// from `queue.get_timestamp_period()`.
     #[must_use]
     pub fn new(device: &wgpu::Device, period_ns: f32) -> DiagRecorder {
-        let queries = MAX_DISPATCHES * 2;
+        let queries = window_query_count();
         let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("wgpu-compute diag timestamps"),
             ty: wgpu::QueryType::Timestamp,
@@ -597,6 +627,36 @@ mod tests {
         let table = render_summary(&records);
         assert!(table.contains("k1_q4k_gemv,2,"));
         assert!(table.contains("TOTAL,3,"));
+    }
+
+    #[test]
+    fn query_sizing_never_exceeds_the_wgpu_cap() {
+        // The recorder creates exactly one query set, sized by
+        // window_query_count(); wgpu validates the count at
+        // creation and a set above the cap fails on the real
+        // device, so the count the code path uses must sit at
+        // or under it.
+        assert_eq!(MAX_QUERIES_PER_SET, 4096);
+        assert!(window_query_count() <= MAX_QUERIES_PER_SET);
+        assert_eq!(window_query_count(), MAX_DISPATCHES * 2);
+        // The 2048-dispatch window floor is pinned beside the
+        // cap in the compile-time asserts above.
+    }
+
+    #[test]
+    fn full_window_accounting_at_capacity() {
+        // At the real capacity the allocator hands out exactly
+        // MAX_DISPATCHES slots, then drops and counts; the
+        // range the drain resolves (used slots, two queries
+        // each) is exactly the query set, never beyond it.
+        let slots = SlotAllocator::new(MAX_DISPATCHES);
+        for expected in 0..MAX_DISPATCHES {
+            assert_eq!(slots.alloc(), Some(expected));
+        }
+        assert_eq!(slots.alloc(), None);
+        assert_eq!(slots.used(), MAX_DISPATCHES);
+        assert_eq!(slots.used() * 2, window_query_count());
+        assert_eq!(slots.dropped(), 1);
     }
 
     #[test]

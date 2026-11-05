@@ -81,6 +81,25 @@ def wait_health(proc, log_path: Path):
     raise RuntimeError("llama-server did not become healthy in 60 s")
 
 
+def step_prob(step):
+    """Sampled-token probability from a /completion step. This
+    llama.cpp build reports logprob / top_logprobs (no prob
+    fields); older shapes report prob / top_probs. Accept both."""
+    if "prob" in step:
+        return step["prob"]
+    return 2.718281828459045 ** step["logprob"]
+
+
+def step_top(step):
+    """Top candidates of a step as [{id, prob}], best first."""
+    cands = step.get("top_probs") or step.get("top_logprobs") or []
+    out = []
+    for t in cands:
+        p = t["prob"] if "prob" in t else 2.718281828459045 ** t["logprob"]
+        out.append({"id": t["id"], "prob": p})
+    return out
+
+
 def llama_complete(prompt_ids):
     body = json.dumps({
         "prompt": prompt_ids,
@@ -224,21 +243,17 @@ def main():
         pos_rows = []
         for pos in range(1, prefix + 1):
             step = steps[pos - 1]
+            lprob = step_prob(step)
             our_top = (o.get("tops", {}).get(str(pos)) or [{}])[0]
             pos_rows.append({
                 "pos": pos,
                 "id": step["id"],
-                "llama_top1_prob": step["prob"],
+                "llama_top1_prob": lprob,
                 "ours_top1_prob": our_top.get("prob"),
-                "delta": (our_top.get("prob") - step["prob"])
+                "delta": (our_top.get("prob") - lprob)
                 if our_top.get("prob") is not None else None,
             })
-        first_llama_top5 = []
-        if steps:
-            first_llama_top5 = [
-                {"id": t["id"], "prob": t["prob"]}
-                for t in steps[0].get("top_probs", [])
-            ]
+        first_llama_top5 = step_top(steps[0]) if steps else []
         compare["prompts"][pid] = {
             "prompt_ids_match": o.get("prompt_ids") == l.get("prompt_ids"),
             "ours_prompt_ids": o.get("prompt_ids"),

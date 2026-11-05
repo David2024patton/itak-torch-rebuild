@@ -5,6 +5,7 @@
 # CPU only. Never touches ports 8080/8091/8092. Production stays down.
 set -u
 cd ~/overnight-baseline || exit 1
+export PATH="$HOME/.cargo/bin:$PATH"
 export CARGO_BUILD_JOBS=4
 export MALLOC_ARENA_MAX=2 MALLOC_TRIM_THRESHOLD_=0
 MODEL=/mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf

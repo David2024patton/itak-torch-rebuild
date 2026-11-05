@@ -45,6 +45,66 @@ use std::time::Instant;
 use muse_glimmer::{GlimmerModel, PositionCache, StderrDiag};
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
 
+/// EXPERIMENT ONLY (overnight logit-scale run, 2026-11-05): the
+/// environment variable `ITAK_EXPERIMENT_LOGIT_SCALE`, when set to a
+/// positive finite number, replaces the file's `logit_scale` in the
+/// config this example hands to the model. Unset (the default) the
+/// file value is used untouched. This exists to measure how sensitive
+/// Glimmer's output distribution is to the scale (TODO T-9.3 residue);
+/// it is not a shipped knob and no library code reads it.
+fn experiment_logit_scale(raw: Option<&str>, file_value: f32) -> Result<f32, String> {
+    let Some(raw) = raw else {
+        return Ok(file_value);
+    };
+    let forced: f32 = raw
+        .parse()
+        .map_err(|_| format!("ITAK_EXPERIMENT_LOGIT_SCALE: not a number: {raw:?}"))?;
+    if !forced.is_finite() || forced <= 0.0 {
+        return Err(format!(
+            "ITAK_EXPERIMENT_LOGIT_SCALE: must be positive and finite, got {forced}"
+        ));
+    }
+    Ok(forced)
+}
+
+/// Diagnostics on one finished (scaled, softcapped) logit vector:
+/// the finished range, the implied pre-softcap range recovered by
+/// inverting `cap * tanh(w / cap)` (entries saturated to the cap in
+/// f32 are counted, and the recovered max is then a lower bound),
+/// the implied raw lm_head range (pre-softcap divided by the scale),
+/// and how many of the top 100 finished logits sit beyond
+/// `0.9 * cap`, the saturation yardstick of the experiment note.
+fn print_logit_stats(label: &str, logits: &[f32], cfg: &muse_glimmer::GlimmerConfig) {
+    let cap = cfg.logit_softcap;
+    let scale = cfg.logit_scale;
+    let fin_min = logits.iter().copied().fold(f32::INFINITY, f32::min);
+    let fin_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut sorted: Vec<f32> = logits.to_vec();
+    sorted.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let top100 = &sorted[..sorted.len().min(100)];
+    let beyond = top100.iter().filter(|&&z| z > 0.9 * cap).count();
+    let saturated = logits.iter().filter(|&&z| z >= cap).count();
+    // Invert the softcap on the entries that did not saturate to the
+    // cap in f32; the recovered range is over those entries only.
+    let mut pre_min = f32::INFINITY;
+    let mut pre_max = f32::NEG_INFINITY;
+    for &z in logits {
+        if z < cap && z > -cap {
+            let w = cap * (z / cap).atanh();
+            pre_min = pre_min.min(w);
+            pre_max = pre_max.max(w);
+        }
+    }
+    println!(
+        "{label} stats: finished_range=[{fin_min:.4},{fin_max:.4}] \
+         presoftcap_range=[{pre_min:.4},{pre_max:.4}] saturated_to_cap={saturated} \
+         raw_range=[{:.4},{:.4}] top100_beyond_0.9cap={beyond}",
+        pre_min / scale,
+        pre_max / scale,
+    );
+    std::io::stdout().flush().ok();
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let (Some(path), Some(prompt)) = (args.get(1), args.get(2)) else {
@@ -153,13 +213,28 @@ fn run(
     println!("phase=open_file ms={}", t_open.elapsed().as_millis());
     println!("file: {path} bytes={}", file.file_len());
 
-    let cfg = itak_loader::load_config(&file).map_err(|e| e.to_string())?;
+    let mut cfg = itak_loader::load_config(&file).map_err(|e| e.to_string())?;
+    // EXPERIMENT ONLY: see `experiment_logit_scale`. Defaults to the
+    // file value; shipped behavior is unchanged.
+    let file_scale = cfg.logit_scale;
+    cfg.logit_scale = experiment_logit_scale(
+        std::env::var("ITAK_EXPERIMENT_LOGIT_SCALE").ok().as_deref(),
+        file_scale,
+    )?;
+    if cfg.logit_scale != file_scale {
+        println!(
+            "experiment: logit_scale overridden file={file_scale} forced={}",
+            cfg.logit_scale
+        );
+    }
     println!(
-        "config: layers={} hidden={} vocab={} bos={:?}",
+        "config: layers={} hidden={} vocab={} bos={:?} logit_scale={} logit_softcap={}",
         cfg.block_count,
         cfg.hidden,
         cfg.vocab_size,
-        file.tokenizer().map(|t| t.bos_token_id).unwrap_or(None)
+        file.tokenizer().map(|t| t.bos_token_id).unwrap_or(None),
+        cfg.logit_scale,
+        cfg.logit_softcap
     );
 
     // Tokenize before any weight work: the printed id sequence is
@@ -233,6 +308,7 @@ fn run(
     let top = top_k(&logits, 5);
     println!("phase=prefill ms={prefill_ms} prompt_tokens={}", ids.len());
     print_top("prefill_top", &top, &vocab);
+    print_logit_stats("prefill", &logits, model.config());
     let mut next = top[0].0;
     generated.push(next);
     println!(
@@ -367,4 +443,28 @@ fn run_resident(
         println!("peak_rss_kb={kb}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    use super::experiment_logit_scale;
+
+    #[test]
+    fn unset_env_keeps_the_file_value() {
+        assert_eq!(experiment_logit_scale(None, 0.196_116_13), Ok(0.196_116_13));
+    }
+
+    #[test]
+    fn set_env_forces_the_scale() {
+        assert_eq!(experiment_logit_scale(Some("1.0"), 0.196_116_13), Ok(1.0));
+        assert_eq!(experiment_logit_scale(Some("0.5"), 0.196_116_13), Ok(0.5));
+    }
+
+    #[test]
+    fn bad_env_values_refuse() {
+        assert!(experiment_logit_scale(Some("bogus"), 0.196_116_13).is_err());
+        assert!(experiment_logit_scale(Some("0"), 0.196_116_13).is_err());
+        assert!(experiment_logit_scale(Some("-1.0"), 0.196_116_13).is_err());
+        assert!(experiment_logit_scale(Some("inf"), 0.196_116_13).is_err());
+    }
 }

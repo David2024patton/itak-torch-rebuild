@@ -54,9 +54,18 @@ impl<'a> GgufMetadata<'a> {
 }
 
 impl Metadata for GgufMetadata<'_> {
+    // The scalar getters route through the `gguf` crate's `opt_*`
+    // reads, never the strict getters: the strict getters build their
+    // refusal through `require`, which logs a `missing_metadata`
+    // error event for a merely absent key. Absence is a legitimate
+    // answer to an optional probe (llama.cpp reads
+    // `rope.freq_base_swa` exactly that way: an optional override
+    // over the train base), so it must stay silent. A present key
+    // holding the wrong kind of value still refuses inside the
+    // `opt_*` read, and that refusal is logged there and noted here.
     fn get_string(&self, key: &str) -> Option<String> {
-        match self.file.metadata().get_string(key) {
-            Ok(v) => Some(v.to_string()),
+        match self.file.metadata().opt_string(key) {
+            Ok(v) => v.map(str::to_string),
             Err(e) => {
                 self.note_unreadable(key, &e);
                 None
@@ -65,8 +74,8 @@ impl Metadata for GgufMetadata<'_> {
     }
 
     fn get_u32(&self, key: &str) -> Option<u32> {
-        match self.file.metadata().get_u32(key) {
-            Ok(v) => Some(v),
+        match self.file.metadata().opt_u32(key) {
+            Ok(v) => v,
             Err(e) => {
                 self.note_unreadable(key, &e);
                 None
@@ -75,8 +84,8 @@ impl Metadata for GgufMetadata<'_> {
     }
 
     fn get_f32(&self, key: &str) -> Option<f32> {
-        match self.file.metadata().get_f32(key) {
-            Ok(v) => Some(v),
+        match self.file.metadata().opt_f32(key) {
+            Ok(v) => v,
             Err(e) => {
                 self.note_unreadable(key, &e);
                 None
@@ -87,6 +96,42 @@ impl Metadata for GgufMetadata<'_> {
     fn get_array_len(&self, key: &str) -> Option<usize> {
         match self.file.metadata().get(key) {
             Some(MetadataValue::Array(items)) => Some(items.len()),
+            Some(_) => {
+                diag::debug(
+                    "metadata_unreadable",
+                    &format!("key={key} reason=stored value is not an array"),
+                );
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
+        // Raw lookup, like get_array_len: absence is silent, and a
+        // present value of the wrong shape earns the diag line here
+        // (the strict array getters would log absence as an error,
+        // which an optional probe must not do).
+        match self.file.metadata().get(key) {
+            Some(MetadataValue::Array(items)) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        MetadataValue::Bool(v) => out.push(*v),
+                        other => {
+                            diag::debug(
+                                "metadata_unreadable",
+                                &format!(
+                                    "key={key} reason=array element is {}, not bool",
+                                    other.type_name()
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Some(out)
+            }
             Some(_) => {
                 diag::debug(
                     "metadata_unreadable",

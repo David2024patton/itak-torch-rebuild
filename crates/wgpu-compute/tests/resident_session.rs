@@ -662,21 +662,23 @@ fn resident_session_partial_batch_chunk_shares_one_quantize_per_stage() {
     );
 }
 
-/// The diag smoke collector (David's order, 2026-11-04: every
+/// The diag smoke report (David's order, 2026-11-04: every
 /// kernel, every block, one full report from a smoke run).
 /// Opt-in: it runs only when `WGPU_COMPUTE_DIAG=timing` and
 /// `WGPU_COMPUTE_DIAG_OUT` names the report file, because the
-/// recorder it drains exists only in timing mode. It drives
-/// the resident session over the mixed fixture (Q4_K, Q6_K and
-/// Q5_K tensors) through a batched chunk and two decode steps,
-/// drains the timestamp recorder after each forward (one
-/// query window covers several forwards; draining per forward
-/// keeps it that way), and writes the per-kernel summary
-/// table: dispatch count, total ms, share of GPU time, weight
-/// bytes, and aggregate GB/s per kernel.
+/// recorder exists only in timing mode. It drives the
+/// resident session over the mixed fixture (Q4_K, Q6_K and
+/// Q5_K tensors) through a batched chunk and two decode steps
+/// and reads the report the SESSION produced: the session
+/// drains the recorder after every chunk into its own
+/// accumulator and writes the summary table itself at finish
+/// (dispatch count, total ms, share of GPU time, weight
+/// bytes, and aggregate GB/s per kernel). No manual drain or
+/// collection happens here anymore; that is the property
+/// under test.
 #[test]
 fn resident_session_diag_smoke_report() {
-    use wgpu_compute::timestamps::{render_summary, DIAG_OUT_ENV};
+    use wgpu_compute::timestamps::DIAG_OUT_ENV;
     use wgpu_compute::DiagMode;
 
     let Some(out_path) = std::env::var_os(DIAG_OUT_ENV) else {
@@ -709,35 +711,165 @@ fn resident_session_diag_smoke_report() {
     let weights = cross_weights_mixed(&cfg);
     let mut session =
         ResidentSession::new(&backend, &cfg, &weights).expect("resident session builds");
-    let ctx = backend.context();
     for tokens in [&[3u32, 100, 57, 900][..], &[42][..], &[7][..]] {
         session.forward(tokens).expect("diag smoke forward");
-        recorder
-            .drain(&ctx.device, &ctx.queue)
-            .expect("diag drain after forward");
     }
-    let records = recorder.take_records();
+    session.finish_diag_report();
+    let distinct = session.diag_kernel_names();
     assert!(
-        !records.is_empty(),
+        session.diag_dispatch_count() > 0,
         "diag smoke recorded no dispatches: the instrumentation is not reaching the session"
     );
-    let distinct: std::collections::BTreeSet<&str> = records.iter().map(|r| r.kernel).collect();
     assert!(
         distinct.len() >= 5,
         "diag smoke should cover the kernel family, saw only {distinct:?}"
     );
     assert!(
-        distinct.contains("k1_q4k_gemv"),
+        distinct.contains(&"k1_q4k_gemv"),
         "decode forwards must stamp the Q4_K GEMV, saw {distinct:?}"
     );
-    let table = render_summary(&records);
+    let table = session
+        .diag_summary_csv()
+        .expect("a timing session carries a diag report");
     assert!(table.contains("TOTAL,"));
-    std::fs::write(&out_path, &table).expect("write diag smoke report");
+    // The session wrote the report file itself at finish:
+    // the content on disk is a summary table naming the same
+    // kernels (asserted by content, not byte equality, so a
+    // sibling session finishing later in the same test binary
+    // cannot flake this check).
+    let written = std::fs::read_to_string(&out_path).expect("session wrote the diag report file");
+    assert!(written.contains("TOTAL,"), "report file: {written}");
+    assert!(
+        written.contains("k1_q4k_gemv"),
+        "report file names the decode GEMV: {written}"
+    );
     eprintln!(
         "diag smoke: {} dispatches across {} kernels, {} dropped, report written to {}",
-        records.len(),
+        session.diag_dispatch_count(),
         distinct.len(),
         recorder.dropped(),
         std::path::Path::new(&out_path).display()
+    );
+}
+
+/// The drain fix's executing pin: in timing mode a plain
+/// resident session emits diag records through its own run
+/// path, with NO collector, NO manual drain, and NO finish
+/// call: the records are already folded the moment a forward
+/// returns, because the session drains after every chunk.
+/// (Before the fix, this exact shape of run emitted zero
+/// records: `DiagRecorder::drain` had no caller outside the
+/// test-only collector.)
+#[test]
+fn resident_session_diag_drains_itself() {
+    use wgpu_compute::DiagMode;
+
+    if DiagMode::from_env() != DiagMode::Timing {
+        eprintln!("skipping diag self-drain: WGPU_COMPUTE_DIAG is not `timing`");
+        return;
+    }
+    let backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping diag self-drain: no suitable adapter (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    if backend.context().diag_recorder().is_none() {
+        eprintln!(
+            "skipping diag self-drain: timing requested but the device granted \
+             no timestamp features, so no recorder exists"
+        );
+        return;
+    }
+    let cfg = cross_cfg();
+    let weights = cross_weights_mixed(&cfg);
+    let mut session =
+        ResidentSession::new(&backend, &cfg, &weights).expect("resident session builds");
+    assert_eq!(
+        session.diag_dispatch_count(),
+        0,
+        "no forward yet, no records"
+    );
+    session
+        .forward(&[3, 100, 57, 900])
+        .expect("batched forward");
+    // The pin: records exist NOW, mid-run, without any drain
+    // call from this test.
+    let after_chunk = session.diag_dispatch_count();
+    assert!(
+        after_chunk > 0,
+        "the session must drain its own chunks: no records after one forward"
+    );
+    session.forward(&[42]).expect("decode forward");
+    assert!(
+        session.diag_dispatch_count() > after_chunk,
+        "each chunk adds its own records"
+    );
+    let names = session.diag_kernel_names();
+    assert!(
+        names.contains(&"k1_q4k_gemv"),
+        "decode forwards must stamp the Q4_K GEMV, saw {names:?}"
+    );
+    let table = session
+        .diag_summary_csv()
+        .expect("a timing session carries a diag report");
+    assert!(table.contains("TOTAL,"), "summary table: {table}");
+    assert!(
+        table.contains("k1_q4k_gemv"),
+        "summary names the kernels: {table}"
+    );
+    // Dropping the session finishes the report (tally line,
+    // and the file when WGPU_COMPUTE_DIAG_OUT is set); that
+    // path is exercised here simply by the scope ending.
+}
+
+/// The off path through the session API: with diag timing
+/// off (the default), a session carries no accumulator, so
+/// no records can appear and no report file can be written,
+/// and finishing the report is a harmless no-op. This is the
+/// session-level half of the off-path contract in
+/// `diag_timestamps.rs`.
+#[test]
+fn resident_session_diag_off_by_default() {
+    use wgpu_compute::DiagMode;
+
+    if DiagMode::from_env() == DiagMode::Timing {
+        eprintln!("skipping diag off check: this process runs with diag timing on");
+        return;
+    }
+    let backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping diag off check: no suitable adapter (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    let cfg = cross_cfg();
+    let weights = cross_weights_mixed(&cfg);
+    let mut session =
+        ResidentSession::new(&backend, &cfg, &weights).expect("resident session builds");
+    session.forward(&[42]).expect("plain forward");
+    assert!(
+        session.diag_summary_csv().is_none(),
+        "off mode: no diag report exists"
+    );
+    assert_eq!(session.diag_dispatch_count(), 0, "off mode: no records");
+    assert!(
+        session.diag_kernel_names().is_empty(),
+        "off mode: no kernels"
+    );
+    session.finish_diag_report();
+    assert!(
+        session.diag_summary_csv().is_none(),
+        "off mode: finishing changes nothing"
     );
 }

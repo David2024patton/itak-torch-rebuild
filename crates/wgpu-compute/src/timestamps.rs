@@ -8,6 +8,13 @@
 //! `[wgpu-compute-diag]` lines on stderr), so a smoke run
 //! reports everything that fired, in order, with GPU durations.
 //!
+//! The drain is driven by the sessions themselves: every
+//! resident session drains after each submitted chunk and
+//! folds the records into a [`DiagAccumulator`], which writes
+//! the per-kernel summary table to the [`DIAG_OUT_ENV`] file
+//! when the run finishes. No caller has to collect anything
+//! by hand for a real run to produce the report.
+//!
 //! Logger name: `wgpu-compute::timestamps`, records under the
 //! `[wgpu-compute-diag]` prefix. Raise it with
 //! `WGPU_COMPUTE_DIAG=timing`; the config default is off, and off
@@ -19,6 +26,7 @@
 //! stamps and counts them rather than corrupting timings.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,8 +36,9 @@ use crate::error::{Result, WgpuError};
 /// `off` (default) or `timing`.
 pub const DIAG_ENV: &str = "WGPU_COMPUTE_DIAG";
 
-/// Environment variable naming the file the smoke collector
-/// writes its per-kernel summary table to.
+/// Environment variable naming the file a session writes its
+/// per-kernel summary table to when its run finishes (see
+/// [`DiagAccumulator`]).
 pub const DIAG_OUT_ENV: &str = "WGPU_COMPUTE_DIAG_OUT";
 
 /// Hard wgpu cap on one query set: a `QuerySetDescriptor`
@@ -44,8 +53,10 @@ pub const MAX_QUERIES_PER_SET: u32 = 4096;
 /// `MAX_QUERIES_PER_SET / 2` dispatch windows. One resident
 /// forward of the full model fires on the order of a thousand
 /// dispatches, so a window covers about two forwards; the
-/// smoke collector drains between forwards. Overflow drops
-/// and counts, never wraps into another dispatch's slots.
+/// sessions drain after every chunk (one submission, a few
+/// hundred dispatches), which keeps them far inside it.
+/// Overflow drops and counts, never wraps into another
+/// dispatch's slots.
 ///
 /// One capped set, not several: the drain path resolves one
 /// contiguous range into one resolve/staging buffer pair, and
@@ -240,16 +251,26 @@ pub fn summarize(records: &[DispatchRecord]) -> (Vec<KernelSummary>, u64) {
     (rows, total_ns)
 }
 
-/// Render the per-kernel summary table the smoke collector
-/// writes: one row per kernel with dispatch count, total time,
-/// share of the run's GPU time, streamed bytes, and the
-/// aggregate GB/s where a weight stream exists.
+/// Render the per-kernel summary table: one row per kernel
+/// with dispatch count, total time, share of the run's GPU
+/// time, streamed bytes, and the aggregate GB/s where a
+/// weight stream exists.
 #[must_use]
 pub fn render_summary(records: &[DispatchRecord]) -> String {
     let (rows, total_ns) = summarize(records);
+    render_summaries(&rows, total_ns, records.len() as u64)
+}
+
+/// Render a summary table from pre-aggregated rows (the
+/// [`summarize`] output shape, or a [`DiagAccumulator`]'s
+/// folded equivalent): byte-identical to [`render_summary`]
+/// over the same record set, which the accumulator's tests
+/// pin.
+#[must_use]
+pub fn render_summaries(rows: &[KernelSummary], total_ns: u64, total_records: u64) -> String {
     let mut out = String::new();
     out.push_str("kernel,count,total_ms,share_pct,weight_bytes,gbps\n");
-    for row in &rows {
+    for row in rows {
         let share = if total_ns == 0 {
             0.0
         } else {
@@ -267,7 +288,7 @@ pub fn render_summary(records: &[DispatchRecord]) -> String {
     }
     out.push_str(&format!(
         "TOTAL,{},{:.3},100.0,,\n",
-        records.len(),
+        total_records,
         total_ns as f64 / 1_000_000.0
     ));
     out
@@ -397,10 +418,21 @@ impl DiagRecorder {
     }
 
     /// Dispatches dropped so far because a window filled
-    /// before a drain.
+    /// before a drain. Cumulative for the recorder's lifetime:
+    /// a drain resolves and resets the window but never this
+    /// counter, so it is the per-backend total every session
+    /// on the backend reports against.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.slots.dropped()
+    }
+
+    /// Dispatch slots handed out in the current window and
+    /// not yet drained: how many stamps the next
+    /// [`DiagRecorder::drain`] will resolve.
+    #[must_use]
+    pub fn pending_dispatches(&self) -> u32 {
+        self.slots.used()
     }
 
     /// Open a stamp bracket inside `pass`: allocate a slot and
@@ -509,10 +541,207 @@ impl DiagRecorder {
     }
 
     /// Take all completed records, leaving the queue empty.
-    /// The smoke collector calls this after its drains.
+    /// A [`DiagAccumulator`] folds them out after each of its
+    /// drains, so in a session-driven run the queue holds at
+    /// most one window's worth at a time.
     #[must_use]
     pub fn take_records(&self) -> Vec<DispatchRecord> {
         std::mem::take(&mut *self.completed.lock().unwrap())
+    }
+}
+
+/// The session-side half of the diag story: the running
+/// summary one run accumulates as its session drains the
+/// recorder. A session creates one only when its context
+/// carries a recorder (timing mode on a capable device), so
+/// its absence is the off path's guarantee that no report
+/// work happens at all.
+///
+/// Cadence: the owning session calls
+/// [`DiagAccumulator::drain_and_fold`] after every submitted
+/// chunk. One chunk is one submission of a few hundred
+/// dispatches (the full model's chunk measured 445; the
+/// fixture's under a hundred), far inside the 2048-dispatch
+/// window, so pending stamps never approach the cap and the
+/// only way a stamp is lost is a single chunk bigger than
+/// the whole window, which no plan shape produces; even then
+/// the loss is the recorder's counted drop, surfaced in the
+/// finish line, never a silent one. Folding after each drain
+/// also bounds memory: the accumulator holds one aggregate
+/// row per kernel, not one record per dispatch, however long
+/// the run.
+///
+/// Finish: [`DiagAccumulator::write_report`] (the sessions
+/// call it from their end-of-run finish, explicit or at drop)
+/// prints the one-line tally through the diag channel and,
+/// when [`DIAG_OUT_ENV`] named a file at construction,
+/// writes the summary table there, in the exact
+/// [`render_summary`] format. Diagnostics never fail the run
+/// they observe: a failed drain or a failed write is counted
+/// and reported on the channel, and generation proceeds.
+#[derive(Debug)]
+pub struct DiagAccumulator {
+    out_path: Option<PathBuf>,
+    by_kernel: BTreeMap<&'static str, KernelSummary>,
+    total_records: u64,
+    total_ns: u64,
+    drain_failures: u64,
+    finished: bool,
+}
+
+impl DiagAccumulator {
+    /// An accumulator reporting to `out_path` (or to the diag
+    /// channel only, when `None`).
+    #[must_use]
+    pub fn new(out_path: Option<PathBuf>) -> DiagAccumulator {
+        DiagAccumulator {
+            out_path,
+            by_kernel: BTreeMap::new(),
+            total_records: 0,
+            total_ns: 0,
+            drain_failures: 0,
+            finished: false,
+        }
+    }
+
+    /// An accumulator whose report file is whatever
+    /// [`DIAG_OUT_ENV`] names in the current environment
+    /// (unset: channel only). Read once, at construction, so
+    /// a run's destination cannot move mid-flight.
+    #[must_use]
+    pub fn from_env() -> DiagAccumulator {
+        DiagAccumulator::new(std::env::var_os(DIAG_OUT_ENV).map(PathBuf::from))
+    }
+
+    /// The report file this accumulator writes at finish, if
+    /// it has one.
+    #[must_use]
+    pub fn out_path(&self) -> Option<&std::path::Path> {
+        self.out_path.as_deref()
+    }
+
+    /// Dispatch records folded so far.
+    #[must_use]
+    pub fn total_records(&self) -> u64 {
+        self.total_records
+    }
+
+    /// Drains that failed (and were reported on the channel)
+    /// so far.
+    #[must_use]
+    pub fn drain_failures(&self) -> u64 {
+        self.drain_failures
+    }
+
+    /// Names of the kernels folded so far, in name order.
+    #[must_use]
+    pub fn kernel_names(&self) -> Vec<&'static str> {
+        self.by_kernel.keys().copied().collect()
+    }
+
+    /// Fold resolved records into the running aggregates:
+    /// the same per-kernel sums [`summarize`] computes, kept
+    /// incrementally.
+    fn fold_records(&mut self, records: &[DispatchRecord]) {
+        for r in records {
+            self.total_records += 1;
+            self.total_ns += r.duration_ns;
+            let entry = self
+                .by_kernel
+                .entry(r.kernel)
+                .or_insert_with(|| KernelSummary {
+                    kernel: r.kernel.to_string(),
+                    count: 0,
+                    total_ns: 0,
+                    total_bytes: 0,
+                });
+            entry.count += 1;
+            entry.total_ns += r.duration_ns;
+            entry.total_bytes += r.weight_bytes;
+        }
+    }
+
+    /// Drain the recorder once and fold whatever it resolved
+    /// into the running aggregates. Returns how many records
+    /// the drain resolved. A failed drain is counted and
+    /// reported through the diag channel; it is never
+    /// propagated, because diagnostics must not fail the
+    /// generation they observe.
+    pub fn drain_and_fold(
+        &mut self,
+        recorder: &DiagRecorder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> usize {
+        match recorder.drain(device, queue) {
+            Ok(_) => {
+                let records = recorder.take_records();
+                let n = records.len();
+                self.fold_records(&records);
+                n
+            }
+            Err(e) => {
+                self.drain_failures += 1;
+                eprintln!("[wgpu-compute-diag] drain failed: {e}");
+                0
+            }
+        }
+    }
+
+    /// The summary table over everything folded so far, in
+    /// the exact [`render_summary`] format.
+    #[must_use]
+    pub fn render_csv(&self) -> String {
+        let mut rows: Vec<KernelSummary> = self.by_kernel.values().cloned().collect();
+        rows.sort_by(|a, b| b.total_ns.cmp(&a.total_ns).then(a.kernel.cmp(&b.kernel)));
+        render_summaries(&rows, self.total_ns, self.total_records)
+    }
+
+    /// Finish the run's report, once: print the tally line
+    /// through the diag channel and write the summary table
+    /// to the report file when one is configured and any
+    /// records were folded. `dropped` is the recorder's
+    /// lifetime drop count, passed in because the accumulator
+    /// does not own the recorder. Later calls are no-ops.
+    /// Returns whether this call performed the finish.
+    pub fn write_report(&mut self, dropped: u64) -> bool {
+        if self.finished {
+            return false;
+        }
+        self.finished = true;
+        if self.total_records == 0 && dropped == 0 && self.drain_failures == 0 {
+            return true;
+        }
+        let failures = if self.drain_failures == 0 {
+            String::new()
+        } else {
+            format!(", {} drain failures", self.drain_failures)
+        };
+        match &self.out_path {
+            Some(path) if self.total_records > 0 => match std::fs::write(path, self.render_csv()) {
+                Ok(()) => eprintln!(
+                    "[wgpu-compute-diag] session report: {} dispatches across {} kernels, \
+                         {dropped} dropped{failures}, report written to {}",
+                    self.total_records,
+                    self.by_kernel.len(),
+                    path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[wgpu-compute-diag] session report: {} dispatches across {} kernels, \
+                         {dropped} dropped{failures}, report write to {} failed: {e}",
+                    self.total_records,
+                    self.by_kernel.len(),
+                    path.display()
+                ),
+            },
+            _ => eprintln!(
+                "[wgpu-compute-diag] session report: {} dispatches across {} kernels, \
+                 {dropped} dropped{failures}, no report file ({DIAG_OUT_ENV} unset)",
+                self.total_records,
+                self.by_kernel.len()
+            ),
+        }
+        true
     }
 }
 
@@ -671,5 +900,62 @@ mod tests {
         slots.reset();
         assert_eq!(slots.alloc(), Some(0));
         assert_eq!(slots.used(), 1);
+    }
+
+    #[test]
+    fn accumulator_folds_and_renders_like_the_collector() {
+        // The session-side fold must aggregate exactly what
+        // summarize() computes over the raw records, across
+        // any number of drains: the rendered table over the
+        // folded state is byte-identical to render_summary
+        // over the concatenated record set.
+        let records = vec![
+            record("k1_q4k_gemv", 100, 300),
+            record("k4_rmsnorm", 0, 900),
+            record("k1_q4k_gemv", 300, 100),
+        ];
+        let mut acc = DiagAccumulator::new(None);
+        assert_eq!(acc.total_records(), 0);
+        assert!(acc.kernel_names().is_empty());
+        acc.fold_records(&records);
+        assert_eq!(acc.total_records(), 3);
+        assert_eq!(acc.kernel_names(), vec!["k1_q4k_gemv", "k4_rmsnorm"]);
+        assert_eq!(acc.render_csv(), render_summary(&records));
+        acc.fold_records(&records);
+        assert_eq!(acc.total_records(), 6);
+        let doubled: Vec<DispatchRecord> = records.iter().chain(&records).cloned().collect();
+        assert_eq!(acc.render_csv(), render_summary(&doubled));
+    }
+
+    #[test]
+    fn accumulator_writes_its_report_once() {
+        let path =
+            std::env::temp_dir().join(format!("wgpu-compute-diag-acc-{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        // Nothing folded and nothing dropped: the finish is
+        // performed (and spent) but no file appears.
+        let mut empty = DiagAccumulator::new(Some(path.clone()));
+        assert!(empty.write_report(0));
+        assert!(!path.exists(), "an empty run writes no report file");
+        assert!(!empty.write_report(0), "the finish happens once");
+
+        // Records folded: the file lands with the summary
+        // table, and a second finish neither rewrites it nor
+        // reports again.
+        let mut acc = DiagAccumulator::new(Some(path.clone()));
+        acc.fold_records(&[record("k1_q4k_gemv", 100, 300)]);
+        assert!(acc.write_report(2));
+        let text = std::fs::read_to_string(&path).expect("report file written");
+        assert!(text.contains("k1_q4k_gemv,1,"), "report rows: {text}");
+        assert!(text.contains("TOTAL,1,"), "report total: {text}");
+        std::fs::write(&path, "sentinel").expect("plant sentinel");
+        assert!(!acc.write_report(2));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("sentinel readable"),
+            "sentinel",
+            "a second finish must not rewrite the report"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

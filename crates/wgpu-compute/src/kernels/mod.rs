@@ -57,6 +57,16 @@
 //! Q5_K, Q6_K). The session routes to it only under
 //! its env-set threshold, which defaults off; see the
 //! module's own docs for the reasoning.
+//!
+//! K19 is the counter-proposal to K18 in the same
+//! band: the Q4_K small-batch product in llama.cpp's
+//! mul_mat_vec register-streaming shape, batch
+//! specialized into the shader as literals, weights
+//! dequantized in registers with no weight staging in
+//! workgroup memory at all (the streaming-rate
+//! research's structural verdict on both staged
+//! attempts). The session routes to it only under its
+//! own env-set threshold, which also defaults off.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -67,6 +77,7 @@ pub mod k15_q4k_mmq_wide;
 pub mod k16_q6k_mmq_wide;
 pub mod k17_dflash;
 pub mod k18_small_batch;
+pub mod k19_q4k_mmv;
 pub mod k1_q4k_gemv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;

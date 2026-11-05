@@ -12,7 +12,10 @@
 //! isolation. The composition is the cost, not the math.
 //!
 //! This module is the composition fixed. A session uploads the
-//! whole weight set once, owns the activation scratch, the
+//! whole weight set once (and flushes the upload queue before
+//! construction returns, so the copies are paid at
+//! construction, not inside the first forward), owns the
+//! activation scratch, the
 //! per-layer KV buffers ([`DeviceKv`], the storage half of the
 //! trait path's `GpuKvState`), and the logits buffer, and runs
 //! each forward chunk as ONE command-buffer chain: the
@@ -28,7 +31,13 @@
 //! into the readback staging appended to the same encoder. The
 //! only host traffic per chunk is the token ids in (one queue
 //! write of a few bytes per token) and the finished logits out
-//! (one map). Nothing else crosses the bus.
+//! (one map). Nothing else crosses the bus. A multi-chunk
+//! `forward` maps only its final chunk's logits (see
+//! [`ResidentSession::forward`]): the earlier chunks' copies
+//! land in their staging unread, because only the last
+//! chunk's logits are ever returned, and skipping their maps
+//! is what lets a prefill's chunk submissions pipeline
+//! instead of draining the device between chunks.
 //!
 //! One source of truth for the step order: this driver mirrors
 //! `GlimmerModel::forward_rows` line for line, and the crate's
@@ -162,6 +171,28 @@ fn chunk_rows_for(cap: usize, n: usize) -> usize {
     n.min(cap)
 }
 
+/// Whether chunk `index` of a `count`-chunk forward
+/// defers its tail readback (the logits vector, or the
+/// argmax tail's eight bytes): every chunk but the
+/// last. A forward returns only its final chunk's tail,
+/// so an earlier chunk's readback would drain the
+/// device (the full poll inside `map_staging`) just to
+/// discard its contents, and until it returned the host
+/// could not prepare the next chunk: the submissions
+/// would serialize against the device. A deferred chunk
+/// encodes and submits identically (same chain, same
+/// head, same logits copy into staging, same diag
+/// stamps); only its map is skipped, so the host runs
+/// ahead preparing chunk N+1 while the device still
+/// runs chunk N. The final chunk always reads back (it
+/// carries the return value), so a single-chunk forward
+/// (every decode step) never defers. Pure, so the
+/// pipelining contract is unit-testable without a
+/// device.
+fn defers_readback(index: usize, count: usize) -> bool {
+    index + 1 < count
+}
+
 /// Chunk row count at which a plan's projections switch from
 /// the GEMV kernels to the matrix-matrix kernels: the MMQ
 /// pair (K12 quantize plus K13/K14, when the backend built
@@ -231,12 +262,18 @@ pub struct SessionStats {
     pub submissions: u64,
     /// KV growth copy submissions outside the forward chains.
     pub aux_submissions: u64,
-    /// Logits readbacks (one per chunk).
+    /// Logits readbacks (one per `forward` call: a
+    /// multi-chunk forward defers every chunk's readback
+    /// but the last chunk's, whose single blocking map
+    /// collects the only logits the call returns; the
+    /// per-chunk logits copies still land in staging,
+    /// unmapped).
     pub readbacks: u64,
-    /// Argmax readbacks (one per chunk forwarded through
-    /// [`ResidentSession::forward_argmax`]): eight bytes each
-    /// (the winning index and logit) instead of the logits
-    /// vector's 808 KB at the real vocabulary.
+    /// Argmax readbacks (one per `forward_argmax` call,
+    /// under the same deferral as [`Self::readbacks`]):
+    /// eight bytes each (the winning index and logit)
+    /// instead of the logits vector's 808 KB at the real
+    /// vocabulary.
     pub argmax_readbacks: u64,
     /// Compute dispatches recorded (across all chunks).
     pub dispatches: u64,
@@ -3393,6 +3430,35 @@ impl<'a> ResidentSession<'a> {
             cfg.vocab_size,
             cfg.hidden
         );
+        // Flush the weight uploads before the session is
+        // handed out. `upload_bytes` stages its copies on
+        // the queue: they execute in queue order ahead of
+        // the next submission, so an unflushed session
+        // leaves the whole weight set (16.76 GB on the real
+        // Glimmer file) to be copied in front of the first
+        // forward's first chunk, and that chunk's blocking
+        // readback is where the copy time lands: the
+        // prefill profile's ~1.7 s first-slice latency
+        // (bench/prefill-profile-2026-11-05.md), in the
+        // prefill wall but in no kernel's timing, since
+        // copies are not dispatches. Submitting an empty
+        // command buffer flushes the queue's pending
+        // writes and the poll pays the copies here, at
+        // construction, where "session built" should mean
+        // the weights are resident. The total copy work is
+        // unchanged; only its attribution moves.
+        ctx.queue.submit([ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("session upload flush"),
+            })
+            .finish()]);
+        ctx.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| GlimmerError::StepFailed {
+                step: "session",
+                detail: format!("flushing the session's weight uploads failed: {e}"),
+            })?;
         Ok(ResidentSession {
             backend,
             cfg: cfg.clone(),
@@ -3453,7 +3519,11 @@ impl<'a> ResidentSession<'a> {
     /// path's `GlimmerModel::forward` returns. The prompt is
     /// processed in chunks (one submission each); a
     /// single-token decode is one chunk, one submission, one
-    /// readback.
+    /// readback. A multi-chunk forward reads back only its
+    /// final chunk (see [`defers_readback`]): the chunk
+    /// submissions pipeline, the host preparing chunk N+1
+    /// while the device still runs chunk N, and the final
+    /// chunk's blocking map is the call's only device wait.
     ///
     /// # Errors
     ///
@@ -3466,17 +3536,41 @@ impl<'a> ResidentSession<'a> {
         self.validate_tokens(tokens)?;
         self.stats.forwards += 1;
         self.stats.tokens += tokens.len() as u64;
+        // The chunk count is known before any chunk runs
+        // (the cap is fixed for the session's life), so the
+        // loop can mark every chunk but the last deferred:
+        // their logits are computed and copied exactly as
+        // before but never mapped, and the submissions
+        // pipeline instead of each one draining the device
+        // on a blocking readback whose contents the next
+        // iteration would overwrite unread.
+        let mut count = 0usize;
+        let mut remaining = tokens.len();
+        while remaining > 0 {
+            let rows = self.chunk_rows(remaining);
+            count += 1;
+            remaining -= rows;
+        }
         let mut rest = tokens;
         let mut logits = Vec::new();
+        let mut index = 0usize;
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
-            match self.forward_chunk(&rest[..rows], ChunkTail::Logits, &[])?.0 {
+            let defer = defers_readback(index, count);
+            match self
+                .forward_chunk(&rest[..rows], ChunkTail::Logits, &[], defer)?
+                .0
+            {
                 ChunkOutcome::Logits(chunk_logits) => logits = chunk_logits,
+                // A deferred chunk produces no outcome; the
+                // final chunk's logits are the forward's.
+                ChunkOutcome::Deferred => {}
                 ChunkOutcome::Argmax(..) | ChunkOutcome::Block(..) => {
                     unreachable!("logits tail yields logits")
                 }
             }
             rest = &rest[rows..];
+            index += 1;
         }
         Ok(logits)
     }
@@ -3495,7 +3589,12 @@ impl<'a> ResidentSession<'a> {
     /// the resident-session test pins. Callers that need the
     /// full distribution (sampling, top-k, probabilities)
     /// keep using `forward`; this method exists for the
-    /// greedy path, where the vector itself is waste.
+    /// greedy path, where the vector itself is waste. Like
+    /// `forward`, a multi-chunk call defers every chunk's
+    /// readback but the final chunk's (see
+    /// [`defers_readback`]): an intermediate chunk's winner
+    /// is overwritten unread by the next chunk, so its
+    /// eight-byte map was the same pure serialization.
     ///
     /// # Errors
     ///
@@ -3505,17 +3604,36 @@ impl<'a> ResidentSession<'a> {
         self.validate_tokens(tokens)?;
         self.stats.forwards += 1;
         self.stats.tokens += tokens.len() as u64;
+        // The same deferral as `forward`: the chunk count
+        // is known up front, and every chunk but the last
+        // submits without its readback.
+        let mut count = 0usize;
+        let mut remaining = tokens.len();
+        while remaining > 0 {
+            let rows = self.chunk_rows(remaining);
+            count += 1;
+            remaining -= rows;
+        }
         let mut rest = tokens;
         let mut winner = (0, f32::NEG_INFINITY);
+        let mut index = 0usize;
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
-            match self.forward_chunk(&rest[..rows], ChunkTail::Argmax, &[])?.0 {
+            let defer = defers_readback(index, count);
+            match self
+                .forward_chunk(&rest[..rows], ChunkTail::Argmax, &[], defer)?
+                .0
+            {
                 ChunkOutcome::Argmax(id, logit) => winner = (id, logit),
+                // A deferred chunk's winner is never read;
+                // the final chunk's winner is the call's.
+                ChunkOutcome::Deferred => {}
                 ChunkOutcome::Logits(_) | ChunkOutcome::Block(_) => {
                     unreachable!("argmax tail yields argmax")
                 }
             }
             rest = &rest[rows..];
+            index += 1;
         }
         Ok(winner)
     }
@@ -3553,10 +3671,10 @@ impl<'a> ResidentSession<'a> {
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
             let (outcome, chunk_captures) =
-                self.forward_chunk(&rest[..rows], ChunkTail::Logits, &layers)?;
+                self.forward_chunk(&rest[..rows], ChunkTail::Logits, &layers, false)?;
             match outcome {
                 ChunkOutcome::Logits(chunk_logits) => logits = chunk_logits,
-                ChunkOutcome::Argmax(..) | ChunkOutcome::Block(..) => {
+                ChunkOutcome::Argmax(..) | ChunkOutcome::Block(..) | ChunkOutcome::Deferred => {
                     unreachable!("logits tail yields logits")
                 }
             }
@@ -3597,10 +3715,10 @@ impl<'a> ResidentSession<'a> {
         while !rest.is_empty() {
             let rows = self.chunk_rows(rest.len());
             let (outcome, chunk_captures) =
-                self.forward_chunk(&rest[..rows], ChunkTail::BlockLogits, &layers)?;
+                self.forward_chunk(&rest[..rows], ChunkTail::BlockLogits, &layers, false)?;
             match outcome {
                 ChunkOutcome::Block(chunk_logits) => logits.extend_from_slice(&chunk_logits),
-                ChunkOutcome::Logits(_) | ChunkOutcome::Argmax(..) => {
+                ChunkOutcome::Logits(_) | ChunkOutcome::Argmax(..) | ChunkOutcome::Deferred => {
                     unreachable!("block tail yields block logits")
                 }
             }
@@ -3744,17 +3862,29 @@ impl<'a> ResidentSession<'a> {
     /// encodes as one pass per layer range, with an encoder
     /// copy of stream A into the capture staging at each
     /// named layer's entry; the copies are not dispatches and
-    /// the stats count none.
+    /// the stats count none. When `defer_readback` is set (a
+    /// non-final chunk of a multi-chunk `forward` or
+    /// `forward_argmax`, see [`defers_readback`]) the chunk
+    /// encodes and submits identically but skips its map and
+    /// yields [`ChunkOutcome::Deferred`]: the tail's copy
+    /// still lands in the plan's staging, unread. Deferral
+    /// is honored only for the logits and argmax tails
+    /// without captures; every other shape reads back as
+    /// before.
     fn forward_chunk(
         &mut self,
         tokens: &[u32],
         tail: ChunkTail,
         capture_layers: &[usize],
+        defer_readback: bool,
     ) -> Result<(ChunkOutcome, Vec<LayerInputCapture>)> {
         let ctx = self.backend.context();
         let rows = tokens.len();
         let start = self.position;
         let end = start + rows;
+        let defer = defer_readback
+            && matches!(tail, ChunkTail::Logits | ChunkTail::Argmax)
+            && capture_layers.is_empty();
 
         // Grow the KV first: growth submits its own copy
         // command buffers (counted apart) and replaces layer
@@ -3922,6 +4052,13 @@ impl<'a> ResidentSession<'a> {
         self.stats.chunks += 1;
         self.stats.dispatches += dispatches;
         let outcome = match tail {
+            // Deferred: the submission stands, the tail's
+            // copy is in staging, and no map drains the
+            // device for contents nobody will read. The
+            // forward's final chunk reads back for all of
+            // them.
+            ChunkTail::Logits if defer => ChunkOutcome::Deferred,
+            ChunkTail::Argmax if defer => ChunkOutcome::Deferred,
             ChunkTail::Logits => {
                 let logits = ctx
                     .map_staging(&staging, self.cfg.vocab_size as usize)
@@ -3996,12 +4133,37 @@ enum ChunkOutcome {
     Argmax(u32, f32),
     /// Every row's finished logits, row-major `[rows][vocab]`.
     Block(Vec<f32>),
+    /// No outcome: a deferred chunk of a multi-chunk
+    /// `forward` or `forward_argmax`, submitted without
+    /// its readback. Its tail copy landed in the plan's
+    /// staging unread; the call's final chunk produces
+    /// the only outcome the caller sees.
+    Deferred,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use muse_glimmer::PatternSource;
+
+    #[test]
+    fn defers_readback_only_before_the_final_chunk() {
+        // The pipelining contract, pinned: a single-chunk
+        // forward (every decode step, and any prompt under
+        // the cap) never defers; its only chunk carries the
+        // return value.
+        assert!(!defers_readback(0, 1));
+        // Two chunks (the resident test's 70-token prompt
+        // at the 64-row cap): the first defers, the second
+        // reads back.
+        assert!(defers_readback(0, 2));
+        assert!(!defers_readback(1, 2));
+        // The profiled shape (1,022 tokens at the 64-row
+        // cap): sixteen chunks, the first fifteen defer.
+        assert!(defers_readback(0, 16));
+        assert!(defers_readback(14, 16));
+        assert!(!defers_readback(15, 16));
+    }
 
     #[test]
     fn pow2_chunks_decompose_the_verify_band() {

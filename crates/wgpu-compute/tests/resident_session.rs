@@ -17,8 +17,10 @@
 //! Pass bar, the cross-backend bar: top-1 (argmax) agreement
 //! at every step across all three drivers, and max-abs logit
 //! difference under 0.5 between every pair. The submission
-//! contract is asserted too: one submission and one readback
-//! per chunk, no exceptions.
+//! contract is asserted too: one submission per chunk, and
+//! one blocking logits readback per forward (a multi-chunk
+//! forward defers every chunk's readback but its final
+//! chunk's; see the multi-chunk deferral test below).
 //!
 //! Needs a discrete Vulkan GPU under the backend's default
 //! policy; skips with a printed reason where none qualifies.
@@ -380,7 +382,10 @@ fn resident_session_matches_trait_and_cpu() {
         stats.submissions, 6,
         "one submission per chunk, no exceptions"
     );
-    assert_eq!(stats.readbacks, 6, "one logits readback per chunk");
+    assert_eq!(
+        stats.readbacks, 6,
+        "one logits readback per (single-chunk) forward"
+    );
     // The dispatch count is the full 6-layer chain per chunk,
     // at the fused count: the fixture's layers are all Q4_K,
     // so every layer batches QKV+gate and pairs gate+up, and
@@ -478,7 +483,7 @@ fn host_greedy(logits: &[f32]) -> (u32, f32) {
 /// winner (and the same winning logit) as `forward` plus the
 /// host greedy pick, on a multi-chunk prompt and across a
 /// greedy generation, while reading back eight bytes per
-/// chunk instead of the logits vector.
+/// readback instead of the logits vector.
 #[test]
 fn resident_session_argmax_tail_matches_logits() {
     let logits_backend = match WgpuCompute::new() {
@@ -516,9 +521,25 @@ fn resident_session_argmax_tail_matches_logits() {
     );
     assert_eq!(logits_session.position(), argmax_session.position());
     let a_stats = argmax_session.stats();
-    assert_eq!(a_stats.argmax_readbacks, 2, "one argmax readback per chunk");
+    // The two-chunk prompt defers its first chunk's
+    // readback on the argmax tail too: one blocking
+    // readback (the final chunk's) serves the forward.
+    assert_eq!(
+        a_stats.argmax_readbacks, 1,
+        "one argmax readback per (multi-chunk) forward"
+    );
     assert_eq!(a_stats.readbacks, 0, "the argmax tail never reads logits");
-    assert_eq!(logits_session.stats().readbacks, 2);
+    // The logits session's two-chunk forward defers its
+    // first chunk's readback: submissions and chunks still
+    // count per chunk, but exactly one blocking readback
+    // (the final chunk's) serves the whole forward.
+    let l_stats = logits_session.stats();
+    assert_eq!(l_stats.chunks, 2);
+    assert_eq!(l_stats.submissions, 2);
+    assert_eq!(
+        l_stats.readbacks, 1,
+        "a multi-chunk forward reads back once, at its final chunk"
+    );
 
     // Greedy generation: each session feeds its own winner;
     // the streams must stay identical step by step.
@@ -537,8 +558,84 @@ fn resident_session_argmax_tail_matches_logits() {
         );
         next = vec![step_id];
     }
-    assert_eq!(argmax_session.stats().argmax_readbacks, 14);
+    // 1 for the two-chunk prompt (its first chunk
+    // deferred) plus 12 single-chunk decode steps.
+    assert_eq!(argmax_session.stats().argmax_readbacks, 13);
     assert_eq!(argmax_session.position(), logits_session.position());
+}
+
+/// The prefill pipelining contract: a multi-chunk
+/// `forward` submits every chunk but reads back only its
+/// final chunk's logits, and the logits it returns are
+/// the ones a chunk-at-a-time driver produces (each chunk
+/// its own forward there, hence each chunk read back).
+/// The deferral is the whole change: same chunk
+/// submissions, same dispatches, same results; one
+/// blocking map instead of one per chunk, so on a real
+/// device the host prepares chunk N+1 while the device
+/// still runs chunk N instead of draining it first.
+#[test]
+fn resident_session_multichunk_forward_defers_readbacks() {
+    let pipelined_backend = match WgpuCompute::new() {
+        Ok(b) => b,
+        Err(WgpuError::NoSuitableAdapter { seen, .. }) => {
+            eprintln!(
+                "skipping resident multichunk deferral test: no suitable adapter \
+                 (enumerated: [{}])",
+                seen.join("; ")
+            );
+            return;
+        }
+        Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+    };
+    let stepped_backend = WgpuCompute::new().expect("stepped backend instance builds");
+    let cfg = cross_cfg();
+    let weights = cross_weights(&cfg);
+    let mut pipelined =
+        ResidentSession::new(&pipelined_backend, &cfg, &weights).expect("pipelined session builds");
+    let mut stepped =
+        ResidentSession::new(&stepped_backend, &cfg, &weights).expect("stepped session builds");
+
+    // 150 tokens at the 64-row cap: chunks of 64, 64, 22.
+    let prompt: Vec<u32> = (0..150).map(|i| (i * 37 % 1024) as u32).collect();
+    let pipelined_logits = pipelined.forward(&prompt).expect("pipelined forward");
+    let mut stepped_logits = Vec::new();
+    for chunk in prompt.chunks(64) {
+        stepped_logits = stepped.forward(chunk).expect("stepped forward");
+    }
+    assert_eq!(pipelined.position(), 150);
+    assert_eq!(stepped.position(), 150);
+    assert_eq!(
+        argmax(&pipelined_logits),
+        argmax(&stepped_logits),
+        "deferral changed the winning token"
+    );
+    let d = max_abs(&pipelined_logits, &stepped_logits);
+    assert!(
+        d < 0.5,
+        "deferred and stepped logits drift beyond the cross-path bound: {d}"
+    );
+
+    // The fingerprint: the same chunks and submissions in
+    // both drivers, one readback against three, and a
+    // dispatch count that does not move.
+    let p_stats = pipelined.stats();
+    assert_eq!(p_stats.forwards, 1);
+    assert_eq!(p_stats.chunks, 3);
+    assert_eq!(
+        p_stats.submissions, 3,
+        "one submission per chunk, pipelined or not"
+    );
+    assert_eq!(p_stats.readbacks, 1, "only the final chunk reads back");
+    let s_stats = stepped.stats();
+    assert_eq!(s_stats.forwards, 3);
+    assert_eq!(s_stats.chunks, 3);
+    assert_eq!(s_stats.submissions, 3);
+    assert_eq!(s_stats.readbacks, 3, "every stepped forward reads back");
+    assert_eq!(
+        p_stats.dispatches, s_stats.dispatches,
+        "deferral changes no dispatch: the device work is identical"
+    );
 }
 
 /// Quantize-once, proven end to end: the mixed fixture

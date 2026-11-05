@@ -484,6 +484,184 @@ pub(crate) fn upload_proj(
     }
 }
 
+/// A projection matrix uploaded for the small-batch
+/// sweep harness (`examples/mmv_sweep.rs`): the same
+/// resident weight handle the session builds through
+/// [`upload_proj`], from raw parts instead of a
+/// [`TensorView`], so the harness can sweep synthetic
+/// tensors at real model shapes. Prepares go through
+/// [`prepare_proj`] itself, the session's own routing
+/// ladder, so the variant a sweep measures is the
+/// variant the session would dispatch under the same
+/// environment: the two can never drift onto different
+/// kernels.
+pub struct ProjBench {
+    weights: ProjWeights,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl ProjBench {
+    /// Upload one synthetic projection tensor. The
+    /// dtype acceptance and refusal text mirror
+    /// [`upload_proj`] exactly: Q4_K, Q6_K, and Q5_K
+    /// upload; everything else is refused by name.
+    pub fn upload(
+        backend: &WgpuCompute,
+        name: &str,
+        dtype: Dtype,
+        raw: &[u8],
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<ProjBench> {
+        let step = "proj_bench";
+        let ctx = backend.context();
+        let weights = match dtype {
+            Dtype::Q4K => backend
+                .k1()
+                .upload(ctx, name, raw, in_features, out_features)
+                .map(ProjWeights::Q4K)
+                .map_err(|e| we(e, step))?,
+            Dtype::Q6K => backend
+                .k2()
+                .upload(ctx, name, raw, in_features, out_features)
+                .map(ProjWeights::Q6K)
+                .map_err(|e| we(e, step))?,
+            Dtype::Q5K => backend
+                .k3()
+                .upload(ctx, name, raw, in_features, out_features)
+                .map(ProjWeights::Q5K)
+                .map_err(|e| we(e, step))?,
+            other => {
+                return Err(GlimmerError::StepFailed {
+                    step,
+                    detail: format!(
+                        "tensor {name} has dtype {other:?}; the gemv kernels cover Q4_K, Q6_K, and Q5_K"
+                    ),
+                });
+            }
+        };
+        Ok(ProjBench {
+            weights,
+            in_features,
+            out_features,
+        })
+    }
+
+    /// Resident weight bytes of the uploaded tensor:
+    /// the stream the timed dispatch reads.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.weights.byte_len()
+    }
+
+    /// Input width of the projection.
+    #[must_use]
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// Output width of the projection.
+    #[must_use]
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Prepare one projection dispatch at `batch` rows
+    /// through the session's routing ladder
+    /// ([`prepare_proj`], no shared `h` quantize: the
+    /// bench measures one projection at a time, so each
+    /// quantized form prepares its own quantize exactly
+    /// as it does for a non-`h` projection in a forward).
+    pub fn prepare(
+        &self,
+        backend: &WgpuCompute,
+        input: &wgpu::Buffer,
+        q8_qs: &wgpu::Buffer,
+        q8_ds: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: usize,
+    ) -> Result<ProjBenchCall> {
+        prepare_proj(
+            backend,
+            &self.weights,
+            input,
+            q8_qs,
+            q8_ds,
+            output,
+            batch,
+            "proj_bench",
+            None,
+        )
+        .map(|call| ProjBenchCall { call })
+    }
+}
+
+/// One prepared projection dispatch for the sweep
+/// harness: the session's own [`ProjCall`], wrapped so
+/// the harness can encode it, name the kernel form the
+/// routing chose, and classify its numerics (a form
+/// that quantizes its activation answers to the wider
+/// quantization band, not to reassociation noise).
+pub struct ProjBenchCall {
+    call: ProjCall,
+}
+
+impl ProjBenchCall {
+    /// Record this dispatch into the open compute pass.
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        self.call.encode_into(pass);
+    }
+
+    /// Compute dispatches this projection records: the
+    /// session's own accounting (see
+    /// [`ProjCall::dispatches`]).
+    #[must_use]
+    pub fn dispatches(&self) -> u64 {
+        self.call.dispatches()
+    }
+
+    /// The product kernel the routing chose, under the
+    /// diag timestamps system's name for it. A composed
+    /// form (a K12 quantize feeding its product) is
+    /// named by its product kernel; the quantize is
+    /// part of the measured composition.
+    #[must_use]
+    pub fn kernel_name(&self) -> &'static str {
+        match &self.call {
+            ProjCall::Q4K(_) => "k1_q4k_gemv",
+            ProjCall::Q6K(_) => "k2_q6k_gemv",
+            ProjCall::Q5K(_) => "k3_q5k_gemv",
+            ProjCall::GemmQ4K(_) => "k10_q4k_gemm",
+            ProjCall::GemmQ6K(_) => "k11_q6k_gemm",
+            ProjCall::MmqQ4K { .. } => "k13_q4k_mmq",
+            ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
+            ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
+            ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
+            ProjCall::SmallQ4K { .. } => "k18_q4k_small",
+            ProjCall::SmallQ6K { .. } => "k18_q6k_small",
+            ProjCall::SmallQ5K { .. } => "k18_q5k_small",
+        }
+    }
+
+    /// Whether this form quantizes its activation to
+    /// Q8 before the product (the MMQ and small-batch
+    /// forms): its output answers to the crate's 5%
+    /// quantization band against the f32 GEMV form, not
+    /// to the tight reassociation bound.
+    #[must_use]
+    pub fn quantized(&self) -> bool {
+        !matches!(
+            self.call,
+            ProjCall::Q4K(_)
+                | ProjCall::Q6K(_)
+                | ProjCall::Q5K(_)
+                | ProjCall::GemmQ4K(_)
+                | ProjCall::GemmQ6K(_)
+        )
+    }
+}
+
 /// Choose the Q4_K MMQ product for an already-prepared
 /// K12 quantize call: the wide product (K15) first when
 /// the batch is at or past the backend's wide row

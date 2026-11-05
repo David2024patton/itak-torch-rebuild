@@ -108,7 +108,7 @@ pub use kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, K8Pipeline, ARGMAX_GROUPS,
 };
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
-pub use session::{ResidentSession, SessionStats};
+pub use session::{ProjBench, ProjBenchCall, ResidentSession, SessionStats};
 pub use timestamps::{
     DiagMode, DiagRecorder, DiagStamp, DispatchMeta, DispatchRecord, KernelSummary,
 };

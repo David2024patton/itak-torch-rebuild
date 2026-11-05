@@ -68,7 +68,7 @@ became the product's limits.
 | Module | Owns (its grid slot) | Interface | Depends on |
 | --- | --- | --- | --- |
 | itak-core (published, versioned module) | pkg/types (the contracts), pkg/debug (structured logger), pkg/event, pkg/health, pkg/registry. Published and versioned, never a relative sibling folder | Imported by itakd and by the console tooling | Nothing |
-| pkg/ipc | The Go side of the seam: control client, shared-memory rings, protocol version check | `Client.Generate(ctx, req) -> stream of token events` | itak-core |
+| pkg/ipc | The Go side of the seam: control client for the socket protocol of Section 4, protocol version check | `Client.Generate(ctx, req) -> stream of token events` | itak-core |
 | pkg/server | HTTP surface: OpenAI-compatible chat, completions, embeddings, models; Ollama compatibility. Auth middleware in front of every route group from the first commit | HTTP; binds 127.0.0.1 by default, LAN exposure only by explicit flag | pkg/ipc, pkg/auth |
 | pkg/auth | API keys (hashed at rest, per-user), tenant identity, cluster shared secret. Identity is threaded into scheduler and cache keys | Middleware + identity context | itak-core |
 | pkg/sched | Scheduler, continuous batching, chunked prefill, slot manager, token budgets, rate limiting, priority lanes (every lane drained in every mode) | `Submit(identity, req) -> handle` | pkg/ipc |
@@ -91,52 +91,66 @@ became the product's limits.
 
 ## 4. The seam: Go and Rust IPC contract
 
-Transport: a Unix domain socket (Linux) or named pipe (Windows) for
-control, plus shared-memory segments for bulk data. The socket never
-carries tensors.
+As built (this section describes the shipped seam; the definition of
+record is `crates/itak-engine/src/protocol.rs` on the Rust side and
+`platform/internal/engine/unix.go` on the Go side, and SERVING.md
+carries the same definition in prose):
+
+Transport: a Unix domain socket. The engine binds the path given by
+`--socket` / `ITAK_ENGINE_SOCKET` (default `/tmp/itak-engine.sock`)
+and loads its one model at startup from `--model`; there is no
+load-model message, and a model that fails to load, including at the
+tensor coverage gate, exits the process non-zero, so a partial model
+never serves. Everything crosses the socket: there is no
+shared-memory data plane, and no tensor or token stream travels
+anywhere else.
 
 Framing and versioning:
 
-- Every frame is length-prefixed and starts with a fixed header:
-  protocol version (u16), message type (u16), request id (u64), payload
-  length (u32). Payloads are the itak-types shapes, serialized in one
-  agreed encoding used by both sides.
-- The first exchange is Hello: each side states its protocol version
-  and capability list. A major-version mismatch is a named refusal
-  through the diagnostic channel on both sides, never a hang and never
-  a silent downgrade.
-- Every operational limit on the seam (frame size, ring capacity,
-  per-request deadline, restart budget) is config with a default.
+- One JSON object per line (NDJSON). A frame is a single line. The
+  engine's reader caps a line at the configured maximum frame size
+  (`--max-frame-bytes` / `ITAK_ENGINE_MAX_FRAME_BYTES`, default
+  4,194,304 bytes) and refuses an over-long line as a named
+  `bad_frame` error and closes, instead of growing a buffer without
+  bound; the Go client caps a frame at the same 4 MiB.
+- The first frame on every connection is Hello:
+  `{"op":"hello","proto":1,"client":"torch-platform"}`. The engine
+  answers with a `hello_ack` frame carrying its protocol version
+  (1) and a detail string. A peer speaking another version gets an
+  `error` frame with code `protocol_mismatch`, and the Go client
+  likewise refuses a hello_ack carrying any other version, so a
+  mismatch fails by name, never by hang and never by silent
+  downgrade. Any frame arriving before Hello is refused.
+- Before the handshake, the engine checks the connecting process's
+  uid from the kernel peer credentials (SO_PEERCRED): a different
+  uid gets one `peer_refused` error frame and the connection closes
+  at once.
+- Every operational limit on the seam is config with a default,
+  never a compiled constant: frame size (above), the engine's slot
+  count (`--slots`, default 1) and bounded job queue (`--max-queued`,
+  default 8), the default generation cap (`--default-max-tokens`,
+  default 128), the embed batch limits (`--max-embed-inputs`,
+  `--max-embed-tokens`), and the platform supervisor's restart
+  budget for the engine process (TODO T-9.11).
 
-Message set (control plane):
+Message set (one `op` per frame):
 
 | Message | Direction | Carries |
 | --- | --- | --- |
-| Hello / HelloAck | both | Protocol versions, capabilities, hardware report summary |
-| LoadModel / LoadResult | Go to Rust | Path, arch expectations; result carries the coverage report or the named load error |
-| UnloadModel | Go to Rust | Model handle |
-| CreateSession / DestroySession | Go to Rust | Session config (context size, KV policy) |
-| Tokenize / Detokenize | Go to Rust | Text or ids; the engine owns the tokenizer, the platform never guesses (the old /v1/tokenize char-count fabrication cannot recur) |
-| Generate | Go to Rust | Token ids (or a shared-memory reference), sampling block, grammar block, stop rules |
-| TokenEvent | Rust to Go | Streamed token ids and logprobs via the shared-memory ring, with a socket wakeup |
-| Abort | Go to Rust | Request id; the engine stops at the next token boundary |
-| Embed | Go to Rust | Text; returns a shared-memory handle to the vectors |
-| SaveState / LoadState | Go to Rust | Paths confined to the configured state directory, validated on the platform side before the message is sent |
-| Health / Diagnostics | Go to Rust | Liveness plus the diag dump: what the engine refused, fell back on, or decided, with codes |
-| Shutdown | Go to Rust | Graceful drain, then exit |
+| hello / hello_ack | both | Protocol version (1) and the client name; the ack carries the engine's detail string. A version mismatch is the named `protocol_mismatch` error instead |
+| ping / pong | Go to Rust, reply | Health probe and its reply |
+| debug / debug_info | Go to Rust, reply | The engine's self-report: model identity, tensor coverage, and slot and job counters |
+| generate | Go to Rust | Prompt text (the engine owns the tokenizer; the platform sends text, never token ids), model name, max_tokens, stop strings, and the sampling block: temperature, top_p, top_k, seed, presence and frequency penalties |
+| token | Rust to Go | One streamed piece of the completion, on the same socket: text and token_id per frame. The final frame carries `done` true and `finish_reason` set to `stop` or `length`, with empty text |
+| embed / embeddings | Go to Rust, reply | Input texts; the reply frame itself carries one vector per input, in input order: mean-pooled token embeddings from the model's own embedding table, L2-normalized, as JSON arrays |
+| chat_template / chat_template | Go to Rust, reply | The request asks for the model's own chat template; the reply carries the template text from the GGUF metadata plus the bos and eos token texts. A model whose file carries no template gets the named `no_chat_template` error. The platform renders the template; the engine only serves it |
+| error | Rust to Go | A named refusal: `code` and `message`. The platform maps bad_request, context_overflow, model_not_found, and protocol_mismatch to a client error; forward_failed, detokenize_failed, engine_died, unknown_op, bad_frame, and internal to a gateway error; and engine_busy (every slot running and the bounded queue full) to 503 |
 
-Data plane (shared memory):
-
-- One ring per active generation: token ids and logprobs flow Rust to
-  Go without copies. Ring capacity is config; a full ring applies
-  backpressure to the token loop, never drops tokens.
-- Embeddings and KV snapshots move as shared-memory handles with
-  explicit ownership and release messages.
-- The engine publishes a per-token progress heartbeat, so the platform
-  enforces per-request deadlines from observed progress. A stuck engine
-  is detected in seconds, which closes the class of failure where a
-  generation held a mutex against a 10-minute deadline and died
-  unnamed.
+There is no abort message and no session or state message: the
+engine's slots and job queue are internal, and the platform cancels
+a generation by closing its connection, which its client does when
+the request context ends; the exchange on that connection ends with
+it.
 
 Failure semantics:
 

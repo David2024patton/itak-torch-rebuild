@@ -11,6 +11,7 @@
 //! that returns placeholder or partially-filled weights.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
 
 use crate::dequant;
@@ -78,15 +79,65 @@ impl TensorInfo {
     }
 }
 
-/// A parsed GGUF file, memory-resident.
+/// Backing store for the file image.
 ///
-/// The whole file is held in memory; memory-mapped backing is the planned
-/// next step for the loader module (PLAN T-2.1) and does not change this
-/// API. Everything the engine needs for correctness (typed metadata,
-/// per-tensor geometry, checked ranges) is validated here.
+/// `Owned` is the in-memory buffer handed to
+/// [`GgufFile::from_bytes`]. `Mapped` is the on-disk file mapped by
+/// [`GgufFile::open`] (PLAN T-2.1): the image occupies no anonymous
+/// memory, so opening a model no longer costs its file size in RAM;
+/// pages are faulted in by the kernel as tensors are read and can be
+/// evicted under memory pressure. Both forms serve the identical
+/// byte slice, so nothing downstream of the parse can tell them
+/// apart.
+#[derive(Debug)]
+enum ImageBacking {
+    Owned(Vec<u8>),
+    Mapped(memmap2::Mmap),
+}
+
+impl ImageBacking {
+    /// The whole file image as a byte slice.
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(map) => map,
+        }
+    }
+}
+
+/// Memory-map an opened file for read-only access.
+///
+/// This is the crate's only unsafe call site (see the crate-level
+/// lint note in `lib.rs`).
+#[allow(unsafe_code)]
+fn map_file(file: &File) -> std::io::Result<memmap2::Mmap> {
+    // SAFETY: `Mmap::map` is unsafe because the mapping aliases the
+    // file's bytes: if another process truncates or rewrites the
+    // file while it is mapped, reads of the affected pages can
+    // observe changed bytes or fault with SIGBUS past a truncated
+    // end instead of returning an error. This loader treats GGUF
+    // model files as immutable artifacts for the life of a
+    // `GgufFile`: `open` maps the file once, nothing in this crate
+    // ever writes through the mapping (it is mapped read-only), and
+    // callers must not modify or truncate a file while a `GgufFile`
+    // opened from it is alive. That is the standing deployment
+    // contract for model files (they are replaced by rename between
+    // runs, never edited in place), and it is the same assumption
+    // every mmap-backed GGUF reader (llama.cpp included) makes.
+    unsafe { memmap2::Mmap::map(file) }
+}
+
+/// A parsed GGUF file.
+///
+/// The file image is either an owned in-memory buffer
+/// ([`GgufFile::from_bytes`]) or a memory mapping of the file on
+/// disk ([`GgufFile::open`], PLAN T-2.1); the API is the same for
+/// both. Everything the engine needs for correctness (typed
+/// metadata, per-tensor geometry, checked ranges) is validated
+/// here.
 #[derive(Debug)]
 pub struct GgufFile {
-    bytes: Vec<u8>,
+    backing: ImageBacking,
     version: u32,
     metadata: Metadata,
     tensors: Vec<TensorInfo>,
@@ -96,16 +147,41 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
-    /// Read and parse a GGUF file from disk.
+    /// Open and parse a GGUF file from disk.
+    ///
+    /// The file is memory-mapped, not read into memory (PLAN T-2.1),
+    /// so opening a file costs no anonymous RAM proportional to its
+    /// size. The file must not be modified or truncated while the
+    /// returned `GgufFile` is alive; see [`map_file`] for the full
+    /// contract.
+    ///
+    /// # Errors
+    /// The same named errors as [`GgufFile::from_bytes`] for the
+    /// file's contents, plus `Io` when the file cannot be opened or
+    /// mapped.
     pub fn open(path: &Path) -> Result<Self> {
         diag::debug("file_open", &format!("path={}", path.display()));
-        let bytes = std::fs::read(path)?;
-        Self::from_bytes(bytes)
+        let file = File::open(path)?;
+        if file.metadata()?.len() == 0 {
+            // A zero-length file cannot be mapped (and the mapping
+            // library refuses it), but it still has a named parse
+            // failure: parse the empty image so `open` reports the
+            // same `Truncated` error the in-memory path reports.
+            return Self::from_bytes(Vec::new());
+        }
+        let map = map_file(&file)?;
+        Self::parse(ImageBacking::Mapped(map))
     }
 
     /// Parse a GGUF file from an in-memory byte buffer.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        let mut reader = Reader::new(&bytes);
+        Self::parse(ImageBacking::Owned(bytes))
+    }
+
+    /// Parse a GGUF file from its image backing.
+    fn parse(backing: ImageBacking) -> Result<Self> {
+        let bytes = backing.as_slice();
+        let mut reader = Reader::new(bytes);
 
         let magic = reader.read_bytes(4, "magic")?;
         if magic != GGUF_MAGIC {
@@ -252,7 +328,7 @@ impl GgufFile {
         );
 
         Ok(Self {
-            bytes,
+            backing,
             version,
             metadata,
             tensors,
@@ -260,6 +336,11 @@ impl GgufFile {
             alignment,
             data_start,
         })
+    }
+
+    /// The whole file image, whichever backing form it has.
+    fn bytes(&self) -> &[u8] {
+        self.backing.as_slice()
     }
 
     /// GGUF format version (always 3 for a successfully parsed file).
@@ -290,7 +371,7 @@ impl GgufFile {
 
     /// Total file size in bytes.
     pub fn file_len(&self) -> usize {
-        self.bytes.len()
+        self.bytes().len()
     }
 
     /// All tensor directory entries, in file order.
@@ -341,9 +422,12 @@ impl GgufFile {
         };
         let start = self.data_start + info.rel_offset as usize;
         let end = start + len as usize;
-        // Ranges were checked at parse time; this slice can only fail if the
-        // file was mutated in memory, which cannot happen through this API.
-        Ok(&self.bytes[start..end])
+        // Ranges were checked at parse time against the image length;
+        // this slice can only fail if the image was mutated behind the
+        // API, which the backing forms do not allow from safe code (for
+        // the mapped form it would take another process rewriting the
+        // file, excluded by the contract on `open`).
+        Ok(&self.bytes()[start..end])
     }
 
     /// Load a tensor fully dequantized to f32.

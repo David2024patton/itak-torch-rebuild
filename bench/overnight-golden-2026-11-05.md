@@ -74,7 +74,7 @@ identity record's first 8 tokens exactly.
 
 (d2) Glimmer first-token top-5 probability golden (TODO T-9.3):
 NEW generator golden/gen_first_token_probs.py (same throwaway
-CPU-server pattern, n_predict=1, n_probs=5, post_sampling_probs),
+CPU-server pattern, n_predict=1, n_probs=5),
 committed fixture
 golden/fixtures/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.top5.jsonl,
 all 15 prompts of set 1.0. First attempt failed with
@@ -85,17 +85,46 @@ completion_token_output::to_json in the server's own source tree;
 confirmed by a live probe whose step keys were
 [bytes, id, prob, token, top_probs]). The generator was fixed to
 that shape, restaged with hash verification, and rerun.
-STATUS AT COMMIT TIME (2026-11-05T05:20Z): the fixed generator is
-committed here and hash-verified in staging, and the rerun is
-queued on the phase lock (~/overnight-golden/run-top5.sh, flock
--w 14400) behind the other overnight lanes, whose lock sessions
-ran long. The fixture file itself had not landed when this note
-was committed. Pickup: when ~/overnight-golden/out/glimmer.top5.jsonl
-appears on the server, copy it to
-golden/fixtures/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.top5.jsonl,
-verify its metadata (model sha256 4cc57c0f..., build a7af149,
-15 records), and amend this section with the top-1 probabilities.
-Everything else in this note is final.
+STATUS (updated 2026-11-05): the first landed run was DEGENERATE
+and was refused at verification. It requested
+post_sampling_probs=true at temperature 0, so the greedy sampling
+chain collapsed every distribution to a one-hot: each record's
+top5 held exactly 1 entry and every top-1 probability was exactly
+1.0 (that output is preserved on the server as
+~/overnight-golden/out/glimmer.top5.degenerate.jsonl). Model
+sha256, build a7af149, record count (15), and the top-1 tokens
+were all correct; only the probability semantics were wrong.
+Fix: the generator now requests PRE-sampling (logit)
+probabilities, post_sampling_probs=false. Field name and
+semantics were confirmed in the server's own source before the
+change (tools/server/server-task.cpp,
+completion_token_output::to_json and probs_vector_to_json;
+tools/server/server-context.cpp, populate_token_probs and the
+need_pre_sample_logits gate): with the flag false this build
+answers "top_logprobs", log-probabilities taken from the raw
+logit distribution via get_token_probabilities, and the generator
+converts them back with exp() so the fixture keeps plain
+probabilities and its original schema. A hard validation guard
+(validate_records in the generator) now runs before any write:
+unless every record holds exactly N_PROBS top entries and the
+top-1 probabilities are not all exactly 1.0, the run raises and
+writes no fixture, so this failure mode can never file silently
+again. The fixed generator is commit 7dcf01c on this lane
+(sha256 f6bdbd0b8aa8...), restaged with hash verification, and
+rerun under the phase lock; the waiter queued at 08:46Z acquired
+the lock in the final minute of its 4 h window and the fixture
+landed at 2026-11-05T12:46Z. LANDED FIXTURE:
+golden/fixtures/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.top5.jsonl
+(sha256 0e36c10d8178...), metadata verified: model sha256
+4cc57c0f51040a22..., build 0.7.0-dev (137, a7af149), flags
+post_sampling_probs=false, 15 records, exactly 5 entries per
+top5, every sampled token equal to its record's top-1, top-5
+probability sums all below 1. factual_capital top-1 is id 13796
+(" Paris") at 0.396216, against 0.3962 from the baseline
+agreement run (diff 1.6e-05, inside the n_probs reporting-path
+tolerance); runner-ups are " a" 0.096076, " the" 0.051315,
+" one" 0.046183, " known" 0.032286. Everything else in this note
+is final.
 
 ## Determinism check
 

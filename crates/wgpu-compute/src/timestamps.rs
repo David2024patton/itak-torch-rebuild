@@ -672,4 +672,32 @@ mod tests {
         assert_eq!(slots.alloc(), Some(0));
         assert_eq!(slots.used(), 1);
     }
+
+    #[test]
+    fn k20_q6k_mmv_records_group_under_their_kernel_name() {
+        // Registration for the K20 register-streaming
+        // kernel's diag stamp (`k20_q6k_mmv`, stamped at
+        // K20 prepare in
+        // crates/wgpu-compute/src/kernels/k20_q6k_mmv.rs):
+        // records carrying the name aggregate under it
+        // and render, like every other kernel's, beside
+        // the Q6_K GEMV they share a family with.
+        let records = vec![
+            record("k20_q6k_mmv", 212, 100),
+            record("k20_q6k_mmv", 212, 300),
+            record("k2_q6k_gemv", 212, 50),
+        ];
+        let (rows, total) = summarize(&records);
+        assert_eq!(total, 450);
+        assert_eq!(rows.len(), 2);
+        let k20 = rows
+            .iter()
+            .find(|r| r.kernel == "k20_q6k_mmv")
+            .expect("k20 records group under their kernel name");
+        assert_eq!(k20.count, 2);
+        assert_eq!(k20.total_ns, 400);
+        assert_eq!(k20.total_bytes, 424);
+        let table = render_summary(&records);
+        assert!(table.contains("k20_q6k_mmv,2,"));
+    }
 }

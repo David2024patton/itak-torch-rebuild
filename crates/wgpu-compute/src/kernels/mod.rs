@@ -57,6 +57,18 @@
 //! Q5_K, Q6_K). The session routes to it only under
 //! its env-set threshold, which defaults off; see the
 //! module's own docs for the reasoning.
+//!
+//! K20 is the Q6_K register-streaming small-batch
+//! product: K18's Q6_K band (2..=16 rows, one weight
+//! stream per dispatch) in llama.cpp `mul_mat_vec`'s
+//! shape instead of the MMQ shape, dequantizing in
+//! registers and staging nothing but reduction
+//! partials, as the counter-proposal to K18's and the
+//! wide MMQ's workgroup-memory staging (the streaming
+//! measurements behind it are in the module's own
+//! docs). It shares its routing threshold with the
+//! Q4_K register-streaming product (env
+//! `WGPU_COMPUTE_MMV_MAX_ROWS`, default off).
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -68,6 +80,7 @@ pub mod k16_q6k_mmq_wide;
 pub mod k17_dflash;
 pub mod k18_small_batch;
 pub mod k1_q4k_gemv;
+pub mod k20_q6k_mmv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;
 pub mod k4_rmsnorm;

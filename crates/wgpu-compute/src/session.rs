@@ -97,6 +97,7 @@ use crate::kernels::k15_q4k_mmq_wide::K15Call;
 use crate::kernels::k16_q6k_mmq_wide::K16Call;
 use crate::kernels::k18_small_batch::K18Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
+use crate::kernels::k20_q6k_mmv::K20Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
@@ -368,6 +369,11 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K18Call,
     },
+    /// K20 (Q6_K register-streaming small-batch) dispatch:
+    /// a single dispatch, no quantize in front of it (the
+    /// kernel consumes the f32 rows directly, so its
+    /// dispatch count is the GEMV's).
+    MmvQ6K(K20Call),
 }
 
 impl ProjCall {
@@ -415,6 +421,7 @@ impl ProjCall {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
             }
+            ProjCall::MmvQ6K(c) => c.encode_into(pass),
         }
     }
 
@@ -802,6 +809,48 @@ fn small_batch_applies(backend: &WgpuCompute, batch: u32) -> bool {
     batch >= 2 && batch <= backend.small_batch_max_rows()
 }
 
+/// Whether `batch` sits in the register-streaming band
+/// the backend's config enables: 2 rows up to the
+/// resolved `mmv_max_rows` threshold (default 1, which
+/// enables nothing). The kernels' own band
+/// ([`crate::kernels::k20_q6k_mmv::MMV_MIN_BATCH`]..=
+/// [`crate::kernels::k20_q6k_mmv::MMV_MAX_BATCH`]) bounds
+/// it at prepare. One threshold serves the whole
+/// register-streaming family.
+fn mmv_applies(backend: &WgpuCompute, batch: u32) -> bool {
+    batch >= 2 && batch <= backend.mmv_max_rows()
+}
+
+/// Try the K20 register-streaming form of a plain Q6_K
+/// projection: one dispatch over the f32 input rows
+/// themselves, no quantize in front of it. `None` when
+/// the batch is outside the configured band or the
+/// prepare refuses the shape (logged by name): the
+/// caller then continues down the ladder. This is the
+/// fallback ladder's composition step, at plan-build
+/// time; it never substitutes inside a dispatch.
+fn try_mmv_q6k(
+    backend: &WgpuCompute,
+    weights: &K2Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !mmv_applies(backend, batch) {
+        return None;
+    }
+    match backend
+        .k20()
+        .prepare(backend.context(), weights, input, output, batch)
+    {
+        Ok(c) => Some(ProjCall::MmvQ6K(c)),
+        Err(e) => {
+            dbg_log!("mmv q6k refused at the product prepare: {e}; the ladder continues");
+            None
+        }
+    }
+}
+
 /// Try the K18 small-batch form of a plain Q4_K
 /// projection: the K12 plain quantize of `input`
 /// feeding the K18 product. `None` when the batch is
@@ -920,8 +969,14 @@ fn try_small_q5k(
 /// MMQ pair when the backend built it, the GEMM kernels
 /// (K10/K11) behind them when it built those; below the
 /// threshold, and for Q5_K (the one-row head) at any size,
-/// the GEMV kernels run. One rung sits between those: in
-/// the small-batch band (2 rows up to the backend's
+/// the GEMV kernels run. Two rungs sit between those: in
+/// the register-streaming band (2 rows up to the backend's
+/// configured `mmv_max_rows`, shipped off), the K20
+/// register-streaming product serves Q6_K, taking
+/// precedence over the staged form when both bands are
+/// open (it is the band's structural challenger; see
+/// bench/mmv-q6k-2026-11-05.md); and in the
+/// small-batch band (2 rows up to the backend's
 /// configured `small_batch_max_rows`, shipped off), the
 /// K18 small-batch products serve all three families
 /// when the backend built them. Every form consumes the
@@ -983,6 +1038,9 @@ fn prepare_proj(
                         .map(ProjCall::GemmQ6K)
                         .map_err(|e| we(e, step));
                 }
+            }
+            if let Some(c) = try_mmv_q6k(backend, w, input, output, batch) {
+                return Ok(c);
             }
             if let Some(c) = try_small_q6k(backend, w, input, q8_qs, q8_ds, output, batch) {
                 return Ok(c);

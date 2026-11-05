@@ -94,6 +94,7 @@ pub use kernels::k18_small_batch::{
 pub use kernels::k1_q4k_gemv::{
     K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
 };
+pub use kernels::k20_q6k_mmv::{K20Call, K20Pipeline};
 pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};
 pub use kernels::k3_q5k_gemv::{
     K3Call, K3Pipeline, K3Shape, K3Weights, FINISH_NONE, FINISH_SCALE, FINISH_SOFTCAP,

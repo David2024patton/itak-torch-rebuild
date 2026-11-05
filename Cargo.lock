@@ -1038,6 +1038,7 @@ dependencies = [
  "dflash",
  "gguf",
  "muse-glimmer",
+ "naga",
  "pollster",
  "torch-math",
  "wgpu",

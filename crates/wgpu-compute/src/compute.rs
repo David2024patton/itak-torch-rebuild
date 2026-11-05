@@ -47,6 +47,7 @@ use crate::kernels::k18_small_batch::{K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipe
 use crate::kernels::k19_q4k_mmv::K19Pipeline;
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k21_q5k_mmv::K21Pipeline;
+use crate::kernels::k22_q4k_mmq::K22Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -202,6 +203,28 @@ fn resolve_chunked_gemv_max_rows(raw: Option<&str>) -> u32 {
     }
 }
 
+/// Environment variable naming the K22 (Q4_K MMQ,
+/// register-organization prototype) routing switch: the
+/// exact value `1` makes the resident session prefer the
+/// K22 product over the standard K13 product for Q4_K MMQ
+/// projections. Operational config, not a compiled
+/// constant, and deliberately fail-closed: an unset
+/// variable, or any other value, keeps K22 out of the
+/// ladder entirely, so the shipped ladder is byte-for-byte
+/// the ladder every existing proof ran on. The shipped
+/// default follows the wide-MMQ and K18 precedent: an
+/// unproven kernel does not enter the ladder by default.
+/// The server proof that can move this switch's default
+/// is sequenced in bench/k22-mmq-2026-11-05.md.
+pub const K22_MMQ_ENV: &str = "WGPU_COMPUTE_K22_MMQ";
+
+/// Resolve the K22 routing switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_k22_mmq(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -298,6 +321,8 @@ pub struct WgpuCompute {
     k12_swiglu: K12QuantPipeline,
     k13: Option<K13Pipeline>,
     k14: Option<K14Pipeline>,
+    k22: Option<K22Pipeline>,
+    k22_mmq: bool,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -392,6 +417,22 @@ impl WgpuCompute {
         let k12_swiglu = K12QuantPipeline::new(&ctx.device, ACT_SWIGLU)?;
         let k13 = K13Pipeline::for_device(&ctx.device)?;
         let k14 = K14Pipeline::for_device(&ctx.device)?;
+        // The K22 Q4_K MMQ prototype (the register-
+        // organization rework of K13): optional on the
+        // same terms as the standard MMQ set, and built
+        // regardless of its routing switch so a shader
+        // defect fails at construction, not on first
+        // routed use. Only its routing is config, read
+        // here (see K22_MMQ_ENV); the default keeps it
+        // out of the ladder until the server proof
+        // moves it.
+        let k22 = K22Pipeline::for_device(&ctx.device)?;
+        let k22_mmq = resolve_k22_mmq(std::env::var(K22_MMQ_ENV).ok().as_deref());
+        dbg_log!(
+            "mmq k22 config: enabled={k22_mmq} (env {K22_MMQ_ENV}, only \"1\" enables); \
+             k22={}",
+            k22.is_some()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -490,6 +531,8 @@ impl WgpuCompute {
             k12_swiglu,
             k13,
             k14,
+            k22,
+            k22_mmq,
             k15,
             k16,
             wide_min_rows,
@@ -652,6 +695,24 @@ impl WgpuCompute {
     /// the workgroup storage. See [`WgpuCompute::k13`].
     pub(crate) fn k14(&self) -> Option<&K14Pipeline> {
         self.k14.as_ref()
+    }
+
+    /// The K22 (Q4_K MMQ, register-organization
+    /// prototype) pipeline, when this device grants the
+    /// workgroup storage its staging set needs. See
+    /// [`WgpuCompute::k13`] for the fallback contract.
+    pub(crate) fn k22(&self) -> Option<&K22Pipeline> {
+        self.k22.as_ref()
+    }
+
+    /// Whether the resident session prefers the K22
+    /// product over the standard K13 product for Q4_K MMQ
+    /// projections: config resolved at construction from
+    /// [`K22_MMQ_ENV`], never a constant compiled into the
+    /// selection seam. `false` (the default) leaves the
+    /// shipped ladder untouched.
+    pub(crate) fn k22_mmq(&self) -> bool {
+        self.k22_mmq
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -1320,6 +1381,23 @@ mod tests {
         assert_eq!(resolve_mmv_max_rows(Some("mmv")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("-2")), DEFAULT_MMV_MAX_ROWS);
+    }
+
+    #[test]
+    fn k22_mmq_switch_resolution() {
+        // Unset: off. The shipped ladder is the ladder
+        // with K22 nowhere in it.
+        assert!(!resolve_k22_mmq(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position: the switch is fail-closed by
+        // design, so a typo routes the proven kernel, not
+        // the prototype.
+        assert!(resolve_k22_mmq(Some("1")));
+        assert!(resolve_k22_mmq(Some(" 1 ")));
+        assert!(!resolve_k22_mmq(Some("0")));
+        assert!(!resolve_k22_mmq(Some("true")));
+        assert!(!resolve_k22_mmq(Some("")));
+        assert!(!resolve_k22_mmq(Some("11")));
     }
 
     #[test]

@@ -63,7 +63,9 @@
 
 use crate::device::GpuContext;
 use crate::error::{Result, WgpuError};
-use crate::kernels::k1_q4k_gemv::{grid_dims, K1ActGeom, ACT_GATED, ACT_NONE, ACT_SWIGLU};
+use crate::kernels::k1_q4k_gemv::{
+    grid_dims, resolve_row_window, K1ActGeom, RowWindow, ACT_GATED, ACT_NONE, ACT_SWIGLU,
+};
 
 use crate::diag::dbg_log;
 
@@ -739,7 +741,60 @@ impl K2Pipeline {
                 ),
             });
         }
-        self.prepare_inner(ctx, weights, input, None, output, batch, None)
+        self.prepare_inner(ctx, weights, input, None, output, batch, None, None)
+    }
+
+    /// Prepare a dispatch over a contiguous window of
+    /// rows of the caller's buffers: rows
+    /// `row_start..row_start + rows` of `input` and
+    /// `output`, bound as buffer windows so the kernel
+    /// sees the window as its whole batch. The shader is
+    /// the shipped one, unchanged; the window changes
+    /// only which rows the dispatch covers, and each
+    /// output element's math is the whole-batch
+    /// dispatch's, element for element. The resident
+    /// session's chunked GEMV form serves a small batch
+    /// as several such dispatches at power-of-two row
+    /// counts instead of one dispatch at the batch's own
+    /// count.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when this pipeline
+    /// carries an activation mode (those prepare through
+    /// [`K2Pipeline::prepare_act`]), or when the window
+    /// itself is refused (see
+    /// [`resolve_row_window`](crate::kernels::k1_q4k_gemv::resolve_row_window)).
+    pub fn prepare_rows(
+        &self,
+        ctx: &GpuContext,
+        weights: &K2Weights,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        row_start: u32,
+        rows: u32,
+    ) -> Result<K2Call> {
+        if self.act != ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k2 call".to_string(),
+                detail: format!(
+                    "this pipeline carries activation mode {}; prepare through prepare_act",
+                    self.act
+                ),
+            });
+        }
+        let window = resolve_row_window(
+            &ctx.device,
+            "k2",
+            weights.in_features,
+            4,
+            weights.out_rows,
+            input,
+            output,
+            row_start,
+            rows,
+        )?;
+        self.prepare_inner(ctx, weights, input, None, output, rows, None, Some(&window))
     }
 
     /// Prepare an activation dispatch: the GEMV over stream A
@@ -826,6 +881,7 @@ impl K2Pipeline {
             output,
             batch,
             Some(geom),
+            None,
         )
     }
 
@@ -842,6 +898,7 @@ impl K2Pipeline {
         output: &wgpu::Buffer,
         batch: u32,
         geom: Option<&K1ActGeom>,
+        window: Option<&RowWindow>,
     ) -> Result<K2Call> {
         if batch == 0 {
             return Err(WgpuError::InvalidTensor {
@@ -885,11 +942,17 @@ impl K2Pipeline {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: input.as_entire_binding(),
+                resource: match window {
+                    Some(w) => w.in_binding(input),
+                    None => input.as_entire_binding(),
+                },
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: output.as_entire_binding(),
+                resource: match window {
+                    Some(w) => w.out_binding(output),
+                    None => output.as_entire_binding(),
+                },
             },
             wgpu::BindGroupEntry {
                 binding: 3,
@@ -919,7 +982,13 @@ impl K2Pipeline {
                 // The device streams the padded layout: 212
                 // bytes per 210-byte file block.
                 weight_bytes: weights.byte_len * 212 / 210,
-                shape: format!("batch={batch} act={} grid={}x{}", self.act, grid.0, grid.1),
+                shape: format!(
+                    "batch={batch} act={} grid={}x{}{}",
+                    self.act,
+                    grid.0,
+                    grid.1,
+                    window.map_or_else(String::new, |w| w.stamp_suffix())
+                ),
             }),
         })
     }

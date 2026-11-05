@@ -368,6 +368,16 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K18Call,
     },
+    /// K1 dispatches chunked at power-of-two row counts
+    /// (the chunked GEMV form): one windowed GEMV call
+    /// per chunk, in row order, covering the batch.
+    ChunkedQ4K(Vec<K1Call>),
+    /// K2 dispatches chunked at power-of-two row counts
+    /// (the chunked GEMV form; see [`ProjCall::ChunkedQ4K`]).
+    ChunkedQ6K(Vec<K2Call>),
+    /// K3 dispatches chunked at power-of-two row counts
+    /// (the chunked GEMV form; see [`ProjCall::ChunkedQ4K`]).
+    ChunkedQ5K(Vec<K3Call>),
 }
 
 impl ProjCall {
@@ -415,6 +425,21 @@ impl ProjCall {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
             }
+            ProjCall::ChunkedQ4K(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
+            ProjCall::ChunkedQ6K(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
+            ProjCall::ChunkedQ5K(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
         }
     }
 
@@ -425,7 +450,8 @@ impl ProjCall {
     /// one: the shared dispatch is counted once on the
     /// layer plan, not once per member. The K18 small
     /// forms always prepare their own quantize (they
-    /// never ride the share), so they record two.
+    /// never ride the share), so they record two. A
+    /// chunked GEMV form records one per chunk dispatch.
     fn dispatches(&self) -> u64 {
         match self {
             ProjCall::MmqQ4K { quant, .. }
@@ -433,6 +459,9 @@ impl ProjCall {
             | ProjCall::MmqWideQ4K { quant, .. }
             | ProjCall::MmqWideQ6K { quant, .. } => 1 + u64::from(quant.is_some()),
             ProjCall::SmallQ4K { .. } | ProjCall::SmallQ6K { .. } | ProjCall::SmallQ5K { .. } => 2,
+            ProjCall::ChunkedQ4K(calls) => calls.len() as u64,
+            ProjCall::ChunkedQ6K(calls) => calls.len() as u64,
+            ProjCall::ChunkedQ5K(calls) => calls.len() as u64,
             _ => 1,
         }
     }
@@ -914,18 +943,153 @@ fn try_small_q5k(
     }
 }
 
+/// Whether `batch` sits in the chunked-GEMV band the
+/// backend's config enables: 2 rows up to the resolved
+/// `chunked_gemv_max_rows` threshold (default 1, which
+/// enables nothing), and below [`GEMM_MIN_ROWS`], where
+/// the matrix forms own the ladder.
+fn chunked_gemv_applies(backend: &WgpuCompute, batch: u32) -> bool {
+    batch >= 2 && batch <= backend.chunked_gemv_max_rows() && (batch as usize) < GEMM_MIN_ROWS
+}
+
+/// Decompose `batch` into power-of-two row chunks,
+/// largest first, as `(start, len)` pairs in row order:
+/// 7 decomposes to `[(0, 4), (4, 2), (6, 1)]`. Every
+/// chunk's row count is a power of two: the counts the
+/// published strix-llama.cpp RADV report found scaling
+/// through the small-batch path, where arbitrary counts
+/// (3, 5, 6) ran several times slower than 1, 2, 4 (see
+/// bench/chunked-gemv-2026-11-05.md). A power-of-two
+/// batch decomposes to itself, one chunk.
+fn pow2_chunks(batch: u32) -> Vec<(u32, u32)> {
+    let mut chunks = Vec::new();
+    let mut start = 0u32;
+    let mut rest = batch;
+    while rest > 0 {
+        let len = 1u32 << (31 - rest.leading_zeros());
+        chunks.push((start, len));
+        start += len;
+        rest -= len;
+    }
+    chunks
+}
+
+/// Try the chunked GEMV form of a plain Q4_K projection:
+/// the batch served as one windowed K1 dispatch per
+/// power-of-two chunk (see [`pow2_chunks`]), instead of
+/// one dispatch at the batch's own count. `None` when
+/// the batch is outside the configured band or a window
+/// prepare refuses (logged by name): the caller then
+/// takes the whole-batch GEMV form. This is the fallback
+/// ladder's composition step, at plan-build time; it
+/// never substitutes inside a dispatch. The form
+/// prepares no quantize: like every GEMV form it reads
+/// the resident activation rows directly, so the
+/// quantize-once sharing the quantized forms ride is
+/// neither duplicated nor disturbed by chunking.
+fn try_chunked_q4k(
+    backend: &WgpuCompute,
+    weights: &K1Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !chunked_gemv_applies(backend, batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    let mut calls = Vec::new();
+    for (start, len) in pow2_chunks(batch) {
+        match backend
+            .k1()
+            .prepare_rows(ctx, weights, input, output, start, len)
+        {
+            Ok(c) => calls.push(c),
+            Err(e) => {
+                dbg_log!("chunked q4k refused at the window prepare: {e}; the gemv form serves it");
+                return None;
+            }
+        }
+    }
+    Some(ProjCall::ChunkedQ4K(calls))
+}
+
+/// Try the chunked GEMV form of a plain Q6_K
+/// projection. See [`try_chunked_q4k`] for the contract.
+fn try_chunked_q6k(
+    backend: &WgpuCompute,
+    weights: &K2Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !chunked_gemv_applies(backend, batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    let mut calls = Vec::new();
+    for (start, len) in pow2_chunks(batch) {
+        match backend
+            .k2()
+            .prepare_rows(ctx, weights, input, output, start, len)
+        {
+            Ok(c) => calls.push(c),
+            Err(e) => {
+                dbg_log!("chunked q6k refused at the window prepare: {e}; the gemv form serves it");
+                return None;
+            }
+        }
+    }
+    Some(ProjCall::ChunkedQ6K(calls))
+}
+
+/// Try the chunked GEMV form of a plain Q5_K
+/// projection. See [`try_chunked_q4k`] for the contract.
+fn try_chunked_q5k(
+    backend: &WgpuCompute,
+    weights: &K3Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !chunked_gemv_applies(backend, batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    let mut calls = Vec::new();
+    for (start, len) in pow2_chunks(batch) {
+        match backend
+            .k3()
+            .prepare_rows(ctx, weights, input, output, start, len)
+        {
+            Ok(c) => calls.push(c),
+            Err(e) => {
+                dbg_log!("chunked q5k refused at the window prepare: {e}; the gemv form serves it");
+                return None;
+            }
+        }
+    }
+    Some(ProjCall::ChunkedQ5K(calls))
+}
+
 /// Prepare one projection dispatch over resident buffers.
 /// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
 /// families dispatch through the matrix-matrix forms: the
 /// MMQ pair when the backend built it, the GEMM kernels
 /// (K10/K11) behind them when it built those; below the
 /// threshold, and for Q5_K (the one-row head) at any size,
-/// the GEMV kernels run. One rung sits between those: in
+/// the GEMV kernels run. Two rungs sit between those: in
 /// the small-batch band (2 rows up to the backend's
 /// configured `small_batch_max_rows`, shipped off), the
 /// K18 small-batch products serve all three families
-/// when the backend built them. Every form consumes the
-/// same resident buffers, so the choice never changes
+/// when the backend built them; and in the chunked band
+/// (2 rows up to the backend's configured
+/// `chunked_gemv_max_rows`, shipped off), the GEMV
+/// kernels themselves serve the batch as several
+/// windowed dispatches at power-of-two row counts (the
+/// chunked GEMV form), tried after K18 and before the
+/// single whole-batch GEMV dispatch. Every form consumes
+/// the same resident buffers, so the choice never changes
 /// the chain's data layout. `share` is the layer stage's
 /// shared `h` quantize (see [`HShare`]) when this
 /// projection reads the layer's `h`, and `None` for every
@@ -965,6 +1129,9 @@ fn prepare_proj(
             if let Some(c) = try_small_q4k(backend, w, input, q8_qs, q8_ds, output, batch) {
                 return Ok(c);
             }
+            if let Some(c) = try_chunked_q4k(backend, w, input, output, batch) {
+                return Ok(c);
+            }
             backend
                 .k1()
                 .prepare(ctx, w, input, output, batch)
@@ -987,6 +1154,9 @@ fn prepare_proj(
             if let Some(c) = try_small_q6k(backend, w, input, q8_qs, q8_ds, output, batch) {
                 return Ok(c);
             }
+            if let Some(c) = try_chunked_q6k(backend, w, input, output, batch) {
+                return Ok(c);
+            }
             backend
                 .k2()
                 .prepare(ctx, w, input, output, batch)
@@ -995,6 +1165,9 @@ fn prepare_proj(
         }
         ProjWeights::Q5K(w) => {
             if let Some(c) = try_small_q5k(backend, w, input, q8_qs, q8_ds, output, batch) {
+                return Ok(c);
+            }
+            if let Some(c) = try_chunked_q5k(backend, w, input, output, batch) {
                 return Ok(c);
             }
             backend
@@ -3729,6 +3902,38 @@ enum ChunkOutcome {
 mod tests {
     use super::*;
     use muse_glimmer::PatternSource;
+
+    #[test]
+    fn pow2_chunks_decompose_the_verify_band() {
+        // The exact decompositions the chunked GEMV form
+        // dispatches at, largest power of two first.
+        assert_eq!(pow2_chunks(2), vec![(0, 2)]);
+        assert_eq!(pow2_chunks(3), vec![(0, 2), (2, 1)]);
+        assert_eq!(pow2_chunks(4), vec![(0, 4)]);
+        assert_eq!(pow2_chunks(5), vec![(0, 4), (4, 1)]);
+        assert_eq!(pow2_chunks(6), vec![(0, 4), (4, 2)]);
+        assert_eq!(pow2_chunks(7), vec![(0, 4), (4, 2), (6, 1)]);
+        assert_eq!(pow2_chunks(8), vec![(0, 8)]);
+        assert_eq!(pow2_chunks(15), vec![(0, 8), (8, 4), (12, 2), (14, 1)]);
+    }
+
+    #[test]
+    fn pow2_chunks_cover_any_batch_contiguously() {
+        for batch in 1..=64u32 {
+            let chunks = pow2_chunks(batch);
+            let covered: u32 = chunks.iter().map(|&(_, len)| len).sum();
+            assert_eq!(covered, batch, "batch {batch} must be covered exactly");
+            let mut next = 0;
+            for &(start, len) in &chunks {
+                assert_eq!(start, next, "batch {batch} chunks must be contiguous");
+                assert!(
+                    len.is_power_of_two(),
+                    "batch {batch} chunk {len} is not a power of two"
+                );
+                next += len;
+            }
+        }
+    }
 
     #[test]
     fn chunk_cap_resolution_takes_valid_counts() {

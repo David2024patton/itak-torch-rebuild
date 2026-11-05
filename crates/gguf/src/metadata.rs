@@ -390,4 +390,48 @@ mod tests {
             "the missing-key refusal must emit its diag event"
         );
     }
+
+    #[test]
+    fn opt_getters_are_silent_when_the_key_is_absent() {
+        // The optional reads exist for probes whose absence is a
+        // legitimate answer (an arch's optional override key, for
+        // example). They must answer Ok(None) without constructing
+        // the MissingMetadata refusal, so no missing_metadata event
+        // fires for the probe key. The key is unique to this test.
+        let md = Metadata::from_entries(vec![]);
+        assert_eq!(md.opt_f32("lane_opt_probe.absent").unwrap(), None);
+        assert_eq!(md.opt_u32("lane_opt_probe.absent").unwrap(), None);
+        assert_eq!(md.opt_string("lane_opt_probe.absent").unwrap(), None);
+        assert!(
+            !diag::captured_errors()
+                .iter()
+                .any(|l| l.contains("lane_opt_probe.absent")),
+            "an absent optional key must not emit any diag error"
+        );
+    }
+
+    #[test]
+    fn opt_getter_still_refuses_a_wrong_type_loudly() {
+        // Silence is for absence only: a present key holding the
+        // wrong kind of value refuses through the same mismatch seam
+        // as the strict getters, event included.
+        let md = Metadata::from_entries(vec![(
+            "lane_opt_probe.wrong_type".to_string(),
+            MetadataValue::String("not a float".to_string()),
+        )]);
+        let err = md
+            .opt_f32("lane_opt_probe.wrong_type")
+            .expect_err("a string value is not an f32");
+        assert!(
+            matches!(err, GgufError::MetadataTypeMismatch { .. }),
+            "error: {err}"
+        );
+        assert!(
+            diag::captured_errors().iter().any(|l| {
+                l.contains("event=metadata_type_mismatch")
+                    && l.contains("key=lane_opt_probe.wrong_type")
+            }),
+            "the wrong-type refusal must emit its diag event"
+        );
+    }
 }

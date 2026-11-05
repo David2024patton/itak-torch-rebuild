@@ -181,8 +181,8 @@ impl GlimmerConfig {
             ));
         }
 
-        let pattern_text = meta.get_string(SWA_PATTERN_KEY);
-        let (layers, pattern_source) = derive_layer_pattern(block_count, pattern_text.as_deref())?;
+        let pattern_flags = meta.get_bool_array(SWA_PATTERN_KEY);
+        let (layers, pattern_source) = derive_layer_pattern(block_count, pattern_flags.as_deref())?;
 
         let vocab = meta
             .get_array_len(KEY_VOCAB_TOKENS)
@@ -314,7 +314,10 @@ mod tests {
         assert!((cfg.logit_softcap - 20.0).abs() < f32::EPSILON);
         assert!((cfg.logit_scale - 0.196_116_13).abs() < 1e-6);
         assert_eq!(cfg.vocab_size, 202_048);
-        assert_eq!(cfg.pattern_source, PatternSource::MeasuredFallback);
+        // The real file carries the pattern as a bool array, so the
+        // pattern comes from the file itself; the layers it derives
+        // are the measured ones (globals asserted just below).
+        assert_eq!(cfg.pattern_source, PatternSource::Metadata);
         assert_eq!(
             cfg.global_layer_indices(),
             vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]
@@ -340,6 +343,22 @@ mod tests {
         assert_eq!(cfg.global_layer_count(), 0);
         assert_eq!(cfg.sliding_layer_count(), 2);
         assert_eq!(cfg.vocab_size, 128);
+    }
+
+    #[test]
+    fn absent_pattern_key_falls_back_to_the_measured_pattern() {
+        // A file without the pattern key (the shape this loader was
+        // written against before the array read existed) still parses:
+        // the measured fallback produces the same layers and says so
+        // in pattern_source.
+        let mut meta = real_glimmer_metadata();
+        meta.remove(SWA_PATTERN_KEY);
+        let cfg = GlimmerConfig::from_metadata(&meta).expect("real metadata parses");
+        assert_eq!(cfg.pattern_source, PatternSource::MeasuredFallback);
+        assert_eq!(
+            cfg.global_layer_indices(),
+            vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]
+        );
     }
 
     #[test]

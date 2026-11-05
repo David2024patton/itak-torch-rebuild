@@ -6,11 +6,24 @@
 //! `~/workspace/glimmer-blueprint/GLIMMER-DISSECTION.md`): 52 layers, 39
 //! sliding-window and 13 global, the global layers at indices
 //! 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, every fourth layer
-//! starting at index 3. The file's metadata carries the window size but
-//! no per-layer pattern key, so the measured pattern is the recorded
-//! fallback. If a future file ships an explicit pattern key, it wins, and
-//! [`PatternSource`] records which one produced the pattern so the origin
-//! is never silent.
+//! starting at index 3.
+//!
+//! The file does carry the pattern, under
+//! `muse-glimmer.attention.sliding_window_pattern`, as an array of 52
+//! bools (header read 2026-11-05): `[true, true, true, false]` repeated
+//! 13 times, `true` marking a sliding-window layer. That is the shape
+//! llama.cpp reads first (`load_swa_pattern` in src/llama-model.cpp
+//! reads the key as an array of `is_swa` flags before any fallback).
+//! The 2026-10-29 census recorded the window size but not this key's
+//! stored type, and the loader probed the key as a string instead, so
+//! every load fell back to the measured pattern and the probe logged a
+//! type mismatch. The file's array and the measured fallback agree
+//! exactly (the fallback is llama.cpp's own period-4 pattern:
+//! `set_swa_pattern(4, false)` in src/llama-hparams.cpp marks layer
+//! `il` sliding iff `il % 4 < 3`), and the array now wins, as it should:
+//! the file's own declaration over a measurement. [`PatternSource`]
+//! records which one produced the pattern so the origin is never
+//! silent.
 
 use crate::config::{KEY_BLOCK_COUNT, MAX_BLOCK_COUNT};
 use crate::error::{GlimmerError, Result};
@@ -37,10 +50,11 @@ pub enum PatternSource {
     MeasuredFallback,
 }
 
-/// Metadata key for an explicit pattern: a string of `S` (sliding) and
-/// `G` (global), one character per layer, in layer order. No shipping
-/// Glimmer file carries it yet; it is read first so a file that grows
-/// the key is honored automatically.
+/// Metadata key for the file's explicit pattern: an array of bools,
+/// one per layer in layer order, `true` for a sliding-window layer and
+/// `false` for a global one. This is the shape the real file stores
+/// (GGUF array of BOOL, 52 elements) and the shape llama.cpp reads
+/// (`load_swa_pattern`'s array read into `is_swa_impl`).
 pub const SWA_PATTERN_KEY: &str = "muse-glimmer.attention.sliding_window_pattern";
 
 /// Derive the layer pattern.
@@ -51,13 +65,14 @@ pub const SWA_PATTERN_KEY: &str = "muse-glimmer.attention.sliding_window_pattern
 /// process here instead of failing by name.
 ///
 /// With `pattern` present (read from [`SWA_PATTERN_KEY`]), it must hold
-/// exactly `block_count` characters of `S` or `G`; anything else is an
-/// [`GlimmerError::InvalidMetadata`] naming the key. Without it, the
-/// measured fallback applies: every fourth layer starting at index 3 is
-/// global, the rest sliding-window.
+/// exactly `block_count` elements, one per layer; a different length
+/// is an [`GlimmerError::InvalidMetadata`] naming the key. Without it,
+/// the measured fallback applies: every fourth layer starting at
+/// index 3 is global, the rest sliding-window (the same pattern
+/// llama.cpp's period-4 default produces for this architecture).
 pub fn derive_layer_pattern(
     block_count: u32,
-    pattern: Option<&str>,
+    pattern: Option<&[bool]>,
 ) -> Result<(Vec<LayerKind>, PatternSource)> {
     if block_count > MAX_BLOCK_COUNT {
         return Err(GlimmerError::InvalidMetadata {
@@ -68,29 +83,26 @@ pub fn derive_layer_pattern(
         });
     }
     match pattern {
-        Some(text) => {
-            let mut layers = Vec::with_capacity(block_count as usize);
-            for ch in text.chars() {
-                match ch {
-                    'S' => layers.push(LayerKind::SlidingWindow),
-                    'G' => layers.push(LayerKind::Global),
-                    _ => {
-                        return Err(GlimmerError::InvalidMetadata {
-                            key: SWA_PATTERN_KEY,
-                            detail: format!("pattern character {ch:?} is neither 'S' nor 'G'"),
-                        })
-                    }
-                }
-            }
-            if layers.len() != block_count as usize {
+        Some(flags) => {
+            if flags.len() != block_count as usize {
                 return Err(GlimmerError::InvalidMetadata {
                     key: SWA_PATTERN_KEY,
                     detail: format!(
                         "pattern has {} layers but block_count is {block_count}",
-                        layers.len()
+                        flags.len()
                     ),
                 });
             }
+            let layers = flags
+                .iter()
+                .map(|&is_swa| {
+                    if is_swa {
+                        LayerKind::SlidingWindow
+                    } else {
+                        LayerKind::Global
+                    }
+                })
+                .collect();
             Ok((layers, PatternSource::Metadata))
         }
         None => {
@@ -136,7 +148,8 @@ mod tests {
 
     #[test]
     fn explicit_metadata_pattern_wins() {
-        let (layers, source) = derive_layer_pattern(4, Some("SGSG")).expect("pattern");
+        let (layers, source) =
+            derive_layer_pattern(4, Some(&[true, false, true, false])).expect("pattern");
         assert_eq!(source, PatternSource::Metadata);
         assert_eq!(
             layers,
@@ -151,17 +164,60 @@ mod tests {
 
     #[test]
     fn pattern_length_must_match_block_count() {
-        let err = derive_layer_pattern(52, Some("SG")).expect_err("short pattern must fail");
+        let err =
+            derive_layer_pattern(52, Some(&[true, false])).expect_err("short pattern must fail");
         match err {
             GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, SWA_PATTERN_KEY),
             other => panic!("expected InvalidMetadata, got {other:?}"),
         }
     }
 
+    /// The pattern array exactly as stored in the real file's GGUF
+    /// header, read 2026-11-05 from
+    /// `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf`: key
+    /// `muse-glimmer.attention.sliding_window_pattern`, ARRAY of BOOL,
+    /// 52 elements, `[1, 1, 1, 0]` repeated 13 times (1 = the layer is
+    /// a sliding-window layer, llama.cpp's `is_swa` semantics).
+    const REAL_FILE_PATTERN: [bool; 52] = [
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false, //
+        true, true, true, false,
+    ];
+
     #[test]
-    fn pattern_rejects_unknown_characters() {
-        let err = derive_layer_pattern(3, Some("SXG")).expect_err("bad character must fail");
-        assert!(matches!(err, GlimmerError::InvalidMetadata { .. }));
+    fn real_file_array_derives_the_measured_fallback_pattern() {
+        // Equivalence proof for the read fix: the file's own array,
+        // quoted above from its header, must derive exactly the layer
+        // pattern the measured fallback produces, so accepting the
+        // array changes provenance (Metadata, not MeasuredFallback)
+        // and nothing else.
+        let (from_file, file_source) =
+            derive_layer_pattern(52, Some(&REAL_FILE_PATTERN)).expect("file pattern");
+        let (from_fallback, fallback_source) =
+            derive_layer_pattern(52, None).expect("fallback pattern");
+        assert_eq!(file_source, PatternSource::Metadata);
+        assert_eq!(fallback_source, PatternSource::MeasuredFallback);
+        assert_eq!(from_file, from_fallback);
+        let globals: Vec<usize> = from_file
+            .iter()
+            .enumerate()
+            .filter(|(_, k)| **k == LayerKind::Global)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            globals,
+            vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]
+        );
     }
 
     #[test]

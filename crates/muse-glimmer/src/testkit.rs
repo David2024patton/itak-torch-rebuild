@@ -3,6 +3,7 @@
 //! only; nothing here ships in the library's API surface.
 
 use crate::config::*;
+use crate::layer::SWA_PATTERN_KEY;
 use crate::metadata::MapMetadata;
 
 /// Metadata exactly as measured in the real Muse-Glimmer-30B GGUF
@@ -23,6 +24,11 @@ pub fn real_glimmer_metadata() -> MapMetadata {
     m.insert_f32(KEY_ROPE_FREQ_BASE, 500_000.0);
     m.insert_f32(KEY_RMS_EPS, 1e-5);
     m.insert_u32(KEY_SLIDING_WINDOW, 2048);
+    // The pattern array exactly as stored in the real file's header
+    // (read 2026-11-05): ARRAY of BOOL, `[true, true, true, false]`
+    // repeated 13 times. The literal 52 values are quoted in
+    // layer.rs's tests, which pin this construction to them.
+    m.insert_bool_array(SWA_PATTERN_KEY, (0..52).map(|i| i % 4 != 3).collect());
     m.insert_f32(KEY_LOGIT_SOFTCAP, 20.0);
     m.insert_f32(KEY_LOGIT_SCALE, 0.196_116_13);
     m.insert_array_len(KEY_VOCAB_TOKENS, 202_048);

@@ -6,7 +6,8 @@
 
 use gguf::{GgufFile, MetadataValue};
 use itak_loader::{coverage, load_config, load_weights, GgufTensorSource, LoaderError};
-use muse_glimmer::{Dtype, GlimmerError, TensorSource};
+use muse_glimmer::layer::SWA_PATTERN_KEY;
+use muse_glimmer::{Dtype, GlimmerError, LayerKind, PatternSource, TensorSource};
 
 // ---------- tiny GGUF writer (adapted from crates/gguf/tests) ----------
 
@@ -199,6 +200,77 @@ fn config_loads_end_to_end_from_gguf_bytes() {
     assert_eq!(cfg.gqa_group(), 2);
     assert_eq!(cfg.vocab_size, 128);
     assert_eq!(cfg.name.as_deref(), Some("Tiny Glimmer"));
+    // The tiny file carries no pattern key and no SWA rope base: both
+    // optional reads fall back the way llama.cpp does (measured
+    // pattern; train base), and say so in the config.
+    assert_eq!(cfg.pattern_source, PatternSource::MeasuredFallback);
+    assert!((cfg.rope_freq_base_swa - 10_000.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn bool_array_pattern_drives_the_config() {
+    // The shape the real Glimmer file stores: an array of bools, one
+    // per layer, true for sliding-window. It must win over the
+    // measured fallback and drive the layer kinds directly.
+    let mut md = tiny_metadata();
+    md.push((
+        SWA_PATTERN_KEY.into(),
+        MetadataValue::Array(vec![MetadataValue::Bool(true), MetadataValue::Bool(false)]),
+    ));
+    let file = GgufFile::from_bytes(build(&refs(&md), &tiny_tensors())).unwrap();
+    let cfg = load_config(&file).expect("config loads");
+    assert_eq!(cfg.pattern_source, PatternSource::Metadata);
+    assert_eq!(
+        cfg.layers,
+        vec![LayerKind::SlidingWindow, LayerKind::Global]
+    );
+}
+
+#[test]
+fn explicit_swa_rope_base_in_the_file_wins() {
+    let mut md = tiny_metadata();
+    md.push((
+        "muse-glimmer.rope.freq_base_swa".into(),
+        MetadataValue::Float32(1_000.0),
+    ));
+    let file = GgufFile::from_bytes(build(&refs(&md), &tiny_tensors())).unwrap();
+    let cfg = load_config(&file).expect("config loads");
+    assert!((cfg.rope_freq_base_swa - 1_000.0).abs() < f32::EPSILON);
+    assert!((cfg.rope_freq_base - 10_000.0).abs() < f32::EPSILON);
+}
+
+#[test]
+fn wrong_length_bool_pattern_is_refused_by_name() {
+    // One flag for a two-layer model: the file's declaration
+    // contradicts its own block_count, so the load refuses by name
+    // instead of guessing which layers the flag meant.
+    let mut md = tiny_metadata();
+    md.push((
+        SWA_PATTERN_KEY.into(),
+        MetadataValue::Array(vec![MetadataValue::Bool(true)]),
+    ));
+    let file = GgufFile::from_bytes(build(&refs(&md), &tiny_tensors())).unwrap();
+    let err = load_config(&file).unwrap_err();
+    match err {
+        GlimmerError::InvalidMetadata { key, .. } => assert_eq!(key, SWA_PATTERN_KEY),
+        other => panic!("expected InvalidMetadata, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_array_pattern_value_falls_back_to_the_measured_pattern() {
+    // A pattern key holding the wrong kind of value is unreadable as
+    // a pattern: the adapter answers None (and notes it on the diag
+    // channel), so the config takes the measured fallback rather
+    // than inventing a reading of the wrong shape.
+    let mut md = tiny_metadata();
+    md.push((
+        SWA_PATTERN_KEY.into(),
+        MetadataValue::String("SG".to_string()),
+    ));
+    let file = GgufFile::from_bytes(build(&refs(&md), &tiny_tensors())).unwrap();
+    let cfg = load_config(&file).expect("config loads");
+    assert_eq!(cfg.pattern_source, PatternSource::MeasuredFallback);
 }
 
 #[test]

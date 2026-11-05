@@ -1,0 +1,110 @@
+phase=open_file ms=15930
+file: /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf bytes=16756683904
+config: layers=52 hidden=6656 vocab=202048 bos=Some(200000) logit_scale=0.19611613 logit_softcap=20
+prompt: "The chemical symbol for water is"
+add_bos_token=true encode_ids=[954, 12332, 9985, 393, 3427, 373]
+prompt_ids=[200000, 954, 12332, 9985, 393, 3427, 373]
+coverage: expected=731 found=731 missing=0
+phase=load_weights ms=4842
+phase=backend_open backend=cpu ms=0
+phase=prefill ms=1656259 prompt_tokens=7
+prefill_top rank=0 id=465 tok="ĠH" logit=17.642365 prob=0.711187
+prefill_top rank=1 id=5789 tok="Ġ$\\" logit=14.856224 prob=0.043851
+prefill_top rank=2 id=24420 tok="Ġ____" logit=14.007825 prob=0.018773
+prefill_top rank=3 id=5325 tok="Ġ\\(\\" logit=13.945222 prob=0.017633
+prefill_top rank=4 id=523 tok="Ġ$" logit=13.598858 prob=0.012471
+prefill stats: finished_range=[-12.7153,17.6424] presoftcap_range=[-15.0206,27.7047] saturated_to_cap=0 raw_range=[-76.5904,141.2668] top100_beyond_0.9cap=0
+gen step=1 id=465 tok="ĠH" source=prefill
+step2_top rank=0 id=30 tok="2" logit=17.704737 prob=0.855384
+step2_top rank=1 id=29589 tok="âĤĤ" logit=14.797121 prob=0.046709
+step2_top rank=2 id=451 tok="20" logit=14.628559 prob=0.039463
+step2_top rank=3 id=220 tok="Ġ" logit=13.686640 prob=0.015386
+step2_top rank=4 id=16 tok="$" logit=13.364678 prob=0.011151
+gen step=2 id=30 tok="2" ms=47099
+step3_top rank=0 id=59 tok="O" logit=17.588634 prob=0.984342
+step3_top rank=1 id=530 tok="ĠO" logit=13.050127 prob=0.010522
+step3_top rank=2 id=91 tok="o" logit=11.692986 prob=0.002708
+step3_top rank=3 id=4093 tok="âĢĭ" logit=10.260558 prob=0.000647
+step3_top rank=4 id=220 tok="Ġ" logit=8.767834 prob=0.000145
+gen step=3 id=59 tok="O" ms=46159
+step4_top rank=0 id=26 tok="." logit=18.771378 prob=0.598439
+step4_top rank=1 id=24 tok="," logit=17.914902 prob=0.254131
+step4_top rank=2 id=1574 tok=".ĊĊ" logit=15.764725 prob=0.029597
+step4_top rank=3 id=335 tok=".Ċ" logit=15.354329 prob=0.019634
+step4_top rank=4 id=341 tok="Ġand" logit=15.177431 prob=0.016451
+gen step=4 id=26 tok="." ms=46707
+step5_top rank=0 id=2473 tok="ĠWhat" logit=16.715300 prob=0.199355
+step5_top rank=1 id=589 tok="ĠThe" logit=16.374720 prob=0.141812
+step5_top rank=2 id=1394 tok="ĠThis" logit=15.959872 prob=0.093659
+step5_top rank=3 id=10146 tok="ĠWhich" logit=15.803738 prob=0.080120
+step5_top rank=4 id=2403 tok="ĠHow" logit=15.667030 prob=0.069883
+gen step=5 id=2473 tok="ĠWhat" ms=46396
+step6_top rank=0 id=2406 tok="Ġdoes" logit=17.770332 prob=0.514977
+step6_top rank=1 id=373 tok="Ġis" logit=17.217762 prob=0.296353
+step6_top rank=2 id=641 tok="Ġdo" logit=15.451941 prob=0.050690
+step6_top rank=3 id=583 tok="Ġare" logit=15.339135 prob=0.045283
+step6_top rank=4 id=1416 tok="Ġnumber" logit=14.582346 prob=0.021245
+gen step=6 id=2406 tok="Ġdoes" ms=46942
+step7_top rank=0 id=290 tok="Ġthe" logit=18.949545 prob=0.630554
+step7_top rank=1 id=544 tok="Ġthis" logit=17.630026 prob=0.168524
+step7_top rank=2 id=536 tok="Ġit" logit=16.942181 prob=0.084710
+step7_top rank=3 id=511 tok="Ġthat" logit=16.279638 prob=0.043671
+step7_top rank=4 id=465 tok="ĠH" logit=15.671736 prob=0.023779
+gen step=7 id=290 tok="Ġthe" ms=46898
+step8_top rank=0 id=220 tok="Ġ" logit=16.947304 prob=0.499345
+step8_top rank=1 id=392 tok="Ġ\"" logit=15.178806 prob=0.085183
+step8_top rank=2 id=94686 tok="Ġsubscript" logit=15.068455 prob=0.076283
+step8_top rank=3 id=1416 tok="Ġnumber" logit=15.064322 prob=0.075968
+step8_top rank=4 id=9985 tok="Ġsymbol" logit=14.936981 prob=0.066885
+gen step=8 id=220 tok="Ġ" ms=47009
+step9_top rank=0 id=30 tok="2" logit=18.223873 prob=0.997513
+step9_top rank=1 id=29 tok="1" logit=11.058435 prob=0.000771
+step9_top rank=2 id=220 tok="Ġ" logit=10.504627 prob=0.000443
+step9_top rank=3 id=28 tok="0" logit=9.707325 prob=0.000200
+step9_top rank=4 id=31 tok="3" logit=9.249581 prob=0.000126
+gen step=9 id=30 tok="2" ms=46757
+step10_top rank=0 id=310 tok="Ġin" logit=16.546673 prob=0.257016
+step10_top rank=1 id=3641 tok="Ġrepresent" logit=16.485865 prob=0.241853
+step10_top rank=2 id=3676 tok="Ġmean" logit=16.483788 prob=0.241351
+step10_top rank=3 id=3023 tok="Ġstand" logit=15.464602 prob=0.087101
+step10_top rank=4 id=14339 tok="Ġindicate" logit=15.081429 prob=0.059376
+gen step=10 id=310 tok="Ġin" ms=46941
+step11_top rank=0 id=465 tok="ĠH" logit=18.272388 prob=0.449663
+step11_top rank=1 id=290 tok="Ġthe" logit=17.879656 prob=0.303616
+step11_top rank=2 id=544 tok="Ġthis" logit=17.476873 prob=0.202955
+step11_top rank=3 id=7828 tok="Ġfront" logit=14.819704 prob=0.014237
+step11_top rank=4 id=3427 tok="Ġwater" logit=14.204218 prob=0.007693
+gen step=11 id=465 tok="ĠH" ms=46895
+step12_top rank=0 id=30 tok="2" logit=18.818981 prob=0.988218
+step12_top rank=1 id=451 tok="20" logit=13.861639 prob=0.006949
+step12_top rank=2 id=220 tok="Ġ" logit=12.506047 prob=0.001791
+step12_top rank=3 id=29589 tok="âĤĤ" logit=11.867155 prob=0.000946
+step12_top rank=4 id=1946 tok="_{" logit=10.488940 prob=0.000238
+gen step=12 id=30 tok="2" ms=49314
+step13_top rank=0 id=59 tok="O" logit=17.928679 prob=0.993406
+step13_top rank=1 id=530 tok="ĠO" logit=11.906200 prob=0.002408
+step13_top rank=2 id=3641 tok="Ġrepresent" logit=11.010387 prob=0.000983
+step13_top rank=3 id=173726 tok="Ġsignify" logit=10.564648 prob=0.000629
+step13_top rank=4 id=14339 tok="Ġindicate" logit=10.277208 prob=0.000472
+gen step=13 id=59 tok="O" ms=47535
+step14_top rank=0 id=3641 tok="Ġrepresent" logit=16.929523 prob=0.353354
+step14_top rank=1 id=3676 tok="Ġmean" logit=16.804722 prob=0.311895
+step14_top rank=2 id=14339 tok="Ġindicate" logit=15.696211 prob=0.102941
+step14_top rank=3 id=3023 tok="Ġstand" logit=15.330679 prob=0.071423
+step14_top rank=4 id=10676 tok="Ġtell" logit=15.033875 prob=0.053081
+gen step=14 id=3641 tok="Ġrepresent" ms=46969
+step15_top rank=0 id=1044 tok="?Ċ" logit=17.225115 prob=0.382511
+step15_top rank=1 id=43 tok="?" logit=17.144562 prob=0.352907
+step15_top rank=2 id=17285 tok="?ĊĊ" logit=16.694796 prob=0.225076
+step15_top rank=3 id=310 tok="Ġin" logit=13.383381 prob=0.008207
+step15_top rank=4 id=198 tok="Ċ" logit=13.382591 prob=0.008201
+gen step=15 id=1044 tok="?Ċ" ms=47001
+step16_top rank=0 id=45 tok="A" logit=17.643568 prob=0.328738
+step16_top rank=1 id=954 tok="The" logit=17.569963 prob=0.305410
+step16_top rank=2 id=77 tok="a" logit=16.142645 prob=0.073284
+step16_top rank=3 id=592 tok="In" logit=15.466623 prob=0.037275
+step16_top rank=4 id=4487 tok="It" logit=15.374309 prob=0.033988
+gen step=16 id=45 tok="A" ms=46872
+generated_ids=[465, 30, 59, 26, 2473, 2406, 290, 220, 30, 310, 465, 30, 59, 3641, 1044, 45]
+generated_text=" H2O. What does the 2 in H2O represent?\nA"
+peak_rss_kb=38158892

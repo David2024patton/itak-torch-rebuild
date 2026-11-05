@@ -1,0 +1,21 @@
+phase=open_file ms=16022
+file: /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf bytes=16756683904
+experiment: logit_scale overridden file=0.19611613 forced=1
+config: layers=52 hidden=6656 vocab=202048 bos=Some(200000) logit_scale=1 logit_softcap=20
+prompt: "The capital of Japan is"
+add_bos_token=true encode_ids=[954, 7963, 323, 11197, 373]
+prompt_ids=[200000, 954, 7963, 323, 11197, 373]
+coverage: expected=731 found=731 missing=0
+phase=load_weights ms=5382
+phase=backend_open backend=cpu ms=0
+phase=prefill ms=1447180 prompt_tokens=6
+prefill_top rank=0 id=40171 tok="ĠTokyo" logit=19.999966 prob=0.001504
+prefill_top rank=1 id=262 tok="Ġa" logit=19.998377 prob=0.001502
+prefill_top rank=2 id=3721 tok="Ġ**" logit=19.996861 prob=0.001499
+prefill_top rank=3 id=290 tok="Ġthe" logit=19.996202 prob=0.001498
+prefill_top rank=4 id=1085 tok="Ġone" logit=19.993313 prob=0.001494
+prefill stats: finished_range=[-19.9900,20.0000] presoftcap_range=[-82.9794,139.6138] saturated_to_cap=0 raw_range=[-82.9794,139.6138] top100_beyond_0.9cap=100
+gen step=1 id=40171 tok="ĠTokyo" source=prefill
+generated_ids=[40171]
+generated_text=" Tokyo"
+peak_rss_kb=38156148

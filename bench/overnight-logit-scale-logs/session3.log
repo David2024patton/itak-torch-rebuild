@@ -1,0 +1,19 @@
+BUILD START 2026-11-05T12:46:53+00:00
+   Compiling wgpu-core-deps-windows-linux-android v27.0.0
+   Compiling wgpu-compute v0.1.0 (/home/server/overnight-logitscale/crates/wgpu-compute)
+    Finished `release` profile [optimized] target(s) in 35.79s
+BUILD END 2026-11-05T12:47:28+00:00
+RUN START arm=baseline slug=golden n=16 2026-11-05T12:47:28+00:00
+RUN END arm=baseline slug=golden n=16 elapsed_s=2211 rc=0
+RUN START arm=forced slug=golden n=16 2026-11-05T13:24:19+00:00
+RUN END arm=forced slug=golden n=16 elapsed_s=2186 rc=0
+RUN START arm=baseline slug=japan n=16 2026-11-05T14:00:45+00:00
+RUN END arm=baseline slug=japan n=16 elapsed_s=2191 rc=0
+RUN START arm=forced slug=japan n=1 2026-11-05T14:37:16+00:00
+RUN END arm=forced slug=japan n=1 elapsed_s=1470 rc=0
+RUN START arm=baseline slug=water n=16 2026-11-05T15:01:46+00:00
+RUN END arm=baseline slug=water n=16 elapsed_s=2384 rc=0
+RUN START arm=forced slug=water n=1 2026-11-05T15:41:30+00:00
+RUN END arm=forced slug=water n=1 elapsed_s=1675 rc=0
+CORE DONE 2026-11-05T16:09:25+00:00
+RUN START arm=forced slug=japan n=16 2026-11-05T16:09:25+00:00

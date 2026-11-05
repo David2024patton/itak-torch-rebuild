@@ -1,0 +1,111 @@
+phase=open_file ms=14646
+file: /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf bytes=16756683904
+experiment: logit_scale overridden file=0.19611613 forced=1
+config: layers=52 hidden=6656 vocab=202048 bos=Some(200000) logit_scale=1 logit_softcap=20
+prompt: "The capital of France is"
+add_bos_token=true encode_ids=[954, 7963, 323, 11698, 373]
+prompt_ids=[200000, 954, 7963, 323, 11698, 373]
+coverage: expected=731 found=731 missing=0
+phase=load_weights ms=5153
+phase=backend_open backend=cpu ms=0
+phase=prefill ms=1464484 prompt_tokens=6
+prefill_top rank=0 id=13796 tok="ĠParis" logit=19.999945 prob=0.000968
+prefill_top rank=1 id=262 tok="Ġa" logit=19.999369 prob=0.000967
+prefill_top rank=2 id=290 tok="Ġthe" logit=19.998516 prob=0.000966
+prefill_top rank=3 id=1085 tok="Ġone" logit=19.998421 prob=0.000966
+prefill_top rank=4 id=1437 tok="Ġalso" logit=19.997526 prob=0.000965
+prefill stats: finished_range=[-19.9872,19.9999] presoftcap_range=[-80.4453,135.0004] saturated_to_cap=0 raw_range=[-80.4453,135.0004] top100_beyond_0.9cap=100
+gen step=1 id=13796 tok="ĠParis" source=prefill
+step2_top rank=0 id=26 tok="." logit=20.000000 prob=0.002340
+step2_top rank=1 id=24 tok="," logit=19.999992 prob=0.002340
+step2_top rank=2 id=1574 tok=".ĊĊ" logit=19.999966 prob=0.002340
+step2_top rank=3 id=341 tok="Ġand" logit=19.999805 prob=0.002340
+step2_top rank=4 id=335 tok=".Ċ" logit=19.999310 prob=0.002339
+gen step=2 id=26 tok="." ms=46761
+step3_top rank=0 id=1573 tok="ĠIt" logit=19.999935 prob=0.000803
+step3_top rank=1 id=589 tok="ĠThe" logit=19.999882 prob=0.000803
+step3_top rank=2 id=13796 tok="ĠParis" logit=19.999805 prob=0.000803
+step3_top rank=3 id=1394 tok="ĠThis" logit=19.998098 prob=0.000801
+step3_top rank=4 id=220 tok="Ġ" logit=19.997839 prob=0.000801
+gen step=3 id=1573 tok="ĠIt" ms=45990
+step4_top rank=0 id=373 tok="Ġis" logit=20.000000 prob=0.003043
+step4_top rank=1 id=947 tok="Ġhas" logit=19.999763 prob=0.003042
+step4_top rank=2 id=1082 tok="âĢĻs" logit=19.999662 prob=0.003042
+step4_top rank=3 id=812 tok="Ġwas" logit=19.997704 prob=0.003036
+step4_top rank=4 id=23374 tok="Ġlies" logit=19.996880 prob=0.003034
+gen step=4 id=373 tok="Ġis" ms=47460
+step5_top rank=0 id=290 tok="Ġthe" logit=19.999977 prob=0.002011
+step5_top rank=1 id=262 tok="Ġa" logit=19.999855 prob=0.002010
+step5_top rank=2 id=1085 tok="Ġone" logit=19.999832 prob=0.002010
+step5_top rank=3 id=1437 tok="Ġalso" logit=19.999825 prob=0.002010
+step5_top rank=4 id=5711 tok="Ġknown" logit=19.999813 prob=0.002010
+gen step=5 id=290 tok="Ġthe" ms=46510
+step6_top rank=0 id=2167 tok="Ġmost" logit=19.999830 prob=0.003346
+step6_top rank=1 id=13467 tok="Ġlargest" logit=19.999748 prob=0.003346
+step6_top rank=2 id=21989 tok="Ġbiggest" logit=19.996143 prob=0.003334
+step6_top rank=3 id=7257 tok="Ġcountry" logit=19.995941 prob=0.003333
+step6_top rank=4 id=7963 tok="Ġcapital" logit=19.995680 prob=0.003332
+gen step=6 id=2167 tok="Ġmost" ms=47145
+step7_top rank=0 id=26899 tok="Ġpopul" logit=19.999483 prob=0.012290
+step7_top rank=1 id=70785 tok="Ġpopulated" logit=19.998411 prob=0.012277
+step7_top rank=2 id=25600 tok="Ġvisited" logit=19.992800 prob=0.012209
+step7_top rank=3 id=7559 tok="Ġpopular" logit=19.987713 prob=0.012147
+step7_top rank=4 id=24093 tok="Ġfamous" logit=19.980684 prob=0.012062
+gen step=7 id=26899 tok="Ġpopul" ms=46936
+step8_top rank=0 id=1212 tok="ous" logit=19.999264 prob=0.531652
+step8_top rank=1 id=11381 tok="ously" logit=18.936867 prob=0.183753
+step8_top rank=2 id=66950 tok="ousand" logit=17.854250 prob=0.062239
+step8_top rank=3 id=474 tok="ou" logit=17.776825 prob=0.057602
+step8_top rank=4 id=5364 tok="ouse" logit=17.651690 prob=0.050826
+gen step=8 id=1212 tok="ous" ms=46243
+step9_top rank=0 id=6996 tok="Ġcity" logit=19.999920 prob=0.024823
+step9_top rank=1 id=341 tok="Ġand" logit=19.978094 prob=0.024287
+step9_top rank=2 id=19547 tok="Ġurban" logit=19.964344 prob=0.023956
+step9_top rank=3 id=47465 tok="Ġcommune" logit=19.938601 prob=0.023347
+step9_top rank=4 id=101719 tok="Ġmetropolitan" logit=19.938076 prob=0.023334
+gen step=9 id=6996 tok="Ġcity" ms=46103
+step10_top rank=0 id=310 tok="Ġin" logit=19.999998 prob=0.011754
+step10_top rank=1 id=323 tok="Ġof" logit=19.999321 prob=0.011746
+step10_top rank=2 id=341 tok="Ġand" logit=19.999025 prob=0.011742
+step10_top rank=3 id=24 tok="," logit=19.998106 prob=0.011731
+step10_top rank=4 id=517 tok="Ġwith" logit=19.992718 prob=0.011668
+gen step=10 id=310 tok="Ġin" ms=46289
+step11_top rank=0 id=11698 tok="ĠFrance" logit=19.999910 prob=0.023833
+step11_top rank=1 id=290 tok="Ġthe" logit=19.999592 prob=0.023825
+step11_top rank=2 id=101719 tok="Ġmetropolitan" logit=19.964975 prob=0.023015
+step11_top rank=3 id=6945 tok="ĠEurope" logit=19.958958 prob=0.022876
+step11_top rank=4 id=13796 tok="ĠParis" logit=19.941370 prob=0.022478
+gen step=11 id=11698 tok="ĠFrance" ms=46307
+step12_top rank=0 id=341 tok="Ġand" logit=19.999992 prob=0.005165
+step12_top rank=1 id=24 tok="," logit=19.999987 prob=0.005165
+step12_top rank=2 id=26 tok="." logit=19.999907 prob=0.005164
+step12_top rank=3 id=517 tok="Ġwith" logit=19.999880 prob=0.005164
+step12_top rank=4 id=1574 tok=".ĊĊ" logit=19.999058 prob=0.005160
+gen step=12 id=341 tok="Ġand" ms=45724
+step13_top rank=0 id=290 tok="Ġthe" logit=19.999973 prob=0.004713
+step13_top rank=1 id=373 tok="Ġis" logit=19.999809 prob=0.004712
+step13_top rank=2 id=1085 tok="Ġone" logit=19.999620 prob=0.004711
+step13_top rank=3 id=1437 tok="Ġalso" logit=19.999523 prob=0.004711
+step13_top rank=4 id=1492 tok="Ġits" logit=19.997936 prob=0.004703
+gen step=13 id=290 tok="Ġthe" ms=49830
+step14_top rank=0 id=2167 tok="Ġmost" logit=19.999180 prob=0.006063
+step14_top rank=1 id=13467 tok="Ġlargest" logit=19.997747 prob=0.006055
+step14_top rank=2 id=220 tok="Ġ" logit=19.997496 prob=0.006053
+step14_top rank=3 id=2432 tok="Ġsecond" logit=19.997356 prob=0.006052
+step14_top rank=4 id=5376 tok="Ġcenter" logit=19.996403 prob=0.006046
+gen step=14 id=2167 tok="Ġmost" ms=45880
+step15_top rank=0 id=26899 tok="Ġpopul" logit=19.999149 prob=0.010547
+step15_top rank=1 id=25600 tok="Ġvisited" logit=19.999022 prob=0.010546
+step15_top rank=2 id=7559 tok="Ġpopular" logit=19.998415 prob=0.010539
+step15_top rank=3 id=70785 tok="Ġpopulated" logit=19.997808 prob=0.010533
+step15_top rank=4 id=3806 tok="Ġimportant" logit=19.992439 prob=0.010476
+gen step=15 id=26899 tok="Ġpopul" ms=46693
+step16_top rank=0 id=1212 tok="ous" logit=19.994482 prob=0.695986
+step16_top rank=1 id=11381 tok="ously" logit=19.135696 prob=0.294873
+step16_top rank=2 id=15106 tok="oust" logit=15.286531 prob=0.006280
+step16_top rank=3 id=338 tok="us" logit=13.840258 prob=0.001479
+step16_top rank=4 id=1043 tok="..." logit=12.996113 prob=0.000636
+gen step=16 id=1212 tok="ous" ms=45414
+generated_ids=[13796, 26, 1573, 373, 290, 2167, 26899, 1212, 6996, 310, 11698, 341, 290, 2167, 26899, 1212]
+generated_text=" Paris. It is the most populous city in France and the most populous"
+peak_rss_kb=38159092

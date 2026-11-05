@@ -1,0 +1,4 @@
+[gguf][error] event=metadata_type_mismatch key=muse-glimmer.attention.sliding_window_pattern expected=string found=array
+[gguf][error] event=missing_metadata key=muse-glimmer.rope.freq_base_swa
+[muse-glimmer] forward.begin: tokens=6 position=0 layers=52
+[muse-glimmer] forward.end: logits=202048 position=6

@@ -1,0 +1,21 @@
+phase=open_file ms=16054
+file: /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf bytes=16756683904
+experiment: logit_scale overridden file=0.19611613 forced=1
+config: layers=52 hidden=6656 vocab=202048 bos=Some(200000) logit_scale=1 logit_softcap=20
+prompt: "The chemical symbol for water is"
+add_bos_token=true encode_ids=[954, 12332, 9985, 393, 3427, 373]
+prompt_ids=[200000, 954, 12332, 9985, 393, 3427, 373]
+coverage: expected=731 found=731 missing=0
+phase=load_weights ms=5003
+phase=backend_open backend=cpu ms=0
+phase=prefill ms=1651736 prompt_tokens=7
+prefill_top rank=0 id=465 tok="ĠH" logit=19.999969 prob=0.002741
+prefill_top rank=1 id=5789 tok="Ġ$\\" logit=19.997684 prob=0.002735
+prefill_top rank=2 id=24420 tok="Ġ____" logit=19.994280 prob=0.002725
+prefill_top rank=3 id=5325 tok="Ġ\\(\\" logit=19.993912 prob=0.002724
+prefill_top rank=4 id=523 tok="Ġ$" logit=19.991482 prob=0.002718
+prefill stats: finished_range=[-19.9811,20.0000] presoftcap_range=[-76.5902,140.7058] saturated_to_cap=0 raw_range=[-76.5902,140.7058] top100_beyond_0.9cap=100
+gen step=1 id=465 tok="ĠH" source=prefill
+generated_ids=[465]
+generated_text=" H"
+peak_rss_kb=38156084

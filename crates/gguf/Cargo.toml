@@ -6,5 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Strict GGUF v3 loader: header, metadata, tensor directory, and f32 dequantization with fail-loud errors"
 
+[dependencies]
+# Memory-mapping for GgufFile::open (PLAN T-2.1): the file image is
+# mapped, not read into anonymous RAM. This is the crate's only
+# dependency; the parser, metadata, and dequantizers are std-only.
+memmap2 = "0.9"
+
 [lints]
 workspace = true

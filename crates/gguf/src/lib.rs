@@ -31,7 +31,11 @@
 //! let weights = file.load_f32("token_embd.weight").unwrap();
 //! ```
 
-#![forbid(unsafe_code)]
+// Unsafe is denied crate-wide, with exactly one exception: the
+// memory-map call in `file::map_file` (PLAN T-2.1), which carries an
+// item-level allow and a safety contract. Every other unsafe block in
+// this crate is a lint error.
+#![deny(unsafe_code)]
 
 pub mod config;
 pub mod dequant;

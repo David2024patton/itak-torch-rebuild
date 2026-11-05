@@ -95,6 +95,7 @@ pub use kernels::k19_q4k_mmv::{K19Call, K19Pipeline, MmvShape, MMV_MAX_BATCH, MM
 pub use kernels::k1_q4k_gemv::{
     K1ActGeom, K1Call, K1Pipeline, K1Shape, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU,
 };
+pub use kernels::k20_q6k_mmv::{K20Call, K20Pipeline};
 pub use kernels::k21_q5k_mmv::{K21Call, K21Pipeline, K21Shape};
 pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};
 pub use kernels::k3_q5k_gemv::{

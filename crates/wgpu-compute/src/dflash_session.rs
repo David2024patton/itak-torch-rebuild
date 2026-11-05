@@ -74,6 +74,7 @@ use crate::kernels::k4_rmsnorm::K4Call;
 use crate::kernels::k7_swiglu::K7Call;
 use crate::kernels::k8_head::K8GatherRowsCall;
 use crate::session::{upload_norm, upload_proj, ProjWeights};
+use crate::timestamps::DiagAccumulator;
 
 /// Result alias in draft vocabulary.
 type Result<T> = std::result::Result<T, DflashError>;
@@ -766,6 +767,12 @@ pub struct DflashSession<'a> {
     kv_capacity: usize,
     stats: DflashSessionStats,
     diag: Arc<dyn Diag>,
+    /// The GPU-timing accumulator (crate::timestamps),
+    /// present only when the backend's context carries a
+    /// timestamp recorder; distinct from the `diag` event
+    /// sink above. `None` is the off path, exactly as in
+    /// [`crate::ResidentSession`].
+    diag_acc: Option<DiagAccumulator>,
 }
 
 impl std::fmt::Debug for DflashSession<'_> {
@@ -996,6 +1003,10 @@ impl<'a> DflashSession<'a> {
             kv_capacity: session_cfg.kv_capacity,
             stats: DflashSessionStats::default(),
             diag,
+            diag_acc: backend
+                .context()
+                .diag_recorder()
+                .map(|_| DiagAccumulator::from_env()),
         })
     }
 
@@ -1045,6 +1056,71 @@ impl<'a> DflashSession<'a> {
         self.held.clear();
         self.diag
             .event("session.reset", "committed positions cleared");
+    }
+
+    /// Drain the diag timestamp recorder into the session's
+    /// accumulator, mirroring [`crate::ResidentSession`]:
+    /// called after every submitted chunk of the inject,
+    /// fuse, and block-forward paths. A no-op off the timing
+    /// path.
+    fn drain_diag(&mut self) {
+        let Some(acc) = &mut self.diag_acc else {
+            return;
+        };
+        let ctx = self.backend.context();
+        if let Some(recorder) = ctx.diag_recorder() {
+            acc.drain_and_fold(recorder, &ctx.device, &ctx.queue);
+        }
+    }
+
+    /// Dispatch records the diag accumulator has folded so
+    /// far (zero when timing is off or nothing has run).
+    #[must_use]
+    pub fn diag_dispatch_count(&self) -> u64 {
+        self.diag_acc
+            .as_ref()
+            .map_or(0, DiagAccumulator::total_records)
+    }
+
+    /// Names of the kernels the diag accumulator has folded
+    /// so far, in name order (empty when timing is off).
+    #[must_use]
+    pub fn diag_kernel_names(&self) -> Vec<&'static str> {
+        self.diag_acc
+            .as_ref()
+            .map_or_else(Vec::new, DiagAccumulator::kernel_names)
+    }
+
+    /// The diag summary table over everything folded so far,
+    /// in the `render_summary` CSV format, or `None` when the
+    /// session carries no accumulator (timing off).
+    #[must_use]
+    pub fn diag_summary_csv(&self) -> Option<String> {
+        self.diag_acc.as_ref().map(DiagAccumulator::render_csv)
+    }
+
+    /// Finish the diag report now: one last drain, then the
+    /// tally line and the summary file (when
+    /// `WGPU_COMPUTE_DIAG_OUT` named one). Idempotent; the
+    /// session's drop calls it for callers that never do.
+    pub fn finish_diag_report(&mut self) {
+        let Some(acc) = &mut self.diag_acc else {
+            return;
+        };
+        let ctx = self.backend.context();
+        if let Some(recorder) = ctx.diag_recorder() {
+            acc.drain_and_fold(recorder, &ctx.device, &ctx.queue);
+            acc.write_report(recorder.dropped());
+        }
+    }
+}
+
+impl Drop for DflashSession<'_> {
+    fn drop(&mut self) {
+        // End of run: finish the diag report the caller did
+        // not finish explicitly. A no-op off the timing path
+        // and after an explicit finish.
+        self.finish_diag_report();
     }
 }
 
@@ -1517,6 +1593,7 @@ impl<'a> DflashSession<'a> {
             );
             ctx.queue.submit([encoder.finish()]);
             self.stats.submissions += 1;
+            self.drain_diag();
             offset += rows;
         }
         self.held.extend(positions.iter().copied());
@@ -1592,6 +1669,7 @@ impl<'a> DflashSession<'a> {
                 .map_err(|e| we(STEP_SESSION, e))?;
             out.extend_from_slice(&part);
             self.stats.readbacks += 1;
+            self.drain_diag();
             offset += crows;
         }
         Ok(out)
@@ -1688,6 +1766,7 @@ impl<'a> DflashSession<'a> {
             .map_err(|e| we(STEP_BLOCK, e))?;
         self.stats.blocks += 1;
         self.stats.readbacks += 1;
+        self.drain_diag();
         self.diag
             .event("forward_block.end", &format!("logits={}", logits.len()));
         Ok(logits)

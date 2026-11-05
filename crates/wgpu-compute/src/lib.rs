@@ -113,5 +113,5 @@ pub use kernels::k8_head::{
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
 pub use session::{ProjBench, ProjBenchCall, ResidentSession, SessionStats};
 pub use timestamps::{
-    DiagMode, DiagRecorder, DiagStamp, DispatchMeta, DispatchRecord, KernelSummary,
+    DiagAccumulator, DiagMode, DiagRecorder, DiagStamp, DispatchMeta, DispatchRecord, KernelSummary,
 };

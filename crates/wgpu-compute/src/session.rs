@@ -74,7 +74,12 @@
 //! Debug: session construction and forward log buffer sizes,
 //! positions, and submission counts through `crate::diag`;
 //! the counts themselves are also returned in
-//! [`SessionStats`].
+//! [`SessionStats`]. Per-dispatch GPU timing
+//! (`crate::timestamps`) needs no caller cooperation either:
+//! in timing mode the session drains the recorder after every
+//! chunk into its [`DiagAccumulator`] and finishes the report
+//! (the summary table to `WGPU_COMPUTE_DIAG_OUT`, when set)
+//! at end of run.
 
 use std::collections::HashMap;
 
@@ -109,6 +114,7 @@ use crate::kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, ARGMAX_GROUPS, GATHER_NORM_MAX_WIDTH,
 };
 use crate::kernels::k9_attn_prep::{K9PrepCall, PrepArgs};
+use crate::timestamps::DiagAccumulator;
 
 /// The post-norm epsilon, hardcoded to match the reference
 /// converter and `muse_glimmer::model`'s own `POST_NORM_EPS`
@@ -3533,6 +3539,11 @@ pub struct ResidentSession<'a> {
     plans: HashMap<usize, ChunkPlan>,
     /// Accumulated counters.
     stats: SessionStats,
+    /// The diag timing accumulator, present only when the
+    /// backend's context carries a timestamp recorder
+    /// (timing mode on a capable device). `None` is the off
+    /// path: no drains, no report, no behavior change.
+    diag_acc: Option<DiagAccumulator>,
 }
 
 impl<'a> ResidentSession<'a> {
@@ -3625,6 +3636,19 @@ impl<'a> ResidentSession<'a> {
             cfg.vocab_size,
             cfg.hidden
         );
+        // The diag accumulator exists exactly when the
+        // context carries a recorder; it reads its report
+        // destination from the environment once, here.
+        let diag_acc = ctx.diag_recorder().map(|_| DiagAccumulator::from_env());
+        if let Some(acc) = &diag_acc {
+            dbg_log!(
+                "session diag timing on: drains after every chunk, report to {}",
+                acc.out_path().map_or_else(
+                    || "the diag channel only".to_string(),
+                    |p| p.display().to_string()
+                )
+            );
+        }
         Ok(ResidentSession {
             backend,
             cfg: cfg.clone(),
@@ -3638,6 +3662,7 @@ impl<'a> ResidentSession<'a> {
             position: 0,
             plans: HashMap::new(),
             stats: SessionStats::default(),
+            diag_acc,
         })
     }
 
@@ -4201,7 +4226,79 @@ impl<'a> ResidentSession<'a> {
              submissions={}",
             self.stats.submissions
         );
+        // The chunk's submission is complete and read back,
+        // so its timestamp stamps are final: drain them into
+        // the report before the next chunk starts filling
+        // the window again. A no-op off the timing path.
+        self.drain_diag();
         Ok((outcome, captures))
+    }
+
+    /// Drain the diag timestamp recorder into the session's
+    /// accumulator. Called after every chunk submission (and
+    /// from [`ResidentSession::finish_diag_report`]); with no
+    /// recorder this is one branch and nothing else, which is
+    /// what keeps the off path's encode and submission stream
+    /// byte-identical.
+    fn drain_diag(&mut self) {
+        let Some(acc) = &mut self.diag_acc else {
+            return;
+        };
+        let ctx = self.backend.context();
+        if let Some(recorder) = ctx.diag_recorder() {
+            acc.drain_and_fold(recorder, &ctx.device, &ctx.queue);
+        }
+    }
+
+    /// Dispatch records the diag accumulator has folded so
+    /// far (zero when timing is off or nothing has run).
+    #[must_use]
+    pub fn diag_dispatch_count(&self) -> u64 {
+        self.diag_acc
+            .as_ref()
+            .map_or(0, DiagAccumulator::total_records)
+    }
+
+    /// Names of the kernels the diag accumulator has folded
+    /// so far, in name order (empty when timing is off).
+    #[must_use]
+    pub fn diag_kernel_names(&self) -> Vec<&'static str> {
+        self.diag_acc
+            .as_ref()
+            .map_or_else(Vec::new, DiagAccumulator::kernel_names)
+    }
+
+    /// The diag summary table over everything folded so far,
+    /// in the `render_summary` CSV format, or `None` when the
+    /// session carries no accumulator (timing off).
+    #[must_use]
+    pub fn diag_summary_csv(&self) -> Option<String> {
+        self.diag_acc.as_ref().map(DiagAccumulator::render_csv)
+    }
+
+    /// Finish the diag report now: one last drain, then the
+    /// tally line and the summary file (when
+    /// `WGPU_COMPUTE_DIAG_OUT` named one). Idempotent; the
+    /// session's drop calls it for callers that never do, so
+    /// every timing run leaves its report behind.
+    pub fn finish_diag_report(&mut self) {
+        let Some(acc) = &mut self.diag_acc else {
+            return;
+        };
+        let ctx = self.backend.context();
+        if let Some(recorder) = ctx.diag_recorder() {
+            acc.drain_and_fold(recorder, &ctx.device, &ctx.queue);
+            acc.write_report(recorder.dropped());
+        }
+    }
+}
+
+impl Drop for ResidentSession<'_> {
+    fn drop(&mut self) {
+        // End of run: whatever the caller did not finish
+        // explicitly, finish here. A no-op off the timing
+        // path and after an explicit finish.
+        self.finish_diag_report();
     }
 }
 

@@ -91,6 +91,17 @@
 //! docs). It shares its routing threshold with the
 //! Q4_K register-streaming product (env
 //! `WGPU_COMPUTE_MMV_MAX_ROWS`, default off).
+//!
+//! K22 is the Q4_K MMQ product reorganized for
+//! occupancy: the prefill profile measured K13 at
+//! VGPR 256 (the architectural cap) streaming at under
+//! 5% of the card's ceiling, so K22 runs the same MMQ
+//! math in llama.cpp mul_mmq's register organization
+//! (a per-thread register cache consumed column by
+//! column, scalar integer dots, immediate folds) at the
+//! same tile coverage. The session routes to it only
+//! under its own env switch, which defaults off; see
+//! the module's own docs for the reasoning.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -105,6 +116,7 @@ pub mod k19_q4k_mmv;
 pub mod k1_q4k_gemv;
 pub mod k20_q6k_mmv;
 pub mod k21_q5k_mmv;
+pub mod k22_q4k_mmq;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;
 pub mod k4_rmsnorm;

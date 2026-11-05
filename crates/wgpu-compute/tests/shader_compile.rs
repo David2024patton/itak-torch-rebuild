@@ -860,3 +860,77 @@ fn k21_q5k_mmv_shaders_compile_on_any_available_adapter() {
         );
     }
 }
+
+#[test]
+fn k22_mmq_shader_compiles_on_any_available_adapter() {
+    use wgpu_compute::kernels::k22_q4k_mmq::k22_staging_bytes;
+    use wgpu_compute::K22Pipeline;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping k22 compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    // First device: the default limits, whose workgroup
+    // storage grant (16 KiB) is below K22's staging set.
+    // for_device must answer Ok(None) (the composition
+    // fallback), and the direct constructor must refuse
+    // by name: the two halves of the K13 contract.
+    let (capped, _q1) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k22 capped test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("capped device for k22 test");
+    match K22Pipeline::for_device(&capped) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("k22 under default limits must be Ok(None), got a pipeline"),
+        Err(e) => panic!("k22 under default limits must be Ok(None), got error: {e}"),
+    }
+    let err = match K22Pipeline::new(&capped) {
+        Ok(_) => panic!("k22 must refuse a 16 KiB storage grant by name"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("workgroup memory"),
+        "refusal names the binding limit: {err}"
+    );
+    // Second device: the adapter's own limits. When the
+    // grant covers the staging set the one generated
+    // shader (the geometry is fixed, so there is exactly
+    // one variant) must compile; for_device must agree.
+    let (full, _q2) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k22 full test"),
+        required_features: wanted,
+        required_limits: adapter.limits(),
+        ..Default::default()
+    }))
+    .expect("full-limits device for k22 test");
+    let granted = full.limits().max_compute_workgroup_storage_size;
+    if granted >= k22_staging_bytes() {
+        let _pipeline = K22Pipeline::new(&full)
+            .unwrap_or_else(|e| panic!("k22 must build on {} (grant {granted}): {e}", info.name));
+        eprintln!("k22 shader compiled on {} ({:?})", info.name, info.backend);
+        assert!(
+            matches!(K22Pipeline::for_device(&full), Ok(Some(_))),
+            "for_device must agree with the grant on {}",
+            info.name
+        );
+    } else {
+        assert!(
+            matches!(K22Pipeline::for_device(&full), Ok(None)),
+            "for_device must refuse cleanly under the grant on {}",
+            info.name
+        );
+        eprintln!(
+            "k22 skipped on {}: grant {granted} below its staging set",
+            info.name
+        );
+    }
+}

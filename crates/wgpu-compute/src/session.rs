@@ -105,6 +105,7 @@ use crate::kernels::k19_q4k_mmv::K19Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k20_q6k_mmv::K20Call;
 use crate::kernels::k21_q5k_mmv::K21Call;
+use crate::kernels::k22_q4k_mmq::K22Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
@@ -356,6 +357,19 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K16Call,
     },
+    /// K12 quantize + K22 (Q4_K MMQ in the
+    /// register-organization prototype form) dispatches.
+    /// Constructed only when the backend's K22 switch is
+    /// on; at shipped defaults this variant never appears
+    /// in a plan.
+    MmqK22Q4K {
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
+        /// The integer product dispatch.
+        mmq: K22Call,
+    },
     /// K12 quantize + K18 (Q4_K small-batch) dispatches.
     SmallQ4K {
         /// The activation quantize dispatch.
@@ -436,6 +450,12 @@ impl ProjCall {
                 }
                 mmq.encode_into(pass);
             }
+            ProjCall::MmqK22Q4K { quant, mmq } => {
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
+                mmq.encode_into(pass);
+            }
             ProjCall::SmallQ4K { quant, mmq } => {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
@@ -483,7 +503,8 @@ impl ProjCall {
             ProjCall::MmqQ4K { quant, .. }
             | ProjCall::MmqQ6K { quant, .. }
             | ProjCall::MmqWideQ4K { quant, .. }
-            | ProjCall::MmqWideQ6K { quant, .. } => 1 + u64::from(quant.is_some()),
+            | ProjCall::MmqWideQ6K { quant, .. }
+            | ProjCall::MmqK22Q4K { quant, .. } => 1 + u64::from(quant.is_some()),
             ProjCall::SmallQ4K { .. } | ProjCall::SmallQ6K { .. } | ProjCall::SmallQ5K { .. } => 2,
             ProjCall::ChunkedQ4K(calls) => calls.len() as u64,
             ProjCall::ChunkedQ6K(calls) => calls.len() as u64,
@@ -691,6 +712,7 @@ impl ProjBenchCall {
             ProjCall::GemmQ6K(_) => "k11_q6k_gemm",
             ProjCall::MmqQ4K { .. } => "k13_q4k_mmq",
             ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
+            ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
             ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
             ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
             ProjCall::SmallQ4K { .. } => "k18_q4k_small",
@@ -732,16 +754,20 @@ impl ProjBenchCall {
 /// Choose the Q4_K MMQ product for an already-prepared
 /// K12 quantize call: the wide product (K15) first when
 /// the batch is at or past the backend's wide row
-/// threshold, the standard product (K13) behind it.
-/// `None` when neither pipeline exists or both prepares
-/// refuse: the caller then takes the GEMM form. Every
-/// refusal is logged by name; the choice is made here, at
-/// plan-build time, and never substitutes inside a
-/// dispatch. All the MMQ projection forms (plain, gated,
-/// SwiGLU) share this product choice: the activation
-/// transform lives in the quantize call they hand over,
-/// upstream of the product, so the ladder is one code
-/// path per family.
+/// threshold, then the K22 register-organization
+/// prototype when the backend's K22 switch is on, the
+/// standard product (K13) behind both. With the K22
+/// switch off (the shipped default) the ladder is the
+/// shipped ladder exactly: the K22 rung is skipped
+/// without being consulted. `None` when no pipeline
+/// exists or every prepare refuses: the caller then
+/// takes the GEMM form. Every refusal is logged by name;
+/// the choice is made here, at plan-build time, and
+/// never substitutes inside a dispatch. All the MMQ
+/// projection forms (plain, gated, SwiGLU) share this
+/// product choice: the activation transform lives in the
+/// quantize call they hand over, upstream of the
+/// product, so the ladder is one code path per family.
 fn mmq_product_q4k(
     backend: &WgpuCompute,
     weights: &K1Weights,
@@ -759,6 +785,19 @@ fn mmq_product_q4k(
                 Err(e) => {
                     dbg_log!(
                         "mmq wide q4k refused at the product prepare: {e}; \
+                         the standard mmq form serves it"
+                    );
+                }
+            }
+        }
+    }
+    if backend.k22_mmq() {
+        if let Some(k22) = backend.k22() {
+            match k22.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+                Ok(mmq) => return Some(ProjCall::MmqK22Q4K { quant, mmq }),
+                Err(e) => {
+                    dbg_log!(
+                        "mmq k22 q4k refused at the product prepare: {e}; \
                          the standard mmq form serves it"
                     );
                 }

@@ -163,6 +163,44 @@ fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
     }
 }
 
+/// Environment variable naming the chunked-GEMV row
+/// threshold override: the largest batch row count at
+/// which the session serves a plain projection as
+/// several windowed GEMV dispatches at power-of-two row
+/// counts (the chunked form) instead of one GEMV dispatch
+/// at the batch's own count, inside the band from 2 rows
+/// up to below the matrix threshold. Operational config,
+/// not a compiled constant: set it to 15 to enable the
+/// chunked form across the whole speculative verify band,
+/// or leave it at the default to keep the ladder's GEMV
+/// rung exactly as shipped. An unparsable value falls
+/// back to [`DEFAULT_CHUNKED_GEMV_MAX_ROWS`], with the
+/// fallback logged at construction.
+pub const CHUNKED_GEMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_CHUNKED_GEMV_MAX_ROWS";
+
+/// The chunked-GEMV row threshold when the environment
+/// does not override it: 1, which is OFF, since the
+/// ladder only routes batches of 2 or more rows to the
+/// chunked form. The shipped default follows the K18
+/// precedent: an unproven dispatch shape does not enter
+/// the ladder by default. The head-to-head proof that
+/// can move this value is sequenced in
+/// bench/chunked-gemv-2026-11-05.md.
+pub const DEFAULT_CHUNKED_GEMV_MAX_ROWS: u32 = 1;
+
+/// Resolve the chunked-GEMV row threshold from the raw
+/// environment value: a plain u32, or the default when
+/// unset or unparsable.
+fn resolve_chunked_gemv_max_rows(raw: Option<&str>) -> u32 {
+    match raw {
+        Some(s) => s
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(DEFAULT_CHUNKED_GEMV_MAX_ROWS),
+        None => DEFAULT_CHUNKED_GEMV_MAX_ROWS,
+    }
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -269,6 +307,7 @@ pub struct WgpuCompute {
     small_batch_max_rows: u32,
     k19: K19Pipeline,
     mmv_max_rows: u32,
+    chunked_gemv_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -408,6 +447,20 @@ impl WgpuCompute {
              default {DEFAULT_MMV_MAX_ROWS}); k19 shape {}",
             k19.shape().name()
         );
+        // The chunked-GEMV dispatch shape: no pipelines
+        // of its own (it re-dispatches the GEMV kernels
+        // over row windows), only the row threshold at
+        // which the session prefers it over the single
+        // GEMV dispatch, read here (see
+        // CHUNKED_GEMV_MAX_ROWS_ENV); the default keeps
+        // it out of the ladder until the head-to-head
+        // proof moves it.
+        let chunked_gemv_max_rows =
+            resolve_chunked_gemv_max_rows(std::env::var(CHUNKED_GEMV_MAX_ROWS_ENV).ok().as_deref());
+        dbg_log!(
+            "chunked gemv config: max_rows={chunked_gemv_max_rows} (env \
+             {CHUNKED_GEMV_MAX_ROWS_ENV}, default {DEFAULT_CHUNKED_GEMV_MAX_ROWS})"
+        );
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -443,6 +496,7 @@ impl WgpuCompute {
             small_batch_max_rows,
             k19,
             mmv_max_rows,
+            chunked_gemv_max_rows,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -678,6 +732,18 @@ impl WgpuCompute {
     /// routes nothing.
     pub(crate) fn mmv_max_rows(&self) -> u32 {
         self.mmv_max_rows
+    }
+
+    /// The largest batch row count at which the resident
+    /// session prefers the chunked GEMV form (several
+    /// windowed GEMV dispatches at power-of-two row
+    /// counts) over the single GEMV dispatch, inside the
+    /// band from 2 rows up: config resolved at
+    /// construction from [`CHUNKED_GEMV_MAX_ROWS_ENV`],
+    /// never a constant compiled into the selection
+    /// seam. The shipped default (1) routes nothing.
+    pub(crate) fn chunked_gemv_max_rows(&self) -> u32 {
+        self.chunked_gemv_max_rows
     }
 
     /// Drop all stored KV state, device buffers and host mirror.
@@ -1239,5 +1305,36 @@ mod tests {
         assert_eq!(resolve_mmv_max_rows(Some("mmv")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("-2")), DEFAULT_MMV_MAX_ROWS);
+    }
+
+    #[test]
+    fn chunked_gemv_max_rows_resolution() {
+        // Unset: the default, which is off (1 routes
+        // nothing, since the ladder's band starts at 2).
+        assert_eq!(
+            resolve_chunked_gemv_max_rows(None),
+            DEFAULT_CHUNKED_GEMV_MAX_ROWS
+        );
+        assert_eq!(DEFAULT_CHUNKED_GEMV_MAX_ROWS, 1);
+        // Plain values pass through, including the
+        // head-to-head proof position: 15 (the routed
+        // band under GEMM_MIN_ROWS).
+        assert_eq!(resolve_chunked_gemv_max_rows(Some("15")), 15);
+        assert_eq!(resolve_chunked_gemv_max_rows(Some(" 7 ")), 7);
+        assert_eq!(resolve_chunked_gemv_max_rows(Some(" 0 ")), 0);
+        // Unparsable values fall back to the default
+        // rather than failing backend construction.
+        assert_eq!(
+            resolve_chunked_gemv_max_rows(Some("chunked")),
+            DEFAULT_CHUNKED_GEMV_MAX_ROWS
+        );
+        assert_eq!(
+            resolve_chunked_gemv_max_rows(Some("")),
+            DEFAULT_CHUNKED_GEMV_MAX_ROWS
+        );
+        assert_eq!(
+            resolve_chunked_gemv_max_rows(Some("-2")),
+            DEFAULT_CHUNKED_GEMV_MAX_ROWS
+        );
     }
 }

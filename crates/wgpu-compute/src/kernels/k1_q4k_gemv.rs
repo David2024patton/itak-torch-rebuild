@@ -824,6 +824,128 @@ pub fn grid_dims(total: u64) -> (u32, u32) {
     (x, y.min(u64::from(u32::MAX)) as u32)
 }
 
+/// A contiguous row window into a projection's input and
+/// output buffers, in bytes: a windowed GEMV prepare
+/// ([`K1Pipeline::prepare_rows`] and its K2/K3 siblings)
+/// binds exactly this window, so the kernel's row 0 is the
+/// window's first row and its batch is the window's row
+/// count. The window changes only which rows a dispatch
+/// covers; the per-row math is the shipped kernel's,
+/// untouched.
+#[derive(Debug, Clone, Copy)]
+pub struct RowWindow {
+    /// First row of the window within the caller's buffers.
+    pub first_row: u32,
+    /// Byte offset of the window's first input row.
+    pub in_offset: u64,
+    /// Byte length of the window's input rows.
+    pub in_bytes: u64,
+    /// Byte offset of the window's first output row.
+    pub out_offset: u64,
+    /// Byte length of the window's output rows.
+    pub out_bytes: u64,
+}
+
+impl RowWindow {
+    /// The input binding for this window: the buffer from
+    /// the window's offset, for exactly the window's bytes.
+    pub fn in_binding<'a>(&self, buffer: &'a wgpu::Buffer) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset: self.in_offset,
+            size: std::num::NonZeroU64::new(self.in_bytes),
+        })
+    }
+
+    /// The output binding for this window (see
+    /// [`RowWindow::in_binding`]).
+    pub fn out_binding<'a>(&self, buffer: &'a wgpu::Buffer) -> wgpu::BindingResource<'a> {
+        wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset: self.out_offset,
+            size: std::num::NonZeroU64::new(self.out_bytes),
+        })
+    }
+
+    /// The diag shape suffix naming the window's first
+    /// row, so a chunked dispatch is distinguishable from
+    /// a whole-batch one in the timestamp report.
+    pub fn stamp_suffix(&self) -> String {
+        format!(" win@{}", self.first_row)
+    }
+}
+
+/// Resolve and validate a row window over a projection's
+/// buffers: rows `row_start..row_start + rows` of a tensor
+/// with `in_features` input elements per row (at
+/// `in_elem_bytes` bytes each) and `out_rows` f32 outputs
+/// per row, inside `input` and `output`. Shared by the
+/// three GEMV pipelines' windowed prepares.
+///
+/// # Errors
+///
+/// [`WgpuError::InvalidTensor`] naming `name` when the
+/// window is empty, when it runs past either buffer, or
+/// when a window offset is not a multiple of the device's
+/// minimum storage-binding offset alignment (a window is
+/// a buffer binding, so its offsets carry the binding
+/// alignment rule; geometries whose row stride is not a
+/// multiple of it cannot be windowed and refuse here, by
+/// name, for the caller's fallback to serve whole).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_row_window(
+    device: &wgpu::Device,
+    name: &str,
+    in_features: usize,
+    in_elem_bytes: u64,
+    out_rows: usize,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    row_start: u32,
+    rows: u32,
+) -> Result<RowWindow> {
+    if rows == 0 {
+        return Err(WgpuError::InvalidTensor {
+            name: format!("{name} call"),
+            detail: "row window is empty".to_string(),
+        });
+    }
+    let in_row = in_features as u64 * in_elem_bytes;
+    let out_row = out_rows as u64 * 4;
+    let end = u64::from(row_start) + u64::from(rows);
+    if end * in_row > input.size() || end * out_row > output.size() {
+        return Err(WgpuError::InvalidTensor {
+            name: format!("{name} call"),
+            detail: format!(
+                "row window {row_start}..{end} runs past the buffers \
+                 (input {} bytes at {in_row} per row, output {} bytes at {out_row} per row)",
+                input.size(),
+                output.size()
+            ),
+        });
+    }
+    let align = u64::from(device.limits().min_storage_buffer_offset_alignment);
+    let in_offset = u64::from(row_start) * in_row;
+    let out_offset = u64::from(row_start) * out_row;
+    if in_offset % align != 0 || out_offset % align != 0 {
+        return Err(WgpuError::InvalidTensor {
+            name: format!("{name} call"),
+            detail: format!(
+                "row window at row {row_start} has binding offsets \
+                 (input {in_offset}, output {out_offset}) that are not multiples \
+                 of the device's {align}-byte storage binding alignment"
+            ),
+        });
+    }
+    Ok(RowWindow {
+        first_row: row_start,
+        in_offset,
+        in_bytes: u64::from(rows) * in_row,
+        out_offset,
+        out_bytes: u64::from(rows) * out_row,
+    })
+}
+
 /// A Q4_K weight tensor resident on the device: one storage buffer
 /// holding the tensor's raw GGUF bytes, bound whole per dispatch
 /// (BACKEND.md Section 5's per-tensor buffer strategy).
@@ -1197,7 +1319,60 @@ impl K1Pipeline {
                 ),
             });
         }
-        self.prepare_inner(ctx, weights, input, None, output, batch, None)
+        self.prepare_inner(ctx, weights, input, None, output, batch, None, None)
+    }
+
+    /// Prepare a dispatch over a contiguous window of
+    /// rows of the caller's buffers: rows
+    /// `row_start..row_start + rows` of `input` and
+    /// `output`, bound as buffer windows so the kernel
+    /// sees the window as its whole batch. The shader is
+    /// the shipped one, unchanged; the window changes
+    /// only which rows the dispatch covers, and each
+    /// output element's math is the whole-batch
+    /// dispatch's, element for element. The resident
+    /// session's chunked GEMV form serves a small batch
+    /// as several such dispatches at power-of-two row
+    /// counts instead of one dispatch at the batch's own
+    /// count.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] when this pipeline
+    /// carries an activation mode (those prepare through
+    /// [`K1Pipeline::prepare_act`]), or when the window
+    /// itself is refused (see [`resolve_row_window`]).
+    pub fn prepare_rows(
+        &self,
+        ctx: &GpuContext,
+        weights: &K1Weights,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        row_start: u32,
+        rows: u32,
+    ) -> Result<K1Call> {
+        if self.act != ACT_NONE {
+            return Err(WgpuError::InvalidTensor {
+                name: "k1 call".to_string(),
+                detail: format!(
+                    "this pipeline carries activation mode {}; prepare through prepare_act",
+                    self.act
+                ),
+            });
+        }
+        let in_elem_bytes = if self.shape.input_is_f16() { 2 } else { 4 };
+        let window = resolve_row_window(
+            &ctx.device,
+            "k1",
+            weights.in_features,
+            in_elem_bytes,
+            weights.out_rows,
+            input,
+            output,
+            row_start,
+            rows,
+        )?;
+        self.prepare_inner(ctx, weights, input, None, output, rows, None, Some(&window))
     }
 
     /// Prepare an activation dispatch (see [`ACT_GATED`] and
@@ -1295,6 +1470,7 @@ impl K1Pipeline {
             output,
             batch,
             Some(geom),
+            None,
         )
     }
 
@@ -1313,6 +1489,7 @@ impl K1Pipeline {
         output: &wgpu::Buffer,
         batch: u32,
         geom: Option<&K1ActGeom>,
+        window: Option<&RowWindow>,
     ) -> Result<K1Call> {
         if batch == 0 {
             return Err(WgpuError::InvalidTensor {
@@ -1363,11 +1540,17 @@ impl K1Pipeline {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: input.as_entire_binding(),
+                resource: match window {
+                    Some(w) => w.in_binding(input),
+                    None => input.as_entire_binding(),
+                },
             },
             wgpu::BindGroupEntry {
                 binding: 2,
-                resource: output.as_entire_binding(),
+                resource: match window {
+                    Some(w) => w.out_binding(output),
+                    None => output.as_entire_binding(),
+                },
             },
             wgpu::BindGroupEntry {
                 binding: 3,
@@ -1395,7 +1578,13 @@ impl K1Pipeline {
                 cols: weights.in_features as u64,
                 quant: "Q4_K",
                 weight_bytes: weights.byte_len,
-                shape: format!("batch={batch} act={} grid={}x{}", self.act, grid.0, grid.1),
+                shape: format!(
+                    "batch={batch} act={} grid={}x{}{}",
+                    self.act,
+                    grid.0,
+                    grid.1,
+                    window.map_or_else(String::new, |w| w.stamp_suffix())
+                ),
             }),
         })
     }

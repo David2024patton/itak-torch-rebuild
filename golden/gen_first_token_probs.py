@@ -4,10 +4,25 @@
 For each prompt in the golden prompt set this records the top 5
 candidate first tokens with their probabilities, as reported by a
 throwaway CPU llama-server (/completion, n_predict=1, n_probs=5,
-temperature 0). The probability-level reference complements the
-token-level fixtures: an engine's logit path (final norm, softcap,
-logit scale) can be checked against these numbers within tolerance
-even where its greedy trajectory would match anyway.
+temperature 0). The probabilities are PRE-sampling (logit)
+probabilities: the request sets post_sampling_probs=false, because
+post-sampling probabilities at temperature 0 collapse to a one-hot
+(the sampled token reports prob 1.0 and the alternatives vanish),
+which is useless as a reference. With post_sampling_probs=false
+this llama.cpp build answers with "top_logprobs" (log-probabilities
+from the raw logit distribution, server-task.cpp
+completion_token_output::to_json); the generator converts them back
+with exp() so the fixture carries plain probabilities. The
+probability-level reference complements the token-level fixtures:
+an engine's logit path (final norm, softcap, logit scale) can be
+checked against these numbers within tolerance even where its
+greedy trajectory would match anyway.
+
+A hard validation guard runs before anything is written: every
+record must hold exactly N_PROBS top entries and the top-1
+probabilities must not be degenerate (all exactly 1.0). A run that
+fails the guard raises and writes no fixture, so a bad probability
+run can never file silently.
 
 Same discipline as gen_golden.py: CPU only (-ngl 0), localhost,
 port 18923 by default, the server is terminated in a finally block,
@@ -31,6 +46,7 @@ Standard library only.
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 import sys
 import tempfile
@@ -105,7 +121,7 @@ def complete_first(port, prompt):
         "temperature": TEMPERATURE,
         "seed": SEED,
         "n_probs": N_PROBS,
-        "post_sampling_probs": True,
+        "post_sampling_probs": False,
         "cache_prompt": False,
     }).encode("utf-8")
     req = urllib.request.Request(
@@ -114,6 +130,30 @@ def complete_first(port, prompt):
     )
     with urllib.request.urlopen(req, timeout=900) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def validate_records(records):
+    """Hard guard: refuse to file a degenerate probability fixture.
+
+    Every record must carry exactly N_PROBS top entries, and the
+    top-1 probabilities must not all be exactly 1.0 (the signature
+    of post-sampling probabilities at temperature 0, which collapse
+    to a one-hot). Raises RuntimeError, so the run exits nonzero
+    and no fixture is written.
+    """
+    for r in records:
+        if len(r["top5"]) != N_PROBS:
+            raise RuntimeError(
+                f"validation failed: {r['id']} has {len(r['top5'])} top "
+                f"entries, expected exactly {N_PROBS}; refusing to "
+                f"write a degenerate fixture"
+            )
+    if records and all(r["top5"][0]["prob"] == 1.0 for r in records):
+        raise RuntimeError(
+            "validation failed: every top-1 probability is exactly "
+            "1.0 (degenerate one-hot, the post-sampling-at-temperature-0 "
+            "signature); refusing to write a degenerate fixture"
+        )
 
 
 def main():
@@ -143,7 +183,7 @@ def main():
         "flags": {
             "n_gpu_layers": 0, "ctx_size": CTX, "threads": THREADS,
             "n_predict": 1, "n_probs": N_PROBS, "temperature": TEMPERATURE,
-            "seed": SEED, "post_sampling_probs": True,
+            "seed": SEED, "post_sampling_probs": False,
             "chat_template": "none (raw completion)",
         },
         "prompts_file": args.prompts.name,
@@ -177,16 +217,21 @@ def main():
                     f"{p['id']}: expected exactly 1 probability step, "
                     f"got {len(steps)}"
                 )
-            # This llama.cpp build reports the per-step alternatives
-            # under "top_probs", each {"id", "token", "bytes", "prob"}
-            # (server-task.cpp, completion_token_output::to_json).
-            if "top_probs" not in steps[0]:
+            # Pre-sampling (post_sampling_probs=false): this llama.cpp
+            # build reports the per-step alternatives under
+            # "top_logprobs", each {"id", "token", "bytes", "logprob"}
+            # holding the log-probability from the raw logit
+            # distribution (server-task.cpp,
+            # completion_token_output::to_json). Convert back to plain
+            # probabilities with exp() for the fixture.
+            if "top_logprobs" not in steps[0]:
                 raise RuntimeError(
-                    f"{p['id']}: step has no top_probs; keys are "
+                    f"{p['id']}: step has no top_logprobs; keys are "
                     f"{sorted(steps[0].keys())}"
                 )
-            top5 = [{"id": pr["id"], "text": pr["token"], "prob": pr["prob"]}
-                    for pr in steps[0]["top_probs"][:N_PROBS]]
+            top5 = [{"id": pr["id"], "text": pr["token"],
+                     "prob": math.exp(pr["logprob"])}
+                    for pr in steps[0]["top_logprobs"][:N_PROBS]]
             records.append({
                 "id": p["id"],
                 "category": p["category"],
@@ -204,6 +249,8 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    validate_records(records)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:

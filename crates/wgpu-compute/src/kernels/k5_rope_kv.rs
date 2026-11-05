@@ -137,6 +137,9 @@ pub struct K5RotateCall {
     bind_group: wgpu::BindGroup,
     params: wgpu::Buffer,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K5RotateCall {
@@ -155,9 +158,13 @@ impl K5RotateCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the rotation at a new absolute start position (the
@@ -183,6 +190,9 @@ pub struct K5AppendCall {
     bind_group: wgpu::BindGroup,
     params: wgpu::Buffer,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K5AppendCall {
@@ -201,9 +211,13 @@ impl K5AppendCall {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Point the append at a new absolute start position (the
@@ -319,6 +333,14 @@ impl K5Pipeline {
             bind_group,
             params: params_buf,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k5_rope_rotate",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("heads={heads} head_dim={head_dim} start={start_position}"),
+            }),
         })
     }
 
@@ -428,6 +450,14 @@ impl K5Pipeline {
             bind_group,
             params: params_buf,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k5_kv_append",
+                rows: rows as u64,
+                cols: kv_width as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("rows={rows} kv_width={kv_width}"),
+            }),
         })
     }
 

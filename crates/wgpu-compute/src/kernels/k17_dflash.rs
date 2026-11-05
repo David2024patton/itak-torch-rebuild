@@ -324,6 +324,9 @@ pub struct K17RotateCall {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K17RotateCall {
@@ -340,9 +343,13 @@ impl K17RotateCall {
     /// Record this dispatch into an already-open compute
     /// pass (the session composition form).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -358,6 +365,9 @@ pub struct K17AttendCall {
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
     params: Arc<wgpu::Buffer>,
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 /// Byte offset of the `block_start` field in the attend
@@ -381,9 +391,13 @@ impl K17AttendCall {
     /// Record this dispatch into an already-open compute
     /// pass (the session composition form).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 
     /// Rewrite the runtime params (block start position,
@@ -496,6 +510,14 @@ impl K17Pipeline {
             pipeline: self.rotate.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k17_dflash_rotate",
+                rows: rows as u64,
+                cols: (heads * head_dim) as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("rows={rows} heads={heads} head_dim={head_dim}"),
+            }),
         })
     }
 
@@ -632,6 +654,16 @@ impl K17Pipeline {
             bind_group,
             grid: ((rows * q_heads) as u32, 1),
             params: params_buf,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k17_dflash_attend",
+                rows: rows as u64,
+                cols: key_len as u64,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!(
+                    "rows={rows} q_heads={q_heads} kv_heads={kv_heads} key_len={key_len} value_len={value_len} block_rows={block_rows}"
+                ),
+            }),
         })
     }
 }

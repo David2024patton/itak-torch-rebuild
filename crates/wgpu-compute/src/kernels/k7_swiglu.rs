@@ -95,6 +95,9 @@ pub struct K7Call {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K7Call {
@@ -113,9 +116,13 @@ impl K7Call {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -155,7 +162,9 @@ impl K7Pipeline {
 
     /// Prepare an elementwise dispatch over device buffers:
     /// `out[i] = op(a[i], b[i])` for `n` elements, through
-    /// `pipeline`.
+    /// `pipeline`. The mode tag rides along so the diag stamp
+    /// can name the operation (swiglu vs gate).
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &self,
         ctx: &GpuContext,
@@ -164,6 +173,7 @@ impl K7Pipeline {
         b: &wgpu::Buffer,
         out: &wgpu::Buffer,
         n: usize,
+        mode: &'static str,
     ) -> K7Call {
         let total = (n as u64).div_ceil(u64::from(WORKGROUP));
         let grid = crate::kernels::k1_q4k_gemv::grid_dims(total);
@@ -196,6 +206,14 @@ impl K7Pipeline {
             pipeline: pipeline.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k7_swiglu_gate",
+                rows: n as u64,
+                cols: 1,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("mode={mode} n={n}"),
+            }),
         }
     }
 
@@ -209,7 +227,7 @@ impl K7Pipeline {
         out: &wgpu::Buffer,
         n: usize,
     ) -> K7Call {
-        self.prepare(ctx, &self.swiglu, gate, up, out, n)
+        self.prepare(ctx, &self.swiglu, gate, up, out, n, "swiglu")
     }
 
     /// Prepare an attention-gate dispatch over device buffers:
@@ -223,7 +241,7 @@ impl K7Pipeline {
         out: &wgpu::Buffer,
         n: usize,
     ) -> K7Call {
-        self.prepare(ctx, &self.gate, attn_out, gate, out, n)
+        self.prepare(ctx, &self.gate, attn_out, gate, out, n, "gate")
     }
 
     /// Shared elementwise body: upload both operands, dispatch,
@@ -248,7 +266,7 @@ impl K7Pipeline {
         let a_buf = ctx.upload_f32("k7 a", a);
         let b_buf = ctx.upload_f32("k7 b", b);
         let out_buf = ctx.scratch_buffer("k7 output", (a.len() * 4) as u64);
-        let call = self.prepare(ctx, pipeline, &a_buf, &b_buf, &out_buf, a.len());
+        let call = self.prepare(ctx, pipeline, &a_buf, &b_buf, &out_buf, a.len(), what);
         let mut encoder = ctx
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {

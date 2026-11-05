@@ -383,6 +383,9 @@ pub struct K4Call {
     pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     grid: (u32, u32),
+    /// Diag timestamp stamp (see `crate::timestamps`); `None`
+    /// unless the context carries a recorder.
+    diag: Option<crate::timestamps::DiagStamp>,
 }
 
 impl K4Call {
@@ -401,9 +404,13 @@ impl K4Call {
     /// per segment (wgpu inserts the hazard barriers
     /// between dispatches inside the pass).
     pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
     }
 }
 
@@ -546,6 +553,14 @@ impl K4Pipeline {
             pipeline: self.norm.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k4_rmsnorm",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: weight.map_or(0, |w| w.size()),
+                shape: format!("mode={mode_value} rows={rows} width={width}"),
+            }),
         }
     }
 
@@ -703,6 +718,14 @@ impl K4Pipeline {
             pipeline: self.chain.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k4_norm_chain",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: w_post.size() + w_pre.size(),
+                shape: format!("rows={rows} width={width}"),
+            }),
         })
     }
 
@@ -789,6 +812,14 @@ impl K4Pipeline {
             pipeline: self.close.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k4_norm_close",
+                rows: rows as u64,
+                cols: width as u64,
+                quant: "",
+                weight_bytes: w_post.size() + w_final.size(),
+                shape: format!("rows={rows} width={width}"),
+            }),
         })
     }
 
@@ -833,6 +864,14 @@ impl K4Pipeline {
             pipeline: self.add.clone(),
             bind_group,
             grid,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k4_add",
+                rows: n as u64,
+                cols: 1,
+                quant: "",
+                weight_bytes: 0,
+                shape: format!("n={n}"),
+            }),
         }
     }
 

@@ -71,6 +71,7 @@ pub mod diag;
 pub mod error;
 pub mod kernels;
 pub mod session;
+pub mod timestamps;
 
 pub use compute::WgpuCompute;
 pub use detect::{detect, AdapterFacts, DetectPolicy};
@@ -108,3 +109,6 @@ pub use kernels::k8_head::{
 };
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
 pub use session::{ResidentSession, SessionStats};
+pub use timestamps::{
+    DiagMode, DiagRecorder, DiagStamp, DispatchMeta, DispatchRecord, KernelSummary,
+};

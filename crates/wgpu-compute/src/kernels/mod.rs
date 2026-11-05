@@ -57,6 +57,18 @@
 //! Q5_K, Q6_K). The session routes to it only under
 //! its env-set threshold, which defaults off; see the
 //! module's own docs for the reasoning.
+//!
+//! K21 is the Q5_K arm of the register-streaming
+//! small-batch family (K19 carries Q4_K): the same
+//! 2..=16 band as K18, but llama.cpp mul_mat_vec's
+//! shape instead of the MMQ's: weights dequantize in
+//! registers and are never staged in workgroup
+//! memory, the batch lives inside the workgroup as
+//! generation-specialized register accumulators, and
+//! the only workgroup array is the reduction
+//! partials. The session routes to it only under the
+//! shared MMV env threshold, which defaults off; see
+//! the module's own docs for the reasoning.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -68,6 +80,7 @@ pub mod k16_q6k_mmq_wide;
 pub mod k17_dflash;
 pub mod k18_small_batch;
 pub mod k1_q4k_gemv;
+pub mod k21_q5k_mmv;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;
 pub mod k4_rmsnorm;

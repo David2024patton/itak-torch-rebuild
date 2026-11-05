@@ -45,6 +45,7 @@ use crate::kernels::k16_q6k_mmq_wide::K16Pipeline;
 use crate::kernels::k17_dflash::K17Pipeline;
 use crate::kernels::k18_small_batch::{K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline};
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
+use crate::kernels::k21_q5k_mmv::K21Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -124,6 +125,41 @@ fn resolve_small_batch_max_rows(raw: Option<&str>) -> u32 {
             .parse::<u32>()
             .unwrap_or(DEFAULT_SMALL_BATCH_MAX_ROWS),
         None => DEFAULT_SMALL_BATCH_MAX_ROWS,
+    }
+}
+
+/// Environment variable naming the register-streaming
+/// small-batch (MMV) threshold override: the largest
+/// batch row count at which the session prefers the
+/// register-streaming products (K19 for Q4_K, K21 for
+/// Q5_K) over the K18 and GEMV forms, inside the band
+/// from 2 rows up. Operational config, not a compiled
+/// constant: set it to 16 to enable the MMV forms
+/// across their band (each kernel itself refuses past
+/// its cap), or leave it at the default to keep them
+/// out of the ladder entirely. An unparsable value
+/// falls back to [`DEFAULT_MMV_MAX_ROWS`], with the
+/// fallback logged at construction.
+pub const MMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_MMV_MAX_ROWS";
+
+/// The MMV row threshold when the environment does not
+/// override it: 1, which is OFF, since the ladder only
+/// routes batches of 2 or more rows to the MMV forms.
+/// The shipped default follows the wide-MMQ and K18
+/// precedent: an unproven kernel does not enter the
+/// ladder by default. The server proofs that can move
+/// this value are sequenced in
+/// bench/mmv-prototype-2026-11-05.md (Q4_K) and
+/// bench/mmv-q5k-2026-11-05.md (Q5_K).
+pub const DEFAULT_MMV_MAX_ROWS: u32 = 1;
+
+/// Resolve the MMV row threshold from the raw
+/// environment value: a plain u32, or the default when
+/// unset or unparsable.
+fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
+    match raw {
+        Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_MMV_MAX_ROWS),
+        None => DEFAULT_MMV_MAX_ROWS,
     }
 }
 
@@ -231,6 +267,8 @@ pub struct WgpuCompute {
     k18_q6k: Option<K18Q6KPipeline>,
     k18_q5k: Option<K18Q5KPipeline>,
     small_batch_max_rows: u32,
+    k21: K21Pipeline,
+    mmv_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
 }
@@ -354,6 +392,23 @@ impl WgpuCompute {
             k18_q6k.is_some(),
             k18_q5k.is_some()
         );
+        // The register-streaming small-batch product
+        // (K21, the Q5_K arm of the MMV family):
+        // unconditional, because its only workgroup
+        // memory is the reduction partials, so no
+        // device class refuses it the way the staged
+        // sets are refused. The row threshold at which
+        // the session starts preferring the MMV forms
+        // is config, read here (see MMV_MAX_ROWS_ENV);
+        // the default keeps them out of the ladder
+        // until the server proof moves it.
+        let k21 = K21Pipeline::new(&ctx.device)?;
+        let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
+        dbg_log!(
+            "mmv config: max_rows={mmv_max_rows} (env {MMV_MAX_ROWS_ENV}, \
+             default {DEFAULT_MMV_MAX_ROWS}); k21={}",
+            k21.shape().name()
+        );
         dbg_log!("backend ready on {}", ctx.adapter.name);
         Ok(WgpuCompute {
             ctx,
@@ -387,6 +442,8 @@ impl WgpuCompute {
             k18_q6k,
             k18_q5k,
             small_batch_max_rows,
+            k21,
+            mmv_max_rows,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
         })
@@ -601,6 +658,27 @@ impl WgpuCompute {
     /// default (1) routes nothing.
     pub(crate) fn small_batch_max_rows(&self) -> u32 {
         self.small_batch_max_rows
+    }
+
+    /// The K21 (Q5_K register-streaming small-batch)
+    /// pipeline. Unconditional: its only workgroup
+    /// memory is the reduction partials, so no device
+    /// class refuses it. See [`WgpuCompute::k18_q4k`]
+    /// for the staged sets' fallback contract.
+    pub(crate) fn k21(&self) -> &K21Pipeline {
+        &self.k21
+    }
+
+    /// The largest batch row count at which the resident
+    /// session prefers the register-streaming products
+    /// (the MMV family: K19 for Q4_K, K21 for Q5_K) over
+    /// the K18 and GEMV forms, inside the band from 2
+    /// rows up: config resolved at construction from
+    /// [`MMV_MAX_ROWS_ENV`], never a constant compiled
+    /// into the selection seam. The shipped default (1)
+    /// routes nothing.
+    pub(crate) fn mmv_max_rows(&self) -> u32 {
+        self.mmv_max_rows
     }
 
     /// Drop all stored KV state, device buffers and host mirror.
@@ -1142,5 +1220,25 @@ mod tests {
             resolve_small_batch_max_rows(Some("-2")),
             DEFAULT_SMALL_BATCH_MAX_ROWS
         );
+    }
+
+    #[test]
+    fn mmv_max_rows_resolution() {
+        // Unset: the default, which is off (1 routes
+        // nothing, since the ladder's band starts at 2).
+        assert_eq!(resolve_mmv_max_rows(None), DEFAULT_MMV_MAX_ROWS);
+        assert_eq!(DEFAULT_MMV_MAX_ROWS, 1);
+        // Plain values pass through, including the
+        // proof positions: 15 (the routed band under
+        // GEMM_MIN_ROWS) and 16 (the kernels' full
+        // band).
+        assert_eq!(resolve_mmv_max_rows(Some("15")), 15);
+        assert_eq!(resolve_mmv_max_rows(Some("16")), 16);
+        assert_eq!(resolve_mmv_max_rows(Some(" 0 ")), 0);
+        // Unparsable values fall back to the default
+        // rather than failing backend construction.
+        assert_eq!(resolve_mmv_max_rows(Some("mmv")), DEFAULT_MMV_MAX_ROWS);
+        assert_eq!(resolve_mmv_max_rows(Some("")), DEFAULT_MMV_MAX_ROWS);
+        assert_eq!(resolve_mmv_max_rows(Some("-2")), DEFAULT_MMV_MAX_ROWS);
     }
 }

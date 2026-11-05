@@ -19,6 +19,7 @@ wgpu = "27"
 
 [dev-dependencies]
 cpu-compute = { path = "../cpu-compute" }
+naga = "27"
 pollster = "0.4"
 torch-math = { path = "../torch-math" }
 wgpu = "27"

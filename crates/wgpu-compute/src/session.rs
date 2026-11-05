@@ -97,6 +97,7 @@ use crate::kernels::k15_q4k_mmq_wide::K15Call;
 use crate::kernels::k16_q6k_mmq_wide::K16Call;
 use crate::kernels::k18_small_batch::K18Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
+use crate::kernels::k21_q5k_mmv::K21Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
@@ -368,6 +369,10 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K18Call,
     },
+    /// K21 (Q5_K register-streaming small-batch) dispatch:
+    /// one dispatch, no quantize (the MMV form reads the
+    /// f32 input directly, like the GEMV).
+    MmvQ5K(K21Call),
 }
 
 impl ProjCall {
@@ -415,6 +420,7 @@ impl ProjCall {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
             }
+            ProjCall::MmvQ5K(c) => c.encode_into(pass),
         }
     }
 
@@ -914,17 +920,61 @@ fn try_small_q5k(
     }
 }
 
+/// Whether `batch` sits in the register-streaming
+/// (MMV) band the backend's config enables: 2 rows up
+/// to the resolved `mmv_max_rows` threshold (default
+/// 1, which enables nothing). Each MMV kernel's own
+/// cap ([`crate::kernels::k21_q5k_mmv::MMV_MAX_BATCH`]
+/// for K21) bounds the band from above at prepare.
+fn mmv_applies(backend: &WgpuCompute, batch: u32) -> bool {
+    batch >= 2 && batch <= backend.mmv_max_rows()
+}
+
+/// Try the K21 register-streaming form of a plain
+/// Q5_K projection: the f32 input feeds the product
+/// directly, no quantize dispatch. `None` when the
+/// batch is outside the configured band or the
+/// prepare refuses the shape (logged by name): the
+/// caller then continues down the ladder. This is the
+/// fallback ladder's composition step, at plan-build
+/// time; it never substitutes inside a dispatch.
+fn try_mmv_q5k(
+    backend: &WgpuCompute,
+    weights: &K3Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<ProjCall> {
+    if !mmv_applies(backend, batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    match backend.k21().prepare(ctx, weights, input, output, batch) {
+        Ok(c) => Some(ProjCall::MmvQ5K(c)),
+        Err(e) => {
+            dbg_log!("mmv q5k refused at the product prepare: {e}; the ladder continues");
+            None
+        }
+    }
+}
+
 /// Prepare one projection dispatch over resident buffers.
 /// At chunk sizes past [`GEMM_MIN_ROWS`] the Q4_K and Q6_K
 /// families dispatch through the matrix-matrix forms: the
 /// MMQ pair when the backend built it, the GEMM kernels
 /// (K10/K11) behind them when it built those; below the
 /// threshold, and for Q5_K (the one-row head) at any size,
-/// the GEMV kernels run. One rung sits between those: in
-/// the small-batch band (2 rows up to the backend's
-/// configured `small_batch_max_rows`, shipped off), the
-/// K18 small-batch products serve all three families
-/// when the backend built them. Every form consumes the
+/// the GEMV kernels run. Two rungs sit between those: in
+/// the register-streaming band (2 rows up to the backend's
+/// configured `mmv_max_rows`, shipped off), the MMV
+/// products serve their families first (K21 for Q5_K),
+/// because the register-streaming form is the band's
+/// structural challenger and the A/B should not be
+/// confounded; behind them, in the small-batch band (2
+/// rows up to the backend's configured
+/// `small_batch_max_rows`, shipped off), the K18
+/// small-batch products serve all three families when
+/// the backend built them. Every form consumes the
 /// same resident buffers, so the choice never changes
 /// the chain's data layout. `share` is the layer stage's
 /// shared `h` quantize (see [`HShare`]) when this
@@ -994,6 +1044,9 @@ fn prepare_proj(
                 .map_err(|e| we(e, step))
         }
         ProjWeights::Q5K(w) => {
+            if let Some(c) = try_mmv_q5k(backend, w, input, output, batch) {
+                return Ok(c);
+            }
             if let Some(c) = try_small_q5k(backend, w, input, q8_qs, q8_ds, output, batch) {
                 return Ok(c);
             }

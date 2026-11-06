@@ -97,6 +97,7 @@ pub use kernels::k1_q4k_gemv::{
 };
 pub use kernels::k20_q6k_mmv::{K20Call, K20Pipeline};
 pub use kernels::k21_q5k_mmv::{K21Call, K21Pipeline, K21Shape};
+pub use kernels::k21_q5k_mmv_finish::{K21FinishCall, K21FinishPipeline};
 pub use kernels::k22_q4k_mmq::{k22_staging_bytes, K22Call, K22Pipeline};
 pub use kernels::k23_q4k_mmq::{k23_staging_bytes, K23Call, K23Pipeline};
 pub use kernels::k2_q6k_gemv::{K2Call, K2Pipeline, K2Shape, K2Weights};

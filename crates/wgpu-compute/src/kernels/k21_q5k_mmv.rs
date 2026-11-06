@@ -251,8 +251,12 @@ pub fn shipped_shape(features: wgpu::Features) -> K21Shape {
 
 /// IEEE 754 half to f32, shared WGSL text (K3's,
 /// mirroring gguf::dequant::f16_to_f32 for every value
-/// a weight file can hold).
-const F16_TO_F32_WGSL: &str = r#"
+/// a weight file can hold). `pub(crate)` because the
+/// finish-carrying variant
+/// (`k21_q5k_mmv_finish`) binds the same text into
+/// its generated shaders: the two generators must not
+/// be able to drift on the conversion.
+pub(crate) const F16_TO_F32_WGSL: &str = r#"
 // IEEE 754 half to f32, mirroring gguf::dequant::f16_to_f32 for
 // every value a weight file can hold (normals, subnormals, zero;
 // inf and NaN payloads keep their class).

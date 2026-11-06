@@ -861,6 +861,93 @@ fn k21_q5k_mmv_shaders_compile_on_any_available_adapter() {
     }
 }
 
+/// The K21F (finish-carrying Q5_K register-streaming)
+/// shaders on any adapter wgpu enumerates here: the
+/// shipped pipeline builds, and every generated batch
+/// variant in the band compiles for every reduction
+/// shape the device can run. The finish is uniform
+/// state, not a generation literal, so the variant
+/// count is K21's (one per batch); what this gate adds
+/// over K21's is that the finish-carrying text (the
+/// params tail, the `finish_apply` prelude, the
+/// wrapped stores) compiles everywhere K21's does.
+#[test]
+fn k21_finish_shaders_compile_on_any_available_adapter() {
+    use wgpu_compute::kernels::k21_q5k_mmv::{K21Shape, MMV_MAX_BATCH, MMV_MIN_BATCH};
+    use wgpu_compute::K21FinishPipeline;
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::all(),
+        ..Default::default()
+    });
+    let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+    let Some(adapter) = adapters.into_iter().next() else {
+        eprintln!("skipping k21 finish compile test: wgpu enumerates no adapters here");
+        return;
+    };
+    let info = adapter.get_info();
+    let wanted = adapter.features() & (wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16);
+    let (device, _queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("wgpu-compute k21 finish compile test"),
+        required_features: wanted,
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    }))
+    .expect("device for k21 finish compile test");
+    let features = device.features();
+    // The shipped pipeline builds on any adapter: its
+    // only workgroup memory is the reduction partials,
+    // far under the default grant.
+    let _pipeline = K21FinishPipeline::new(&device)
+        .unwrap_or_else(|e| panic!("K21 finish pipeline must build on {}: {e}", info.name));
+    eprintln!(
+        "K21 finish shipped shader compiled on {} ({:?})",
+        info.name, info.backend
+    );
+    // Every batch variant in the band compiles, for
+    // every shape the device can run.
+    for shape in [K21Shape::new(2, 128), K21Shape::new(2, 128).with_subgroup()] {
+        let pipe = match K21FinishPipeline::with_shape(&device, shape) {
+            Ok(p) => p,
+            Err(e) => {
+                // A refusal is only acceptable when it
+                // names the feature this device was not
+                // granted.
+                assert!(
+                    shape.subgroup && !features.contains(wgpu::Features::SUBGROUP),
+                    "shape {} must build on {} with features {features:?}: {e}",
+                    shape.name(),
+                    info.name
+                );
+                eprintln!("shape {} refused as expected: {e}", shape.name());
+                continue;
+            }
+        };
+        for batch in MMV_MIN_BATCH..=MMV_MAX_BATCH {
+            pipe.precompile(&device, batch).unwrap_or_else(|e| {
+                panic!(
+                    "k21 finish shape {} batch {batch} must compile on {}: {e}",
+                    shape.name(),
+                    info.name
+                )
+            });
+        }
+        eprintln!(
+            "k21 finish shape {} compiled all batches {MMV_MIN_BATCH}..={MMV_MAX_BATCH} on {}",
+            shape.name(),
+            info.name
+        );
+        // Past the cap the variant request refuses by
+        // name.
+        let err = pipe
+            .precompile(&device, MMV_MAX_BATCH + 1)
+            .expect_err("batch past the cap must refuse");
+        assert!(
+            err.to_string().contains("outside 2..=16"),
+            "refusal names the band: {err}"
+        );
+    }
+}
+
 #[test]
 fn k22_mmq_shader_compiles_on_any_available_adapter() {
     use wgpu_compute::kernels::k22_q4k_mmq::k22_staging_bytes;

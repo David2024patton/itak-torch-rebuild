@@ -48,6 +48,7 @@ use crate::kernels::k19_q4k_mmv::{K19Pipeline, MMV_MAX_BATCH, MMV_MIN_BATCH};
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k20_q6k_mmv::K20Pipeline;
 use crate::kernels::k21_q5k_mmv::K21Pipeline;
+use crate::kernels::k21_q5k_mmv_finish::K21FinishPipeline;
 use crate::kernels::k22_q4k_mmq::K22Pipeline;
 use crate::kernels::k23_q4k_mmq::K23Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
@@ -738,6 +739,12 @@ pub struct WgpuCompute {
     k19: K19Pipeline,
     k20: K20Pipeline,
     k21: K21Pipeline,
+    // Registered at construction, routed nowhere
+    // yet: the routing lane (bench/k21-finish-
+    // 2026-11-06.md) is its first reader. Remove
+    // this allowance when that lane lands.
+    #[allow(dead_code)]
+    k21_finish: K21FinishPipeline,
     mmv_max_rows: u32,
     mmv_bands: MmvBands,
     chunked_gemv_max_rows: u32,
@@ -926,6 +933,18 @@ impl WgpuCompute {
         let k19 = K19Pipeline::new(&ctx.device)?;
         let k20 = K20Pipeline::new(&ctx.device)?;
         let k21 = K21Pipeline::new(&ctx.device)?;
+        // The finish-carrying form of K21, for the
+        // Q5_K head sites: plain K21 cannot serve them
+        // (they prepare K3 with the fused scale and
+        // softcap finish), which is why the 2026-11-06
+        // verdict shows K21 firing zero times in the
+        // real forward. Built unconditionally like its
+        // sibling, and routed NOWHERE yet: the
+        // session's head sites keep preparing K3 until
+        // the routing change lands under the same MMV
+        // threshold (proof sequence in
+        // bench/k21-finish-2026-11-06.md).
+        let k21_finish = K21FinishPipeline::new(&ctx.device)?;
         let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
         log_mmv_band_fallbacks();
         let mmv_bands = resolve_mmv_bands(|name| std::env::var(name).ok());
@@ -993,6 +1012,7 @@ impl WgpuCompute {
             k19,
             k20,
             k21,
+            k21_finish,
             mmv_max_rows,
             mmv_bands,
             chunked_gemv_max_rows,
@@ -1288,6 +1308,23 @@ impl WgpuCompute {
     /// for the staged sets' fallback contract.
     pub(crate) fn k21(&self) -> &K21Pipeline {
         &self.k21
+    }
+
+    /// The K21 finish-carrying pipeline (the Q5_K
+    /// register-streaming small-batch product with
+    /// K3's fused head finish at its reduction's final
+    /// store), for the resident session's Q5_K head
+    /// sites. Registered at construction and routed to
+    /// by nothing yet: no session code prepares it in
+    /// this change (see the construction note in
+    /// [`WgpuCompute::from_context`] and
+    /// bench/k21-finish-2026-11-06.md). The
+    /// `dead_code` allowance beside it and on the
+    /// field is the registration marker: remove both
+    /// when the routing lane lands.
+    #[allow(dead_code)]
+    pub(crate) fn k21_finish(&self) -> &K21FinishPipeline {
+        &self.k21_finish
     }
 
     /// The largest batch row count at which the resident
@@ -2256,5 +2293,30 @@ mod tests {
             resolve_chunked_gemv_max_rows(Some("-2")),
             DEFAULT_CHUNKED_GEMV_MAX_ROWS
         );
+    }
+
+    #[test]
+    fn k21_finish_pipeline_is_registered() {
+        // Registration proof: a backend that
+        // constructs carries the finish-carrying K21
+        // pipeline, under the same shipped shape as
+        // plain K21 (the finish changes the store, not
+        // the tile). Skips where no adapter qualifies
+        // (this VM); executes on the card, where the
+        // construction-time compile of the band-floor
+        // finish variant is itself part of the gate.
+        let backend = match WgpuCompute::new() {
+            Ok(b) => b,
+            Err(crate::error::WgpuError::NoSuitableAdapter { seen, .. }) => {
+                eprintln!(
+                    "skipping k21 finish registration test: no suitable adapter \
+                     (enumerated: [{}])",
+                    seen.join("; ")
+                );
+                return;
+            }
+            Err(e) => panic!("backend construction failed unexpectedly: {e}"),
+        };
+        assert_eq!(backend.k21_finish().shape(), backend.k21().shape());
     }
 }

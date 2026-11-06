@@ -83,6 +83,19 @@
 //! routing table; see the module's own docs for the
 //! reasoning.
 //!
+//! K21F is K21's finish-carrying form: the same
+//! register-streaming Q5_K product with the head's
+//! fused finishing map (logit scale, tanh softcap,
+//! K3's modes and expressions) applied at the
+//! reduction's final store, built because the
+//! 2026-11-06 verdict showed plain K21 never fires
+//! in the real forward: on the current model file
+//! the Q5_K tensors are the head, and the head sites
+//! prepare a finish this variant now carries. It is
+//! registered at backend construction and routed
+//! nowhere yet; the routing change and its proof
+//! sequence are in bench/k21-finish-2026-11-06.md.
+//!
 //! K20 is the Q6_K register-streaming small-batch
 //! product: K18's Q6_K band (2..=16 rows, one weight
 //! stream per dispatch) in llama.cpp `mul_mat_vec`'s
@@ -132,6 +145,7 @@ pub mod k19_q4k_mmv;
 pub mod k1_q4k_gemv;
 pub mod k20_q6k_mmv;
 pub mod k21_q5k_mmv;
+pub mod k21_q5k_mmv_finish;
 pub mod k22_q4k_mmq;
 pub mod k23_q4k_mmq;
 pub mod k2_q6k_gemv;

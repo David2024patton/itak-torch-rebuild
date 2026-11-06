@@ -619,6 +619,237 @@ fn k6_flash_matches_two_pass() {
     );
 }
 
+/// Run the staged flash form over the same resident KV as
+/// the shipped flash (and the two-pass form, where the
+/// scores buffer stays a sane size) and compare: the
+/// staged form's per-element operation sequence is the
+/// shipped flash sequence, so its output must reproduce
+/// the shipped output to float-contraction noise, and the
+/// two-pass output to the same tolerance the shipped form
+/// is held to. Skips by name on a device that did not
+/// build the staged pipeline (workgroup storage below its
+/// staging set); on the server card the set fits and this
+/// runs in full.
+fn check_flash_staged(geom: AttendGeom, seed: u64, two_pass: bool) {
+    let Some(gpu) = backend_or_skip() else {
+        return;
+    };
+    let ctx = gpu.context();
+    let k6 = K6Pipeline::new(&ctx.device).expect("k6 pipeline");
+    if !k6.flash_staged_available() {
+        eprintln!(
+            "skipping staged flash check (rows={}, stored={}): the device did \
+             not build the staged pipeline",
+            geom.rows, geom.stored
+        );
+        return;
+    }
+    let q_width = geom.q_heads * geom.head_dim;
+    let kv_width = geom.kv_heads * geom.head_dim;
+    let capacity = geom.ring.unwrap_or(geom.first_pos + geom.stored);
+    let q = ctx.upload_f32("staged flash q", &lcg(seed, geom.rows * q_width));
+    let kv = LayerKv {
+        k: ctx.upload_f32("staged flash kv k", &lcg(seed + 1, capacity * kv_width)),
+        v: ctx.upload_f32("staged flash kv v", &lcg(seed + 2, capacity * kv_width)),
+        capacity,
+    };
+    let out_flash = ctx.scratch_buffer("staged flash out fused", (geom.rows * q_width * 4) as u64);
+    let out_staged =
+        ctx.scratch_buffer("staged flash out staged", (geom.rows * q_width * 4) as u64);
+    let flash = k6
+        .prepare_flash(ctx, &q, &kv, &out_flash, &geom)
+        .expect("prepare flash");
+    let staged = k6
+        .prepare_flash_staged(ctx, &q, &kv, &out_staged, &geom)
+        .expect("prepare staged flash");
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        flash.encode_into(&mut pass);
+        staged.encode_into(&mut pass);
+    }
+    if two_pass {
+        let scores_buf = ctx.scratch_buffer(
+            "staged flash scores",
+            (geom.rows * geom.q_heads * geom.stored * 4) as u64,
+        );
+        let out_two = ctx.scratch_buffer("staged flash out two", (geom.rows * q_width * 4) as u64);
+        let scores = k6
+            .prepare_scores(ctx, &q, &kv, &scores_buf, &geom)
+            .expect("prepare scores");
+        let reduce = k6
+            .prepare_reduce(ctx, &scores_buf, &kv, &out_two, &geom)
+            .expect("prepare reduce");
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            scores.encode_into(&mut pass);
+            reduce.encode_into(&mut pass);
+        }
+        ctx.queue.submit([encoder.finish()]);
+        let want = ctx
+            .read_f32(&out_two, geom.rows * q_width)
+            .expect("read two-pass");
+        let got = ctx
+            .read_f32(&out_staged, geom.rows * q_width)
+            .expect("read staged flash");
+        let d = max_abs(&got, &want);
+        eprintln!(
+            "k6 staged flash vs two-pass (rows={}, stored={}, window={:?}): \
+             max abs diff {d:.3e}",
+            geom.rows, geom.stored, geom.window
+        );
+        assert!(d < 1e-6, "staged flash drifted from two-pass: {d}");
+    } else {
+        ctx.queue.submit([encoder.finish()]);
+    }
+    let want = ctx
+        .read_f32(&out_flash, geom.rows * q_width)
+        .expect("read flash");
+    let got = ctx
+        .read_f32(&out_staged, geom.rows * q_width)
+        .expect("read staged flash");
+    let d = max_abs(&got, &want);
+    eprintln!(
+        "k6 staged flash vs shipped flash (rows={}, stored={}, window={:?}): \
+         max abs diff {d:.3e}",
+        geom.rows, geom.stored, geom.window
+    );
+    assert!(d < 1e-6, "staged flash drifted from shipped flash: {d}");
+}
+
+#[test]
+fn k6_flash_staged_matches_shipped_at_glimmer_shapes() {
+    // The real model geometry throughout: 32 Q heads over
+    // 2 KV heads at head dim 128 (the existing flash tests
+    // run head dim 64; the staged form is specialized to
+    // the 128-wide head, so it is pinned at the real one).
+    //
+    // Global layer, decode row, a stored count that
+    // crosses staged-block boundaries (300 = 9 blocks of
+    // 32 plus a tail of 12). The session never routes a
+    // single row to the staged form, but the kernel itself
+    // must be correct there: the routing is policy, the
+    // kernel is math.
+    check_flash_staged(
+        AttendGeom {
+            rows: 1,
+            q_heads: 32,
+            kv_heads: 2,
+            head_dim: 128,
+            stored: 300,
+            first_pos: 0,
+            start_pos: 299,
+            window: None,
+            ring: None,
+        },
+        51,
+        true,
+    );
+    // A full prefill chunk over a global layer: 64 rows
+    // (8 staged row blocks), 1,024 stored (32 KV blocks).
+    check_flash_staged(
+        AttendGeom {
+            rows: 64,
+            q_heads: 32,
+            kv_heads: 2,
+            head_dim: 128,
+            stored: 1024,
+            first_pos: 0,
+            start_pos: 960,
+            window: None,
+            ring: None,
+        },
+        53,
+        true,
+    );
+    // Row-block edge: 9 rows is one full block of 8 plus a
+    // one-row tail block whose other seven rows must stage,
+    // compute, and never write out.
+    check_flash_staged(
+        AttendGeom {
+            rows: 9,
+            q_heads: 32,
+            kv_heads: 2,
+            head_dim: 128,
+            stored: 300,
+            first_pos: 0,
+            start_pos: 291,
+            window: None,
+            ring: None,
+        },
+        55,
+        true,
+    );
+    // KV-block edges: stored counts just under, exactly at,
+    // and just over one 32-key block.
+    for (stored, start_pos, seed) in [(31usize, 30usize, 57u64), (32, 31, 59), (33, 32, 61)] {
+        check_flash_staged(
+            AttendGeom {
+                rows: 8,
+                q_heads: 32,
+                kv_heads: 2,
+                head_dim: 128,
+                stored,
+                first_pos: 0,
+                start_pos,
+                window: None,
+                ring: None,
+            },
+            seed,
+            true,
+        );
+    }
+    // Sliding layer at the real window: 2,048, ring 2,111
+    // (the session's ring law at the 64-row cap), stored
+    // spanning 66 staged blocks, deep absolute positions.
+    // No two-pass leg: its scores buffer at this geometry
+    // is 17 MB of scratch to re-prove what the smaller
+    // cases already pin; the shipped flash is the reference
+    // here, itself pinned against two-pass above and in
+    // k6_flash_matches_two_pass.
+    check_flash_staged(
+        AttendGeom {
+            rows: 64,
+            q_heads: 32,
+            kv_heads: 2,
+            head_dim: 128,
+            stored: 2111,
+            first_pos: 128_961,
+            start_pos: 131_008,
+            window: Some(2048),
+            ring: Some(2111),
+        },
+        63,
+        false,
+    );
+    // Sliding decode row at the real window, deep in the
+    // ring: the mask must bite the oldest 2,048-window
+    // boundary exactly where the shipped form bites it.
+    check_flash_staged(
+        AttendGeom {
+            rows: 1,
+            q_heads: 32,
+            kv_heads: 2,
+            head_dim: 128,
+            stored: 2048,
+            first_pos: 5000,
+            start_pos: 7047,
+            window: Some(2048),
+            ring: Some(2048),
+        },
+        65,
+        true,
+    );
+}
+
 #[test]
 fn k4_norm_chain_matches_the_two_dispatch_composition() {
     let Some(gpu) = backend_or_skip() else {

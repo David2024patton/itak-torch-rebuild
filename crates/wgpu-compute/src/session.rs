@@ -2905,10 +2905,38 @@ impl ChunkPlan {
             // sliding mask and the chunked ring carry over
             // unchanged, and no scores buffer is materialized
             // at any context length.
-            let flash = backend
-                .k6()
-                .prepare_flash(ctx, &scratch.q_normed, kv_layer, &scratch.attn, &geom)
-                .map_err(|e| we(e, "attention"))?;
+            //
+            // With the backend's staged-flash switch on
+            // (WGPU_COMPUTE_FLASH_STAGED), multi-row plans
+            // take the staged form instead: same bindings,
+            // params, and output, with K/V walked in blocks
+            // of 32 keys staged in workgroup memory (see
+            // FLASH_STAGED_SHADER). Single-row plans keep
+            // the shipped form even with the switch on: a
+            // one-row workgroup would stage a block for one
+            // active row of eight, the same reasoning that
+            // routes llama's N == 1 calls to its scalar path
+            // (ggml-vulkan.cpp, get_fa_tuning_params). With
+            // the switch off, or on a device whose staged
+            // pipeline was never built, this is exactly the
+            // shipped call.
+            let flash = if backend.flash_staged()
+                && rows > 1
+                && backend.k6().flash_staged_available()
+            {
+                backend.k6().prepare_flash_staged(
+                    ctx,
+                    &scratch.q_normed,
+                    kv_layer,
+                    &scratch.attn,
+                    &geom,
+                )
+            } else {
+                backend
+                    .k6()
+                    .prepare_flash(ctx, &scratch.q_normed, kv_layer, &scratch.attn, &geom)
+            }
+            .map_err(|e| we(e, "attention"))?;
             // The gate and the output projection. When the
             // output weights are Q4_K, the gate multiply fuses
             // into the output projection's activation stage

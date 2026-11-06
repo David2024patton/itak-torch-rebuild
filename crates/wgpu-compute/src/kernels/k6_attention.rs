@@ -34,6 +34,14 @@
 //!   session runs it at every shape, decode rows and prefill
 //!   chunks alike (the chunk-plan switch is recorded in
 //!   bench/flash-chunk-2026-11-04.md).
+//! - **Flash, staged**: the same fused math with its memory
+//!   traffic reorganized into llama.cpp's blocked form (see
+//!   [`FLASH_STAGED_SHADER`]): K and V walked in blocks of
+//!   32 keys staged in workgroup memory, 8 query rows per
+//!   workgroup. Env-gated at the backend
+//!   (`WGPU_COMPUTE_FLASH_STAGED` in `crate::compute`) and
+//!   routed only for multi-row calls; the shipped flash
+//!   remains the default and the single-row form.
 //!
 //! KV state: like `cpu-compute`, this backend owns its KV
 //! storage, because the `Cache` trait the forward hands over is
@@ -321,6 +329,241 @@ fn flash_main(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (lane < params.head_dim) {
         out[q_base + lane] = acc / sum;
+    }
+}
+"#;
+
+/// Workgroup-memory bytes the staged flash form below
+/// declares, pinned against its shader text by a unit test:
+/// the K/V block tile (32 keys at a padded 129-float stride,
+/// 4,128 f32), the query block tile (8 rows at the 128-float
+/// head-dim bound, 1,024 f32), and the score tile (8 rows x
+/// 32 keys, 256 f32): (4,128 + 1,024 + 256) * 4 = 21,632
+/// bytes. A device granting less than this does not build
+/// the staged pipeline at all (see
+/// [`K6Pipeline::flash_staged_available`]); the backend
+/// requests the adapter's own limits, and the server card
+/// grants 64 KiB, so the staged set fits there with room.
+pub const FLASH_STAGED_LDS_BYTES: u32 = 21_632;
+
+/// The staged flash shader: the shipped flash math with the
+/// memory traffic reorganized into llama.cpp's blocked form
+/// (parity spec Family 5, bench/llama-parity-specs-2026-11-06.md
+/// gap 5). One workgroup of 256 threads serves a block of
+/// Br = 8 query rows for one Q head and walks the stored
+/// keys in blocks of Bc = 32 (flash_attn_base.glsl:4-21's
+/// Bc; the AMD scalar tuning at head dim 128 and row_split 1
+/// picks block_rows 8 and block_cols 32, ggml-vulkan.cpp:
+/// 1200-1245). Per KV block the workgroup stages the block's
+/// K rows into workgroup memory with coalesced loads, scores
+/// all 8 rows against the staged block, stages the block's
+/// V rows into the same tile, and runs the online-softmax
+/// accumulation reading V from workgroup memory. The query
+/// block is staged once up front. The shipped form, by
+/// contrast, stages only a 256-wide score tile: its score
+/// phase reads every key row from global memory once per
+/// query row and its reduce re-reads every value row from
+/// global memory, which is the traffic that makes its cost
+/// grow quadratically across a prompt (1,013.1 ms at 1,022
+/// tokens, bench/prefill-profile-2026-11-05.md).
+///
+/// Thread map: `tid / 32` is the query row inside the block
+/// and `tid % 32` is the lane. In the score phase lane `j`
+/// owns key `j` of the block and computes the full dot over
+/// the head dim from the two staged tiles. In the reduce
+/// phase lane `l` owns channels `l`, `l + 32`, `l + 64`,
+/// `l + 96` (those under the head dim) of its row and loops
+/// the block's keys in ascending order. The K/V tile's row
+/// stride is padded by one float (head_dim + 1) so the
+/// score phase's simultaneous reads across keys and the
+/// reduce phase's reads across channels both land on
+/// distinct workgroup-memory banks at the head dims this
+/// engine serves (128 and 64, both 0 mod 32).
+///
+/// Correctness contract: the per-element float operation
+/// sequence is the shipped flash kernel's, exactly. Scores
+/// are the same ascending-channel dot products of the same
+/// values, multiplied by the same scale; masked keys take
+/// the same -1.0e30 sentinel; the reduce carries (max, sum,
+/// accumulator) across blocks in ascending key order with
+/// the same per-key rescale and the same skip test. Only
+/// the storage the operands pass through differs (workgroup
+/// tiles instead of global buffers), so the outputs agree
+/// with the shipped form to the bit in exact arithmetic and
+/// to driver float-contraction noise in practice; the
+/// device tests pin them against both the shipped flash and
+/// the two-pass form. Staging reads the same KV slots the
+/// shipped form reads: every key in the stored range is
+/// visible to at least the block row at its own position,
+/// so no slot outside the state's capacity is touched.
+///
+/// Bounds, stated: the head dim is capped at 128 by the
+/// same `check_geom` the shipped form runs (the query tile
+/// is sized at that bound), and the block walk is uniform
+/// across the workgroup (every thread reaches every
+/// barrier; rows past the call's row count stage as zeros,
+/// compute, and are never written out).
+const FLASH_STAGED_SHADER: &str = r#"
+struct FlashParams {
+    rows: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    stored: u32,
+    first_pos: u32,
+    start_pos: u32,
+    window: u32,
+    ring: u32,
+    scale: f32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<f32>;
+@group(0) @binding(2) var<storage, read> values: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> params: FlashParams;
+
+// The K/V block tile: 32 keys at a padded (head_dim + 1)
+// stride, sized at the head-dim bound of 128.
+var<workgroup> kv_tile: array<f32, 4128>;
+// The query block tile: 8 rows at the head-dim bound.
+var<workgroup> q_tile: array<f32, 1024>;
+// The score tile: 8 rows x 32 keys.
+var<workgroup> s_tile: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn flash_staged_main(@builtin(workgroup_id) wid: vec3<u32>,
+                     @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat_wg = wid.y * params.grid_x + wid.x;
+    let head = flat_wg % params.q_heads;
+    let row_block = flat_wg / params.q_heads;
+    let kv_head = head / (params.q_heads / params.kv_heads);
+    let tid = lid.x;
+    let row_in_block = tid / 32u;
+    let lane = tid % 32u;
+    let row = row_block * 8u + row_in_block;
+    let p = params.start_pos + row;
+    let hd = params.head_dim;
+    let stride = hd + 1u;
+
+    // Stage the query block once: rows past the call's row
+    // count stage as zeros (they compute and never write
+    // out, keeping every barrier uniform).
+    for (var e = tid; e < 8u * hd; e += 256u) {
+        let r = e / hd;
+        let d = e % hd;
+        let grow = row_block * 8u + r;
+        var v = 0.0;
+        if (grow < params.rows) {
+            v = q[(grow * params.q_heads + head) * hd + d];
+        }
+        q_tile[r * hd + d] = v;
+    }
+    workgroupBarrier();
+
+    var m = -1.0e30;
+    var sum = 0.0;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
+    for (var t0 = 0u; t0 < params.stored; t0 += 32u) {
+        let block_len = min(32u, params.stored - t0);
+        // Stage this block's K rows, slot-mapped exactly as
+        // the shipped kernels slot them (the ring modulus is
+        // the ring capacity, never the mask window).
+        for (var e = tid; e < block_len * hd; e += 256u) {
+            let j = e / hd;
+            let d = e % hd;
+            let kp = params.first_pos + t0 + j;
+            var slot = kp;
+            if (params.ring != 0u) {
+                slot = kp % params.ring;
+            }
+            kv_tile[j * stride + d] =
+                keys[(slot * params.kv_heads + kv_head) * hd + d];
+        }
+        workgroupBarrier();
+        // Score phase: lane j scores key t0 + j for this
+        // thread's row, the shipped mask and dot order.
+        var sc = -1.0e30;
+        if (lane < block_len) {
+            let kp = params.first_pos + t0 + lane;
+            var visible = kp <= p;
+            if (params.window != 0u && kp + params.window <= p) {
+                visible = false;
+            }
+            if (visible) {
+                var s = 0.0;
+                for (var d = 0u; d < hd; d++) {
+                    s += q_tile[row_in_block * hd + d] * kv_tile[lane * stride + d];
+                }
+                sc = s * params.scale;
+            }
+        }
+        s_tile[row_in_block * 32u + lane] = sc;
+        workgroupBarrier();
+        // Stage this block's V rows into the same tile (the
+        // score phase's reads of the K staging are done).
+        for (var e = tid; e < block_len * hd; e += 256u) {
+            let j = e / hd;
+            let d = e % hd;
+            let kp = params.first_pos + t0 + j;
+            var slot = kp;
+            if (params.ring != 0u) {
+                slot = kp % params.ring;
+            }
+            kv_tile[j * stride + d] =
+                values[(slot * params.kv_heads + kv_head) * hd + d];
+        }
+        workgroupBarrier();
+        // Reduce phase: the shipped online-softmax loop over
+        // the block, ascending, state carried across blocks;
+        // lane l accumulates channels l, l + 32, l + 64,
+        // l + 96 of its row, reading V from the tile.
+        for (var j = 0u; j < block_len; j++) {
+            let s2 = s_tile[row_in_block * 32u + j];
+            if (s2 <= -1.0e29) {
+                continue;
+            }
+            if (s2 > m) {
+                let corr = exp(m - s2);
+                acc0 *= corr;
+                acc1 *= corr;
+                acc2 *= corr;
+                acc3 *= corr;
+                sum *= corr;
+                m = s2;
+            }
+            let w = exp(s2 - m);
+            let vbase = j * stride + lane;
+            acc0 += w * kv_tile[vbase];
+            if (lane + 32u < hd) {
+                acc1 += w * kv_tile[vbase + 32u];
+            }
+            if (lane + 64u < hd) {
+                acc2 += w * kv_tile[vbase + 64u];
+            }
+            if (lane + 96u < hd) {
+                acc3 += w * kv_tile[vbase + 96u];
+            }
+            sum += w;
+        }
+        workgroupBarrier();
+    }
+    if (row < params.rows) {
+        let out_base = (row * params.q_heads + head) * hd + lane;
+        out[out_base] = acc0 / sum;
+        if (lane + 32u < hd) {
+            out[out_base + 32u] = acc1 / sum;
+        }
+        if (lane + 64u < hd) {
+            out[out_base + 64u] = acc2 / sum;
+        }
+        if (lane + 96u < hd) {
+            out[out_base + 96u] = acc3 / sum;
+        }
     }
 }
 "#;
@@ -868,12 +1111,20 @@ impl K6FlashCall {
 }
 
 /// The compiled K6 pipelines (scores, reduce, and the fused
-/// flash form).
+/// flash form, plus the staged flash form when the device
+/// grants its workgroup-memory set).
 #[derive(Debug)]
 pub struct K6Pipeline {
     scores: wgpu::ComputePipeline,
     reduce: wgpu::ComputePipeline,
     flash: wgpu::ComputePipeline,
+    /// The staged flash form (see [`FLASH_STAGED_SHADER`]);
+    /// `None` on a device granting less workgroup storage
+    /// than [`FLASH_STAGED_LDS_BYTES`], with the absence
+    /// logged at construction. Routing to it is the
+    /// backend's config (see `WGPU_COMPUTE_FLASH_STAGED` in
+    /// `crate::compute`), never this struct's decision.
+    flash_staged: Option<wgpu::ComputePipeline>,
 }
 
 impl K6Pipeline {
@@ -900,12 +1151,46 @@ impl K6Pipeline {
         let scores = build(SCORES_SHADER, "scores_main", "k6 attention scores");
         let reduce = build(REDUCE_SHADER, "reduce_main", "k6 attention reduce");
         let flash = build(FLASH_SHADER, "flash_main", "k6 attention flash");
+        // The staged flash form is optional on the K13
+        // terms: a device granting less workgroup storage
+        // than its staging set does not build it, and the
+        // session keeps the shipped flash form there. A
+        // device that does grant the set builds it
+        // unconditionally, so a shader defect fails at
+        // construction, not on first routed use.
+        let granted = device.limits().max_compute_workgroup_storage_size;
+        let flash_staged = if granted >= FLASH_STAGED_LDS_BYTES {
+            Some(build(
+                FLASH_STAGED_SHADER,
+                "flash_staged_main",
+                "k6 attention flash staged",
+            ))
+        } else {
+            dbg_log!(
+                "k6 flash staged unavailable: device grants {granted} bytes of \
+                 workgroup storage, below the staged set's {FLASH_STAGED_LDS_BYTES} bytes"
+            );
+            None
+        };
         dbg_log!("k6 pipelines built");
         Ok(K6Pipeline {
             scores,
             reduce,
             flash,
+            flash_staged,
         })
+    }
+
+    /// Whether the staged flash form was built on this
+    /// device (see [`FLASH_STAGED_SHADER`]). The session
+    /// consults this alongside the backend's routing switch;
+    /// an unavailable staged form is a silent-by-construction
+    /// fallback to the shipped flash, with the absence
+    /// already named in the construction log above and in
+    /// the backend's config line.
+    #[must_use]
+    pub fn flash_staged_available(&self) -> bool {
+        self.flash_staged.is_some()
     }
 
     /// Validate the geometry both kernels are about to run.
@@ -1132,13 +1417,95 @@ impl K6Pipeline {
         out: &wgpu::Buffer,
         geom: &AttendGeom,
     ) -> Result<K6FlashCall> {
+        self.prepare_flash_form(
+            ctx,
+            q,
+            kv,
+            out,
+            geom,
+            &self.flash,
+            "k6_attn_flash",
+            "k6 flash bind group",
+            (geom.rows * geom.q_heads) as u64,
+        )
+    }
+
+    /// Prepare a staged flash dispatch: the same contract,
+    /// bindings, params, and output as [`Self::prepare_flash`],
+    /// run through the staged shader (see
+    /// [`FLASH_STAGED_SHADER`]): one workgroup per block of
+    /// 8 query rows and Q head, K/V walked in staged blocks
+    /// of 32 keys. The session routes here only when the
+    /// backend's flash-staged switch is on and the call has
+    /// more than one row (a one-row call would stage a block
+    /// for a single active row of eight; llama routes N == 1
+    /// to its scalar path on the same reasoning,
+    /// ggml-vulkan.cpp's `get_fa_tuning_params`).
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry,
+    /// or when the staged pipeline was not built on this
+    /// device (workgroup storage below
+    /// [`FLASH_STAGED_LDS_BYTES`]): a named refusal, never a
+    /// silent substitution. Callers that want the fallback
+    /// check [`Self::flash_staged_available`] first, as the
+    /// session does.
+    pub fn prepare_flash_staged(
+        &self,
+        ctx: &GpuContext,
+        q: &wgpu::Buffer,
+        kv: &LayerKv,
+        out: &wgpu::Buffer,
+        geom: &AttendGeom,
+    ) -> Result<K6FlashCall> {
+        let Some(pipeline) = &self.flash_staged else {
+            return Err(WgpuError::InvalidTensor {
+                name: "k6 attention flash staged".to_string(),
+                detail: format!(
+                    "the staged flash pipeline was not built on this device: \
+                     its staging set needs {FLASH_STAGED_LDS_BYTES} bytes of \
+                     workgroup storage"
+                ),
+            });
+        };
+        self.prepare_flash_form(
+            ctx,
+            q,
+            kv,
+            out,
+            geom,
+            pipeline,
+            "k6_attn_flash_staged",
+            "k6 flash staged bind group",
+            ((geom.rows.div_ceil(8)) * geom.q_heads) as u64,
+        )
+    }
+
+    /// The shared body of the two flash prepares: identical
+    /// bind group, params, and call shape; the forms differ
+    /// only in pipeline, diag kernel name, and dispatch grid
+    /// (one workgroup per query row in the shipped form, per
+    /// block of 8 query rows in the staged form).
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_flash_form(
+        &self,
+        ctx: &GpuContext,
+        q: &wgpu::Buffer,
+        kv: &LayerKv,
+        out: &wgpu::Buffer,
+        geom: &AttendGeom,
+        pipeline: &wgpu::ComputePipeline,
+        kernel: &'static str,
+        bind_label: &'static str,
+        total_wg: u64,
+    ) -> Result<K6FlashCall> {
         Self::check_geom(geom)?;
-        let total_wg = (geom.rows * geom.q_heads) as u64;
         let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
         let params_buf = ctx.uniform_buffer("k6 flash params", &[0u8; 44]);
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("k6 flash bind group"),
-            layout: &self.flash.get_bind_group_layout(0),
+            label: Some(bind_label),
+            layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1163,7 +1530,7 @@ impl K6Pipeline {
             ],
         });
         let mut call = K6FlashCall {
-            pipeline: self.flash.clone(),
+            pipeline: pipeline.clone(),
             bind_group,
             params: params_buf,
             grid,
@@ -1174,7 +1541,7 @@ impl K6Pipeline {
             window: geom.window,
             ring: geom.ring,
             diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
-                kernel: "k6_attn_flash",
+                kernel,
                 rows: geom.rows as u64,
                 cols: (geom.q_heads * geom.head_dim) as u64,
                 quant: "",
@@ -1235,12 +1602,57 @@ mod tests {
         assert!(SCORES_SHADER.contains("fn scores_main"));
         assert!(REDUCE_SHADER.contains("fn reduce_main"));
         assert!(FLASH_SHADER.contains("fn flash_main"));
+        assert!(FLASH_STAGED_SHADER.contains("fn flash_staged_main"));
         // The mask sentinel and its guard must agree: scores
         // writes -1e30, the reduce skips anything at that depth.
         assert!(SCORES_SHADER.contains("-1.0e30"));
         assert!(REDUCE_SHADER.contains("-1.0e29"));
         assert!(FLASH_SHADER.contains("-1.0e30"));
         assert!(FLASH_SHADER.contains("-1.0e29"));
+        assert!(FLASH_STAGED_SHADER.contains("-1.0e30"));
+        assert!(FLASH_STAGED_SHADER.contains("-1.0e29"));
+    }
+
+    #[test]
+    fn staged_lds_arithmetic_matches_the_shader() {
+        // The three workgroup arrays, by their declared
+        // sizes: the K/V block tile (32 keys at the padded
+        // 129-float stride), the query block tile (8 rows
+        // at the 128-float head-dim bound), and the score
+        // tile (8 rows x 32 keys). Their byte sum is the
+        // constant the pipeline build gates on; a shader
+        // edit that grows a tile without moving the
+        // constant (or the reverse) fails here, before a
+        // device with exactly-enough storage misbuilds.
+        assert!(FLASH_STAGED_SHADER.contains("var<workgroup> kv_tile: array<f32, 4128>;"));
+        assert!(FLASH_STAGED_SHADER.contains("var<workgroup> q_tile: array<f32, 1024>;"));
+        assert!(FLASH_STAGED_SHADER.contains("var<workgroup> s_tile: array<f32, 256>;"));
+        assert_eq!((4128 + 1024 + 256) * 4, FLASH_STAGED_LDS_BYTES);
+        assert_eq!(FLASH_STAGED_LDS_BYTES, 21_632);
+    }
+
+    #[test]
+    fn staged_shader_validates_under_naga() {
+        // The strongest shader gate a machine with no GPU
+        // adapter at all can run: the staged shader must
+        // parse and validate under Naga, the same front end
+        // wgpu feeds the driver with. This proves the WGSL
+        // is well-formed and well-typed; it does not prove
+        // a driver's compiler accepts it or that the
+        // staging wins on hardware, which is the server
+        // protocol's work (bench/flash-rework-2026-11-06.md).
+        let module = naga::front::wgsl::parse_str(FLASH_STAGED_SHADER).unwrap_or_else(|e| {
+            panic!(
+                "staged flash WGSL parse failed: {}",
+                e.emit_to_string(FLASH_STAGED_SHADER)
+            )
+        });
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("staged flash Naga validation failed: {e:?}"));
     }
 
     #[test]

@@ -549,6 +549,33 @@ fn resolve_k22_mmq(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Environment variable naming the staged-flash routing
+/// switch: the exact value `1` makes the resident session
+/// run multi-row attention calls through K6's staged flash
+/// form (K/V blocks of 32 keys staged in workgroup memory,
+/// 8 query rows per workgroup; see
+/// `crate::kernels::k6_attention::FLASH_STAGED_SHADER`)
+/// instead of the shipped flash form. Operational config,
+/// not a compiled constant, and deliberately fail-closed:
+/// an unset variable, or any other value, keeps the staged
+/// form out of the session entirely, so the shipped form
+/// is byte-for-byte the form every existing proof ran on.
+/// Single-row calls keep the shipped form even with the
+/// switch on (a one-row workgroup would stage a KV block
+/// for one active row of eight). The shipped default
+/// follows the K22 precedent: an unproven kernel does not
+/// enter the ladder by default. The server proof that can
+/// move this switch's default is sequenced in
+/// bench/flash-rework-2026-11-06.md.
+pub const FLASH_STAGED_ENV: &str = "WGPU_COMPUTE_FLASH_STAGED";
+
+/// Resolve the staged-flash routing switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_flash_staged(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -647,6 +674,14 @@ pub struct WgpuCompute {
     k14: Option<K14Pipeline>,
     k22: Option<K22Pipeline>,
     k22_mmq: bool,
+    /// Whether the resident session routes multi-row
+    /// attention calls through K6's staged flash form,
+    /// resolved once at construction from
+    /// [`FLASH_STAGED_ENV`], never a constant compiled into
+    /// the routing. The pipeline itself lives in the K6 set
+    /// and may be absent on a low-storage device; the
+    /// session checks both.
+    flash_staged: bool,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -759,6 +794,21 @@ impl WgpuCompute {
              k22={}",
             k22.is_some()
         );
+        // The staged flash form (K6's blocked rework of
+        // the shipped flash): its pipeline was built (or
+        // not) inside the K6 set above, on the device's
+        // workgroup-storage grant; only its routing is
+        // config, read here (see FLASH_STAGED_ENV). The
+        // config line names both halves, so a run log shows
+        // a switch that cannot engage (enabled with no
+        // pipeline) instead of silently timing the shipped
+        // form under the staged name.
+        let flash_staged = resolve_flash_staged(std::env::var(FLASH_STAGED_ENV).ok().as_deref());
+        dbg_log!(
+            "flash staged config: enabled={flash_staged} (env {FLASH_STAGED_ENV}, \
+             only \"1\" enables); staged pipeline={}",
+            k6.flash_staged_available()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -866,6 +916,7 @@ impl WgpuCompute {
             k14,
             k22,
             k22_mmq,
+            flash_staged,
             k15,
             k16,
             wide_min_rows,
@@ -1048,6 +1099,19 @@ impl WgpuCompute {
     /// shipped ladder untouched.
     pub(crate) fn k22_mmq(&self) -> bool {
         self.k22_mmq
+    }
+
+    /// Whether the resident session routes multi-row
+    /// attention calls through K6's staged flash form:
+    /// config resolved at construction from
+    /// [`FLASH_STAGED_ENV`], never a constant compiled into
+    /// the routing. `false` (the default) leaves every call
+    /// on the shipped flash form. The session also requires
+    /// the staged pipeline to exist on this device
+    /// (`K6Pipeline::flash_staged_available`) and the call
+    /// to carry more than one row.
+    pub(crate) fn flash_staged(&self) -> bool {
+        self.flash_staged
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -1997,6 +2061,24 @@ mod tests {
         assert!(!resolve_k22_mmq(Some("true")));
         assert!(!resolve_k22_mmq(Some("")));
         assert!(!resolve_k22_mmq(Some("11")));
+    }
+
+    #[test]
+    fn flash_staged_switch_resolution() {
+        // Unset: off. The shipped flash form is the only
+        // form the session can dispatch.
+        assert!(!resolve_flash_staged(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position, fail-closed like the K22
+        // switch: a typo routes the proven kernel, not
+        // the rework.
+        assert!(resolve_flash_staged(Some("1")));
+        assert!(resolve_flash_staged(Some(" 1 ")));
+        assert!(!resolve_flash_staged(Some("0")));
+        assert!(!resolve_flash_staged(Some("true")));
+        assert!(!resolve_flash_staged(Some("")));
+        assert!(!resolve_flash_staged(Some("11")));
+        assert_eq!(FLASH_STAGED_ENV, "WGPU_COMPUTE_FLASH_STAGED");
     }
 
     #[test]

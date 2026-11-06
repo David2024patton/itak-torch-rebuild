@@ -13,8 +13,9 @@ by patch.
 
 - The split (David, 2026-10-27, DECISIONS.md): Rust owns the hot token
   loop. Go owns platform, API, scheduling, caches, cluster, and training
-  orchestration. Two processes, one seam: a socket for control, shared
-  memory for tensors and token streams.
+  orchestration. Two processes, one seam: a Unix domain socket carrying
+  NDJSON frames for everything, control, tensors, and token streams
+  alike; there is no shared-memory data plane (Section 4).
 - Mojo stays the lab. Flutter is the console. Neither is on the serving
   path.
 - First-class architecture target number one is muse-glimmer (Glimmer).
@@ -34,7 +35,7 @@ transport does not care):
 
 | Process | Language | Owns | Never does |
 | --- | --- | --- | --- |
-| itakd (platform) | Go | HTTP API, auth, scheduling, batching policy, caches, model operations, cluster, training orchestration, observability | Token math, weight math, anything inside the per-token loop |
+| torchd (platform) | Go | HTTP API, auth, scheduling, batching policy, caches, model operations, cluster, training orchestration, observability | Token math, weight math, anything inside the per-token loop |
 | itak-engine | Rust | Model loading, tokenization, the forward pass, sampling, KV state, speculative execution, GPU backends | HTTP, tenancy decisions, anything that requires knowing who asked |
 
 The engine is replaceable without touching the platform and the platform
@@ -49,7 +50,7 @@ became the product's limits.
 
 | Module | Owns (its grid slot) | Interface | Depends on |
 | --- | --- | --- | --- |
-| itak-types | The shared contracts mirrored from Go pkg/types: requests, responses, sampling params, errors, every struct carrying a version field | Pure data; both sides compile against the same shapes | Nothing |
+| itak-types | The shared contracts of the Section 4 protocol: requests, responses, sampling params, errors, every struct carrying a version field; the Go side mirrors them in platform/internal/engine | Pure data; both sides compile against the same shapes | Nothing |
 | itak-diag | Structured logging and the diagnostic channel: every refusal, fallback, and verdict in the engine emits here with a stable code | `diag!(code, fields)` macros; a diagnostics dump endpoint on the control socket | itak-types |
 | itak-gguf | GGUF parsing and mmap weight access. The full mainline ggml type table (Section 5.2). Produces a load coverage report for every file | `load(path) -> ModelFile + CoverageReport`; any gap is an error value, never a silent default | itak-types, itak-diag |
 | itak-loader | Turns a ModelFile into an in-memory model by asking the arch module for its tensor map and verifying every required tensor arrived, readable, right shape | `build(file, arch) -> Model` or a named load error listing exactly what is missing | itak-gguf, itak-arch |
@@ -67,19 +68,28 @@ became the product's limits.
 
 | Module | Owns (its grid slot) | Interface | Depends on |
 | --- | --- | --- | --- |
-| itak-core (published, versioned module) | pkg/types (the contracts), pkg/debug (structured logger), pkg/event, pkg/health, pkg/registry. Published and versioned, never a relative sibling folder | Imported by itakd and by the console tooling | Nothing |
-| pkg/ipc | The Go side of the seam: control client for the socket protocol of Section 4, protocol version check | `Client.Generate(ctx, req) -> stream of token events` | itak-core |
-| pkg/server | HTTP surface: OpenAI-compatible chat, completions, embeddings, models; Ollama compatibility. Auth middleware in front of every route group from the first commit | HTTP; binds 127.0.0.1 by default, LAN exposure only by explicit flag | pkg/ipc, pkg/auth |
-| pkg/auth | API keys (hashed at rest, per-user), tenant identity, cluster shared secret. Identity is threaded into scheduler and cache keys | Middleware + identity context | itak-core |
-| pkg/sched | Scheduler, continuous batching, chunked prefill, slot manager, token budgets, rate limiting, priority lanes (every lane drained in every mode) | `Submit(identity, req) -> handle` | pkg/ipc |
-| pkg/cache | Response cache, prefix cache, prompt cache, semantic cache. Cache keys carry the tenant dimension | Lookup and store hooks in the request path | pkg/sched |
-| pkg/features | The feature tier the old tree orphaned (guardrails, A/B and payload routing, versioning, tracing), registered explicitly at server construction; startup diagnostics list every registered route | Route registration in NewServer, proven by a test | pkg/server |
-| pkg/sampling | Per-request sampler construction from request parameters; grammar, JSON mode, and JSON schema attach here and actually reach the engine | Builds the sampling block of the IPC Generate message | pkg/ipc |
-| pkg/modelops | HF and OCI pulls, Ollama pull, SHA-256 integrity, versioning, warmup, prefault, GGUF export. Quantize tools either produce the file or exit non-zero | CLI and API verbs | itak-core |
-| pkg/cluster | Cluster coordination and swarm distribution. Join requires the shared secret and an allowlisted address; no automatic LAN discovery by default | Peer protocol over the same auth | pkg/auth |
-| pkg/trainapi | Training HTTP API over the real orchestration handle (no stub getters; a route that cannot work is not registered) | HTTP | pkg/train |
-| pkg/train | Training orchestration: autograd, optimizers, SFT, LoRA, DPO, GRPO, ORPO, QAT, checkpointing; ships with tests from birth (the old stack had zero) | Orchestrates runs; heavy kernels may call the engine side later through the seam | itak-core |
-| cmd/itakd, cmd/torch | Binaries: the platform daemon and the operator CLI | CLI verbs | All of the above |
+| platform (the Go module) | The platform half of the repo as one module, `github.com/David2024patton/itak-torch-rebuild/platform`. The Section 4 contracts are mirrored in internal/engine's client types; structured logging is slog throughout; diagnostics live in internal/diag | Builds platform/cmd/torchd | Nothing |
+| platform/internal/engine | The Go side of the seam: the Client interface and the Unix-socket client for the protocol of Section 4 (hello, ping, debug, generate, embed, chat_template), handshake and protocol version check, named errors, bounded frame reads. Builds the sampling block of the Generate message from the request parameters | `Client.Generate(ctx, req) -> stream of token events` | Nothing (the seam itself) |
+| platform/internal/server | HTTP surface: OpenAI-compatible chat, completions, embeddings, models; SSE streaming, validation, error mapping, generation caps. Auth middleware in front of every route group; startup diagnostics list every registered route | HTTP; binds 127.0.0.1 by default, LAN exposure only by explicit flag | platform/internal/engine, platform/internal/auth, platform/internal/scheduler, platform/internal/cache |
+| platform/internal/auth | The one API-key middleware: constant-time comparison, fails closed, repeated failures throttled per source. The key is configuration (TORCH_API_KEY), never a file or a chat message | Middleware + identity context | Nothing |
+| platform/internal/scheduler | The request scheduling gate: bounds how many engine jobs run at once and queues the rest in priority lanes, each lane capped at a configured number of waiters, every lane provably drained in every mode | Gate in the request path | platform/internal/engine |
+| platform/internal/cache | Exact-match response cache: a TTL on every entry, an entry cap with expiry-first eviction, a purge janitor, an injectable clock. Cache keys are caller-built and carry the tenant dimension | Lookup and store hooks in the request path | Nothing |
+| platform/internal/chattemplate | Renderer for the model's own GGUF chat template: a bounded Jinja subset with render budgets, so a hostile template refuses by name instead of hanging or blowing the stack | `Render(template, messages) -> prompt text` | Nothing |
+| platform/internal/supervisor | Engine process lifecycle: start, health wait, restart within a budget, an allowlisted child environment (PATH plus ITAK_ENGINE_* only) | Process management used by platform/cmd/torchd | platform/internal/engine |
+| platform/internal/diag | The diagnostics registry behind /debug: request counts per route, error counts, and engine call outcomes reported by every module | Snapshot served at /debug | Nothing |
+| platform/cmd/torchd | The platform daemon binary: flags, env, signals, wiring. Every serving limit is a flag with its default recorded | CLI flags | All of the above |
+
+Not yet built, and nothing in the tree answers for them yet: the
+feature tier (guardrails, A/B and payload routing, versioning,
+tracing), model operations (HF and OCI pulls, SHA-256 integrity,
+versioning, warmup, prefault, GGUF export; quantize tools either
+produce the file or exit non-zero), cluster coordination (join
+requires the shared secret and an allowlisted address; no automatic
+LAN discovery by default), and the training stack (an HTTP training
+API over a real orchestration handle, and the orchestration itself:
+autograd, optimizers, SFT, LoRA, DPO, GRPO, ORPO, QAT,
+checkpointing). They keep their stages in Section 7; a route or verb
+that cannot work is not registered.
 
 ### 3.3 Off the serving path
 
@@ -176,7 +186,7 @@ in ~/workspace/model-teardown/.
 | The tokenizer is a real BPE or SentencePiece implementation, loaded from the model's own files, with token-for-token conformance tests against reference outputs and lossless round-trip tests | Native C1, live test F2, the platform tokenizer finding (the Ġ defect: detokenization reverses byte-level encoding, Ġ back to space, byte tokens reassembled) | itak-tokenizer |
 | RoPE is applied in the forward step with the arch module's base and scaling; the final norm runs before the LM head; RMSNorm epsilon, activation (SwiGLU, GEGLU, and family variants), norm positions (pre, post, QK-norm), and logit transforms (softcap, scale) all come from the arch module, never from hardcoded defaults | Native C4 | itak-forward, itak-arch |
 | Decode is incremental: one token per step against a real KV cache. Full re-forward per token does not exist anywhere in the design | Native M2, live test F1 | itak-forward, itak-kv |
-| Sampling parameters, grammar, JSON mode, and stop rules in a request reach the sampler that runs. A parameter the engine cannot honor is refused in the response, never silently ignored | Platform constrained-decoding finding | pkg/sampling, itak-engine |
+| Sampling parameters, grammar, JSON mode, and stop rules in a request reach the sampler that runs. A parameter the engine cannot honor is refused in the response, never silently ignored | Platform constrained-decoding finding | platform/internal/engine, itak-engine |
 | Every config flag has a behavior test proving the flag changes behavior. A flag read only by a log line is a build failure | Native M6 (the UseSpeculative printf), platform dead-feature pattern | All modules; enforced by the gates (5.6) |
 
 ### 5.2 The loader tells the truth
@@ -196,8 +206,8 @@ in ~/workspace/model-teardown/.
 | Routing is by the file's own `general.architecture` string through the arch registry, and the registry is the only way a model loads. An unrecognized string is a named refusal listing what is supported | Native C2, live test F4 | itak-arch |
 | Each arch module's tensor map covers what the family's files actually contain: fused QKV (Phi-3), attention biases (Qwen2, StarCoder2), post-attention and post-FFN norms (Gemma 2, OLMo 2), QK-norms (OLMo 2), tied embeddings (Gemma, StarCoder2), up/down-only MLPs (StarCoder2), MLA tensors and expert tensors read under the file's own arch prefix (DeepSeek: expert counts come from `deepseek2.*` keys, never a hardcoded `llama.*` key) | Live test M1 to M4 and F4, native C3c | itak-arch family modules |
 | Registry configuration numbers are verified against the published configs at build time by a conformance test (the audit's fetched corrections are the seed data: Mixtral RoPE base 1000000, Phi-3 mini context 4096 with window 2047, LLaMA-1 context 2048, Gemma vocab 256128, DeepSeek V3 MLA fields present and its memory estimate computed from per-layer expert math, not a dense shortcut) | Native M4, M5, m1 to m3, m6 | itak-arch, gates |
-| The serve path never routes by file size. Engine selection is by capability: arch support and backend availability, stated in the load result | Native M1 | pkg/modelops, itak-engine |
-| State save and load either persist and restore, verified by a round-trip test, or the verb does not exist. Silent no-op success is forbidden in every module | Native m5 (SaveKVCache no-ops), platform state endpoint finding | itak-kv, pkg/server |
+| The serve path never routes by file size. Engine selection is by capability: arch support and backend availability, stated in the load result | Native M1 | model operations (not yet built), itak-engine |
+| State save and load either persist and restore, verified by a round-trip test, or the verb does not exist. Silent no-op success is forbidden in every module | Native m5 (SaveKVCache no-ops), platform state endpoint finding | itak-kv, platform/internal/server |
 
 ### 5.4 Speculation and subsystems are wired or absent
 
@@ -205,19 +215,19 @@ in ~/workspace/model-teardown/.
 | --- | --- | --- |
 | Speculative decoding exists in exactly the modes the engine executes: DFlash block drafting (Glimmer), n-gram lookup, Medusa from trained artifact files. The generation loop calls the decoder; a draft model configured but not called is impossible by construction | Native M6, platform spec finding (draft loaded, never run) | itak-spec |
 | Sliding-window attention, paged KV, and ring caches are the KV implementation itself, called by the forward step, not library ornaments beside it | Native M7 | itak-kv |
-| Medusa heads are files with version fields, produced by the training stack, loaded and verified at load time. Zero-initialized heads are a load state the engine reports, never a silent default | Native M6, PLAN S6 | itak-spec, pkg/train |
-| A CLI or endpoint that cannot do its work exits non-zero or returns an error saying so. Printing success for simulated output is forbidden (the itak-quant lesson) | Platform itak-quant finding | pkg/modelops, all CLIs |
+| Medusa heads are files with version fields, produced by the training stack, loaded and verified at load time. Zero-initialized heads are a load state the engine reports, never a silent default | Native M6, PLAN S6 | itak-spec, training stack (not yet built) |
+| A CLI or endpoint that cannot do its work exits non-zero or returns an error saying so. Printing success for simulated output is forbidden (the itak-quant lesson) | Platform itak-quant finding | model operations (not yet built), all CLIs |
 | Header comments and docs are checked against behavior in review; a module whose docs claim what its code does not do fails the gate | Native M8 | Gates (5.6) |
 
 ### 5.5 Security from birth
 
 | Rule | Closes | Owner |
 | --- | --- | --- |
-| Every route group sits behind auth middleware from the first server commit. API keys are per-user and hashed at rest; keys reach people through secure links, never files or chat | Platform C1 | pkg/auth, pkg/server |
-| The server binds 127.0.0.1 by default. Binding wider requires an explicit flag, and startup diagnostics state the bind and the auth state in one line | Platform C1 (0.0.0.0 under a localhost comment) | pkg/server |
-| Filesystem paths from requests are confined to configured directories and validated (the old validatePath discipline, applied everywhere, including state save and load) | Platform C2 (arbitrary path state endpoints) | pkg/server, itak-kv |
-| Cluster join requires the shared secret and an allowlisted peer address; there is no automatic LAN discovery unless a flag turns it on | Platform swarm finding | pkg/cluster |
-| Tenant identity from auth is part of scheduler decisions and cache keys from the first version, so isolation is a property of the data flow, not a later layer | Platform tenant finding | pkg/auth, pkg/sched, pkg/cache |
+| Every route group sits behind auth middleware from the first server commit. API keys are per-user and hashed at rest; keys reach people through secure links, never files or chat | Platform C1 | platform/internal/auth, platform/internal/server |
+| The server binds 127.0.0.1 by default. Binding wider requires an explicit flag, and startup diagnostics state the bind and the auth state in one line | Platform C1 (0.0.0.0 under a localhost comment) | platform/internal/server |
+| Filesystem paths from requests are confined to configured directories and validated (the old validatePath discipline, applied everywhere, including state save and load) | Platform C2 (arbitrary path state endpoints) | platform/internal/server, itak-kv |
+| Cluster join requires the shared secret and an allowlisted peer address; there is no automatic LAN discovery unless a flag turns it on | Platform swarm finding | cluster (not yet built) |
+| Tenant identity from auth is part of scheduler decisions and cache keys from the first version, so isolation is a property of the data flow, not a later layer | Platform tenant finding | platform/internal/auth, platform/internal/scheduler, platform/internal/cache |
 
 ### 5.6 Gates from birth
 
@@ -284,7 +294,7 @@ phases; Phase 9 is the Glimmer fast path that runs through them.
 
 | Stage | Content | TODO | Exit proof |
 | --- | --- | --- | --- |
-| 0. Skeleton and contracts | Repo layout, itak-core as a published module, Rust workspace with every crate as a compiling skeleton behind its interface, IPC Hello round trip over socket and shared memory, gates and CI live | Phase 1 | Both processes start, exchange Hello, and shut down clean; gates green on skeletons |
+| 0. Skeleton and contracts | Repo layout, itak-core as a published module, Rust workspace with every crate as a compiling skeleton behind its interface, IPC Hello round trip over the Unix domain socket, gates and CI live | Phase 1 | Both processes start, exchange Hello, and shut down clean; gates green on skeletons |
 | 1. Truthful loading and tokenization | Full type table, coverage report, fail-loud loader, arch dispatch, real tokenizer; conformance over the thirteen-file corpus | Phase 2 (T-2.1, T-2.3, T-2.7, T-2.8) | Every corpus file loads with a complete coverage report or a named refusal; tokenizer matches reference token for token |
 | 2. First verified text (dense, CPU) | Incremental forward with KV for the llama-shaped families (llama, qwen2 with biases), sampling, EOS | Phase 2 (T-2.4, T-2.5) | Generated text matches the reference engine's output on the bench prompt set at temperature 0 |
 | 3. Glimmer end to end in the engine | muse_glimmer module, hybrid KV, softcap path, CPU verified text, then the wgpu backend, then DFlash | Phase 9, with Phase 4 backend items | Glimmer generates verified text on our own stack, CPU then GPU, speed ladder steps 1 to 4 recorded |
@@ -298,7 +308,8 @@ Taken, audited as it lands: the platform's working core concepts and
 code (scheduler and slot batching, response and prefix caches, model
 pulls and integrity checks, Ollama-compatible surface, GGUF converter),
 the FFI speculative decoding logic as the reference for itak-spec
-behavior, the trainer surface as the specification for pkg/train, the
+behavior, the trainer surface as the specification for the training
+stack (not yet built), the
 Mojo engines as lab artifacts, and the design record (the original PLAN,
 DECISIONS, and research notes in this repo).
 

@@ -98,7 +98,7 @@ use muse_glimmer::{
     TensorView, Weights,
 };
 
-use crate::compute::WgpuCompute;
+use crate::compute::{mmv_shape_of, MmvFamily, WgpuCompute};
 use crate::device::GpuContext;
 use crate::diag::dbg_log;
 use crate::error::WgpuError;
@@ -1123,17 +1123,45 @@ fn small_batch_applies(backend: &WgpuCompute, batch: u32) -> bool {
     batch >= 2 && batch <= backend.small_batch_max_rows()
 }
 
-/// Whether `batch` sits in the register-streaming band
-/// the backend's config enables: 2 rows up to the
-/// resolved `mmv_max_rows` threshold (default 1, which
-/// enables nothing). The kernel's own band
-/// ([`crate::kernels::k19_q4k_mmv::MMV_MIN_BATCH`]..=
-/// [`crate::kernels::k19_q4k_mmv::MMV_MAX_BATCH`], the
-/// same constants in every family module) bounds it
-/// at prepare. One threshold serves the whole
-/// register-streaming family.
-fn mmv_applies(backend: &WgpuCompute, batch: u32) -> bool {
-    batch >= 2 && batch <= backend.mmv_max_rows()
+/// Whether the register-streaming product for
+/// `family` serves a projection of shape
+/// (`in_features` x `out_rows`) at `batch` rows: the
+/// backend's routing table
+/// ([`WgpuCompute::mmv_routes`]) admits the batch
+/// only under the global ceiling (2 rows up to the
+/// resolved `mmv_max_rows`, default 1, which enables
+/// nothing) AND inside the (family, shape) cell of
+/// measured wins from the 2026-11-06 sweep
+/// (bench/mmv-band-routing-2026-11-06.md). A batch
+/// the ceiling admits but the cell excludes is the
+/// mid-band cliff the table exists to remove; it is
+/// logged by name so an A/B can see the fall-throughs
+/// it is made of, and the ladder continues exactly
+/// as it did before the table existed. The kernels'
+/// own band ([`crate::kernels::k19_q4k_mmv::MMV_MIN_BATCH`]
+/// ..=[`crate::kernels::k19_q4k_mmv::MMV_MAX_BATCH`],
+/// the same constants in every family module) still
+/// bounds every cell at prepare.
+fn mmv_applies(
+    backend: &WgpuCompute,
+    family: MmvFamily,
+    in_features: usize,
+    out_rows: usize,
+    batch: u32,
+) -> bool {
+    let shape = mmv_shape_of(in_features, out_rows);
+    if backend.mmv_routes(family, shape, batch) {
+        return true;
+    }
+    if batch >= 2 && batch <= backend.mmv_max_rows() {
+        dbg_log!(
+            "mmv {} {} excludes batch {batch} (in {in_features}, out {out_rows}); \
+             the ladder continues",
+            family.name(),
+            shape.name()
+        );
+    }
+    false
 }
 
 /// Try the K19 register-streaming form of a plain Q4_K
@@ -1151,7 +1179,13 @@ fn try_mmv_q4k(
     output: &wgpu::Buffer,
     batch: u32,
 ) -> Option<ProjCall> {
-    if !mmv_applies(backend, batch) {
+    if !mmv_applies(
+        backend,
+        MmvFamily::Q4K,
+        weights.in_features,
+        weights.out_rows,
+        batch,
+    ) {
         return None;
     }
     match backend
@@ -1181,7 +1215,13 @@ fn try_mmv_q6k(
     output: &wgpu::Buffer,
     batch: u32,
 ) -> Option<ProjCall> {
-    if !mmv_applies(backend, batch) {
+    if !mmv_applies(
+        backend,
+        MmvFamily::Q6K,
+        weights.in_features,
+        weights.out_rows,
+        batch,
+    ) {
         return None;
     }
     match backend
@@ -1452,7 +1492,13 @@ fn try_mmv_q5k(
     output: &wgpu::Buffer,
     batch: u32,
 ) -> Option<ProjCall> {
-    if !mmv_applies(backend, batch) {
+    if !mmv_applies(
+        backend,
+        MmvFamily::Q5K,
+        weights.in_features,
+        weights.out_rows,
+        batch,
+    ) {
         return None;
     }
     let ctx = backend.context();
@@ -1476,7 +1522,10 @@ fn try_mmv_q5k(
 /// backend's configured `mmv_max_rows`, shipped off),
 /// the MMV register-streaming products serve their
 /// families first in that family's ladder when its band
-/// is open (K19 for Q4_K, K20 for Q6_K, K21 for Q5_K;
+/// is open and the (family, shape) cell of the
+/// measured-win routing table admits the batch (K19 for
+/// Q4_K, K20 for Q6_K, K21 for Q5_K;
+/// bench/mmv-band-routing-2026-11-06.md);
 /// the register-streaming form is the band's structural
 /// challenger, and the A/B should not be confounded; see
 /// bench/mmv-prototype-2026-11-05.md,

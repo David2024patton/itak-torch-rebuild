@@ -44,7 +44,7 @@ use crate::kernels::k15_q4k_mmq_wide::K15Pipeline;
 use crate::kernels::k16_q6k_mmq_wide::K16Pipeline;
 use crate::kernels::k17_dflash::K17Pipeline;
 use crate::kernels::k18_small_batch::{K18Q4KPipeline, K18Q5KPipeline, K18Q6KPipeline};
-use crate::kernels::k19_q4k_mmv::K19Pipeline;
+use crate::kernels::k19_q4k_mmv::{K19Pipeline, MMV_MAX_BATCH, MMV_MIN_BATCH};
 use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, ACT_SWIGLU};
 use crate::kernels::k20_q6k_mmv::K20Pipeline;
 use crate::kernels::k21_q5k_mmv::K21Pipeline;
@@ -141,9 +141,13 @@ fn resolve_small_batch_max_rows(raw: Option<&str>) -> u32 {
 /// constant: set it to 16 to enable the MMV forms
 /// across their band (each kernel itself refuses past
 /// its cap), or leave it at the default to keep them
-/// out of the ladder entirely. An unparsable value
-/// falls back to [`DEFAULT_MMV_MAX_ROWS`], with the
-/// fallback logged at construction.
+/// out of the ladder entirely. The ceiling is only
+/// the outer gate: the band routing table below
+/// ([`MmvBands`]) narrows it per family and shape to
+/// the cells the 2026-11-06 sweep measured as wins.
+/// An unparsable value falls back to
+/// [`DEFAULT_MMV_MAX_ROWS`], with the fallback
+/// logged at construction.
 pub const MMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_MMV_MAX_ROWS";
 
 /// The MMV row threshold when the environment does not
@@ -165,6 +169,323 @@ fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
     match raw {
         Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_MMV_MAX_ROWS),
         None => DEFAULT_MMV_MAX_ROWS,
+    }
+}
+
+/// The quant family an MMV routing decision belongs
+/// to: the register-streaming products are one per
+/// family (K19 for Q4_K, K20 for Q6_K, K21 for Q5_K),
+/// and the 2026-11-06 sweep measured each family's
+/// cells separately, so the routing table below is
+/// keyed by family first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MmvFamily {
+    Q4K,
+    Q5K,
+    Q6K,
+}
+
+impl MmvFamily {
+    /// The family's short name, as it appears in the
+    /// band env names and the construction log.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            MmvFamily::Q4K => "q4k",
+            MmvFamily::Q5K => "q5k",
+            MmvFamily::Q6K => "q6k",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            MmvFamily::Q4K => 0,
+            MmvFamily::Q5K => 1,
+            MmvFamily::Q6K => 2,
+        }
+    }
+}
+
+/// The shape class of a projection, as the sweep
+/// measured it: the three output widths at the
+/// model's hidden width (attn 6656, ffn 19968,
+/// kv 256). Real projections are classified by
+/// relative geometry in [`mmv_shape_of`], since a
+/// session sees more widths than the sweep's three
+/// (the Q projection at 4096 out, the down
+/// projection at 19968 in).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MmvShape {
+    /// Output near the input width (attention-sized).
+    Attn,
+    /// Output a wide multiple of the input (FFN up).
+    Ffn,
+    /// Output a small fraction of the input (K/V).
+    Kv,
+}
+
+impl MmvShape {
+    /// The shape class's short name, as it appears
+    /// in the band env names and the logs.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            MmvShape::Attn => "attn",
+            MmvShape::Ffn => "ffn",
+            MmvShape::Kv => "kv",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            MmvShape::Attn => 0,
+            MmvShape::Ffn => 1,
+            MmvShape::Kv => 2,
+        }
+    }
+}
+
+/// Classify a projection's geometry into the
+/// sweep's shape classes: a projection whose output
+/// is at most an eighth of its input width is a KV
+/// projection (Glimmer: 256 out of 6656 in); one
+/// whose output is at least twice its input width
+/// is an FFN projection (19968 out of 6656 in);
+/// everything else is attention-class. The measured
+/// cells sit far from both boundaries (256 is 1/26
+/// of 6656, 19968 is 3x), so every real projection
+/// classifies unambiguously; a geometry the sweep
+/// did not measure (the Q projection at 4096 out,
+/// the down projection at 19968 in) lands in the
+/// attention class, the disclosure
+/// bench/mmv-band-routing-2026-11-06.md records.
+pub(crate) fn mmv_shape_of(in_features: usize, out_rows: usize) -> MmvShape {
+    if out_rows * 8 <= in_features {
+        MmvShape::Kv
+    } else if out_rows >= 2 * in_features {
+        MmvShape::Ffn
+    } else {
+        MmvShape::Attn
+    }
+}
+
+/// The env name carrying the band cell for one
+/// (family, shape) pair: the batch-row ranges in
+/// which that family's register-streaming product
+/// serves that shape class, in the syntax
+/// [`parse_mmv_band`] reads. Operational config,
+/// not a compiled constant, like every routing
+/// threshold in this module. Set a cell to "1" to
+/// close it entirely.
+fn mmv_band_env(family: MmvFamily, shape: MmvShape) -> &'static str {
+    match (family, shape) {
+        (MmvFamily::Q4K, MmvShape::Attn) => "WGPU_COMPUTE_MMV_Q4K_ATTN_ROWS",
+        (MmvFamily::Q4K, MmvShape::Ffn) => "WGPU_COMPUTE_MMV_Q4K_FFN_ROWS",
+        (MmvFamily::Q4K, MmvShape::Kv) => "WGPU_COMPUTE_MMV_Q4K_KV_ROWS",
+        (MmvFamily::Q5K, MmvShape::Attn) => "WGPU_COMPUTE_MMV_Q5K_ATTN_ROWS",
+        (MmvFamily::Q5K, MmvShape::Ffn) => "WGPU_COMPUTE_MMV_Q5K_FFN_ROWS",
+        (MmvFamily::Q5K, MmvShape::Kv) => "WGPU_COMPUTE_MMV_Q5K_KV_ROWS",
+        (MmvFamily::Q6K, MmvShape::Attn) => "WGPU_COMPUTE_MMV_Q6K_ATTN_ROWS",
+        (MmvFamily::Q6K, MmvShape::Ffn) => "WGPU_COMPUTE_MMV_Q6K_FFN_ROWS",
+        (MmvFamily::Q6K, MmvShape::Kv) => "WGPU_COMPUTE_MMV_Q6K_KV_ROWS",
+    }
+}
+
+/// The shipped band cell for one (family, shape)
+/// pair, in the same syntax the env override uses,
+/// so the default and the override share one parse
+/// path. Every range here is derived cell by cell
+/// from the 2026-11-06 sweep table in
+/// bench/mmv-band-routing-2026-11-06.md: a batch is
+/// in the cell only where the sweep measured the
+/// MMV form beating the GEMV control there (a tie
+/// or a loss falls through to the ladder), so the
+/// ranges are the measured win map and nothing
+/// else.
+fn default_mmv_band(family: MmvFamily, shape: MmvShape) -> &'static str {
+    match (family, shape) {
+        (MmvFamily::Q4K, MmvShape::Attn) => "6-12",
+        (MmvFamily::Q4K, MmvShape::Ffn) => "2,4-12",
+        (MmvFamily::Q4K, MmvShape::Kv) => "2-3",
+        (MmvFamily::Q5K, MmvShape::Attn) => "2-16",
+        (MmvFamily::Q5K, MmvShape::Ffn) => "3-16",
+        (MmvFamily::Q5K, MmvShape::Kv) => "16",
+        (MmvFamily::Q6K, MmvShape::Attn) => "2-12",
+        (MmvFamily::Q6K, MmvShape::Ffn) => "2-12",
+        (MmvFamily::Q6K, MmvShape::Kv) => "12",
+    }
+}
+
+/// Parse one band cell: comma-separated inclusive
+/// ranges, each a single row ("16") or a span
+/// ("6-12"), whitespace ignored. Parsed ranges are
+/// intersected with the kernels' own band
+/// ([`MMV_MIN_BATCH`]..=[`MMV_MAX_BATCH`]); a range
+/// missing the band entirely drops out, so "1" is
+/// a valid cell that routes nothing. Any malformed
+/// item (empty, non-numeric, a reversed span) makes
+/// the whole value unparsable: `None`, and the
+/// caller falls back to the shipped cell, the
+/// fail-closed direction every resolver in this
+/// module takes.
+fn parse_mmv_band(raw: &str) -> Option<Vec<(u32, u32)>> {
+    let mut ranges = Vec::new();
+    for item in raw.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return None;
+        }
+        let (lo, hi) = match item.split_once('-') {
+            Some((a, b)) => (a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?),
+            None => {
+                let v = item.parse::<u32>().ok()?;
+                (v, v)
+            }
+        };
+        if lo > hi {
+            return None;
+        }
+        let lo = lo.max(MMV_MIN_BATCH);
+        let hi = hi.min(MMV_MAX_BATCH);
+        if lo <= hi {
+            ranges.push((lo, hi));
+        }
+    }
+    Some(ranges)
+}
+
+/// The resolved MMV routing table: one band cell
+/// per (family, shape) pair. The table only ever
+/// narrows the global [`MMV_MAX_ROWS_ENV`] ceiling:
+/// a family's product serves a projection when the
+/// batch is under the ceiling AND inside the cell,
+/// so the shipped ceiling default (1) keeps every
+/// product out of the ladder whatever the table
+/// says, and opening the ceiling admits exactly the
+/// measured-win cells instead of the whole band
+/// whose middle the dose-response sweep convicted
+/// (bench/mmv-verdict-2026-11-05.md, step 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MmvBands {
+    /// `cells[family.index()][shape.index()]`: the
+    /// inclusive batch-row ranges the family's
+    /// product serves for that shape class.
+    cells: [[Vec<(u32, u32)>; 3]; 3],
+}
+
+impl MmvBands {
+    /// Whether the family's register-streaming
+    /// product serves this shape class at `batch`
+    /// rows under the resolved global `ceiling`.
+    pub(crate) fn routes(
+        &self,
+        ceiling: u32,
+        family: MmvFamily,
+        shape: MmvShape,
+        batch: u32,
+    ) -> bool {
+        batch >= MMV_MIN_BATCH
+            && batch <= ceiling
+            && self.cells[family.index()][shape.index()]
+                .iter()
+                .any(|&(lo, hi)| lo <= batch && batch <= hi)
+    }
+
+    /// The table in the band syntax, for the
+    /// construction log: the effective policy is
+    /// always printable from the resolved config.
+    fn describe(&self) -> String {
+        let mut out = String::new();
+        for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(family.name());
+            out.push('[');
+            for (i, shape) in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv]
+                .into_iter()
+                .enumerate()
+            {
+                if i > 0 {
+                    out.push(' ');
+                }
+                out.push_str(shape.name());
+                out.push(' ');
+                out.push_str(&fmt_mmv_band(&self.cells[family.index()][shape.index()]));
+            }
+            out.push(']');
+        }
+        out
+    }
+}
+
+/// One band cell in the syntax [`parse_mmv_band`]
+/// reads, for logs: "6-12", "2,4-12", "16", or
+/// "none" when the cell routes nothing.
+fn fmt_mmv_band(ranges: &[(u32, u32)]) -> String {
+    if ranges.is_empty() {
+        return "none".to_string();
+    }
+    ranges
+        .iter()
+        .map(|&(lo, hi)| {
+            if lo == hi {
+                lo.to_string()
+            } else {
+                format!("{lo}-{hi}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The shipped routing table: every cell at its
+/// [`default_mmv_band`]. Production resolution goes
+/// through [`resolve_mmv_bands`] with the real env;
+/// this is the tests' handle on the defaults alone.
+#[cfg(test)]
+fn default_mmv_bands() -> MmvBands {
+    resolve_mmv_bands(|_| None)
+}
+
+/// Resolve the routing table: each cell from its
+/// env override when set and parsable, else the
+/// shipped cell. The defaults parse through the
+/// same path as an override; a shipped cell that
+/// stopped parsing is a bug, and the `expect` says
+/// so at construction instead of routing silently.
+/// `get` is the env lookup, passed in so tests
+/// resolve against a table of their own.
+fn resolve_mmv_bands(get: impl Fn(&str) -> Option<String>) -> MmvBands {
+    let mut cells: [[Vec<(u32, u32)>; 3]; 3] = Default::default();
+    for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+        for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
+            let parsed = get(mmv_band_env(family, shape))
+                .and_then(|raw| parse_mmv_band(&raw))
+                .or_else(|| parse_mmv_band(default_mmv_band(family, shape)));
+            cells[family.index()][shape.index()] =
+                parsed.expect("the shipped MMV band cells parse");
+        }
+    }
+    MmvBands { cells }
+}
+
+/// Log, per cell, when an env override is present
+/// but unparsable and the shipped cell therefore
+/// applies: a silent fallback in a routing table
+/// is how a typo becomes a mystery cliff.
+fn log_mmv_band_fallbacks() {
+    for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+        for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
+            let env = mmv_band_env(family, shape);
+            if let Ok(raw) = std::env::var(env) {
+                if parse_mmv_band(&raw).is_none() {
+                    dbg_log!(
+                        "mmv band env {env}={raw:?} is unparsable; \
+                         the shipped cell ({}) applies",
+                        default_mmv_band(family, shape)
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -338,6 +659,7 @@ pub struct WgpuCompute {
     k20: K20Pipeline,
     k21: K21Pipeline,
     mmv_max_rows: u32,
+    mmv_bands: MmvBands,
     chunked_gemv_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
@@ -492,13 +814,16 @@ impl WgpuCompute {
         let k20 = K20Pipeline::new(&ctx.device)?;
         let k21 = K21Pipeline::new(&ctx.device)?;
         let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
+        log_mmv_band_fallbacks();
+        let mmv_bands = resolve_mmv_bands(|name| std::env::var(name).ok());
         dbg_log!(
             "mmv config: max_rows={mmv_max_rows} (env {MMV_MAX_ROWS_ENV}, \
              default {DEFAULT_MMV_MAX_ROWS}); k19 shape {}, k20 shape {}, \
-             k21 shape {}",
+             k21 shape {}; bands {}",
             k19.shape().name(),
             k20.shape().name(),
-            k21.shape().name()
+            k21.shape().name(),
+            mmv_bands.describe()
         );
         // The chunked-GEMV dispatch shape: no pipelines
         // of its own (it re-dispatches the GEMV kernels
@@ -553,6 +878,7 @@ impl WgpuCompute {
             k20,
             k21,
             mmv_max_rows,
+            mmv_bands,
             chunked_gemv_max_rows,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
@@ -826,9 +1152,28 @@ impl WgpuCompute {
     /// constant compiled into the selection seam. The
     /// shipped default (1) routes nothing. One threshold
     /// serves the whole register-streaming family, so an
-    /// A/B enables all three arms together.
+    /// A/B enables all three arms together; the band
+    /// table ([`WgpuCompute::mmv_routes`]) then narrows
+    /// the ceiling per family and shape.
     pub(crate) fn mmv_max_rows(&self) -> u32 {
         self.mmv_max_rows
+    }
+
+    /// Whether the register-streaming product for
+    /// `family` serves a projection of shape class
+    /// `shape` at `batch` rows: the batch must sit
+    /// under the [`WgpuCompute::mmv_max_rows`] ceiling
+    /// AND inside the family's band cell for the shape
+    /// (resolved at construction from the
+    /// `WGPU_COMPUTE_MMV_*_ROWS` env cells, shipped
+    /// defaults derived in
+    /// bench/mmv-band-routing-2026-11-06.md). The
+    /// ceiling alone used to be the whole policy; the
+    /// dose-response cliff in the middle of its band
+    /// is what the table removes.
+    pub(crate) fn mmv_routes(&self, family: MmvFamily, shape: MmvShape, batch: u32) -> bool {
+        self.mmv_bands
+            .routes(self.mmv_max_rows, family, shape, batch)
     }
 
     /// The largest batch row count at which the resident
@@ -1402,6 +1747,239 @@ mod tests {
         assert_eq!(resolve_mmv_max_rows(Some("mmv")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("")), DEFAULT_MMV_MAX_ROWS);
         assert_eq!(resolve_mmv_max_rows(Some("-2")), DEFAULT_MMV_MAX_ROWS);
+    }
+
+    #[test]
+    fn mmv_band_parse_forms() {
+        // Single rows, spans, and lists, whitespace
+        // tolerated.
+        assert_eq!(parse_mmv_band("16"), Some(vec![(16, 16)]));
+        assert_eq!(parse_mmv_band("6-12"), Some(vec![(6, 12)]));
+        assert_eq!(parse_mmv_band("2,4-12"), Some(vec![(2, 2), (4, 12)]));
+        assert_eq!(parse_mmv_band(" 2 , 4 - 12 "), Some(vec![(2, 2), (4, 12)]));
+        // Ranges are intersected with the kernels'
+        // own band (2..=16): a span reaching past it
+        // clamps, and a span missing it entirely
+        // drops out, so "1" is a valid cell that
+        // routes nothing.
+        assert_eq!(parse_mmv_band("0-99"), Some(vec![(2, 16)]));
+        assert_eq!(parse_mmv_band("1"), Some(vec![]));
+        assert_eq!(parse_mmv_band("17-20"), Some(vec![]));
+    }
+
+    #[test]
+    fn mmv_band_parse_rejects_malformed() {
+        // Any malformed item poisons the whole
+        // value: resolution then falls back to the
+        // shipped cell rather than guessing a band.
+        for raw in [
+            "",
+            "x",
+            "2-",
+            "-3",
+            "5-2",
+            "2,,3",
+            "2-3-4",
+            "1.5",
+            "99999999999999999999",
+        ] {
+            assert_eq!(parse_mmv_band(raw), None, "input {raw:?}");
+        }
+    }
+
+    #[test]
+    fn mmv_band_resolution_falls_back_to_the_shipped_cell() {
+        // Unset: the shipped cell.
+        let bands = resolve_mmv_bands(|_| None);
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 2));
+        // A parsable override replaces exactly its
+        // own cell; the rest of the table is the
+        // shipped one.
+        let bands = resolve_mmv_bands(|name| {
+            (name == mmv_band_env(MmvFamily::Q4K, MmvShape::Attn)).then(|| "2-3".to_string())
+        });
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 2));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(bands.routes(16, MmvFamily::Q6K, MmvShape::Attn, 6));
+        // An unparsable override falls back to the
+        // shipped cell: it neither disables nor
+        // widens the cell.
+        let bands = resolve_mmv_bands(|name| {
+            (name == mmv_band_env(MmvFamily::Q6K, MmvShape::Kv)).then(|| "junk".to_string())
+        });
+        assert!(bands.routes(16, MmvFamily::Q6K, MmvShape::Kv, 12));
+        assert!(!bands.routes(16, MmvFamily::Q6K, MmvShape::Kv, 6));
+        // An override of "1" closes its cell.
+        let bands = resolve_mmv_bands(|name| {
+            (name == mmv_band_env(MmvFamily::Q5K, MmvShape::Attn)).then(|| "1".to_string())
+        });
+        assert!(!bands.routes(16, MmvFamily::Q5K, MmvShape::Attn, 7));
+    }
+
+    #[test]
+    fn mmv_shape_classification() {
+        // The sweep's measured geometries.
+        assert_eq!(mmv_shape_of(6656, 6656), MmvShape::Attn);
+        assert_eq!(mmv_shape_of(6656, 19968), MmvShape::Ffn);
+        assert_eq!(mmv_shape_of(6656, 256), MmvShape::Kv);
+        // The real model's other projections land in
+        // the attention class: Q (4096 out), O (4096
+        // in), down (19968 in).
+        assert_eq!(mmv_shape_of(6656, 4096), MmvShape::Attn);
+        assert_eq!(mmv_shape_of(4096, 6656), MmvShape::Attn);
+        assert_eq!(mmv_shape_of(19968, 6656), MmvShape::Attn);
+        // The class boundaries themselves: an output
+        // at exactly an eighth of the input is KV, at
+        // exactly double is FFN.
+        assert_eq!(mmv_shape_of(2048, 256), MmvShape::Kv);
+        assert_eq!(mmv_shape_of(6656, 832), MmvShape::Kv);
+        assert_eq!(mmv_shape_of(6656, 833), MmvShape::Attn);
+        assert_eq!(mmv_shape_of(6656, 13312), MmvShape::Ffn);
+        assert_eq!(mmv_shape_of(6656, 202048), MmvShape::Ffn);
+    }
+
+    #[test]
+    fn mmv_default_bands_match_the_measured_win_map() {
+        // The shipped table against the verdict of
+        // the 2026-11-06 sweep, cell by cell
+        // (bench/results/mmv-sweep-20261106-212335/,
+        // derived in
+        // bench/mmv-band-routing-2026-11-06.md). Each
+        // row is batches 2..=16 in order, true where
+        // the family's product routes under a fully
+        // open ceiling. A cell the sweep measured as
+        // a tie or a loss for the MMV arm is false;
+        // rows the sweep did not measure (10, 11, 13,
+        // 14, 15) are true only where two measured
+        // wins bracket them (Q5_K's run to 16; Q4_K
+        // and Q6_K end at 12, their last measured
+        // win, since row 16 on those families is the
+        // MMQ rung in both arms and carries no MMV
+        // measurement).
+        let bands = default_mmv_bands();
+        let expected: [(MmvFamily, MmvShape, [bool; 15]); 9] = [
+            (
+                MmvFamily::Q4K,
+                MmvShape::Attn,
+                [
+                    false, false, false, false, true, true, true, true, true, true, true, false,
+                    false, false, false,
+                ],
+            ),
+            (
+                MmvFamily::Q4K,
+                MmvShape::Ffn,
+                [
+                    true, false, true, true, true, true, true, true, true, true, true, false,
+                    false, false, false,
+                ],
+            ),
+            (
+                MmvFamily::Q4K,
+                MmvShape::Kv,
+                [
+                    true, true, false, false, false, false, false, false, false, false, false,
+                    false, false, false, false,
+                ],
+            ),
+            (MmvFamily::Q5K, MmvShape::Attn, [true; 15]),
+            (
+                MmvFamily::Q5K,
+                MmvShape::Ffn,
+                [
+                    false, true, true, true, true, true, true, true, true, true, true, true, true,
+                    true, true,
+                ],
+            ),
+            (
+                MmvFamily::Q5K,
+                MmvShape::Kv,
+                [
+                    false, false, false, false, false, false, false, false, false, false, false,
+                    false, false, false, true,
+                ],
+            ),
+            (
+                MmvFamily::Q6K,
+                MmvShape::Attn,
+                [
+                    true, true, true, true, true, true, true, true, true, true, true, false, false,
+                    false, false,
+                ],
+            ),
+            (
+                MmvFamily::Q6K,
+                MmvShape::Ffn,
+                [
+                    true, true, true, true, true, true, true, true, true, true, true, false, false,
+                    false, false,
+                ],
+            ),
+            (
+                MmvFamily::Q6K,
+                MmvShape::Kv,
+                [
+                    false, false, false, false, false, false, false, false, false, false, true,
+                    false, false, false, false,
+                ],
+            ),
+        ];
+        for (family, shape, table) in expected {
+            for (i, &want) in table.iter().enumerate() {
+                let batch = i as u32 + 2;
+                assert_eq!(
+                    bands.routes(16, family, shape, batch),
+                    want,
+                    "{} {} batch {batch}",
+                    family.name(),
+                    shape.name()
+                );
+            }
+        }
+        // The construction log prints this same
+        // table in band syntax.
+        assert!(bands
+            .describe()
+            .contains("q4k[attn 6-12 ffn 2,4-12 kv 2-3]"));
+        assert!(bands.describe().contains("q5k[attn 2-16 ffn 3-16 kv 16]"));
+        assert!(bands.describe().contains("q6k[attn 2-12 ffn 2-12 kv 12]"));
+    }
+
+    #[test]
+    fn mmv_routes_ceiling_composition() {
+        let bands = default_mmv_bands();
+        // The shipped ceiling (1) routes nothing,
+        // whatever the table says.
+        for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+            for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
+                for batch in 2..=16 {
+                    assert!(
+                        !bands.routes(DEFAULT_MMV_MAX_ROWS, family, shape, batch),
+                        "{} {} batch {batch} routed under the shipped ceiling",
+                        family.name(),
+                        shape.name()
+                    );
+                }
+            }
+        }
+        // A ceiling clips cells from above: at cap 4
+        // the Q4_K attention cell (6-12) admits
+        // nothing, while Q6_K attention admits its
+        // measured wins at rows 2..=4 and no further.
+        assert!(!bands.routes(4, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(bands.routes(4, MmvFamily::Q6K, MmvShape::Attn, 4));
+        assert!(!bands.routes(4, MmvFamily::Q6K, MmvShape::Attn, 5));
+        // The session dose positions: at cap 12 the
+        // Q5_K KV cell (16 only) is still closed; at
+        // cap 16 it opens.
+        assert!(!bands.routes(12, MmvFamily::Q5K, MmvShape::Kv, 16));
+        assert!(bands.routes(16, MmvFamily::Q5K, MmvShape::Kv, 16));
+        // Batch 1 never routes (the kernels' band
+        // starts at 2), even under a huge ceiling, and
+        // neither does a batch past the kernels' cap.
+        assert!(!bands.routes(u32::MAX, MmvFamily::Q5K, MmvShape::Attn, 1));
+        assert!(!bands.routes(u32::MAX, MmvFamily::Q5K, MmvShape::Attn, 17));
     }
 
     #[test]

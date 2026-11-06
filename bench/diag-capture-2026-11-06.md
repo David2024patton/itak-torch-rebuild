@@ -200,3 +200,76 @@ sized:
   and if so the trace file's name beside the session's other
   artifacts, so a kernel-level question can be answered from
   the same run that produced the fingerprints.
+
+## Completion: the two wirings above are closed (lane/diag-capture-wiring)
+
+Both items from "Integration steps left for other lanes" are
+now wired, in one code commit on top of this note's main.
+
+**1. DflashSession mirror hooks**
+(`crates/wgpu-compute/src/dflash_session.rs`):
+
+- The constructor now builds its accumulator as a local and
+  calls `begin_manifest` with `DflashSession::capture_manifest`,
+  built exactly the resident way (build identity, adapter and
+  driver identity, the backend's resolved configuration in
+  resolved form). The session section comes from the pure
+  `capture_session_pairs` helper: `kind=dflash`, `depth`,
+  `block_size`, then the target shape (`hidden`, `vocab`,
+  `context_length`, `target_hidden`, `conditioning_width`,
+  `kv_capacity`). One naming fact the original item left
+  open: a draft session has no speculative depth (that is
+  `SpecConfig.depth` in itak-spec, and this session never
+  sees it), so the `depth` pair states the draft model's
+  layer count, `block_count`.
+- The block record sits at the one real exit: both public
+  forwards funnel through `run_block`, whose single `Ok`
+  return now calls `capture_block(&logits)`
+  (`record_forward(KIND_BLOCK, ...)`) just before it. Two
+  corrections to the item's description, from the shipped
+  code: the cited line (dflash_session.rs:1698) predates the
+  capped-forward merge, there is no standalone
+  `forward_block` exit to hook; and for
+  `forward_block_capped` the fingerprint covers the
+  returned prefix rows, the only data that forward reads
+  back, which is the capture level's own
+  no-extra-readback rule.
+- Passthroughs mirroring ResidentSession's, all four:
+  `note_model_file`, `note_spec_round`,
+  `diag_capture_records`, `diag_manifest_json`.
+
+**2. Spec round wiring** (`crates/itak-spec`): `SpecSession`
+is generic over its target driver, so the call could not
+name ResidentSession directly. `TargetDriver` gained a
+record-only seam, `note_spec_round(&proposed, accepted)`,
+defaulting to a no-op (the CPU driver records nothing);
+`ResidentTarget` overrides it to forward to
+`ResidentSession::note_spec_round`. `speculative_round`
+calls it exactly once per completed round, after the
+commit and the `spec.round.accept` event, at the point
+where `proposal.tokens` and `accepted` are both in hand;
+a round that fails anywhere above is never recorded, and
+the call feeds nothing back into sampling, acceptance, or
+control flow. `RoundOutcome` is unchanged.
+
+**Test evidence** (VM, this lane): wgpu-compute 234 passed
+/ 0 failed, itak-spec 49 / 0, dflash 24 / 0; clippy
+`-D warnings` and fmt clean over all three crates. New
+pins: `capture_session_pairs_state_the_draft_shape` (the
+exact session pairs);
+`capture_wiring_is_inert_in_timing_mode` (the constructor
+and block-exit calls driven against a timing accumulator:
+no manifest, no records, no sidecars, the resident pin
+restated for the draft);
+`capture_wiring_records_the_block_in_capture_mode`;
+`stub_driver_receives_one_spec_round_record_per_round`
+(itak-spec: one record per completed round, length and
+count equal to the round outcome's, accepted prefix equal
+to the tokens the round emitted). Two adapter-bound pins
+follow the resident tests' opt-in discipline and self-skip
+off the card: `dflash_session_diag_timing_records_no_capture`
+and `dflash_session_diag_capture_records_the_block` in
+`crates/wgpu-compute/tests/dflash_session.rs`, gated on the
+diag env exactly like the resident diag tests; they join
+the card checklist above as the draft session's executing
+proof.

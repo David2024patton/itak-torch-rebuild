@@ -224,10 +224,11 @@ a cache-resident prefix, and the laned walk.
 
 ## VM gates (this lane)
 
-- `cargo test -p itak-spec`: green, 83 tests, including
+- `cargo test -p itak-spec`: green, 48 tests, including
   `argmax_matches_the_scalar_reference`.
 - `cargo test -p wgpu-compute`: green across every binary
-  (lib: 102, including `capped_rows_accepts_only_true_prefixes`).
+  (193 tests in 23 binaries; lib: 102, including
+  `capped_rows_accepts_only_true_prefixes`).
   The device tests, the new capped-forward one included,
   skip with a printed reason on this adapterless VM; their
   execution is step 1 of the server protocol.

@@ -41,6 +41,14 @@ pub struct AdapterFacts {
     pub backend: wgpu::Backend,
     /// wgpu device type classification.
     pub device_type: wgpu::DeviceType,
+    /// Driver name string as the adapter reports it
+    /// (`AdapterInfo.driver`); carried so a diag capture
+    /// manifest can state the exact stack a run executed on.
+    pub driver: String,
+    /// Driver info string as the adapter reports it
+    /// (`AdapterInfo.driver_info`), the version-bearing half
+    /// of the driver identity.
+    pub driver_info: String,
 }
 
 impl AdapterFacts {
@@ -51,6 +59,8 @@ impl AdapterFacts {
             name: info.name,
             backend: info.backend,
             device_type: info.device_type,
+            driver: info.driver,
+            driver_info: info.driver_info,
         }
     }
 
@@ -150,6 +160,8 @@ mod tests {
             name: name.to_string(),
             backend,
             device_type,
+            driver: String::new(),
+            driver_info: String::new(),
         }
     }
 

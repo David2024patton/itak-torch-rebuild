@@ -125,7 +125,9 @@ use crate::kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, ARGMAX_GROUPS, GATHER_NORM_MAX_WIDTH,
 };
 use crate::kernels::k9_attn_prep::{K9PrepCall, PrepArgs};
-use crate::timestamps::DiagAccumulator;
+use crate::timestamps::{
+    build_git, build_version, CaptureRecord, DiagAccumulator, DiagMode, RunManifest,
+};
 
 /// The post-norm epsilon, hardcoded to match the reference
 /// converter and `muse_glimmer::model`'s own `POST_NORM_EPS`
@@ -3832,7 +3834,7 @@ impl<'a> ResidentSession<'a> {
         // The diag accumulator exists exactly when the
         // context carries a recorder; it reads its report
         // destination from the environment once, here.
-        let diag_acc = ctx.diag_recorder().map(|_| DiagAccumulator::from_env());
+        let mut diag_acc = ctx.diag_recorder().map(|_| DiagAccumulator::from_env());
         if let Some(acc) = &diag_acc {
             dbg_log!(
                 "session diag timing on: drains after every chunk, report to {}",
@@ -3841,6 +3843,14 @@ impl<'a> ResidentSession<'a> {
                     |p| p.display().to_string()
                 )
             );
+        }
+        // Capture level: stamp the run manifest now, while
+        // the resolved configuration and the session shape
+        // are all still in hand. A no-op below capture
+        // (begin_manifest itself is capture-gated), so the
+        // timing and off paths construct exactly as before.
+        if let Some(acc) = &mut diag_acc {
+            acc.begin_manifest(Self::capture_manifest(backend, cfg, chunk_cap));
         }
         // Flush the weight uploads before the session is
         // handed out. `upload_bytes` stages its copies on
@@ -3985,6 +3995,7 @@ impl<'a> ResidentSession<'a> {
             rest = &rest[rows..];
             index += 1;
         }
+        self.capture_forward(CaptureRecord::KIND_FORWARD, &logits);
         Ok(logits)
     }
 
@@ -4048,6 +4059,7 @@ impl<'a> ResidentSession<'a> {
             rest = &rest[rows..];
             index += 1;
         }
+        self.capture_argmax(winner);
         Ok(winner)
     }
 
@@ -4094,6 +4106,7 @@ impl<'a> ResidentSession<'a> {
             merge_captures(&mut captures, chunk_captures);
             rest = &rest[rows..];
         }
+        self.capture_forward(CaptureRecord::KIND_FORWARD, &logits);
         Ok((logits, captures))
     }
 
@@ -4138,6 +4151,7 @@ impl<'a> ResidentSession<'a> {
             merge_captures(&mut captures, chunk_captures);
             rest = &rest[rows..];
         }
+        self.capture_forward(CaptureRecord::KIND_BLOCK, &logits);
         Ok((logits, captures))
     }
 
@@ -4525,6 +4539,135 @@ impl<'a> ResidentSession<'a> {
         // the window again. A no-op off the timing path.
         self.drain_diag();
         Ok((outcome, captures))
+    }
+
+    /// The run manifest a resident session stamps at the
+    /// capture diag level: build identity from this crate,
+    /// adapter and driver identity from the backend, the
+    /// resolved configuration the backend and this session
+    /// actually run with (resolved values, never raw env
+    /// text), and the session's own shape. The model section
+    /// is left empty here; the accumulator fills it from a
+    /// noted or registered model file
+    /// ([`DiagAccumulator::begin_manifest`]).
+    fn capture_manifest(
+        backend: &WgpuCompute,
+        cfg: &GlimmerConfig,
+        chunk_cap: usize,
+    ) -> RunManifest {
+        let facts = &backend.context().adapter;
+        let pair = |name: &str, value: String| (name.to_string(), value);
+        RunManifest {
+            diag_mode: DiagMode::Capture.name().to_string(),
+            build_version: build_version().to_string(),
+            git: build_git().to_string(),
+            adapter_name: facts.name.clone(),
+            adapter_backend: format!("{:?}", facts.backend),
+            adapter_device_type: format!("{:?}", facts.device_type),
+            adapter_driver: facts.driver.clone(),
+            adapter_driver_info: facts.driver_info.clone(),
+            resolved_config: vec![
+                pair(
+                    "small_batch_max_rows",
+                    backend.small_batch_max_rows().to_string(),
+                ),
+                pair("mmv_max_rows", backend.mmv_max_rows().to_string()),
+                pair("mmv_bands", backend.mmv_bands_describe()),
+                pair(
+                    "chunked_gemv_max_rows",
+                    backend.chunked_gemv_max_rows().to_string(),
+                ),
+                pair("k22_mmq", backend.k22_mmq().to_string()),
+                pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
+            ],
+            model: None,
+            session: vec![
+                pair("kind", "resident".to_string()),
+                pair("layers", cfg.layers.len().to_string()),
+                pair("hidden", cfg.hidden.to_string()),
+                pair("vocab", cfg.vocab_size.to_string()),
+                pair("context_length", cfg.context_length.to_string()),
+                pair("sliding_window", cfg.sliding_window.to_string()),
+                pair("key_length", cfg.key_length.to_string()),
+                pair("value_length", cfg.value_length.to_string()),
+                pair(
+                    "kv_ring_capacity",
+                    ring_capacity(cfg, chunk_cap).to_string(),
+                ),
+                pair("chunk_rows_cap", chunk_cap.to_string()),
+            ],
+        }
+    }
+
+    /// Record a completed forward's logits with the capture
+    /// accumulator. One branch off the capture level, like
+    /// [`ResidentSession::drain_diag`], and the hash runs
+    /// over the vector the forward already read back: capture
+    /// adds no GPU work and no readback.
+    fn capture_forward(&mut self, kind: &'static str, logits: &[f32]) {
+        if let Some(acc) = &mut self.diag_acc {
+            acc.record_forward(kind, logits);
+        }
+    }
+
+    /// Record a device-argmax forward's winner with the
+    /// capture accumulator (capture level only).
+    fn capture_argmax(&mut self, winner: (u32, f32)) {
+        if let Some(acc) = &mut self.diag_acc {
+            acc.record_argmax(winner.0, winner.1);
+        }
+    }
+
+    /// Fingerprint the model file at `path` into this
+    /// session's capture manifest (its path, size, and
+    /// content fingerprint under
+    /// [`crate::timestamps::MODEL_FINGERPRINT_METHOD`]). A
+    /// session is built from weights, and weights carry no
+    /// path, so the driver that opened the file states it
+    /// here (or registers it once per process through
+    /// [`crate::register_model_file`]). With no accumulator
+    /// (diag off) this is an `Ok(())` no-op.
+    ///
+    /// # Errors
+    ///
+    /// The `io` error when the file cannot be opened,
+    /// stated, or read.
+    pub fn note_model_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        match &mut self.diag_acc {
+            Some(acc) => acc.note_model_file(path),
+            None => Ok(()),
+        }
+    }
+
+    /// Record one speculative round with the capture
+    /// accumulator: the draft's proposed token ids
+    /// (fingerprinted) and how many of them the target
+    /// accepted. The speculative driver calls this once per
+    /// completed round on the TARGET session; off the
+    /// capture level it records nothing. Returns the record
+    /// when one was made.
+    pub fn note_spec_round(&mut self, proposed: &[u32], accepted: usize) -> Option<CaptureRecord> {
+        self.diag_acc
+            .as_mut()?
+            .record_spec_round(proposed, accepted)
+    }
+
+    /// The capture records this session has recorded so far,
+    /// in order (empty off the capture level).
+    #[must_use]
+    pub fn diag_capture_records(&self) -> &[CaptureRecord] {
+        self.diag_acc
+            .as_ref()
+            .map_or(&[], DiagAccumulator::capture_records)
+    }
+
+    /// This session's capture manifest rendered as JSON,
+    /// when one was begun (capture level only).
+    #[must_use]
+    pub fn diag_manifest_json(&self) -> Option<String> {
+        self.diag_acc
+            .as_ref()
+            .and_then(DiagAccumulator::manifest_json)
     }
 
     /// Drain the diag timestamp recorder into the session's

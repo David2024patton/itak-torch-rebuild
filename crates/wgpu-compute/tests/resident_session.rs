@@ -935,8 +935,8 @@ fn resident_session_diag_drains_itself() {
 fn resident_session_diag_off_by_default() {
     use wgpu_compute::DiagMode;
 
-    if DiagMode::from_env() == DiagMode::Timing {
-        eprintln!("skipping diag off check: this process runs with diag timing on");
+    if DiagMode::from_env() != DiagMode::Off {
+        eprintln!("skipping diag off check: this process runs with diag on");
         return;
     }
     let backend = match WgpuCompute::new() {

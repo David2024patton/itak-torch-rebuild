@@ -1307,6 +1307,14 @@ impl WgpuCompute {
         &self.mmv_bands
     }
 
+    /// The resolved MMV band table in its one-line described
+    /// form, for the capture manifest: the bands are resolved
+    /// configuration, so a manifest that omits them cannot
+    /// state the run it claims to describe.
+    pub(crate) fn mmv_bands_describe(&self) -> String {
+        self.mmv_bands.describe()
+    }
+
     /// The largest batch row count at which the resident
     /// session prefers the chunked GEMV form (several
     /// windowed GEMV dispatches at power-of-two row

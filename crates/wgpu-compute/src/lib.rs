@@ -115,5 +115,10 @@ pub use kernels::k8_head::{
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
 pub use session::{ProjBench, ProjBenchCall, ResidentSession, SessionStats};
 pub use timestamps::{
-    DiagAccumulator, DiagMode, DiagRecorder, DiagStamp, DispatchMeta, DispatchRecord, KernelSummary,
+    argmax_of, build_git, build_version, capture_sidecar_path, diff_capture_records,
+    diff_manifest_fields, fingerprint_f32, fingerprint_hex, fingerprint_model_file,
+    fingerprint_u32, manifest_fields, manifest_sidecar_path, parse_capture_csv,
+    register_model_file, registered_model_file, render_capture_csv, CaptureDiff, CaptureDivergence,
+    CaptureRecord, DiagAccumulator, DiagMode, DiagRecorder, DiagStamp, DispatchMeta,
+    DispatchRecord, Fnv1a64, KernelSummary, ModelFileInfo, RunManifest, MODEL_FINGERPRINT_METHOD,
 };

@@ -58,11 +58,13 @@ pub struct GpuContext {
     /// refuses by name there.
     pub features: wgpu::Features,
     /// Per-dispatch GPU timestamp recorder, present only when
-    /// the diag mode is `timing` (env `WGPU_COMPUTE_DIAG`) and
-    /// the device granted the timestamp features. `None` in the
-    /// default world: no query set, no resolve buffers, and
-    /// every prepared call carries no stamp, so the encode path
-    /// is byte-identical to the uninstrumented one.
+    /// the diag mode requests timestamps (`timing`, or
+    /// `capture` which implies timing; env
+    /// `WGPU_COMPUTE_DIAG`) and the device granted the
+    /// timestamp features. `None` in the default world: no
+    /// query set, no resolve buffers, and every prepared call
+    /// carries no stamp, so the encode path is byte-identical
+    /// to the uninstrumented one.
     pub diag: Option<Arc<DiagRecorder>>,
 }
 
@@ -78,10 +80,11 @@ impl GpuContext {
         // pipeline construction (see shipped_shape).
         let diag_mode = DiagMode::from_env();
         let mut wanted = wgpu::Features::SUBGROUP | wgpu::Features::SHADER_F16;
-        if diag_mode == DiagMode::Timing {
-            // Diagnosis runs ask for the timestamp features too;
-            // verdict runs (mode off) request exactly what they
-            // always have, so their device is unchanged.
+        if diag_mode.requests_timestamps() {
+            // Diagnosis runs (timing, and capture which implies
+            // it) ask for the timestamp features too; verdict
+            // runs (mode off) request exactly what they always
+            // have, so their device is unchanged.
             wanted |=
                 wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
@@ -133,8 +136,9 @@ impl GpuContext {
                 granted: limits.max_buffer_size,
             });
         }
-        // The diag recorder exists only in timing mode on a
-        // device that granted both timestamp features. The
+        // The diag recorder exists only when timestamps were
+        // requested (timing mode, or capture which implies it)
+        // on a device that granted both timestamp features. The
         // conversion period is the queue's own, read here at
         // runtime; no value is assumed. A timing request the
         // device cannot serve is named in the diag log and the
@@ -144,11 +148,12 @@ impl GpuContext {
             dbg_log!("diag timing on: timestamp period {period} ns");
             Some(Arc::new(DiagRecorder::new(&device, period)))
         } else {
-            if diag_mode == DiagMode::Timing {
+            if diag_mode.requests_timestamps() {
                 dbg_log!(
-                    "diag timing requested but the device did not grant \
+                    "diag {} requested but the device did not grant \
                      TIMESTAMP_QUERY + TIMESTAMP_QUERY_INSIDE_PASSES; \
-                     instrumentation off"
+                     instrumentation off",
+                    diag_mode.name()
                 );
             }
             None

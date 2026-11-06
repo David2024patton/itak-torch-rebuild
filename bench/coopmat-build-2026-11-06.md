@@ -282,6 +282,141 @@ one formatting pass over the bridge callback.
 
 Committed as lane unit 6cc13cf.
 
-## Step 3: card gates
+## Step 3: card gates (server, 2026-11-06)
 
-(pending)
+Session setup: the lane tree at d5ab2ba was staged to
+~/gpu-wave12 on the server by git archive and verified
+against a 377-file sha256 manifest (all identical).
+Tenants were stopped for the session (docker stop
+cortex-cortex-chat-1 and cortex-cortex-embed-1,
+systemctl --user stop cortex-embed.service) and the
+VRAM guard read 33,271,808 bytes (driver residue only)
+before every leg. Every heavy run held
+flock /tmp/itak-phase.lock. The profile prompt is the
+2026-11-06 profile session's prompt, extracted
+byte-exact from its log (102 repetitions of the fox
+sentence, 1,022 prompt tokens). Raw logs:
+~/gpu-wave12/logs12/ and ~/gpu-wave12/profile12/ on
+the server.
+
+### Leg 1: bridge smoke. PASS.
+
+The full resident suite on the bridged device with
+coopmat routing off (WGPU_COMPUTE_COOPMAT_BRIDGE=1):
+7 passed, 0 failed (resident_session.rs, 19.39 s),
+including the multichunk readback-deferral and diag
+tests by name. Backend construction on the bridged
+device builds every pipeline, K23 included, so the
+bridge plus passthrough construction path is proven
+inside the suite, not only in the kernel's own test.
+
+### Leg 2: numeric correctness vs K13. PASS.
+
+tests/k23_coopmat.rs on the bridged device:
+
+- vs the host reference running the same quantized
+  math, width 6656, out 512: batch 64 max abs diff
+  3.125e-2 at set scale 4.173e4 (rel 7.5e-7); batch
+  62 (the prefill chunk tail) rel 1.1e-6. Both inside
+  the crate's MMQ reassociation bound.
+- vs K13 on the same inputs: batch 64 rel 1.9e-7,
+  batch 62 rel 1.9e-7.
+- K13 parity on the full 6656 x 6656 square, batch
+  64: rel 1.7e-7.
+- Batch-band refusals (0 and 65) return by name.
+
+The shader's staging, de-interleave, scale algebra,
+LDS fold, and transposed store are correct against
+two independent references on the first card run.
+
+### Leg 3: the 1,022-token prefill A/B. K23 LOSES.
+
+Diag-timing runs through prefill_profile, same
+prompt, same binary, only the env differs:
+
+| arm | Q4_K kernel line | wall (timing mode) |
+| --- | --- | --- |
+| control (env unset) | k13_q4k_mmq: 2,912 dispatches, 4,250.1 ms, 45.9 GB/s | 7,164 ms |
+| coopmat (bridge + routing) | k23_q4k_coopmat: 2,912 dispatches, 16,951.3 ms, 11.5 GB/s | 19,851 ms |
+
+Diag-off walls of record: control 6,453 ms, coopmat
+19,518 ms. The Q6_K line is unchanged across arms
+(1,360.8 vs 1,382.8 ms), so the delta is the Q4_K
+product alone: the coopmat kernel is 4.0x slower than
+K13 at the kernel line and 3.0x slower at the wall.
+Dispatch totals are identical (10,448 in every arm
+and mode): routing swaps the kernel, never the plan.
+
+Why, as labeled hypotheses (no ACO autopsy was run
+on this module; the verdict does not need one): the
+port's two disclosed simplifications are the prime
+suspects. The LDS fold runs per sub-block: eight
+tile stores, sixteen subgroup barriers, and a fold
+in which half the subgroup idles per tile, all
+serializing the matrix units' output. And the port
+interleaves load, muladd, store, and fold per tile,
+where llama preloads a sub-block's fragments into
+register arrays before the muladds. The grid is also
+half K13's at the wide shapes (52 workgroups at out
+6656 against the m64 shape's 104, both LDS-capped at
+one workgroup per CU). The named follow-ups, in
+order: the element-extraction epilogue in llama's
+cm_elem_row form; fragment preload arrays; an ACO
+statistics pass (VGPR, spills, scratch) through
+pipeline executable properties.
+
+### Leg 4: env-unset no-leak. PASS.
+
+With every coopmat variable unset, this tree
+reproduces the shipped marks: prefill wall 6,349 ms
+(glimmer_generate) and 6,453 ms (prefill_profile)
+against the recorded 6,330; the K13 kernel line
+4,250.1 ms / 45.9 GB/s against the recorded
+4,199.9 ms / 46.4 GB/s; dispatch totals 10,448 in
+both diag modes; generated ids [7235, 19596, 30054,
+28], exact. The bridge's off path is byte-identical
+in behavior, as designed.
+
+### Session identity under coopmat routing. EXACT.
+
+glimmer_generate --gpu with the bridge and routing
+on, the full 1,022-token prompt: prefill 19,401 ms
+through K23 for every Q4_K projection, generated ids
+[7235, 19596, 30054, 28], the golden sequence. The
+kernel is end-to-end correct through the real model,
+not only against synthetic fixtures. (One harness
+error recorded for honesty: the first
+glimmer_generate invocation omitted --gpu and ran
+the CPU backend at 100% CPU with the card idle; it
+was killed and rerun with the flag. No measurement
+was taken from it.)
+
+### Tenants restored.
+
+docker start on both Cortex containers and
+systemctl --user start cortex-embed.service: both
+containers Up (healthy), the service active, VRAM
+settled at 8,932,200,448 bytes, the tenant set the
+session found.
+
+## Lane verdict
+
+The bridge works and is the durable result: it is
+the only legal door to VK_KHR_cooperative_matrix on
+this wgpu stack, it opens with named fail-closed
+probes, its off path is provably the shipped path,
+and the full resident suite passes on a bridged
+device. The K23 kernel is CORRECT, against the host
+reference, against K13, and through the real model's
+greedy identity. It is also 4x SLOWER than K13 at the
+product it exists to accelerate.
+
+Per the decision rule written before the run
+(material A/B win required for a default flip), the
+recommendation is: WGPU_COMPUTE_COOPMAT stays off by
+default, K13 remains the shipped Q4_K MMQ, and the
+coopmat path stays in the tree behind its two
+switches as the measured starting point for the
+follow-up iteration (extraction epilogue and
+fragment preload), which now has a correct reference
+implementation to optimize against.

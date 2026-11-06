@@ -443,7 +443,7 @@ fn fmt_mmv_band(ranges: &[(u32, u32)]) -> String {
 /// through [`resolve_mmv_bands`] with the real env;
 /// this is the tests' handle on the defaults alone.
 #[cfg(test)]
-fn default_mmv_bands() -> MmvBands {
+pub(crate) fn default_mmv_bands() -> MmvBands {
     resolve_mmv_bands(|_| None)
 }
 
@@ -1297,6 +1297,14 @@ impl WgpuCompute {
     pub(crate) fn mmv_routes(&self, family: MmvFamily, shape: MmvShape, batch: u32) -> bool {
         self.mmv_bands
             .routes(self.mmv_max_rows, family, shape, batch)
+    }
+
+    /// The resolved band table itself, for routing
+    /// seams that resolve their candidates from the
+    /// policy values directly (the draft session's
+    /// ladder; see `dflash_session::proj_candidates`).
+    pub(crate) fn mmv_bands(&self) -> &MmvBands {
+        &self.mmv_bands
     }
 
     /// The largest batch row count at which the resident

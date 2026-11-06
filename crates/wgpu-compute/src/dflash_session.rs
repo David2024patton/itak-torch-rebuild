@@ -32,14 +32,23 @@
 //!   never writes the resident KV, exactly like the CPU
 //!   drafting pass never writes the cache.
 //!
-//! Composition: K1/K2/K3 GEMV projections at every batch
-//! (the draft's blocks are at most `block_size` rows, and
-//! staying on the GEMV family keeps the path free of the
-//! activation quantization the MMQ prefill forms carry),
-//! K4 for every norm and residual add (per-head norms fold
-//! heads into rows), K7 SwiGLU, K8 embedding gather, and
-//! K17 for the two primitives no Glimmer kernel provides
-//! (NEOX rotate, two-source draft attention).
+//! Composition: projections walk the same small-batch
+//! ladder the resident session walks below its matrix
+//! threshold (the register-streaming MMV products first
+//! where the band routing table admits the batch, the
+//! K18 small-batch products behind them, the chunked
+//! GEMV form behind those, the plain K1/K2/K3 GEMV last;
+//! see [`prepare_proj`]), K4 for every norm and residual
+//! add (per-head norms fold heads into rows), K7 SwiGLU,
+//! K8 embedding gather, and K17 for the two primitives
+//! no Glimmer kernel provides (NEOX rotate, two-source
+//! draft attention). The draft never takes the resident
+//! ladder's matrix forms: its blocks are at most
+//! `block_size` rows, and staying below the matrix
+//! threshold keeps the path free of the activation
+//! quantization the MMQ prefill forms carry except
+//! where an operator opens the K18 rung, whose quantize
+//! is the ladder's own.
 //!
 //! Refusals speak draft vocabulary: every backend failure
 //! is mapped to [`DflashError::StepFailed`] with the step
@@ -63,17 +72,22 @@ use std::sync::Arc;
 use dflash::{DflashConfig, DflashError, Diag, NullDiag};
 use muse_glimmer::{Dtype, GlimmerError, TensorSource, TensorView};
 
-use crate::compute::WgpuCompute;
+use crate::compute::{mmv_shape_of, MmvBands, MmvFamily, WgpuCompute};
 use crate::diag::dbg_log;
 use crate::error::WgpuError;
+use crate::kernels::k12_q8_quant::K12QuantCall;
 use crate::kernels::k17_dflash::{K17AttendCall, K17RotateCall};
+use crate::kernels::k18_small_batch::K18Call;
+use crate::kernels::k19_q4k_mmv::K19Call;
 use crate::kernels::k1_q4k_gemv::K1Call;
+use crate::kernels::k20_q6k_mmv::K20Call;
+use crate::kernels::k21_q5k_mmv::K21Call;
 use crate::kernels::k2_q6k_gemv::K2Call;
 use crate::kernels::k3_q5k_gemv::K3Call;
 use crate::kernels::k4_rmsnorm::K4Call;
 use crate::kernels::k7_swiglu::K7Call;
 use crate::kernels::k8_head::K8GatherRowsCall;
-use crate::session::{upload_norm, upload_proj, ProjWeights};
+use crate::session::{pow2_chunks, upload_norm, upload_proj, ProjWeights, GEMM_MIN_ROWS};
 use crate::timestamps::DiagAccumulator;
 
 /// Result alias in draft vocabulary.
@@ -424,6 +438,33 @@ enum DevCall {
     Proj2(K2Call),
     /// K3 (Q5_K GEMV) projection.
     Proj3(K3Call),
+    /// K19 (Q4_K register-streaming) projection: the
+    /// ladder's MMV rung for the Q4_K family.
+    Mmv1(K19Call),
+    /// K20 (Q6_K register-streaming) projection: the
+    /// ladder's MMV rung for the Q6_K family.
+    Mmv2(K20Call),
+    /// K21 (Q5_K register-streaming) projection: the
+    /// ladder's MMV rung for the Q5_K family.
+    Mmv3(K21Call),
+    /// K12 quantize + K18 small-batch product: the
+    /// ladder's small-batch rung, one variant for all
+    /// three families (the call types are shared).
+    Small {
+        /// The activation quantize dispatch.
+        quant: K12QuantCall,
+        /// The integer product dispatch.
+        mmq: K18Call,
+    },
+    /// K1 dispatches chunked at power-of-two row
+    /// counts: the ladder's chunked GEMV rung.
+    Chunked1(Vec<K1Call>),
+    /// K2 dispatches chunked at power-of-two row
+    /// counts: the ladder's chunked GEMV rung.
+    Chunked2(Vec<K2Call>),
+    /// K3 dispatches chunked at power-of-two row
+    /// counts: the ladder's chunked GEMV rung.
+    Chunked3(Vec<K3Call>),
     /// K4 norm or residual add.
     Norm(K4Call),
     /// K7 SwiGLU.
@@ -442,6 +483,28 @@ impl DevCall {
             DevCall::Proj1(c) => c.encode_into(pass),
             DevCall::Proj2(c) => c.encode_into(pass),
             DevCall::Proj3(c) => c.encode_into(pass),
+            DevCall::Mmv1(c) => c.encode_into(pass),
+            DevCall::Mmv2(c) => c.encode_into(pass),
+            DevCall::Mmv3(c) => c.encode_into(pass),
+            DevCall::Small { quant, mmq } => {
+                quant.encode_into(pass);
+                mmq.encode_into(pass);
+            }
+            DevCall::Chunked1(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
+            DevCall::Chunked2(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
+            DevCall::Chunked3(calls) => {
+                for c in calls {
+                    c.encode_into(pass);
+                }
+            }
             DevCall::Norm(c) => c.encode_into(pass),
             DevCall::Swiglu(c) => c.encode_into(pass),
             DevCall::Gather(c) => c.encode_into(pass),
@@ -451,23 +514,299 @@ impl DevCall {
     }
 }
 
-/// Prepare one projection dispatch on the GEMV family,
-/// whichever of K1/K2/K3 the weights' dtype selected at
-/// upload (the resident session's own dispatch split,
-/// minus its prefill matrix forms: the draft's row counts
-/// never leave the GEMV regime, and the GEMV path carries
-/// no activation quantization, so cross-backend parity is
-/// by construction rather than by tolerance luck).
+/// One rung of the draft projection ladder, in the
+/// order [`prepare_proj`] tries them. The GEMV form is
+/// not a rung: it is the unconditional last resort the
+/// ladder falls back to, exactly as in the resident
+/// session's ladder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProjForm {
+    /// The register-streaming MMV products (K19/K20/K21).
+    Mmv,
+    /// The K18 small-batch products (K12 quantize + K18).
+    Small,
+    /// The chunked GEMV form (windowed GEMV dispatches
+    /// at power-of-two row counts).
+    Chunked,
+}
+
+/// The routing family and geometry of one projection:
+/// the family's band cell and the shape class are what
+/// the routing policy resolves on.
+fn proj_dims(weights: &ProjWeights) -> (MmvFamily, usize, usize) {
+    match weights {
+        ProjWeights::Q4K(w) => (MmvFamily::Q4K, w.in_features, w.out_rows),
+        ProjWeights::Q6K(w) => (MmvFamily::Q6K, w.in_features, w.out_rows),
+        ProjWeights::Q5K(w) => (MmvFamily::Q5K, w.in_features, w.out_rows),
+    }
+}
+
+/// The rungs the draft ladder tries for one projection,
+/// in ladder order, resolved from the same policy the
+/// resident session resolves: the band routing table
+/// ([`MmvBands`], narrowed by the global MMV ceiling)
+/// for the MMV rung, the small-batch ceiling for the
+/// K18 rung, and the chunked ceiling plus the matrix
+/// threshold bound for the chunked rung. Every
+/// expression here is the resident predicate's own
+/// (`session::mmv_applies`, `session::small_batch_applies`,
+/// `session::chunked_gemv_applies`) over the resolved
+/// policy values, and [`prepare_proj`] walks exactly
+/// this list, so the unit tests below pin the prepare
+/// path's resolution, not a copy of it. A pure function
+/// of the resolved values so the pin needs no device.
+///
+/// At shipped defaults every ceiling is 1 and the
+/// list is empty at every batch: the GEMV form serves,
+/// byte-identical to the pre-ladder draft.
+#[allow(clippy::too_many_arguments)]
+fn proj_candidates(
+    bands: &MmvBands,
+    mmv_ceiling: u32,
+    small_max: u32,
+    chunked_max: u32,
+    family: MmvFamily,
+    in_features: usize,
+    out_rows: usize,
+    batch: u32,
+) -> Vec<ProjForm> {
+    let mut forms = Vec::new();
+    if bands.routes(
+        mmv_ceiling,
+        family,
+        mmv_shape_of(in_features, out_rows),
+        batch,
+    ) {
+        forms.push(ProjForm::Mmv);
+    }
+    if batch >= 2 && batch <= small_max {
+        forms.push(ProjForm::Small);
+    }
+    if batch >= 2 && batch <= chunked_max && (batch as usize) < GEMM_MIN_ROWS {
+        forms.push(ProjForm::Chunked);
+    }
+    forms
+}
+
+/// Try the MMV rung for one projection: the family's
+/// register-streaming product over the f32 input rows
+/// themselves, no quantize in front of it. `None` when
+/// the prepare refuses the shape (logged by name): the
+/// ladder continues. Applicability is the caller's
+/// decision ([`proj_candidates`]); this is the prepare
+/// half only, mirroring the resident ladder's
+/// `try_mmv_*` bodies.
+fn try_mmv_draft(
+    backend: &WgpuCompute,
+    weights: &ProjWeights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<DevCall> {
+    let ctx = backend.context();
+    match weights {
+        ProjWeights::Q4K(w) => match backend.k19().prepare(ctx, w, input, output, batch) {
+            Ok(c) => Some(DevCall::Mmv1(c)),
+            Err(e) => {
+                dbg_log!("mmv q4k refused at the product prepare: {e}; the ladder continues");
+                None
+            }
+        },
+        ProjWeights::Q6K(w) => match backend.k20().prepare(ctx, w, input, output, batch) {
+            Ok(c) => Some(DevCall::Mmv2(c)),
+            Err(e) => {
+                dbg_log!("mmv q6k refused at the product prepare: {e}; the ladder continues");
+                None
+            }
+        },
+        ProjWeights::Q5K(w) => match backend.k21().prepare(ctx, w, input, output, batch) {
+            Ok(c) => Some(DevCall::Mmv3(c)),
+            Err(e) => {
+                dbg_log!("mmv q5k refused at the product prepare: {e}; the ladder continues");
+                None
+            }
+        },
+    }
+}
+
+/// Try the K18 rung for one projection: the K12 plain
+/// quantize of `input` feeding the family's K18
+/// product. `None` when the device built no K18
+/// pipeline for the family or a prepare refuses
+/// (logged by name): the ladder continues.
+fn try_small_draft(
+    backend: &WgpuCompute,
+    weights: &ProjWeights,
+    input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<DevCall> {
+    let ctx = backend.context();
+    let (family, in_features, _) = proj_dims(weights);
+    let quant = match backend
+        .k12()
+        .prepare(ctx, input, q8_qs, q8_ds, batch, in_features)
+    {
+        Ok(q) => q,
+        Err(e) => {
+            dbg_log!(
+                "small {} refused at the quantize prepare: {e}; the ladder continues",
+                family.name()
+            );
+            return None;
+        }
+    };
+    let product = match weights {
+        ProjWeights::Q4K(w) => backend
+            .k18_q4k()?
+            .prepare(ctx, w, q8_qs, q8_ds, output, batch),
+        ProjWeights::Q6K(w) => backend
+            .k18_q6k()?
+            .prepare(ctx, w, q8_qs, q8_ds, output, batch),
+        ProjWeights::Q5K(w) => backend
+            .k18_q5k()?
+            .prepare(ctx, w, q8_qs, q8_ds, output, batch),
+    };
+    match product {
+        Ok(mmq) => Some(DevCall::Small { quant, mmq }),
+        Err(e) => {
+            dbg_log!(
+                "small {} refused at the product prepare: {e}; the ladder continues",
+                family.name()
+            );
+            None
+        }
+    }
+}
+
+/// Try the chunked rung for one projection: the batch
+/// served as one windowed GEMV dispatch per
+/// power-of-two chunk ([`pow2_chunks`], the resident
+/// ladder's own decomposition). `None` when a window
+/// prepare refuses (logged by name): the ladder
+/// continues to the whole-batch GEMV form.
+fn try_chunked_draft(
+    backend: &WgpuCompute,
+    weights: &ProjWeights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+) -> Option<DevCall> {
+    let ctx = backend.context();
+    match weights {
+        ProjWeights::Q4K(w) => {
+            let mut calls = Vec::new();
+            for (start, len) in pow2_chunks(batch) {
+                match backend.k1().prepare_rows(ctx, w, input, output, start, len) {
+                    Ok(c) => calls.push(c),
+                    Err(e) => {
+                        dbg_log!("chunked q4k refused at the window prepare: {e}; the gemv form serves it");
+                        return None;
+                    }
+                }
+            }
+            Some(DevCall::Chunked1(calls))
+        }
+        ProjWeights::Q6K(w) => {
+            let mut calls = Vec::new();
+            for (start, len) in pow2_chunks(batch) {
+                match backend.k2().prepare_rows(ctx, w, input, output, start, len) {
+                    Ok(c) => calls.push(c),
+                    Err(e) => {
+                        dbg_log!("chunked q6k refused at the window prepare: {e}; the gemv form serves it");
+                        return None;
+                    }
+                }
+            }
+            Some(DevCall::Chunked2(calls))
+        }
+        ProjWeights::Q5K(w) => {
+            let mut calls = Vec::new();
+            for (start, len) in pow2_chunks(batch) {
+                match backend.k3().prepare_rows(ctx, w, input, output, start, len) {
+                    Ok(c) => calls.push(c),
+                    Err(e) => {
+                        dbg_log!("chunked q5k refused at the window prepare: {e}; the gemv form serves it");
+                        return None;
+                    }
+                }
+            }
+            Some(DevCall::Chunked3(calls))
+        }
+    }
+}
+
+/// Prepare one projection dispatch: the draft walks
+/// the same ladder the resident session walks below
+/// its matrix threshold. The register-streaming MMV
+/// products serve first where the band routing table
+/// admits the batch (the global
+/// `WGPU_COMPUTE_MMV_MAX_ROWS` ceiling narrowed by the
+/// per-(family, shape) cells of measured wins), the
+/// K18 small-batch products behind them where the
+/// small-batch ceiling admits it, the chunked GEMV
+/// form behind those, and the plain K1/K2/K3 GEMV
+/// last. The matrix forms are the one resident rung
+/// the draft does not take: its row counts are block
+/// and segment counts, and the MMQ forms' activation
+/// quantization is a prefill tool (the module docs
+/// carry the reasoning). Every form consumes the same
+/// resident buffers, so the choice never changes the
+/// chain's data layout, and a rung's prepare refusal
+/// falls through to the next rung by name, never a
+/// silent substitution inside a dispatch.
+#[allow(clippy::too_many_arguments)]
 fn prepare_proj(
     backend: &WgpuCompute,
     weights: &ProjWeights,
     input: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
     rows: usize,
     step: &'static str,
 ) -> Result<DevCall> {
     let ctx = backend.context();
     let batch = rows as u32;
+    let (family, in_features, out_rows) = proj_dims(weights);
+    let candidates = proj_candidates(
+        backend.mmv_bands(),
+        backend.mmv_max_rows(),
+        backend.small_batch_max_rows(),
+        backend.chunked_gemv_max_rows(),
+        family,
+        in_features,
+        out_rows,
+        batch,
+    );
+    if !candidates.contains(&ProjForm::Mmv) && batch >= 2 && batch <= backend.mmv_max_rows() {
+        // The ceiling admits the batch but the band
+        // cell excludes it: the mid-band cliff the
+        // table exists to remove, logged by name like
+        // the resident ladder logs it, so an A/B can
+        // see the fall-throughs it is made of.
+        let shape = mmv_shape_of(in_features, out_rows);
+        dbg_log!(
+            "mmv {} {} excludes batch {batch} (in {in_features}, out {out_rows}); \
+             the ladder continues",
+            family.name(),
+            shape.name()
+        );
+    }
+    for form in candidates {
+        let call = match form {
+            ProjForm::Mmv => try_mmv_draft(backend, weights, input, output, batch),
+            ProjForm::Small => {
+                try_small_draft(backend, weights, input, q8_qs, q8_ds, output, batch)
+            }
+            ProjForm::Chunked => try_chunked_draft(backend, weights, input, output, batch),
+        };
+        if let Some(call) = call {
+            return Ok(call);
+        }
+    }
     match weights {
         ProjWeights::Q4K(w) => backend
             .k1()
@@ -565,6 +904,20 @@ struct Scratch {
     chunk_positions: wgpu::Buffer,
     /// Fused-rows readback staging (`COPY_DST | MAP_READ`).
     fuse_staging: wgpu::Buffer,
+    /// K12's quantized activations for the projection
+    /// ladder's K18 rung: the packed int8 words,
+    /// `[rows][blocks][8]` u32, blocks counted at the
+    /// widest projection input a plan quantizes (the
+    /// conditioning width, hidden, attention-out, or
+    /// FFN width). One pair serves every projection:
+    /// dispatches inside a pass are totally ordered,
+    /// each quantize immediately precedes its product,
+    /// and no two quantized forms are ever live at once
+    /// (the resident scratch's own discipline).
+    q8_qs: wgpu::Buffer,
+    /// K12's quantized activation scales: one
+    /// `vec4<f32>` per block, beside [`Scratch::q8_qs`].
+    q8_ds: wgpu::Buffer,
 }
 
 impl Scratch {
@@ -577,6 +930,15 @@ impl Scratch {
         let ctx = backend.context();
         let rows = cfg.block_size as usize;
         let hidden = cfg.hidden as usize;
+        // Q8_1 blocks at the widest width any projection
+        // in either plan quantizes (see the field docs),
+        // rows at the largest plan either pass builds.
+        let q8_rows = rows.max(INJECT_CHUNK_ROWS);
+        let q8_blocks = conditioning_width
+            .max(hidden)
+            .max(cfg.attn_out_width() as usize)
+            .max(cfg.ffn_hidden as usize)
+            .div_ceil(32);
         let buf = |label: &str, elems: usize| ctx.scratch_buffer(label, (elems * 4) as u64);
         let staging = |label: &str, elems: usize| {
             ctx.device.create_buffer(&wgpu::BufferDescriptor {
@@ -622,6 +984,8 @@ impl Scratch {
             ),
             chunk_positions: buf("dflash chunk positions", INJECT_CHUNK_ROWS),
             fuse_staging: staging("dflash fuse staging", INJECT_CHUNK_ROWS * hidden),
+            q8_qs: buf("dflash q8 qs", q8_rows * q8_blocks * 8),
+            q8_ds: buf("dflash q8 ds", q8_rows * q8_blocks * 4),
         })
     }
 }
@@ -1253,6 +1617,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.attn_q,
                 &s.h,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.q,
                 rows,
                 STEP_BLOCK,
@@ -1261,6 +1627,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.attn_k,
                 &s.h,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.k,
                 rows,
                 STEP_BLOCK,
@@ -1269,6 +1637,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.attn_v,
                 &s.h,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.v,
                 rows,
                 STEP_BLOCK,
@@ -1355,6 +1725,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.attn_output,
                 &s.attn,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.branch,
                 rows,
                 STEP_BLOCK,
@@ -1390,6 +1762,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.ffn_gate,
                 &s.h,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.gate,
                 rows,
                 STEP_BLOCK,
@@ -1398,6 +1772,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.ffn_up,
                 &s.h,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.up,
                 rows,
                 STEP_BLOCK,
@@ -1413,6 +1789,8 @@ impl<'a> DflashSession<'a> {
                 backend,
                 &layer.ffn_down,
                 &s.act,
+                &s.q8_qs,
+                &s.q8_ds,
                 &s.branch,
                 rows,
                 STEP_BLOCK,
@@ -1440,7 +1818,7 @@ impl<'a> DflashSession<'a> {
             eps,
         )));
         calls.push(prepare_proj(
-            backend, &self.head, &s.h, &s.logits, rows, STEP_BLOCK,
+            backend, &self.head, &s.h, &s.q8_qs, &s.q8_ds, &s.logits, rows, STEP_BLOCK,
         )?);
         Ok(BlockPlan {
             calls,
@@ -1462,7 +1840,16 @@ impl<'a> DflashSession<'a> {
         let key_len = cfg.key_length as usize;
         let eps = cfg.rms_eps;
         let prefix = vec![
-            prepare_proj(backend, &self.fc, &s.features, &s.fused, rows, STEP_INJECT)?,
+            prepare_proj(
+                backend,
+                &self.fc,
+                &s.features,
+                &s.q8_qs,
+                &s.q8_ds,
+                &s.fused,
+                rows,
+                STEP_INJECT,
+            )?,
             DevCall::Norm(backend.k4().prepare_rms_norm(
                 ctx,
                 &s.fused,
@@ -1476,8 +1863,26 @@ impl<'a> DflashSession<'a> {
         let mut layers = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
             layers.push([
-                prepare_proj(backend, &layer.attn_k, &s.fused_n, &s.ik, rows, STEP_INJECT)?,
-                prepare_proj(backend, &layer.attn_v, &s.fused_n, &s.iv, rows, STEP_INJECT)?,
+                prepare_proj(
+                    backend,
+                    &layer.attn_k,
+                    &s.fused_n,
+                    &s.q8_qs,
+                    &s.q8_ds,
+                    &s.ik,
+                    rows,
+                    STEP_INJECT,
+                )?,
+                prepare_proj(
+                    backend,
+                    &layer.attn_v,
+                    &s.fused_n,
+                    &s.q8_qs,
+                    &s.q8_ds,
+                    &s.iv,
+                    rows,
+                    STEP_INJECT,
+                )?,
                 DevCall::Norm(backend.k4().prepare_rms_norm(
                     ctx,
                     &s.ik,
@@ -1915,5 +2320,165 @@ mod tests {
     #[test]
     fn session_config_default_is_the_documented_capacity() {
         assert_eq!(DflashSessionConfig::default().kv_capacity, 8192);
+    }
+
+    /// The draft ladder's resolution, pinned against
+    /// the shipped band table at the draft's own
+    /// geometries. The Glimmer draft is hidden-6656
+    /// like its target, so the shape representatives
+    /// are the sweep's: attention (6656 out), FFN
+    /// (19968 out), KV (256 out), and the head
+    /// (202048 out, FFN class by relative geometry).
+    /// `cands` resolves with the shipped bands and the
+    /// given ceilings in [`proj_candidates`] order
+    /// (mmv ceiling, small ceiling, chunked ceiling).
+    fn cands(
+        ceilings: (u32, u32, u32),
+        family: MmvFamily,
+        in_features: usize,
+        out_rows: usize,
+        batch: u32,
+    ) -> Vec<ProjForm> {
+        proj_candidates(
+            &crate::compute::default_mmv_bands(),
+            ceilings.0,
+            ceilings.1,
+            ceilings.2,
+            family,
+            in_features,
+            out_rows,
+            batch,
+        )
+    }
+
+    const DRAFT_ATTN: (usize, usize) = (6656, 6656);
+    const DRAFT_FFN: (usize, usize) = (6656, 19968);
+    const DRAFT_KV: (usize, usize) = (6656, 256);
+    const DRAFT_HEAD: (usize, usize) = (6656, 202048);
+
+    #[test]
+    fn draft_ladder_ships_closed_at_default_ceilings() {
+        // Every ceiling at its shipped default (1):
+        // no rung applies at any batch, so the GEMV
+        // form serves exactly as the pre-ladder draft
+        // served.
+        for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+            for (inf, out) in [DRAFT_ATTN, DRAFT_FFN, DRAFT_KV, DRAFT_HEAD] {
+                for batch in [2, 3, 7, 12, 16, 64] {
+                    assert_eq!(
+                        cands((1, 1, 1), family, inf, out, batch),
+                        Vec::<ProjForm>::new(),
+                        "{family:?} in {inf} out {out} batch {batch}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn draft_head_routes_to_mmv_at_block_batch() {
+        // The cost map's fattest dispatch: the Q5_K
+        // head at the block's 16 rows, ceiling open.
+        // The Q5_K cells admit 16 in every shape class
+        // (attn 2-16, ffn 3-16, kv exactly 16), so the
+        // head takes K21.
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q5K, DRAFT_HEAD.0, DRAFT_HEAD.1, 16),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q5K, DRAFT_ATTN.0, DRAFT_ATTN.1, 16),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q5K, DRAFT_KV.0, DRAFT_KV.1, 16),
+            vec![ProjForm::Mmv]
+        );
+        // The Q5_K KV cell is exactly row 16: at 12
+        // nothing routes.
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q5K, DRAFT_KV.0, DRAFT_KV.1, 12),
+            Vec::<ProjForm>::new()
+        );
+        // The global gate still rules: ceiling 1
+        // closes the head like everything else.
+        assert_eq!(
+            cands((1, 1, 1), MmvFamily::Q5K, DRAFT_HEAD.0, DRAFT_HEAD.1, 16),
+            Vec::<ProjForm>::new()
+        );
+    }
+
+    #[test]
+    fn draft_block_batch_leaves_q4k_q6k_on_the_lower_ladder() {
+        // At the block's 16 rows the shipped Q4_K and
+        // Q6_K cells admit nothing (their measured
+        // cells end at 12; the sweep never measured
+        // MMV at 16, where MMQ served both arms), so
+        // with the lower ceilings also closed the GEMV
+        // form serves, and the exclusion is policy, not
+        // a kernel limit (the kernels serve 16).
+        for family in [MmvFamily::Q4K, MmvFamily::Q6K] {
+            for (inf, out) in [DRAFT_ATTN, DRAFT_FFN, DRAFT_KV] {
+                assert_eq!(
+                    cands((16, 1, 1), family, inf, out, 16),
+                    Vec::<ProjForm>::new(),
+                    "{family:?} in {inf} out {out}"
+                );
+            }
+        }
+        // Inside the measured band they route: Q4_K
+        // attention at 7, Q6_K attention and KV at 12.
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q4K, DRAFT_ATTN.0, DRAFT_ATTN.1, 7),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q6K, DRAFT_ATTN.0, DRAFT_ATTN.1, 12),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q6K, DRAFT_KV.0, DRAFT_KV.1, 12),
+            vec![ProjForm::Mmv]
+        );
+        // The Q4_K FFN cell has a measured hole at
+        // row 3 ("2,4-12"): 3 falls through, 4 routes.
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q4K, DRAFT_FFN.0, DRAFT_FFN.1, 3),
+            Vec::<ProjForm>::new()
+        );
+        assert_eq!(
+            cands((16, 1, 1), MmvFamily::Q4K, DRAFT_FFN.0, DRAFT_FFN.1, 4),
+            vec![ProjForm::Mmv]
+        );
+    }
+
+    #[test]
+    fn draft_ladder_orders_rungs_and_bounds_the_lower_ones() {
+        // All ceilings open: the order is MMV, then
+        // K18, then chunked, and a batch the MMV cell
+        // excludes still reaches the lower rungs.
+        assert_eq!(
+            cands((16, 16, 15), MmvFamily::Q5K, DRAFT_ATTN.0, DRAFT_ATTN.1, 7),
+            vec![ProjForm::Mmv, ProjForm::Small, ProjForm::Chunked]
+        );
+        assert_eq!(
+            cands((16, 16, 15), MmvFamily::Q4K, DRAFT_KV.0, DRAFT_KV.1, 12),
+            vec![ProjForm::Small, ProjForm::Chunked]
+        );
+        // The chunked rung keeps the resident bound:
+        // at 16 rows the matrix threshold owns the
+        // ladder, so even a wide-open chunked ceiling
+        // admits nothing there.
+        assert_eq!(
+            cands((16, 1, 64), MmvFamily::Q4K, DRAFT_KV.0, DRAFT_KV.1, 16),
+            Vec::<ProjForm>::new()
+        );
+        // Single rows are the GEMV's at every setting.
+        for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+            assert_eq!(
+                cands((16, 16, 64), family, DRAFT_ATTN.0, DRAFT_ATTN.1, 1),
+                Vec::<ProjForm>::new()
+            );
+        }
     }
 }

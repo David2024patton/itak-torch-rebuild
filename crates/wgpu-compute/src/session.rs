@@ -212,8 +212,11 @@ fn defers_readback(index: usize, count: usize) -> bool {
 /// weights per row, and below it the GEMV's decode-tuned
 /// shape is the right tool. Decode plans (one row) never
 /// reach this threshold. The bench record behind the value
-/// is in bench/gpu-resident-2026-10-30.md.
-const GEMM_MIN_ROWS: usize = 16;
+/// is in bench/gpu-resident-2026-10-30.md. Crate-visible
+/// because the draft session's projection ladder applies
+/// the same bound to its chunked rung (see
+/// `dflash_session::proj_candidates`).
+pub(crate) const GEMM_MIN_ROWS: usize = 16;
 
 /// The windowed layers' ring capacity in a session:
 /// `sliding_window + chunk_cap - 1`, where `chunk_cap` is the
@@ -1403,7 +1406,7 @@ fn chunked_gemv_applies(backend: &WgpuCompute, batch: u32) -> bool {
 /// (3, 5, 6) ran several times slower than 1, 2, 4 (see
 /// bench/chunked-gemv-2026-11-05.md). A power-of-two
 /// batch decomposes to itself, one chunk.
-fn pow2_chunks(batch: u32) -> Vec<(u32, u32)> {
+pub(crate) fn pow2_chunks(batch: u32) -> Vec<(u32, u32)> {
     let mut chunks = Vec::new();
     let mut start = 0u32;
     let mut rest = batch;

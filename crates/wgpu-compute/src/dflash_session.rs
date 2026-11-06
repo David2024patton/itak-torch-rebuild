@@ -644,21 +644,28 @@ struct BlockPlan {
     vocab: usize,
 }
 
+/// The readback half of a block encode: the buffer the
+/// chain's logits land in, the staging they are copied to,
+/// and how many of the block's rows the host takes.
+struct BlockReadback<'a> {
+    logits: &'a wgpu::Buffer,
+    staging: &'a wgpu::Buffer,
+    rows: usize,
+}
+
 impl BlockPlan {
     /// Encode the block chain, then copy the first
-    /// `copy_rows` logit rows into the readback staging.
+    /// `readback.rows` logit rows into the readback staging.
     /// The chain always computes every row (block attention
     /// is non-causal; a shorter block is a different draft);
-    /// `copy_rows` sizes only the host transfer.
+    /// `readback.rows` sizes only the host transfer.
     fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         ctx: &crate::device::GpuContext,
         block_start: usize,
         committed: usize,
-        logits: &wgpu::Buffer,
-        staging: &wgpu::Buffer,
-        copy_rows: usize,
+        readback: BlockReadback<'_>,
     ) {
         for &attend in &self.attends {
             if let DevCall::Attend(call) = &self.calls[attend] {
@@ -670,8 +677,9 @@ impl BlockPlan {
         // own invariant, since a copy longer than the plan
         // would read past the logits the chain wrote.
         debug_assert!(
-            copy_rows >= 1 && copy_rows <= self.rows,
-            "copy_rows {copy_rows} outside the plan's 1..={} rows",
+            readback.rows >= 1 && readback.rows <= self.rows,
+            "readback rows {} outside the plan's 1..={} rows",
+            readback.rows,
             self.rows
         );
         {
@@ -684,11 +692,11 @@ impl BlockPlan {
             }
         }
         encoder.copy_buffer_to_buffer(
-            logits,
+            readback.logits,
             0,
-            staging,
+            readback.staging,
             0,
-            (copy_rows * self.vocab * 4) as u64,
+            (readback.rows * self.vocab * 4) as u64,
         );
     }
 }
@@ -1850,9 +1858,11 @@ impl<'a> DflashSession<'a> {
             ctx,
             start_position,
             self.held.len(),
-            &self.scratch.logits,
-            &self.scratch.staging,
-            read_rows,
+            BlockReadback {
+                logits: &self.scratch.logits,
+                staging: &self.scratch.staging,
+                rows: read_rows,
+            },
         );
         ctx.queue.submit([encoder.finish()]);
         self.stats.submissions += 1;

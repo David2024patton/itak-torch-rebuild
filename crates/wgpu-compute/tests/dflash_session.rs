@@ -696,3 +696,70 @@ fn k17_rotate_matches_torch_math() {
         }
     }
 }
+
+/// The capped block forward: the device runs the whole
+/// block either way, so a capped readback must return the
+/// full forward's exact prefix rows, the stats must count
+/// only the values that actually crossed, and a cap that
+/// is not a true prefix refuses by name before any device
+/// work.
+#[test]
+fn dflash_session_capped_forward_returns_the_full_prefix() {
+    let Some(backend) = backend_or_skip("dflash capped forward test") else {
+        return;
+    };
+    let cfg = fixture_cfg();
+    let (tensors, emb_view, out_view) = fixture_tensors(&cfg);
+    let raw = DflashRawWeights::load(&MapSource { tensors }, &cfg).expect("raw weights load");
+    let mut session = DflashSession::new(
+        &backend,
+        &cfg,
+        &raw,
+        Some(&emb_view),
+        Some(&out_view),
+        DflashSessionConfig { kv_capacity: 64 },
+    )
+    .expect("draft session builds");
+    let positions: Vec<usize> = (0..8).collect();
+    let features = features_for(&cfg, &positions);
+    session.inject(&features, &positions).expect("gpu inject");
+
+    let vocab = cfg.vocab_size as usize;
+    let block: Vec<u32> = vec![3, 10, 17, cfg.mask_token_id];
+    assert_eq!(block.len(), cfg.block_size as usize);
+    let full = session.forward_block(&block, 8).expect("full block");
+    assert_eq!(full.len(), block.len() * vocab);
+
+    let mut expected_values = full.len() as u64;
+    for cap in 1..=block.len() {
+        let capped = session
+            .forward_block_capped(&block, 8, cap)
+            .expect("capped block");
+        assert_eq!(capped.len(), cap * vocab, "cap {cap} length");
+        assert_eq!(
+            capped,
+            full[..cap * vocab],
+            "cap {cap} must be the full forward's exact prefix"
+        );
+        expected_values += capped.len() as u64;
+    }
+    let stats = session.stats();
+    assert_eq!(stats.logits_values_read, expected_values);
+    assert_eq!(stats.blocks, 1 + block.len() as u64);
+    assert_eq!(stats.readbacks, stats.blocks);
+
+    let err = session
+        .forward_block_capped(&block, 8, 0)
+        .expect_err("a zero cap refuses");
+    assert!(
+        matches!(&err, DflashError::StepFailed { step, .. } if *step == "dflash forward_block"),
+        "got {err}"
+    );
+    let err = session
+        .forward_block_capped(&block, 8, block.len() + 1)
+        .expect_err("a cap past the block refuses");
+    assert!(
+        matches!(&err, DflashError::StepFailed { step, .. } if *step == "dflash forward_block"),
+        "got {err}"
+    );
+}

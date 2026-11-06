@@ -43,16 +43,67 @@ use crate::error::{Result, SpecError};
 
 /// The greedy choice over a finished logit row: the largest logit, lowest
 /// token id on ties (the engine sampler's tie rule).
+///
+/// The scan runs eight interleaved accumulators so the comparison
+/// chain is not one long dependency, then merges them with the
+/// exact scalar rule. The merge is what keeps the result
+/// bit-identical to the naive scan: an accumulator only ever holds
+/// a value some element actually had (a NaN never wins a `>`
+/// comparison, so no accumulator can hold one), a later accumulator
+/// displaces an earlier one only on a strictly greater value or an
+/// equal value at a lower index, and -0.0 and 0.0 compare equal, so
+/// the first of them wins, as in the scalar scan. Rows under the
+/// lane count take the scalar scan itself. The equivalence is
+/// pinned by `argmax_matches_the_scalar_reference` in the tests,
+/// over adversarial rows (ties across lanes, NaNs, infinities,
+/// signed zeros, denormals).
 pub fn argmax(logits: &[f32]) -> u32 {
-    let mut best = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best = i;
+    /// Interleaved scan lanes: lane `j` visits indices
+    /// `j, j + LANES, j + 2 * LANES, ...` in increasing order.
+    const LANES: usize = 8;
+    if logits.len() < LANES {
+        let mut best = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best = i;
+            }
+        }
+        return best as u32;
+    }
+    // Each lane's sentinel index is its own first index, so a lane
+    // whose elements never beat the sentinel (all NaN or all
+    // negative infinity) reports its first index, exactly what the
+    // scalar scan reports for that lane's elements in isolation.
+    let mut lanes: [(f32, usize); LANES] = std::array::from_fn(|j| (f32::NEG_INFINITY, j));
+    let mut i = 0usize;
+    while i + LANES <= logits.len() {
+        for (j, lane) in lanes.iter_mut().enumerate() {
+            let v = logits[i + j];
+            if v > lane.0 {
+                *lane = (v, i + j);
+            }
+        }
+        i += LANES;
+    }
+    // The tail folds into lane 0 in index order; lane 0's set is
+    // then its strided indices followed by the tail indices, all
+    // in increasing order, so its scalar-rule best is unaffected.
+    while i < logits.len() {
+        let v = logits[i];
+        if v > lanes[0].0 {
+            lanes[0] = (v, i);
+        }
+        i += 1;
+    }
+    let mut best = lanes[0];
+    for lane in &lanes[1..] {
+        if lane.0 > best.0 || (lane.0 == best.0 && lane.1 < best.1) {
+            best = *lane;
         }
     }
-    best as u32
+    best.1 as u32
 }
 
 /// Build a probability distribution from finished logits at a temperature.
@@ -329,6 +380,115 @@ mod tests {
     fn argmax_breaks_ties_by_lowest_id() {
         assert_eq!(argmax(&[1.0, 3.0, 3.0, 2.0]), 1);
         assert_eq!(argmax(&[-5.0, -1.0]), 1);
+    }
+
+    /// The pre-optimization scan, verbatim: the reference the
+    /// laned implementation must match bit for bit (the returned
+    /// index, on every input, not just well-behaved ones).
+    fn argmax_scalar_reference(logits: &[f32]) -> u32 {
+        let mut best = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > best_val {
+                best_val = v;
+                best = i;
+            }
+        }
+        best as u32
+    }
+
+    /// A deterministic xorshift64* source for the equivalence
+    /// sweep (no external crates, same sequence every run).
+    struct SweepRng(u64);
+
+    impl SweepRng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// Draw from a pool chosen to stress the tie and
+        /// special-value rules: small integers (frequent exact
+        /// ties), signed zeros, infinities, NaN, denormals, and
+        /// wide-magnitude values.
+        fn next_logit(&mut self) -> f32 {
+            const POOL: &[f32] = &[
+                0.0,
+                -0.0,
+                1.0,
+                -1.0,
+                2.0,
+                3.0,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NAN,
+                f32::MIN_POSITIVE,
+                -f32::MIN_POSITIVE,
+                1e30,
+                -1e30,
+            ];
+            let r = self.next_u64();
+            if r % 3 == 0 {
+                POOL[((r >> 8) as usize) % POOL.len()]
+            } else {
+                ((r >> 16) % 2001) as f32 * 0.01 - 10.0
+            }
+        }
+    }
+
+    #[test]
+    fn argmax_matches_the_scalar_reference() {
+        // Hand-built adversarial rows: maxima duplicated across
+        // lane boundaries, all-special rows, signed-zero pairs.
+        let fixed: Vec<Vec<f32>> = vec![
+            Vec::new(),
+            vec![f32::NAN; 64],
+            vec![f32::NEG_INFINITY; 65],
+            vec![0.0, -0.0],
+            vec![-0.0, 0.0],
+            {
+                let mut v = vec![1.0; 64];
+                v[63] = 2.0;
+                v
+            },
+            {
+                let mut v = vec![1.0; 64];
+                v[0] = 2.0;
+                v[56] = 2.0;
+                v
+            },
+            {
+                let mut v = vec![f32::NAN; 100];
+                v[99] = -1.0;
+                v
+            },
+        ];
+        for row in &fixed {
+            assert_eq!(
+                argmax(row),
+                argmax_scalar_reference(row),
+                "fixed row {row:?}"
+            );
+        }
+        // Randomized sweep across sizes that cross the lane and
+        // tail boundaries, at the real vocabulary width included.
+        let mut rng = SweepRng(0x9E37_79B9_7F4A_7C15);
+        for &len in &[
+            1usize, 7, 8, 9, 15, 16, 17, 63, 64, 65, 100, 999, 4096, 202_048,
+        ] {
+            for _ in 0..24 {
+                let row: Vec<f32> = (0..len).map(|_| rng.next_logit()).collect();
+                assert_eq!(
+                    argmax(&row),
+                    argmax_scalar_reference(&row),
+                    "argmax diverged from the scalar reference at len {len}"
+                );
+            }
+        }
     }
 
     #[test]

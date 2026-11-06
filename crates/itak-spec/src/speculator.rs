@@ -301,8 +301,18 @@ impl DflashSpeculator {
     }
 
     /// Run the noise block for `pending` on the active
-    /// arm and return the full block logits.
-    fn forward_block_logits(&mut self, pending: u32) -> Result<Vec<f32>> {
+    /// arm and return its first `row_cap` rows of logits.
+    ///
+    /// The cap is a host-transfer hint, not a block shape:
+    /// the block always runs whole (its attention is
+    /// non-causal), and the caller slices only rows
+    /// `1..=row_cap - 1` from the result, so rows past the
+    /// cap are never consumed. The GPU arm therefore reads
+    /// back just the prefix
+    /// ([`wgpu_compute::DflashSession::forward_block_capped`]);
+    /// the CPU arm computes in-process, has no transfer to
+    /// trim, and returns the full block as before.
+    fn forward_block_logits(&mut self, pending: u32, row_cap: usize) -> Result<Vec<f32>> {
         let block = {
             let mut block = vec![self.config.mask_token_id; self.config.block_size as usize];
             block[0] = pending;
@@ -321,13 +331,11 @@ impl DflashSpeculator {
                         source: Box::new(e),
                     })
             }
-            DraftBackendImpl::Gpu { session } => {
-                session
-                    .forward_block(&block, start)
-                    .map_err(|e| SpecError::DraftRefused {
-                        source: Box::new(e),
-                    })
-            }
+            DraftBackendImpl::Gpu { session } => session
+                .forward_block_capped(&block, start, row_cap.min(block.len()))
+                .map_err(|e| SpecError::DraftRefused {
+                    source: Box::new(e),
+                }),
         }
     }
 
@@ -363,6 +371,9 @@ impl DflashSpeculator {
     /// proposals. The block always runs at the draft's full block size:
     /// block attention is non-causal, so a truncated block would change
     /// the earlier rows' distributions; the session slices the result.
+    /// The slice bound is known before the forward, so it goes in as
+    /// the readback cap: rows past it never cross to the host on the
+    /// GPU arm.
     ///
     /// Row semantics (settled by the E3 run): block row `k` is the draft
     /// distribution for the draft token at block position `k + 1`, with
@@ -374,9 +385,11 @@ impl DflashSpeculator {
         arm: DraftArm,
         rng: &mut dyn FnMut() -> f64,
     ) -> Result<Proposal> {
-        let logits = self.forward_block_logits(pending)?;
-        let vocab = self.config.vocab_size as usize;
         let want = n.min(self.config.max_drafts() as usize);
+        // Rows 0..=want are the only rows sliced below: row 0
+        // is the anchor's own, rows 1..=want back the drafts.
+        let logits = self.forward_block_logits(pending, want + 1)?;
+        let vocab = self.config.vocab_size as usize;
         let mut tokens = Vec::with_capacity(want);
         let mut dists: Vec<Vec<f32>> = Vec::new();
         for k in 0..want {

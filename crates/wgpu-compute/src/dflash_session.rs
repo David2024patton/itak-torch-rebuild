@@ -405,6 +405,12 @@ pub struct DflashSessionStats {
     pub submissions: u64,
     /// Logits/fused readbacks mapped.
     pub readbacks: u64,
+    /// Logit values the block forwards' readbacks carried
+    /// to the host. A full block forward carries
+    /// `block_size * vocab` values; the capped forward
+    /// carries only its prefix, and this counter is where
+    /// the difference shows.
+    pub logits_values_read: u64,
     /// Positions the resident KV currently holds.
     pub committed_positions: usize,
 }
@@ -483,6 +489,15 @@ fn prepare_proj(
 /// the CPU implementation's own helper.
 fn reported_width(total: usize, rows: usize) -> usize {
     total.checked_div(rows).unwrap_or(total)
+}
+
+/// The readback prefix a capped block forward resolves:
+/// `row_cap` rows of the `rows`-row block when the cap is
+/// a true prefix (`1..=rows`), else no resolution and the
+/// caller refuses by name. A pure function so the cap
+/// contract is testable without a device.
+fn capped_rows(rows: usize, row_cap: usize) -> Option<usize> {
+    (1..=rows).contains(&row_cap).then_some(row_cap)
 }
 
 /// One draft layer's device residency: projection handles,
@@ -630,6 +645,11 @@ struct BlockPlan {
 }
 
 impl BlockPlan {
+    /// Encode the block chain, then copy the first
+    /// `copy_rows` logit rows into the readback staging.
+    /// The chain always computes every row (block attention
+    /// is non-causal; a shorter block is a different draft);
+    /// `copy_rows` sizes only the host transfer.
     fn encode(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -638,12 +658,22 @@ impl BlockPlan {
         committed: usize,
         logits: &wgpu::Buffer,
         staging: &wgpu::Buffer,
+        copy_rows: usize,
     ) {
         for &attend in &self.attends {
             if let DevCall::Attend(call) = &self.calls[attend] {
                 call.set_runtime(ctx, block_start as u32, committed as u32);
             }
         }
+        // The caller refuses a cap outside `1..=rows` by
+        // name before encoding; this assert is the seam's
+        // own invariant, since a copy longer than the plan
+        // would read past the logits the chain wrote.
+        debug_assert!(
+            copy_rows >= 1 && copy_rows <= self.rows,
+            "copy_rows {copy_rows} outside the plan's 1..={} rows",
+            self.rows
+        );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("dflash block chain"),
@@ -653,7 +683,13 @@ impl BlockPlan {
                 call.encode_into(&mut pass);
             }
         }
-        encoder.copy_buffer_to_buffer(logits, 0, staging, 0, (self.rows * self.vocab * 4) as u64);
+        encoder.copy_buffer_to_buffer(
+            logits,
+            0,
+            staging,
+            0,
+            (copy_rows * self.vocab * 4) as u64,
+        );
     }
 }
 
@@ -1696,6 +1732,48 @@ impl<'a> DflashSession<'a> {
     /// raises here were already settled at construction;
     /// see the module docs.)
     pub fn forward_block(&mut self, tokens: &[u32], start_position: usize) -> Result<Vec<f32>> {
+        self.run_block(tokens, start_position, None)
+    }
+
+    /// Run one block through the draft and read back only
+    /// the first `row_cap` rows of its logits: the prefix
+    /// variant of [`Self::forward_block`] for a caller that
+    /// consumes a bounded prefix of the block (the
+    /// speculative loop slices at most `depth + 1` rows:
+    /// the anchor's row plus one per draft it may propose).
+    ///
+    /// The device still runs the full block: block
+    /// attention is non-causal, so a truncated block would
+    /// change the earlier rows' distributions. Only the
+    /// staging copy and the host map shrink, so the
+    /// returned rows are the full forward's first `row_cap`
+    /// rows, bit for bit, in the same row-major layout.
+    ///
+    /// # Errors
+    ///
+    /// [`DflashError::StepFailed`] under the
+    /// `dflash forward_block` step when `row_cap` is not a
+    /// true prefix of the block (`1..=tokens.len()`); the
+    /// CPU pass's errors, in its order, otherwise.
+    pub fn forward_block_capped(
+        &mut self,
+        tokens: &[u32],
+        start_position: usize,
+        row_cap: usize,
+    ) -> Result<Vec<f32>> {
+        self.run_block(tokens, start_position, Some(row_cap))
+    }
+
+    /// The block pass behind both public forwards: the
+    /// CPU pass's validations in its order, the one
+    /// submission, and the readback of the resolved prefix
+    /// (the whole block when uncapped).
+    fn run_block(
+        &mut self,
+        tokens: &[u32],
+        start_position: usize,
+        row_cap: Option<usize>,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.cfg;
         if tokens.is_empty() {
             return Err(DflashError::EmptyInput);
@@ -1721,6 +1799,17 @@ impl<'a> DflashSession<'a> {
                 context_length: cfg.context_length,
             });
         }
+        let rows = tokens.len();
+        let read_rows = match row_cap {
+            None => rows,
+            Some(cap) => capped_rows(rows, cap).ok_or_else(|| DflashError::StepFailed {
+                step: STEP_BLOCK,
+                detail: format!(
+                    "row cap {cap} is not a prefix of the {rows}-row block; \
+                     the cap sizes the readback only, never the block"
+                ),
+            })?,
+        };
         self.diag.event(
             "forward_block.begin",
             &format!(
@@ -1730,7 +1819,12 @@ impl<'a> DflashSession<'a> {
                 self.held.len()
             ),
         );
-        let rows = tokens.len();
+        if read_rows < rows {
+            self.diag.event(
+                "forward_block.capped",
+                &format!("rows={rows} returned={read_rows}"),
+            );
+        }
         let vocab = cfg.vocab_size as usize;
         let ctx = self.backend.context();
         let token_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -1758,14 +1852,16 @@ impl<'a> DflashSession<'a> {
             self.held.len(),
             &self.scratch.logits,
             &self.scratch.staging,
+            read_rows,
         );
         ctx.queue.submit([encoder.finish()]);
         self.stats.submissions += 1;
         let logits = ctx
-            .map_staging(&self.scratch.staging, rows * vocab)
+            .map_staging(&self.scratch.staging, read_rows * vocab)
             .map_err(|e| we(STEP_BLOCK, e))?;
         self.stats.blocks += 1;
         self.stats.readbacks += 1;
+        self.stats.logits_values_read += logits.len() as u64;
         self.drain_diag();
         self.diag
             .event("forward_block.end", &format!("logits={}", logits.len()));
@@ -1793,6 +1889,17 @@ mod tests {
         assert_eq!(reported_width(24, 4), 6);
         assert_eq!(reported_width(24, 0), 24);
         assert_eq!(reported_width(25, 4), 6);
+    }
+
+    #[test]
+    fn capped_rows_accepts_only_true_prefixes() {
+        assert_eq!(capped_rows(16, 1), Some(1));
+        assert_eq!(capped_rows(16, 2), Some(2));
+        assert_eq!(capped_rows(16, 16), Some(16));
+        assert_eq!(capped_rows(16, 0), None);
+        assert_eq!(capped_rows(16, 17), None);
+        assert_eq!(capped_rows(0, 1), None);
+        assert_eq!(capped_rows(1, 1), Some(1));
     }
 
     #[test]

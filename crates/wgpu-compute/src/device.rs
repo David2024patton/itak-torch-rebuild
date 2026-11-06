@@ -66,6 +66,15 @@ pub struct GpuContext {
     /// carries no stamp, so the encode path is byte-identical
     /// to the uninstrumented one.
     pub diag: Option<Arc<DiagRecorder>>,
+    /// Coopmat capability of this device, present only
+    /// when the device was opened through the coopmat
+    /// bridge ([`crate::coopmat_bridge`]) and its probes
+    /// confirmed VK_KHR_cooperative_matrix with the
+    /// s8 x s8 to s32 16x16x16 subgroup row. `None` on every
+    /// stock device: the coopmat kernel module gates its
+    /// own existence on this field, and a routing request
+    /// against a stock device refuses by name there.
+    pub coopmat: Option<crate::coopmat_bridge::CoopmatInfo>,
 }
 
 impl GpuContext {
@@ -89,21 +98,60 @@ impl GpuContext {
                 wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
         let required_features = adapter.features() & wanted;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let make_desc = |required_features: wgpu::Features| wgpu::DeviceDescriptor {
             label: Some("wgpu-compute device"),
             required_features,
             required_limits: adapter.limits(),
             ..Default::default()
-        }))
-        .map_err(|e| WgpuError::DeviceRequest {
-            detail: e.to_string(),
-        })?;
+        };
+        // The coopmat bridge is entered only when its
+        // switch names it (coopmat_bridge): the bridged
+        // open asks for the same features plus
+        // passthrough shaders, on a device carrying
+        // VK_KHR_cooperative_matrix. Any bridge refusal
+        // is named on the diag channel and the stock
+        // device serves instead, so a machine without
+        // coopmat behaves exactly as it did before the
+        // bridge existed. With the switch off, the
+        // request below is the shipped one, unchanged.
+        let mut coopmat = None;
+        let (device, queue) = if crate::coopmat_bridge::coopmat_bridge_requested() {
+            let bridged_features = required_features
+                | (adapter.features() & wgpu::Features::EXPERIMENTAL_PASSTHROUGH_SHADERS);
+            match crate::coopmat_bridge::open_bridged(adapter, &make_desc(bridged_features)) {
+                Ok((device, queue, info)) => {
+                    coopmat = Some(info);
+                    (device, queue)
+                }
+                Err(refusal) => {
+                    dbg_log!("coopmat bridge refused: {refusal}; the stock device serves");
+                    pollster::block_on(adapter.request_device(&make_desc(required_features)))
+                        .map_err(|e| WgpuError::DeviceRequest {
+                            detail: e.to_string(),
+                        })?
+                }
+            }
+        } else {
+            pollster::block_on(adapter.request_device(&make_desc(required_features))).map_err(
+                |e| WgpuError::DeviceRequest {
+                    detail: e.to_string(),
+                },
+            )?
+        };
         let features = device.features();
         dbg_log!(
             "device features granted: subgroup={} shader_f16={}",
             features.contains(wgpu::Features::SUBGROUP),
             features.contains(wgpu::Features::SHADER_F16)
         );
+        if let Some(info) = coopmat {
+            dbg_log!(
+                "coopmat bridge device open: {} cooperative matrix property rows, \
+                 subgroup size {}",
+                info.property_rows,
+                info.subgroup_size
+            );
+        }
         let limits = device.limits();
         // wgpu reports the binding cap as u32; this crate's
         // accounting is u64 throughout, so widen once, here.
@@ -166,6 +214,7 @@ impl GpuContext {
             device,
             queue,
             diag,
+            coopmat,
         })
     }
 

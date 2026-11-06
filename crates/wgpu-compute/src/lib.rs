@@ -60,10 +60,19 @@
 //! executable reference; the resident path is pinned to it by
 //! the cross-path session test.
 
-#![forbid(unsafe_code)]
+// The coopmat device bridge (coopmat_bridge) is this
+// crate's one unsafe site: it creates a Vulkan device
+// through wgpu-hal's raw-device interop so the device
+// can carry VK_KHR_cooperative_matrix. `deny` (not
+// `forbid`) lets that one module opt in with an
+// `#[allow(unsafe_code)]` and a written safety
+// contract; unsafe anywhere else in the crate is a
+// compile error.
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod compute;
+pub mod coopmat_bridge;
 pub mod detect;
 pub mod device;
 pub mod dflash_session;

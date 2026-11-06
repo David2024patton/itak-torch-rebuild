@@ -16,6 +16,8 @@ gguf = { path = "../gguf" }
 muse-glimmer = { path = "../muse-glimmer" }
 pollster = "0.4"
 wgpu = "27"
+ash = "0.38"
+wgpu-hal = "27"
 
 [dev-dependencies]
 cpu-compute = { path = "../cpu-compute" }

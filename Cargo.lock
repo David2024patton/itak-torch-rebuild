@@ -1045,6 +1045,7 @@ dependencies = [
 name = "wgpu-compute"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "attention",
  "cpu-compute",
  "dflash",
@@ -1054,6 +1055,7 @@ dependencies = [
  "pollster",
  "torch-math",
  "wgpu",
+ "wgpu-hal",
 ]
 
 [[package]]

@@ -196,3 +196,72 @@ shows the control kernels it really ran, and its
   the `WGPU_COMPUTE_CHUNK_MAX_ROWS` guessed above and
   in the sweep script; `bench/mmv-sweep.sh` now uses
   the landed name.
+
+## Verdict run, 2026-11-06: the head-to-head table
+
+`bench/mmv-sweep.sh` run unchanged from main
+`c439e3af45e30275601129568e3e9cb3a89590cb`, staged at
+`~/gpu-wave11`, card cleared (guard read 33,271,808
+bytes VRAM used), phase lock held. All four arms ran
+the full 99-cell matrix on the RX 7900 XTX with diag
+timestamp timing, 25 reps per cell. The four CSVs are
+committed beside this note at
+`bench/results/mmv-sweep-20261106-212335/`
+(control.csv, k18.csv, mmv.csv, chunked.csv); the arm
+logs stay in the staged tree on the server.
+
+**Correctness: 0 disagreeing cells in every arm.** The
+harness's per-cell guard against GEMV (the crate's own
+tolerance rules) passed all 99 cells for control, K18,
+MMV, and chunked alike. For the chunked arm this is
+its on-card correctness leg: every chunked cell
+agrees with the whole-batch GEMV result it decomposes.
+
+**Kernel attribution is exactly as designed.** Control
+serves GEMV in band and MMQ at rows 16; the K18 arm
+serves the k18 small-batch kernels; the MMV arm serves
+k19 (Q4_K), k20 (Q6_K), k21 (Q5_K) at rows 2-12, MMQ
+at rows 16 for Q4_K/Q6_K, and k21 at rows 16 for Q5_K
+(no Q5_K MMQ exists in the ladder); the chunked arm
+serves GEMV kernels with the chunk-count timing
+signature (rows 4 cheaper than rows 3 on the attention
+shape, 0.1350 vs 0.1755 ms, because batch 4 is one
+chunk and batch 3 is two). One reporting defect: the
+chunked arm's `variant_env` column reads `env:none`
+(the harness does not stamp the chunked env name into
+its label), so that arm's engagement rests on its
+timing signature and kernel column, not its label.
+
+**Win counts (lowest median of the four arms, per
+cell): MMV 53, control 32, chunked 11, K18 3.** K18
+loses nearly everywhere in the micro-bench too
+(0.39-0.72 ms where control reads 0.08-0.54 ms on the
+attention shape), consistent with its 2026-11-04
+session verdict; it is not a contender.
+
+The MMV picture is mixed by family and shape, and the
+mix explains the session dose response recorded in
+`bench/mmv-verdict-2026-11-05.md`. Attention shape
+(out 6656), median ms, control vs MMV arm:
+
+| rows | Q4_K ctl | Q4_K k19 | Q5_K ctl | Q5_K k21 | Q6_K ctl | Q6_K k20 |
+|---|---|---|---|---|---|---|
+| 2 | 0.0792 | 0.1054 | 0.1613 | 0.1219 | 0.1540 | 0.1063 |
+| 4 | 0.1294 | 0.1479 | 0.1616 | 0.1582 | 0.1883 | 0.1404 |
+| 7 | 0.2534 | 0.2253 | 0.3578 | 0.2143 | 0.3692 | 0.2813 |
+| 9 | 0.3393 | 0.2895 | 0.4310 | 0.2515 | 0.4303 | 0.2461 |
+| 12 | 0.3979 | 0.3877 | 0.5195 | 0.3629 | 0.5424 | 0.3771 |
+
+K20 (Q6_K) and K21 (Q5_K) beat GEMV at nearly every
+in-band row; K19 (Q4_K) loses to GEMV at rows 2-6 on
+this shape and only draws level near rows 9-12 (it
+does better on the FFN shape; see the CSVs). A depth 1
+verify batch is 2 rows, deep in K19's losing range,
+while a depth 6 verify and the draft-side forwards
+reach the rows and families where the MMV arm wins;
+that is consistent with the session finding that cap
+16 (which opens the whole band, all three families)
+nets positive while caps 4-12 net negative. One cell
+needed the harness's wall-clock fallback (Q6_K KV
+rows 16, diag records did not line up; agree 1), in
+all four arms identically.

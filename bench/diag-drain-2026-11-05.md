@@ -163,3 +163,37 @@ both sessions drain into the shared recorder and each
 finishes its own report; expect two tally lines (draft and
 target) and the later finisher's file content at the shared
 `WGPU_COMPUTE_DIAG_OUT` path.
+
+## Server confirmation, 2026-11-06: CONFIRMED
+
+Protocol above, run from main
+`c439e3af45e30275601129568e3e9cb3a89590cb`, staged at
+`~/gpu-wave11` (manifest 364 files, sha256-identical),
+card cleared (VRAM used 33,271,808 bytes at both
+guards), phase lock held. Logs and CSVs in
+`~/gpu-wave11/logs11/` on the server.
+
+1. Plain generation, `glimmer_generate` with
+   `WGPU_COMPUTE_DIAG=timing` and
+   `WGPU_COMPUTE_DIAG_OUT` set: 28,480 per-dispatch
+   `[wgpu-compute-diag]` lines on stderr during the
+   run, then the finish line
+   `[wgpu-compute-diag] session report: 28480
+   dispatches across 9 kernels, 0 dropped, report
+   written to .../diag-plain.csv`. The CSV holds the
+   9 kernel rows plus a TOTAL row counting 28,480
+   dispatches (k1_q4k_gemv 11,648 dispatches /
+   1,357.2 ms / 574.6 GB/s at the top).
+2. Spec phase A leg (`spec_generate_gpu`, plain mode)
+   with the same env: identical shape — 28,480
+   dispatch lines, the session report tally (28,480
+   dispatches, 9 kernels, 0 dropped), and a populated
+   CSV with the same kernel rows (k1_q4k_gemv
+   1,132.6 ms / 688.6 GB/s).
+
+The defect this fix closed — two full 28,480-dispatch
+real runs with timing on emitting zero records and no
+file (2026-11-05 cleared-card baseline lane) — does
+not reproduce: both real runs here emitted every
+record, the tally, and the file, with zero dropped
+stamps. The drain fix is confirmed on the server.

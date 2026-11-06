@@ -198,3 +198,33 @@ lock held, one heavy job at a time.
    MMV wins clearly, kernel shape was the defect and MMV ships.
    If neither beats Control A, both arms close and the chase moves
    to the next research item (SQTT of the GEMV kernel in the band).
+
+## On-card leg, 2026-11-06: correctness PASS, speed not a win
+
+Step 0 of this note's protocol (the executing on-card
+run of the chunked correctness checks) was discharged
+through the sweep harness verdict run: from main
+`c439e3af45e30275601129568e3e9cb3a89590cb` on the
+cleared RX 7900 XTX, the chunked arm
+(`WGPU_COMPUTE_CHUNKED_GEMV_MAX_ROWS=16`) ran all 99
+cells of the harness matrix and the per-cell
+correctness guard against whole-batch GEMV agreed on
+every cell (0 disagreeing cells), across all three
+quant families, all three shapes, and rows 1-16. The
+chunked timing signature is visible in the table
+(batch 4 cheaper than batch 3 on the attention shape:
+one chunk vs two), proving the decomposition engaged.
+Full table: `bench/results/mmv-sweep-20261106-212335/
+chunked.csv`, recorded in
+`bench/mmv-bench-harness-2026-11-05.md`.
+
+On speed the arm wins 11 of 99 cells against the
+other three arms and generally tracks or trails plain
+GEMV elsewhere: chunking pays a full weight stream
+per chunk, so it only helps where a multi-chunk batch
+would otherwise stream per row. It does not beat the
+MMV arm in the band and does not change any default
+(the flag stays at its shipped off default). The
+named follow-up (routing `prepare_gated_proj` and
+`prepare_swiglu_proj` through the chunked path) is
+not earned by these numbers and stays unbuilt.

@@ -290,3 +290,76 @@ All on the committed tree, PATH with ~/.cargo/bin:
 - `cargo clippy -p wgpu-compute --all-targets -- -D
   warnings`: clean.
 - `cargo check --workspace --all-targets`: clean.
+
+## Server confirmation, 2026-11-06: CONFIRMED, with one prediction corrected
+
+Protocol above, run from main
+`c439e3af45e30275601129568e3e9cb3a89590cb`, staged at
+`~/gpu-wave11` (manifest-verified), cleared card
+(33,271,808 bytes at every guard, including the
+profile script's own two checks), phase lock held.
+Pre-fix comparison values are the 2026-11-05 profile
+run's, preserved in `~/gpu-wave9/prefill-profile-out/`
+on the server; today's outputs are in
+`~/gpu-wave11/prefill-profile-out/` and
+`~/gpu-wave11/logs11/`.
+
+**Step 1, correctness.** `cargo test --release -p
+wgpu-compute --test resident_session` on the card:
+7 passed, 0 failed, executed (11.96 s), including
+`resident_session_multichunk_forward_defers_readbacks`
+by name. Golden identity on the shipped path:
+`glimmer_generate --gpu` on the Stage 1 prompt
+generates ids opening with the golden first 8
+[13796, 26, 1573, 373, 290, 2167, 26899, 1212], the
+full 64-token stream identical to every other run in
+the session. (The leg's first identity attempt was
+invoked with `--ids-only`, which stops before weight
+load by design and proves nothing; it was re-run
+correctly and the defective log is preserved as
+`hostgap-identity.log` beside the good one.)
+
+**Step 2, the profile script unchanged.** Predictions
+against measurements:
+
+- (a) session_build growth: predicted +1.3-1.7 s;
+  measured 7,543 ms (pre-fix) to 7,690 ms, **+147 ms
+  only**. The prediction MISSED at its stated size:
+  the relocated upload flush, isolated at build time,
+  costs about 0.15 s, not the roughly 1.67 s this
+  note's U estimate assigned to it. The prefill
+  improvement below is therefore mostly M2, not M1.
+- (b) slice 0: predicted to fall from 2,064 ms to
+  chunk scale; measured **417 ms**, with the
+  following slices at 376-440 ms. CONFIRMED.
+- (c) timing-off prefill wall: predicted to fall
+  from 8,116 ms toward 6.5-6.7 s; measured **6,330 ms**
+  on the shipped path (`glimmer_generate`, timing
+  off) and 6,521 ms through the profile harness with
+  timing off. CONFIRMED, at and slightly under the
+  predicted band: 1,022 tokens in 6.330 s is 161.5
+  tok/s gross on the shipped path, up from 125.9.
+  (Harness timing-on reps read 7,190 / 7,162 ms and
+  the shipped path with timing on read 6,934 ms;
+  timing still costs the harness more than the
+  shipped path, as before.)
+- (d) tokens unchanged: the long-prompt run's
+  generated ids [7235, 19596, 30054, 28] are
+  identical to the pre-fix run's, and dispatch counts
+  are identical (11,783 both). CONFIRMED.
+
+Reconciliation, corrected: the 1,839 ms prefill
+saving (8,169 to 6,330 on the shipped path) is about
+0.15 s of relocated flush (M1) and about 1.65 s of
+removed per-chunk blocking readbacks (M2: 15 deferred
+chunk drains at roughly 110 ms each). This note's
+original U attribution overstated M1; the mechanism
+ranking in the diagnosis section should be read with
+M2 as the bulk term. The fix's total effect was as
+predicted; its internal split was not.
+
+**Step 3, stats fingerprint.** Shipped-path run:
+forwards=4, chunks=19 (16 prefill chunks + 3 decode
+forwards), readbacks=4, equal to forwards and down
+from 19 pre-fix. Harness run: readbacks=16, equal to
+its 16 per-slice forwards. CONFIRMED as specified.

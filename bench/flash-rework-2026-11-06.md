@@ -158,9 +158,10 @@ form's own tile is 1,024 B, so LDS never binds for it.
 
 ## VM gates (executed 2026-11-06, this lane)
 
-- `cargo test -p wgpu-compute`: 482 passed, 0 failed
-  across 25 test binaries. The new unit tests run on the
-  VM for real: the resolver semantics
+- `cargo test -p wgpu-compute`: 201 passed, 0 failed
+  across 23 test binaries (the lib binary carries 110).
+  The new unit tests were verified by name on this tree:
+  the resolver semantics
   (`flash_staged_switch_resolution`), the LDS pin
   (`staged_lds_arithmetic_matches_the_shader`), and full
   Naga parse + validation of the staged shader

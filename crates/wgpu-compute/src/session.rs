@@ -471,6 +471,28 @@ enum ProjCall {
     /// K3 dispatches chunked at power-of-two row counts
     /// (the chunked GEMV form; see [`ProjCall::ChunkedQ4K`]).
     ChunkedQ5K(Vec<K3Call>),
+    /// K7 activation dispatch + the plain projection it
+    /// feeds: the routed form of a fused-activation
+    /// projection (the gated output projection, the
+    /// SwiGLU-fused down projection). The K7 dispatch
+    /// materializes the activation (K7's own math, the
+    /// strided form over the fused forms' geometry) into
+    /// packed scratch rows, and `proj` is a plain
+    /// [`prepare_proj`] call over them, chosen by the
+    /// same ladder every plain projection takes.
+    /// Constructed only below [`GEMM_MIN_ROWS`], only
+    /// when a rung below the matrix forms admits the
+    /// batch, and only with a materialization buffer
+    /// supplied; the fused forms serve every other case,
+    /// and at shipped defaults (every rung closed) this
+    /// variant never appears in a plan.
+    ActProj {
+        /// The K7 activation dispatch (gate or SwiGLU,
+        /// strided form).
+        act: K7Call,
+        /// The projection over the materialized rows.
+        proj: Box<ProjCall>,
+    },
 }
 
 impl ProjCall {
@@ -548,6 +570,10 @@ impl ProjCall {
                     c.encode_into(pass);
                 }
             }
+            ProjCall::ActProj { act, proj } => {
+                act.encode_into(pass);
+                proj.encode_into(pass);
+            }
         }
     }
 
@@ -572,7 +598,65 @@ impl ProjCall {
             ProjCall::ChunkedQ4K(calls) => calls.len() as u64,
             ProjCall::ChunkedQ6K(calls) => calls.len() as u64,
             ProjCall::ChunkedQ5K(calls) => calls.len() as u64,
+            ProjCall::ActProj { proj, .. } => 1 + proj.dispatches(),
             _ => 1,
+        }
+    }
+
+    /// The product kernel of this form, under the diag
+    /// timestamps system's name for it: the sweep
+    /// harness's naming (see [`ProjBenchCall`]). A
+    /// composed form (a K12 quantize feeding its product,
+    /// a K7 activation feeding its projection) is named
+    /// by its product kernel; the quantize or activation
+    /// is part of the measured composition.
+    fn product_kernel_name(&self) -> &'static str {
+        match self {
+            ProjCall::Q4K(_) => "k1_q4k_gemv",
+            ProjCall::Q6K(_) => "k2_q6k_gemv",
+            ProjCall::Q5K(_) => "k3_q5k_gemv",
+            ProjCall::GemmQ4K(_) => "k10_q4k_gemm",
+            ProjCall::GemmQ6K(_) => "k11_q6k_gemm",
+            ProjCall::MmqQ4K { .. } => "k13_q4k_mmq",
+            ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
+            ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
+            ProjCall::MmqK23Q4K { .. } => "k23_q4k_mmq",
+            ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
+            ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
+            ProjCall::SmallQ4K { .. } => "k18_q4k_small",
+            ProjCall::SmallQ6K { .. } => "k18_q6k_small",
+            ProjCall::SmallQ5K { .. } => "k18_q5k_small",
+            ProjCall::MmvQ4K(_) => "k19_q4k_mmv",
+            ProjCall::MmvQ6K(_) => "k20_q6k_mmv",
+            ProjCall::MmvQ5K(_) => "k21_q5k_mmv",
+            ProjCall::ChunkedQ4K(_) => "k1_q4k_gemv",
+            ProjCall::ChunkedQ6K(_) => "k2_q6k_gemv",
+            ProjCall::ChunkedQ5K(_) => "k3_q5k_gemv",
+            ProjCall::ActProj { proj, .. } => proj.product_kernel_name(),
+        }
+    }
+
+    /// Whether this form quantizes its activation to Q8
+    /// before the product (the MMQ and small-batch forms):
+    /// its output answers to the crate's 5% quantization
+    /// band against the f32 GEMV form, not to the tight
+    /// reassociation bound. A routed form answers for the
+    /// product it wraps.
+    fn activation_quantized(&self) -> bool {
+        match self {
+            ProjCall::ActProj { proj, .. } => proj.activation_quantized(),
+            ProjCall::Q4K(_)
+            | ProjCall::Q6K(_)
+            | ProjCall::Q5K(_)
+            | ProjCall::GemmQ4K(_)
+            | ProjCall::GemmQ6K(_)
+            | ProjCall::MmvQ4K(_)
+            | ProjCall::MmvQ6K(_)
+            | ProjCall::MmvQ5K(_)
+            | ProjCall::ChunkedQ4K(_)
+            | ProjCall::ChunkedQ6K(_)
+            | ProjCall::ChunkedQ5K(_) => false,
+            _ => true,
         }
     }
 }
@@ -767,28 +851,7 @@ impl ProjBenchCall {
     /// part of the measured composition.
     #[must_use]
     pub fn kernel_name(&self) -> &'static str {
-        match &self.call {
-            ProjCall::Q4K(_) => "k1_q4k_gemv",
-            ProjCall::Q6K(_) => "k2_q6k_gemv",
-            ProjCall::Q5K(_) => "k3_q5k_gemv",
-            ProjCall::GemmQ4K(_) => "k10_q4k_gemm",
-            ProjCall::GemmQ6K(_) => "k11_q6k_gemm",
-            ProjCall::MmqQ4K { .. } => "k13_q4k_mmq",
-            ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
-            ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
-            ProjCall::MmqK23Q4K { .. } => "k23_q4k_mmq",
-            ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
-            ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
-            ProjCall::SmallQ4K { .. } => "k18_q4k_small",
-            ProjCall::SmallQ6K { .. } => "k18_q6k_small",
-            ProjCall::SmallQ5K { .. } => "k18_q5k_small",
-            ProjCall::MmvQ4K(_) => "k19_q4k_mmv",
-            ProjCall::MmvQ6K(_) => "k20_q6k_mmv",
-            ProjCall::MmvQ5K(_) => "k21_q5k_mmv",
-            ProjCall::ChunkedQ4K(_) => "k1_q4k_gemv",
-            ProjCall::ChunkedQ6K(_) => "k2_q6k_gemv",
-            ProjCall::ChunkedQ5K(_) => "k3_q5k_gemv",
-        }
+        self.call.product_kernel_name()
     }
 
     /// Whether this form quantizes its activation to
@@ -798,20 +861,7 @@ impl ProjBenchCall {
     /// to the tight reassociation bound.
     #[must_use]
     pub fn quantized(&self) -> bool {
-        !matches!(
-            self.call,
-            ProjCall::Q4K(_)
-                | ProjCall::Q6K(_)
-                | ProjCall::Q5K(_)
-                | ProjCall::GemmQ4K(_)
-                | ProjCall::GemmQ6K(_)
-                | ProjCall::MmvQ4K(_)
-                | ProjCall::MmvQ6K(_)
-                | ProjCall::MmvQ5K(_)
-                | ProjCall::ChunkedQ4K(_)
-                | ProjCall::ChunkedQ6K(_)
-                | ProjCall::ChunkedQ5K(_)
-        )
+        self.call.activation_quantized()
     }
 }
 
@@ -1684,6 +1734,87 @@ fn prepare_proj(
     }
 }
 
+/// Whether any rung of the plain-projection ladder below
+/// the matrix forms would serve a projection of `family`
+/// at (`in_features` x `out_rows`) and `batch`: the
+/// band-routed MMV product, the K18 small-batch product
+/// (when the device built the family's pipeline), or the
+/// chunked GEMV form. The fused-activation prepares
+/// ([`prepare_gated_proj`], [`prepare_swiglu_proj`])
+/// consult this before decomposing into a K7
+/// materialization plus a plain [`prepare_proj`]: when no
+/// rung admits the batch, the ladder's answer is the
+/// plain GEMV product, and the fused form is that same
+/// product with the activation folded in, in one dispatch
+/// instead of two, so the fused form serves it and
+/// nothing changes. At shipped defaults every rung is
+/// closed, so this is false at every batch and the fused
+/// forms serve everything, exactly as before routing.
+fn routed_rung_admits(
+    backend: &WgpuCompute,
+    family: MmvFamily,
+    in_features: usize,
+    out_rows: usize,
+    batch: u32,
+) -> bool {
+    if mmv_applies(backend, family, in_features, out_rows, batch) {
+        return true;
+    }
+    if small_batch_applies(backend, batch) {
+        let built = match family {
+            MmvFamily::Q4K => backend.k18_q4k().is_some(),
+            MmvFamily::Q6K => backend.k18_q6k().is_some(),
+            MmvFamily::Q5K => backend.k18_q5k().is_some(),
+        };
+        if built {
+            return true;
+        }
+    }
+    chunked_gemv_applies(backend, batch)
+}
+
+/// The product half of a routed fused-activation
+/// projection: a plain [`prepare_proj`] over the
+/// materialized activation rows in `act`, when the batch
+/// sits below the matrix forms and a rung below them
+/// admits it (see [`routed_rung_admits`]). `None` when
+/// the fused form serves instead: the batch is out of
+/// the routed range, no rung admits it, or the ladder's
+/// prepare refuses (logged by name), in which case the
+/// fused form is the floor and serves the projection
+/// exactly as it did before routing existed.
+#[allow(clippy::too_many_arguments)]
+fn routed_product(
+    backend: &WgpuCompute,
+    weights: &ProjWeights,
+    family: MmvFamily,
+    in_features: usize,
+    out_rows: usize,
+    act: &wgpu::Buffer,
+    q8_qs: &wgpu::Buffer,
+    q8_ds: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: usize,
+    step: &'static str,
+    what: &'static str,
+) -> Option<ProjCall> {
+    if !(2..GEMM_MIN_ROWS).contains(&batch) {
+        return None;
+    }
+    if !routed_rung_admits(backend, family, in_features, out_rows, batch as u32) {
+        return None;
+    }
+    match prepare_proj(
+        backend, weights, act, q8_qs, q8_ds, output, batch, step, None,
+    ) {
+        Ok(proj) => Some(proj),
+        Err(e) => {
+            dbg_log!("routed {what} refused at the ladder prepare: {e}; the fused form serves it");
+            None
+        }
+    }
+}
+
 /// Prepare the gated output projection (a Q4_K projection
 /// whose activation is the attention rows gated by a second
 /// stream): on chunk plans past [`GEMM_MIN_ROWS`], the MMQ
@@ -1691,22 +1822,37 @@ fn prepare_proj(
 /// [`mmq_product_q4k`] chooses: the wide K15 form past the
 /// wide row threshold, the standard K13 form behind it)
 /// when the backend built it, the GEMM's gated form behind
-/// it, K1's gated form otherwise. The geometry contract is
-/// the same [`K1ActGeom`] in every form.
+/// it, K1's gated form otherwise. Below the matrix forms,
+/// when a rung of the plain ladder admits the batch and
+/// the caller supplies a materialization buffer
+/// (`act_out`), the routed form: K7's strided gate
+/// materializes the activation and a plain
+/// [`prepare_proj`] computes the product (see
+/// [`routed_product`]). The geometry contract is the
+/// same [`K1ActGeom`] in every form.
 #[allow(clippy::too_many_arguments)]
 fn prepare_gated_proj(
     backend: &WgpuCompute,
-    weights: &K1Weights,
+    weights: &ProjWeights,
     input_a: &wgpu::Buffer,
     input_b: &wgpu::Buffer,
     q8_qs: &wgpu::Buffer,
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
+    act_out: Option<&wgpu::Buffer>,
     batch: usize,
     geom: &K1ActGeom,
     step: &'static str,
 ) -> Result<ProjCall> {
     let ctx = backend.context();
+    let ProjWeights::Q4K(w) = weights else {
+        return Err(GlimmerError::StepFailed {
+            step,
+            detail: "the gated output projection is a Q4_K form; \
+                     other families keep the trait composition"
+                .to_string(),
+        });
+    };
     if batch >= GEMM_MIN_ROWS {
         if backend.k13().is_some() || backend.k15().is_some() {
             let quant = backend.k12_gated().prepare_act(
@@ -1716,20 +1862,14 @@ fn prepare_gated_proj(
                 q8_qs,
                 q8_ds,
                 batch as u32,
-                weights.in_features,
+                w.in_features,
                 geom,
             );
             match quant {
                 Ok(quant) => {
-                    if let Some(c) = mmq_product_q4k(
-                        backend,
-                        weights,
-                        q8_qs,
-                        q8_ds,
-                        output,
-                        batch as u32,
-                        Some(quant),
-                    ) {
+                    if let Some(c) =
+                        mmq_product_q4k(backend, w, q8_qs, q8_ds, output, batch as u32, Some(quant))
+                    {
                         return Ok(c);
                     }
                 }
@@ -1743,14 +1883,44 @@ fn prepare_gated_proj(
         }
         if let Some(g) = backend.k10_gated() {
             return g
-                .prepare_act(ctx, weights, input_a, input_b, output, batch as u32, geom)
+                .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
                 .map(ProjCall::GemmQ4K)
                 .map_err(|e| we(e, step));
         }
     }
+    if let Some(act) = act_out {
+        if let Some(proj) = routed_product(
+            backend,
+            weights,
+            MmvFamily::Q4K,
+            w.in_features,
+            w.out_rows,
+            act,
+            q8_qs,
+            q8_ds,
+            output,
+            batch,
+            step,
+            "gated q4k",
+        ) {
+            let act_call = backend.k7().prepare_gate_strided(
+                ctx,
+                input_a,
+                input_b,
+                act,
+                batch,
+                w.in_features,
+                geom,
+            );
+            return Ok(ProjCall::ActProj {
+                act: act_call,
+                proj: Box::new(proj),
+            });
+        }
+    }
     backend
         .k1_gated()
-        .prepare_act(ctx, weights, input_a, input_b, output, batch as u32, geom)
+        .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
         .map(ProjCall::Q4K)
         .map_err(|e| we(e, step))
 }
@@ -1760,7 +1930,13 @@ fn prepare_gated_proj(
 /// [`GEMM_MIN_ROWS`], the MMQ form (the SwiGLU K12 quantize
 /// feeding the family's product kernel) when the backend
 /// built it, the GEMM's SwiGLU form behind it, the family's
-/// GEMV SwiGLU form otherwise.
+/// GEMV SwiGLU form otherwise. Below the matrix forms,
+/// when a rung of the plain ladder admits the batch and
+/// the caller supplies a materialization buffer
+/// (`act_out`), the routed form: K7's strided SwiGLU
+/// materializes the activation and a plain
+/// [`prepare_proj`] computes the product (see
+/// [`routed_product`]).
 #[allow(clippy::too_many_arguments)]
 fn prepare_swiglu_proj(
     backend: &WgpuCompute,
@@ -1770,6 +1946,7 @@ fn prepare_swiglu_proj(
     q8_qs: &wgpu::Buffer,
     q8_ds: &wgpu::Buffer,
     output: &wgpu::Buffer,
+    act_out: Option<&wgpu::Buffer>,
     batch: usize,
     geom: &K1ActGeom,
     step: &'static str,
@@ -1819,6 +1996,36 @@ fn prepare_swiglu_proj(
                         .map_err(|e| we(e, step));
                 }
             }
+            if let Some(act) = act_out {
+                if let Some(proj) = routed_product(
+                    backend,
+                    weights,
+                    MmvFamily::Q4K,
+                    w.in_features,
+                    w.out_rows,
+                    act,
+                    q8_qs,
+                    q8_ds,
+                    output,
+                    batch,
+                    step,
+                    "swiglu q4k",
+                ) {
+                    let act_call = backend.k7().prepare_swiglu_strided(
+                        ctx,
+                        input_a,
+                        input_b,
+                        act,
+                        batch,
+                        w.in_features,
+                        geom,
+                    );
+                    return Ok(ProjCall::ActProj {
+                        act: act_call,
+                        proj: Box::new(proj),
+                    });
+                }
+            }
             backend
                 .k1_swiglu()
                 .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
@@ -1865,6 +2072,36 @@ fn prepare_swiglu_proj(
                         .prepare_act(ctx, w, input_a, input_b, output, batch as u32, geom)
                         .map(ProjCall::GemmQ6K)
                         .map_err(|e| we(e, step));
+                }
+            }
+            if let Some(act) = act_out {
+                if let Some(proj) = routed_product(
+                    backend,
+                    weights,
+                    MmvFamily::Q6K,
+                    w.in_features,
+                    w.out_rows,
+                    act,
+                    q8_qs,
+                    q8_ds,
+                    output,
+                    batch,
+                    step,
+                    "swiglu q6k",
+                ) {
+                    let act_call = backend.k7().prepare_swiglu_strided(
+                        ctx,
+                        input_a,
+                        input_b,
+                        act,
+                        batch,
+                        w.in_features,
+                        geom,
+                    );
+                    return Ok(ProjCall::ActProj {
+                        act: act_call,
+                        proj: Box::new(proj),
+                    });
                 }
             }
             backend
@@ -2986,12 +3223,16 @@ impl ChunkPlan {
             // same gate values), reading the gate rows from
             // the batch's fourth segment when they ride it, or
             // from their own projection otherwise; the K7
-            // multiply dispatch disappears either way. Any
+            // multiply dispatch disappears either way, except
+            // when a plain-ladder rung admits the batch and
+            // the routed form (see prepare_gated_proj)
+            // brings the strided K7 gate back in front of a
+            // plain product. Any
             // other output family keeps the trait composition:
             // separate gate projection, K7 multiply, plain
             // output projection.
             let (proj_gate, gate_mul, proj_o, gate_fused) =
-                if let ProjWeights::Q4K(ow) = &layer.attn_output {
+                if matches!(layer.attn_output, ProjWeights::Q4K(_)) {
                     if layer.batch_gate {
                         let batch = need(&layer.attn_batch)?;
                         // The gate is the batch's last
@@ -3004,12 +3245,13 @@ impl ChunkPlan {
                         };
                         let call = prepare_gated_proj(
                             backend,
-                            ow,
+                            &layer.attn_output,
                             &scratch.attn,
                             &scratch.qkv,
                             &scratch.q8_qs,
                             &scratch.q8_ds,
                             &scratch.branch,
+                            Some(&scratch.attn_gated),
                             rows,
                             &K1ActGeom {
                                 a_stride_elems: q_width,
@@ -3033,12 +3275,13 @@ impl ChunkPlan {
                         )?;
                         let call = prepare_gated_proj(
                             backend,
-                            ow,
+                            &layer.attn_output,
                             &scratch.attn,
                             &scratch.gate,
                             &scratch.q8_qs,
                             &scratch.q8_ds,
                             &scratch.branch,
+                            Some(&scratch.attn_gated),
                             rows,
                             &K1ActGeom {
                                 a_stride_elems: q_width,
@@ -3163,7 +3406,11 @@ impl ChunkPlan {
             // activation fused into its activation stage
             // (K1's or K2's SwiGLU form, K7's exact silu over
             // the same gate/up values): the up projection and
-            // the K7 dispatch both disappear. Unpaired layers
+            // the K7 dispatch both disappear, except when a
+            // plain-ladder rung admits the batch and the
+            // routed form (see prepare_swiglu_proj) brings
+            // the strided K7 SwiGLU back in front of a plain
+            // product. Unpaired layers
             // keep the trait composition: two projections, the
             // K7 activation, the plain down projection.
             let (proj_fg, proj_fu, swiglu, proj_fd) = if let Some(pair) = &layer.ffn_pair {
@@ -3191,6 +3438,7 @@ impl ChunkPlan {
                     &scratch.q8_qs,
                     &scratch.q8_ds,
                     &scratch.branch,
+                    Some(&scratch.ffn_act),
                     rows,
                     &geom,
                     "swiglu_ffn",

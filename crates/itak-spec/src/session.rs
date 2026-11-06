@@ -654,6 +654,17 @@ impl<D: TargetDriver> SpecSession<D> {
                 emitted.len()
             ),
         );
+        // Capture wiring, record only: hand the completed
+        // round's real proposed ids and accepted count to
+        // the driver's record seam, here where both are
+        // still in hand (RoundOutcome below carries counts
+        // only). The resident driver forwards them to its
+        // session's capture accumulator; every other driver
+        // records nothing. Placed after the commit, so a
+        // round that fails anywhere above is never recorded
+        // as completed, and the call itself feeds nothing
+        // back into sampling, acceptance, or control flow.
+        self.driver.note_spec_round(&proposal.tokens, accepted);
         Ok(RoundOutcome {
             emitted,
             proposed: n,

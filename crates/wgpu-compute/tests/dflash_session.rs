@@ -763,3 +763,170 @@ fn dflash_session_capped_forward_returns_the_full_prefix() {
         "got {err}"
     );
 }
+
+/// Build the fixture draft session for the diag tests:
+/// the parity fixture's raw weights and borrowed tables,
+/// with positions 0..8 already injected.
+fn diag_fixture_session<'a>(backend: &'a WgpuCompute, cfg: &DflashConfig) -> DflashSession<'a> {
+    let (tensors, emb_view, out_view) = fixture_tensors(cfg);
+    let raw = DflashRawWeights::load(&MapSource { tensors }, cfg).expect("raw weights load");
+    let mut session = DflashSession::new(
+        backend,
+        cfg,
+        &raw,
+        Some(&emb_view),
+        Some(&out_view),
+        DflashSessionConfig { kv_capacity: 64 },
+    )
+    .expect("draft session builds");
+    let positions: Vec<usize> = (0..8).collect();
+    let features = features_for(cfg, &positions);
+    session.inject(&features, &positions).expect("gpu inject");
+    session
+}
+
+/// The diag capture wiring, timing arm (opt-in, the
+/// resident tests' discipline): runs only when
+/// `WGPU_COMPUTE_DIAG=timing` and `WGPU_COMPUTE_DIAG_OUT`
+/// names the report file. A timing-mode draft session
+/// carries the timing accumulator (its dispatches drain
+/// and count), but the capture hooks stay inert: no
+/// manifest begins, the block forward records no capture
+/// rows, and the finish writes no capture sidecars.
+#[test]
+fn dflash_session_diag_timing_records_no_capture() {
+    use wgpu_compute::DiagMode;
+
+    let Some(out_path) = std::env::var_os(wgpu_compute::timestamps::DIAG_OUT_ENV) else {
+        eprintln!("skipping dflash diag timing: DIAG_OUT is not set");
+        return;
+    };
+    if DiagMode::from_env() != DiagMode::Timing {
+        eprintln!("skipping dflash diag timing: WGPU_COMPUTE_DIAG is not `timing`");
+        return;
+    }
+    let Some(backend) = backend_or_skip("dflash diag timing test") else {
+        return;
+    };
+    if backend.context().diag_recorder().is_none() {
+        eprintln!(
+            "skipping dflash diag timing: timing requested but the device \
+             granted no timestamp features, so no recorder exists"
+        );
+        return;
+    }
+    let out = std::path::PathBuf::from(out_path);
+    // This opt-in run owns the prefix: clear any sidecars a
+    // previous capture run left beside it, so their absence
+    // below is this run's own doing.
+    let _ = std::fs::remove_file(wgpu_compute::manifest_sidecar_path(&out));
+    let _ = std::fs::remove_file(wgpu_compute::capture_sidecar_path(&out));
+
+    let cfg = fixture_cfg();
+    let mut session = diag_fixture_session(&backend, &cfg);
+    assert!(
+        session.diag_manifest_json().is_none(),
+        "timing mode begins no capture manifest"
+    );
+    let block: Vec<u32> = vec![3, 10, 17, cfg.mask_token_id];
+    session.forward_block(&block, 8).expect("gpu block");
+    assert!(
+        session.diag_dispatch_count() > 0,
+        "the timing accumulator must drain the block's dispatches"
+    );
+    assert!(
+        session.diag_capture_records().is_empty(),
+        "timing mode records no capture rows, saw {:?}",
+        session.diag_capture_records()
+    );
+    session.finish_diag_report();
+    assert!(
+        !wgpu_compute::manifest_sidecar_path(&out).exists(),
+        "timing mode writes no manifest sidecar"
+    );
+    assert!(
+        !wgpu_compute::capture_sidecar_path(&out).exists(),
+        "timing mode writes no capture sidecar"
+    );
+}
+
+/// The diag capture wiring, capture arm (opt-in, same
+/// discipline): runs only when
+/// `WGPU_COMPUTE_DIAG=capture` and `WGPU_COMPUTE_DIAG_OUT`
+/// names the report file. The draft session begins its
+/// manifest at construction (kind `dflash`, its depth and
+/// block size), the block forward lands as exactly one
+/// `block` capture record over the rows it read back, and
+/// the finish leaves both sidecars.
+#[test]
+fn dflash_session_diag_capture_records_the_block() {
+    use wgpu_compute::DiagMode;
+
+    let Some(out_path) = std::env::var_os(wgpu_compute::timestamps::DIAG_OUT_ENV) else {
+        eprintln!("skipping dflash diag capture: DIAG_OUT is not set");
+        return;
+    };
+    if DiagMode::from_env() != DiagMode::Capture {
+        eprintln!("skipping dflash diag capture: WGPU_COMPUTE_DIAG is not `capture`");
+        return;
+    }
+    let Some(backend) = backend_or_skip("dflash diag capture test") else {
+        return;
+    };
+    if backend.context().diag_recorder().is_none() {
+        eprintln!(
+            "skipping dflash diag capture: capture requested but the device \
+             granted no timestamp features, so no recorder exists"
+        );
+        return;
+    }
+    let out = std::path::PathBuf::from(out_path);
+    let _ = std::fs::remove_file(wgpu_compute::manifest_sidecar_path(&out));
+    let _ = std::fs::remove_file(wgpu_compute::capture_sidecar_path(&out));
+
+    let cfg = fixture_cfg();
+    let mut session = diag_fixture_session(&backend, &cfg);
+    let manifest = session
+        .diag_manifest_json()
+        .expect("capture mode begins the draft manifest at construction");
+    assert!(
+        manifest.contains("\"kind\":\"dflash\""),
+        "manifest: {manifest}"
+    );
+    assert!(
+        manifest.contains(&format!("\"depth\":\"{}\"", cfg.block_count)),
+        "manifest: {manifest}"
+    );
+    assert!(
+        manifest.contains(&format!("\"block_size\":\"{}\"", cfg.block_size)),
+        "manifest: {manifest}"
+    );
+    assert!(
+        session.diag_capture_records().is_empty(),
+        "no forward yet, no capture records"
+    );
+    let block: Vec<u32> = vec![3, 10, 17, cfg.mask_token_id];
+    session.forward_block(&block, 8).expect("gpu block");
+    let records = session.diag_capture_records();
+    assert_eq!(
+        records.len(),
+        1,
+        "one block forward, one capture record: {records:?}"
+    );
+    assert_eq!(records[0].kind, wgpu_compute::CaptureRecord::KIND_BLOCK);
+    assert_eq!(
+        records[0].values,
+        (block.len() * cfg.vocab_size as usize) as u64,
+        "the fingerprint covers the rows the forward read back"
+    );
+    session.finish_diag_report();
+    assert!(
+        wgpu_compute::manifest_sidecar_path(&out).exists(),
+        "capture mode writes the manifest sidecar"
+    );
+    let capture_text = std::fs::read_to_string(wgpu_compute::capture_sidecar_path(&out))
+        .expect("capture mode writes the capture sidecar");
+    let parsed = wgpu_compute::parse_capture_csv(&capture_text).expect("capture sidecar parses");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kind, wgpu_compute::CaptureRecord::KIND_BLOCK);
+}

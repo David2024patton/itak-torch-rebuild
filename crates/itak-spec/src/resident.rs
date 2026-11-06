@@ -92,4 +92,14 @@ impl TargetDriver for ResidentTarget<'_> {
     fn release(&mut self, _checkpoint: &usize) -> GlimmerResult<()> {
         Ok(())
     }
+
+    /// Forward the completed round to the resident
+    /// session's capture accumulator: at the capture diag
+    /// level the session fingerprints the proposed ids and
+    /// records the accepted count; at every other level the
+    /// session records nothing, so this is a pure
+    /// observation with no effect on the round.
+    fn note_spec_round(&mut self, proposed: &[u32], accepted: usize) {
+        let _ = self.session.note_spec_round(proposed, accepted);
+    }
 }

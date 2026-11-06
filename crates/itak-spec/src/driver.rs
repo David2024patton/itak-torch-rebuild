@@ -83,6 +83,19 @@ pub trait TargetDriver {
     /// Drop the snapshot `checkpoint` took (the round committed
     /// or was rolled back; the snapshot is spent either way).
     fn release(&mut self, checkpoint: &Self::Checkpoint) -> GlimmerResult<()>;
+
+    /// Record one completed speculative round: the draft's
+    /// proposed token ids and how many of them the target
+    /// accepted. The loop calls this exactly once per
+    /// completed round, at the point where both are in hand
+    /// (the round's outcome carries counts only, never the
+    /// ids). Record only: an implementation must not let
+    /// this change sampling, acceptance, or control flow,
+    /// and drivers with nothing to record (the default, the
+    /// CPU driver included) do nothing. The resident driver
+    /// forwards it to the session's capture diag, where it
+    /// lands only at the capture level.
+    fn note_spec_round(&mut self, _proposed: &[u32], _accepted: usize) {}
 }
 
 /// The CPU target driver: the loop's original target path,
@@ -198,12 +211,18 @@ mod tests {
     /// Its KV is the vector of forwarded tokens; a rewind
     /// truncates it. Checkpoint, rewind, and release calls are
     /// recorded for the accounting assertions.
+    /// The stub's spec-round record log: one (proposed ids,
+    /// accepted count) entry per completed round, shared
+    /// with the owning test.
+    type SpecRoundNotes = Rc<RefCell<Vec<(Vec<u32>, usize)>>>;
+
     struct StubTarget {
         config: GlimmerConfig,
         kv: Vec<u32>,
         checkpoints: Rc<RefCell<Vec<usize>>>,
         rewinds: Rc<RefCell<Vec<usize>>>,
         releases: Rc<Cell<usize>>,
+        spec_rounds: SpecRoundNotes,
     }
 
     /// A stub checkpoint: the KV length it saw, plus the row
@@ -223,6 +242,7 @@ mod tests {
         checkpoints: Rc<RefCell<Vec<usize>>>,
         rewinds: Rc<RefCell<Vec<usize>>>,
         releases: Rc<Cell<usize>>,
+        spec_rounds: SpecRoundNotes,
     }
 
     impl StubTarget {
@@ -231,6 +251,7 @@ mod tests {
                 checkpoints: Rc::new(RefCell::new(Vec::new())),
                 rewinds: Rc::new(RefCell::new(Vec::new())),
                 releases: Rc::new(Cell::new(0)),
+                spec_rounds: Rc::new(RefCell::new(Vec::new())),
             };
             (
                 StubTarget {
@@ -239,6 +260,7 @@ mod tests {
                     checkpoints: recorders.checkpoints.clone(),
                     rewinds: recorders.rewinds.clone(),
                     releases: recorders.releases.clone(),
+                    spec_rounds: recorders.spec_rounds.clone(),
                 },
                 recorders,
             )
@@ -343,6 +365,12 @@ mod tests {
         fn release(&mut self, _checkpoint: &StubCheckpoint) -> Result<(), GlimmerError> {
             self.releases.set(self.releases.get() + 1);
             Ok(())
+        }
+
+        fn note_spec_round(&mut self, proposed: &[u32], accepted: usize) {
+            self.spec_rounds
+                .borrow_mut()
+                .push((proposed.to_vec(), accepted));
         }
     }
 
@@ -467,5 +495,68 @@ mod tests {
             "every checkpoint is released exactly once"
         );
         assert_eq!(rec.rewinds.borrow().len(), rounds, "one rewind per round");
+    }
+
+    /// The capture wiring at the seam: the loop hands the
+    /// driver exactly one spec-round record per completed
+    /// round, carrying that round's REAL proposed ids and
+    /// accepted count. The record's length is the round's
+    /// proposed count, its count is the round's accepted
+    /// count, and its accepted prefix is exactly the tokens
+    /// the round emitted from the proposal (the session's
+    /// default config names no stop tokens, so emission is
+    /// never truncated). This is the call the resident
+    /// driver forwards to its session's capture
+    /// accumulator; here the stub records it so the wiring
+    /// itself is pinned without a device.
+    #[test]
+    fn stub_driver_receives_one_spec_round_record_per_round() {
+        let config = SpecConfig {
+            depth: 3,
+            ..SpecConfig::default()
+        };
+        let (stub, rec) = StubTarget::new();
+        let mut session =
+            SpecSession::new(stub, Some(fixture_draft(5)), config, Arc::new(NullDiag))
+                .expect("spec session over stub builds");
+        session.begin(PROMPT).expect("begin");
+
+        let mut outcomes = Vec::new();
+        while session.cache_position() < PROMPT.len() + 12 && outcomes.len() < 20 {
+            let outcome = session.round().expect("round");
+            let stopped = outcome.stopped;
+            outcomes.push(outcome);
+            if stopped {
+                break;
+            }
+        }
+        assert!(!outcomes.is_empty(), "at least one round ran");
+        assert!(
+            outcomes.iter().all(|o| o.proposed > 0),
+            "every round here is speculative: {outcomes:?}"
+        );
+        let notes = rec.spec_rounds.borrow();
+        assert_eq!(
+            notes.len(),
+            outcomes.len(),
+            "one record per completed round"
+        );
+        for (round, (note, outcome)) in notes.iter().zip(outcomes.iter()).enumerate() {
+            assert_eq!(
+                note.0.len(),
+                outcome.proposed,
+                "round {round}: the record carries the round's proposed ids"
+            );
+            assert_eq!(
+                note.1, outcome.accepted,
+                "round {round}: the record carries the round's accepted count"
+            );
+            assert_eq!(
+                &note.0[..outcome.accepted],
+                &outcome.emitted[..outcome.accepted],
+                "round {round}: the recorded ids are the round's real proposal, \
+                 whose accepted prefix is what the round emitted"
+            );
+        }
     }
 }

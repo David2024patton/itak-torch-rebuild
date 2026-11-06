@@ -88,7 +88,9 @@ use crate::kernels::k4_rmsnorm::K4Call;
 use crate::kernels::k7_swiglu::K7Call;
 use crate::kernels::k8_head::K8GatherRowsCall;
 use crate::session::{pow2_chunks, upload_norm, upload_proj, ProjWeights, GEMM_MIN_ROWS};
-use crate::timestamps::DiagAccumulator;
+use crate::timestamps::{
+    build_git, build_version, CaptureRecord, DiagAccumulator, DiagMode, RunManifest,
+};
 
 /// Result alias in draft vocabulary.
 type Result<T> = std::result::Result<T, DflashError>;
@@ -1391,6 +1393,25 @@ impl<'a> DflashSession<'a> {
                 weights.target_hidden
             ),
         );
+        // Capture level: stamp the run manifest now, while
+        // the resolved configuration and the draft's shape
+        // are all still in hand, mirroring
+        // [`crate::ResidentSession`]. A no-op below capture
+        // (begin_manifest itself is capture-gated), so the
+        // timing and off paths construct exactly as before.
+        let mut diag_acc = backend
+            .context()
+            .diag_recorder()
+            .map(|_| DiagAccumulator::from_env());
+        if let Some(acc) = &mut diag_acc {
+            acc.begin_manifest(Self::capture_manifest(
+                backend,
+                cfg,
+                weights.conditioning_width(),
+                weights.target_hidden,
+                session_cfg.kv_capacity,
+            ));
+        }
         Ok(DflashSession {
             backend,
             cfg: cfg.clone(),
@@ -1411,10 +1432,7 @@ impl<'a> DflashSession<'a> {
             kv_capacity: session_cfg.kv_capacity,
             stats: DflashSessionStats::default(),
             diag,
-            diag_acc: backend
-                .context()
-                .diag_recorder()
-                .map(|_| DiagAccumulator::from_env()),
+            diag_acc,
         })
     }
 
@@ -1505,6 +1523,150 @@ impl<'a> DflashSession<'a> {
     #[must_use]
     pub fn diag_summary_csv(&self) -> Option<String> {
         self.diag_acc.as_ref().map(DiagAccumulator::render_csv)
+    }
+
+    /// The session section of the capture manifest, as
+    /// ordered (name, value) pairs: the draft's own shape.
+    /// The draft model's depth is its layer count
+    /// (`block_count`); the speculative depth is the spec
+    /// session's config, not this session's, and is not
+    /// stated here. Pure, so the wiring is unit-testable
+    /// without a device.
+    fn capture_session_pairs(
+        cfg: &DflashConfig,
+        conditioning_width: usize,
+        target_hidden: u32,
+        kv_capacity: usize,
+    ) -> Vec<(String, String)> {
+        let pair = |name: &str, value: String| (name.to_string(), value);
+        vec![
+            pair("kind", "dflash".to_string()),
+            pair("depth", cfg.block_count.to_string()),
+            pair("block_size", cfg.block_size.to_string()),
+            pair("hidden", cfg.hidden.to_string()),
+            pair("vocab", cfg.vocab_size.to_string()),
+            pair("context_length", cfg.context_length.to_string()),
+            pair("target_hidden", target_hidden.to_string()),
+            pair("conditioning_width", conditioning_width.to_string()),
+            pair("kv_capacity", kv_capacity.to_string()),
+        ]
+    }
+
+    /// The run manifest a draft session stamps at the
+    /// capture diag level, mirroring
+    /// [`crate::ResidentSession`]'s: build identity from
+    /// this crate, adapter and driver identity from the
+    /// backend, the resolved configuration the backend
+    /// actually runs with (resolved values, never raw env
+    /// text), and the draft's own shape
+    /// ([`Self::capture_session_pairs`]). The model section
+    /// is left empty here; the accumulator fills it from a
+    /// noted or registered model file
+    /// ([`DiagAccumulator::begin_manifest`]).
+    fn capture_manifest(
+        backend: &WgpuCompute,
+        cfg: &DflashConfig,
+        conditioning_width: usize,
+        target_hidden: u32,
+        kv_capacity: usize,
+    ) -> RunManifest {
+        let facts = &backend.context().adapter;
+        let pair = |name: &str, value: String| (name.to_string(), value);
+        RunManifest {
+            diag_mode: DiagMode::Capture.name().to_string(),
+            build_version: build_version().to_string(),
+            git: build_git().to_string(),
+            adapter_name: facts.name.clone(),
+            adapter_backend: format!("{:?}", facts.backend),
+            adapter_device_type: format!("{:?}", facts.device_type),
+            adapter_driver: facts.driver.clone(),
+            adapter_driver_info: facts.driver_info.clone(),
+            resolved_config: vec![
+                pair(
+                    "small_batch_max_rows",
+                    backend.small_batch_max_rows().to_string(),
+                ),
+                pair("mmv_max_rows", backend.mmv_max_rows().to_string()),
+                pair("mmv_bands", backend.mmv_bands_describe()),
+                pair(
+                    "chunked_gemv_max_rows",
+                    backend.chunked_gemv_max_rows().to_string(),
+                ),
+                pair("k22_mmq", backend.k22_mmq().to_string()),
+                pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
+            ],
+            model: None,
+            session: Self::capture_session_pairs(
+                cfg,
+                conditioning_width,
+                target_hidden,
+                kv_capacity,
+            ),
+        }
+    }
+
+    /// Record a completed block forward's read-back logits
+    /// with the capture accumulator. One branch off the
+    /// capture level, like [`Self::drain_diag`], and the
+    /// hash runs over exactly the rows the forward already
+    /// read back (the whole block for
+    /// [`Self::forward_block`], the returned prefix for
+    /// [`Self::forward_block_capped`]): capture adds no GPU
+    /// work and no readback.
+    fn capture_block(&mut self, logits: &[f32]) {
+        if let Some(acc) = &mut self.diag_acc {
+            acc.record_forward(CaptureRecord::KIND_BLOCK, logits);
+        }
+    }
+
+    /// Fingerprint the model file at `path` into this
+    /// session's capture manifest (its path, size, and
+    /// content fingerprint under
+    /// [`crate::timestamps::MODEL_FINGERPRINT_METHOD`]),
+    /// mirroring [`crate::ResidentSession::note_model_file`].
+    /// With no accumulator (diag off) this is an `Ok(())`
+    /// no-op.
+    ///
+    /// # Errors
+    ///
+    /// The `io` error when the file cannot be opened,
+    /// stated, or read.
+    pub fn note_model_file(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        match &mut self.diag_acc {
+            Some(acc) => acc.note_model_file(path),
+            None => Ok(()),
+        }
+    }
+
+    /// Record one speculative round with the capture
+    /// accumulator, mirroring
+    /// [`crate::ResidentSession::note_spec_round`]: the
+    /// draft's proposed token ids (fingerprinted) and how
+    /// many of them the target accepted. Returns the record
+    /// when one was made; off the capture level it records
+    /// nothing.
+    pub fn note_spec_round(&mut self, proposed: &[u32], accepted: usize) -> Option<CaptureRecord> {
+        self.diag_acc
+            .as_mut()?
+            .record_spec_round(proposed, accepted)
+    }
+
+    /// The capture records this session has recorded so far,
+    /// in order (empty off the capture level).
+    #[must_use]
+    pub fn diag_capture_records(&self) -> &[CaptureRecord] {
+        self.diag_acc
+            .as_ref()
+            .map_or(&[], DiagAccumulator::capture_records)
+    }
+
+    /// This session's capture manifest rendered as JSON,
+    /// when one was begun (capture level only).
+    #[must_use]
+    pub fn diag_manifest_json(&self) -> Option<String> {
+        self.diag_acc
+            .as_ref()
+            .and_then(DiagAccumulator::manifest_json)
     }
 
     /// Finish the diag report now: one last drain, then the
@@ -2278,6 +2440,7 @@ impl<'a> DflashSession<'a> {
         self.stats.readbacks += 1;
         self.stats.logits_values_read += logits.len() as u64;
         self.drain_diag();
+        self.capture_block(&logits);
         self.diag
             .event("forward_block.end", &format!("logits={}", logits.len()));
         Ok(logits)
@@ -2320,6 +2483,126 @@ mod tests {
     #[test]
     fn session_config_default_is_the_documented_capacity() {
         assert_eq!(DflashSessionConfig::default().kv_capacity, 8192);
+    }
+
+    /// A minimal draft config for the capture wiring pins:
+    /// three layers deep, block size 4, the fixture's shape
+    /// discipline in miniature.
+    fn capture_test_cfg() -> DflashConfig {
+        DflashConfig {
+            name: None,
+            block_count: 3,
+            context_length: 128,
+            hidden: 256,
+            ffn_hidden: 512,
+            q_heads: 4,
+            kv_heads: 2,
+            key_length: 64,
+            value_length: 64,
+            rope_freq_base: 10_000.0,
+            rms_eps: 1e-5,
+            block_size: 4,
+            target_layers: vec![0, 2],
+            sliding_window: 3,
+            sliding_pattern: vec![true, false, true],
+            causal_attention: false,
+            mask_token_id: 511,
+            vocab_size: 512,
+        }
+    }
+
+    /// The manifest's session section states the draft's
+    /// own shape: kind, depth (the layer count), and block
+    /// size first, then the target shape the draft serves.
+    #[test]
+    fn capture_session_pairs_state_the_draft_shape() {
+        let pairs = DflashSession::capture_session_pairs(&capture_test_cfg(), 512, 256, 64);
+        let expected: Vec<(String, String)> = [
+            ("kind", "dflash"),
+            ("depth", "3"),
+            ("block_size", "4"),
+            ("hidden", "256"),
+            ("vocab", "512"),
+            ("context_length", "128"),
+            ("target_hidden", "256"),
+            ("conditioning_width", "512"),
+            ("kv_capacity", "64"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(pairs, expected);
+    }
+
+    /// The exact calls the constructor and the block exit
+    /// make, driven against a timing-mode accumulator (the
+    /// resident path's pin, restated for the draft
+    /// session): no manifest begins, the block record
+    /// returns nothing, no capture rows exist, and the
+    /// finish writes the timing report with NO capture
+    /// sidecars beside it.
+    #[test]
+    fn capture_wiring_is_inert_in_timing_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "wgpu-compute-dflash-capture-timing-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("timing.csv");
+        let manifest = RunManifest {
+            session: DflashSession::capture_session_pairs(&capture_test_cfg(), 512, 256, 64),
+            ..RunManifest::default()
+        };
+        let mut acc = DiagAccumulator::with_mode(Some(out.clone()), DiagMode::Timing);
+        acc.begin_manifest(manifest);
+        assert!(acc.manifest_json().is_none(), "timing begins no manifest");
+        assert!(acc
+            .record_forward(CaptureRecord::KIND_BLOCK, &[1.0, 2.0])
+            .is_none());
+        assert!(acc.record_spec_round(&[7, 8], 1).is_none());
+        assert!(acc.capture_records().is_empty());
+        assert!(acc.write_report(0));
+        assert!(!crate::timestamps::manifest_sidecar_path(&out).exists());
+        assert!(!crate::timestamps::capture_sidecar_path(&out).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same calls at capture level: the manifest
+    /// begins with the draft's pairs inside it, and the
+    /// block forward's logits land as one `block` record.
+    #[test]
+    fn capture_wiring_records_the_block_in_capture_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "wgpu-compute-dflash-capture-capture-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("capture.csv");
+        let manifest = RunManifest {
+            session: DflashSession::capture_session_pairs(&capture_test_cfg(), 512, 256, 64),
+            ..RunManifest::default()
+        };
+        let mut acc = DiagAccumulator::with_mode(Some(out.clone()), DiagMode::Capture);
+        acc.begin_manifest(manifest);
+        let json = acc.manifest_json().expect("capture begins a manifest");
+        assert!(json.contains("\"kind\":\"dflash\""), "manifest: {json}");
+        assert!(json.contains("\"depth\":\"3\""), "manifest: {json}");
+        assert!(json.contains("\"block_size\":\"4\""), "manifest: {json}");
+        let record = acc
+            .record_forward(CaptureRecord::KIND_BLOCK, &[0.0, 1.0, 0.5])
+            .expect("capture records the block");
+        assert_eq!(record.kind, CaptureRecord::KIND_BLOCK);
+        assert_eq!(record.values, 3);
+        assert_eq!(acc.capture_record_count(), 1);
+        assert!(acc.write_report(0));
+        let capture_text = std::fs::read_to_string(crate::timestamps::capture_sidecar_path(&out))
+            .expect("capture sidecar written");
+        let parsed =
+            crate::timestamps::parse_capture_csv(&capture_text).expect("capture sidecar parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].kind, CaptureRecord::KIND_BLOCK);
+        assert!(crate::timestamps::manifest_sidecar_path(&out).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The draft ladder's resolution, pinned against

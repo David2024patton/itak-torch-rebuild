@@ -102,6 +102,18 @@
 //! same tile coverage. The session routes to it only
 //! under its own env switch, which defaults off; see
 //! the module's own docs for the reasoning.
+//!
+//! K23 is the same Q4_K MMQ product with the one
+//! structural piece K22 left behind: llama.cpp's staging
+//! repack. The staging rounds shrink to llama's 128-element
+//! quantum, the staged qs arrays take llama's QPITCH skew,
+//! and the scale pairs split into their own arrays, all
+//! transcribed from mul_mmq_cm1; K13's thread organization
+//! and math are unchanged, so a compiled or measured
+//! difference is attributable to the staging alone. The
+//! session routes to it only under its own env switch,
+//! which defaults off; see the module's own docs and
+//! `bench/k23-mmq-repack-2026-11-06.md`.
 
 pub mod k10_q4k_gemm;
 pub mod k11_q6k_gemm;
@@ -117,6 +129,7 @@ pub mod k1_q4k_gemv;
 pub mod k20_q6k_mmv;
 pub mod k21_q5k_mmv;
 pub mod k22_q4k_mmq;
+pub mod k23_q4k_mmq;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;
 pub mod k4_rmsnorm;

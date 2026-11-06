@@ -49,6 +49,7 @@ use crate::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights, ACT_GATED, ACT_NONE, AC
 use crate::kernels::k20_q6k_mmv::K20Pipeline;
 use crate::kernels::k21_q5k_mmv::K21Pipeline;
 use crate::kernels::k22_q4k_mmq::K22Pipeline;
+use crate::kernels::k23_q4k_mmq::K23Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -576,6 +577,27 @@ fn resolve_flash_staged(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Environment variable naming the K23 (Q4_K MMQ,
+/// staging-repack prototype) routing switch: the exact
+/// value `1` makes the resident session prefer the K23
+/// product over the standard K13 product for Q4_K MMQ
+/// projections when the K22 switch is off (K22 keeps its
+/// rung above K23; see `session::mmq_product_q4k`).
+/// Operational config, not a compiled constant, and
+/// deliberately fail-closed on the same terms as
+/// [`K22_MMQ_ENV`]: an unset variable, or any other value,
+/// keeps K23 out of the ladder entirely. The server proof
+/// that can move this switch's default is sequenced in
+/// bench/k23-mmq-repack-2026-11-06.md.
+pub const K23_MMQ_ENV: &str = "WGPU_COMPUTE_K23_MMQ";
+
+/// Resolve the K23 routing switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_k23_mmq(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -682,6 +704,8 @@ pub struct WgpuCompute {
     /// and may be absent on a low-storage device; the
     /// session checks both.
     flash_staged: bool,
+    k23: Option<K23Pipeline>,
+    k23_mmq: bool,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -809,6 +833,21 @@ impl WgpuCompute {
              only \"1\" enables); staged pipeline={}",
             k6.flash_staged_available()
         );
+        // The K23 Q4_K MMQ prototype (K13's organization
+        // with llama's staging repack): optional on the
+        // same terms as K22, and built regardless of its
+        // routing switch so a shader defect fails at
+        // construction, not on first routed use. Only its
+        // routing is config, read here (see K23_MMQ_ENV);
+        // the default keeps it out of the ladder until
+        // the server proof moves it.
+        let k23 = K23Pipeline::for_device(&ctx.device)?;
+        let k23_mmq = resolve_k23_mmq(std::env::var(K23_MMQ_ENV).ok().as_deref());
+        dbg_log!(
+            "mmq k23 config: enabled={k23_mmq} (env {K23_MMQ_ENV}, only \"1\" enables); \
+             k23={}",
+            k23.is_some()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -917,6 +956,8 @@ impl WgpuCompute {
             k22,
             k22_mmq,
             flash_staged,
+            k23,
+            k23_mmq,
             k15,
             k16,
             wide_min_rows,
@@ -1112,6 +1153,24 @@ impl WgpuCompute {
     /// to carry more than one row.
     pub(crate) fn flash_staged(&self) -> bool {
         self.flash_staged
+    }
+
+    /// The K23 (Q4_K MMQ, staging-repack prototype)
+    /// pipeline, when this device grants the workgroup
+    /// storage its staging set needs. See
+    /// [`WgpuCompute::k13`] for the fallback contract.
+    pub(crate) fn k23(&self) -> Option<&K23Pipeline> {
+        self.k23.as_ref()
+    }
+
+    /// Whether the resident session prefers the K23
+    /// product over the standard K13 product for Q4_K MMQ
+    /// projections (below K22's rung): config resolved at
+    /// construction from [`K23_MMQ_ENV`], never a constant
+    /// compiled into the selection seam. `false` (the
+    /// default) leaves the shipped ladder untouched.
+    pub(crate) fn k23_mmq(&self) -> bool {
+        self.k23_mmq
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -2079,6 +2138,23 @@ mod tests {
         assert!(!resolve_flash_staged(Some("")));
         assert!(!resolve_flash_staged(Some("11")));
         assert_eq!(FLASH_STAGED_ENV, "WGPU_COMPUTE_FLASH_STAGED");
+    }
+
+    #[test]
+    fn k23_mmq_switch_resolution() {
+        // Unset: off. The shipped ladder is the ladder
+        // with K23 nowhere in it.
+        assert!(!resolve_k23_mmq(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position: the switch is fail-closed by
+        // design, so a typo routes the proven kernel, not
+        // the prototype.
+        assert!(resolve_k23_mmq(Some("1")));
+        assert!(resolve_k23_mmq(Some(" 1 ")));
+        assert!(!resolve_k23_mmq(Some("0")));
+        assert!(!resolve_k23_mmq(Some("true")));
+        assert!(!resolve_k23_mmq(Some("")));
+        assert!(!resolve_k23_mmq(Some("11")));
     }
 
     #[test]

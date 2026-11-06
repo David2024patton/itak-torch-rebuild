@@ -116,6 +116,7 @@ use crate::kernels::k20_q6k_mmv::K20Call;
 use crate::kernels::k21_q5k_mmv::K21Call;
 use crate::kernels::k21_q5k_mmv_finish::K21FinishCall;
 use crate::kernels::k22_q4k_mmq::K22Call;
+use crate::kernels::k23_q4k_coopmat::K23Call as K23CoopmatCall;
 use crate::kernels::k23_q4k_mmq::K23Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
@@ -427,6 +428,19 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K23Call,
     },
+    /// K12 quantize + K23 (Q4_K coopmat MMQ, the
+    /// cooperative-matrix product) dispatches. Constructed
+    /// only when the backend's coopmat switch is on and a
+    /// bridged device supplied the pipeline; at shipped
+    /// defaults this variant never appears in a plan.
+    MmqCoopmatQ4K {
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
+        /// The integer product dispatch.
+        mmq: K23CoopmatCall,
+    },
     /// K12 quantize + K18 (Q4_K small-batch) dispatches.
     SmallQ4K {
         /// The activation quantize dispatch.
@@ -553,6 +567,12 @@ impl ProjCall {
                 }
                 mmq.encode_into(pass);
             }
+            ProjCall::MmqCoopmatQ4K { quant, mmq } => {
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
+                mmq.encode_into(pass);
+            }
             ProjCall::SmallQ4K { quant, mmq } => {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
@@ -607,7 +627,8 @@ impl ProjCall {
             | ProjCall::MmqWideQ4K { quant, .. }
             | ProjCall::MmqWideQ6K { quant, .. }
             | ProjCall::MmqK22Q4K { quant, .. }
-            | ProjCall::MmqK23Q4K { quant, .. } => 1 + u64::from(quant.is_some()),
+            | ProjCall::MmqK23Q4K { quant, .. }
+            | ProjCall::MmqCoopmatQ4K { quant, .. } => 1 + u64::from(quant.is_some()),
             ProjCall::SmallQ4K { .. } | ProjCall::SmallQ6K { .. } | ProjCall::SmallQ5K { .. } => 2,
             ProjCall::ChunkedQ4K(calls) => calls.len() as u64,
             ProjCall::ChunkedQ6K(calls) => calls.len() as u64,
@@ -635,6 +656,7 @@ impl ProjCall {
             ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
             ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
             ProjCall::MmqK23Q4K { .. } => "k23_q4k_mmq",
+            ProjCall::MmqCoopmatQ4K { .. } => "k23_q4k_coopmat",
             ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
             ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
             ProjCall::SmallQ4K { .. } => "k18_q4k_small",
@@ -882,16 +904,17 @@ impl ProjBenchCall {
 }
 
 /// Choose the Q4_K MMQ product for an already-prepared
-/// K12 quantize call: the wide product (K15) first when
-/// the batch is at or past the backend's wide row
-/// threshold, then the K22 register-organization
-/// prototype when the backend's K22 switch is on, then
-/// the K23 staging-repack prototype when the backend's
-/// K23 switch is on, the standard product (K13) behind
-/// all three. With both prototype switches off (the
-/// shipped default) the ladder is the shipped ladder
-/// exactly: the K22 and K23 rungs are skipped without
-/// being consulted. `None` when no pipeline
+/// K12 quantize call: the K23 coopmat product first when
+/// the backend's coopmat switch is on, then the wide
+/// product (K15) when the batch is at or past the
+/// backend's wide row threshold, then the K22
+/// register-organization prototype when the backend's
+/// K22 switch is on, then the K23 staging-repack
+/// prototype when the backend's K23 switch is on, the
+/// standard product (K13) behind all of them. With every
+/// switch off (the shipped defaults) the ladder is the
+/// shipped ladder exactly: the opt-in rungs are skipped
+/// without being consulted. `None` when no pipeline
 /// exists or every prepare refuses: the caller then
 /// takes the GEMM form. Every refusal is logged by name;
 /// the choice is made here, at plan-build time, and
@@ -910,6 +933,26 @@ fn mmq_product_q4k(
     quant: Option<K12QuantCall>,
 ) -> Option<ProjCall> {
     let ctx = backend.context();
+    if backend.coopmat() {
+        match backend.k23_coopmat() {
+            Some(k23) => match k23.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+                Ok(mmq) => return Some(ProjCall::MmqCoopmatQ4K { quant, mmq }),
+                Err(e) => {
+                    dbg_log!(
+                        "mmq coopmat q4k refused at the product prepare: {e}; \
+                         the standard ladder serves it"
+                    );
+                }
+            },
+            None => {
+                dbg_log!(
+                    "mmq coopmat q4k requested by env but no coopmat pipeline exists \
+                     on this device (stock device, or a bridged device failing the \
+                     kernel's gates); the standard ladder serves it"
+                );
+            }
+        }
+    }
     if batch >= backend.wide_min_rows() {
         if let Some(wide) = backend.k15() {
             match wide.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {

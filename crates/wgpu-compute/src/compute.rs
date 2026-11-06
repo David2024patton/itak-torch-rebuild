@@ -50,6 +50,7 @@ use crate::kernels::k20_q6k_mmv::K20Pipeline;
 use crate::kernels::k21_q5k_mmv::K21Pipeline;
 use crate::kernels::k21_q5k_mmv_finish::K21FinishPipeline;
 use crate::kernels::k22_q4k_mmq::K22Pipeline;
+use crate::kernels::k23_q4k_coopmat::K23Pipeline as K23CoopmatPipeline;
 use crate::kernels::k23_q4k_mmq::K23Pipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
@@ -660,6 +661,30 @@ fn resolve_k23_mmq(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Environment variable naming the K23 (Q4_K coopmat
+/// MMQ) routing switch: the exact value `1` makes the
+/// resident session prefer the cooperative-matrix
+/// product over every other Q4_K MMQ form. Operational
+/// config, not a compiled constant, and deliberately
+/// fail-closed on the K22 pattern: an unset variable,
+/// or any other value, keeps K23 out of the ladder
+/// entirely. The pipeline itself exists only on a
+/// device opened through the coopmat bridge
+/// ([`crate::coopmat_bridge`], its own switch); with
+/// the routing on but no pipeline present, the session
+/// logs the refusal by name at plan build and the
+/// standard ladder serves. The server proof that can
+/// move this switch's default is sequenced in
+/// bench/coopmat-build-2026-11-06.md.
+pub const COOPMAT_ENV: &str = "WGPU_COMPUTE_COOPMAT";
+
+/// Resolve the K23 coopmat routing switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_coopmat(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -768,6 +793,8 @@ pub struct WgpuCompute {
     flash_staged: bool,
     k23: Option<K23Pipeline>,
     k23_mmq: bool,
+    k23_coopmat: Option<K23CoopmatPipeline>,
+    coopmat: bool,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -916,6 +943,23 @@ impl WgpuCompute {
              k23={}",
             k23.is_some()
         );
+        // The K23 Q4_K coopmat MMQ: constructible only
+        // on a bridged device (the passthrough module is
+        // legal only where the bridge enabled the
+        // extension), so it is built from the context's
+        // coopmat record rather than unconditionally;
+        // its routing switch is read here (see
+        // COOPMAT_ENV), default off.
+        let k23_coopmat = match &ctx.coopmat {
+            Some(info) => K23CoopmatPipeline::for_device(&ctx.device, info)?,
+            None => None,
+        };
+        let coopmat = resolve_coopmat(std::env::var(COOPMAT_ENV).ok().as_deref());
+        dbg_log!(
+            "mmq coopmat config: enabled={coopmat} (env {COOPMAT_ENV}, only \"1\" enables); \
+             k23_coopmat={}",
+            k23_coopmat.is_some()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -1041,6 +1085,8 @@ impl WgpuCompute {
             flash_staged,
             k23,
             k23_mmq,
+            k23_coopmat,
+            coopmat,
             k15,
             k16,
             wide_min_rows,
@@ -1256,6 +1302,24 @@ impl WgpuCompute {
     /// default) leaves the shipped ladder untouched.
     pub(crate) fn k23_mmq(&self) -> bool {
         self.k23_mmq
+    }
+
+    /// The K23 (Q4_K coopmat MMQ) pipeline, present only
+    /// on a device opened through the coopmat bridge
+    /// whose probes passed. See [`WgpuCompute::k13`] for
+    /// the fallback contract.
+    pub(crate) fn k23_coopmat(&self) -> Option<&K23CoopmatPipeline> {
+        self.k23_coopmat.as_ref()
+    }
+
+    /// Whether the resident session prefers the K23
+    /// coopmat product over the other Q4_K MMQ forms:
+    /// config resolved at construction from
+    /// [`COOPMAT_ENV`], never a constant compiled into
+    /// the selection seam. `false` (the default) leaves
+    /// the shipped ladder untouched.
+    pub(crate) fn coopmat(&self) -> bool {
+        self.coopmat
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -2333,6 +2397,22 @@ mod tests {
         assert!(!resolve_k23_mmq(Some("true")));
         assert!(!resolve_k23_mmq(Some("")));
         assert!(!resolve_k23_mmq(Some("11")));
+    }
+
+    #[test]
+    fn coopmat_switch_resolution() {
+        // Unset: off. The shipped ladder is the ladder
+        // with K23 nowhere in it.
+        assert!(!resolve_coopmat(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position: fail-closed, like every
+        // routing switch in this backend.
+        assert!(resolve_coopmat(Some("1")));
+        assert!(resolve_coopmat(Some(" 1 ")));
+        assert!(!resolve_coopmat(Some("0")));
+        assert!(!resolve_coopmat(Some("true")));
+        assert!(!resolve_coopmat(Some("")));
+        assert!(!resolve_coopmat(Some("11")));
     }
 
     #[test]

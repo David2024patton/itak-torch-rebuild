@@ -181,3 +181,134 @@ fit; (2) the fresh cleared-card spec controls are owed by the
 same wall (the baseline lane hit it too) and should be taken
 in the same session as the retry, so the A/B stays
 same-session.
+
+## Continuation, 2026-11-06: steps 2-4 RUN on the cleared card
+
+Staged tree: main `c439e3af45e30275601129568e3e9cb3a89590cb`
+(the full speed-wave merge head: K19/K20/K21/K22, chunked
+GEMV, GGUF mmap, diag drain, host-gap fix), exported with
+`git archive`, staged at `~/gpu-wave11` on the server.
+Manifest: 364 tracked files, sha256-identical to the local
+tree. Card state: the Cortex tenants were already stopped
+when the session opened (`cortex-cortex-chat-1` and
+`cortex-cortex-embed-1` Exited (0), `cortex-embed.service`
+inactive); the per-run guard read
+`/sys/class/drm/card2/device/mem_info_vram_used` =
+33,271,808 bytes before and after every run in this leg.
+No number below was taken with a tenant on the card.
+David's 2026-11-06 standing rule (the card is always
+available for testing; he will not start Cortex work
+mid-session) governed the window. Logs preserved in
+`~/gpu-wave11/logs11/` on the server.
+
+### Step 2: identity + golden in the ON position: PASS
+
+`WGPU_COMPUTE_MMV_MAX_ROWS=16`, `spec_generate_gpu`, real
+target and draft files, greedy, Stage 1 prompt
+("The capital of France is"), 64 tokens:
+
+- depth 6: IDENTITY PASS, GOLDEN PASS.
+- depth 1: IDENTITY PASS, GOLDEN PASS.
+
+Phase B (draft + verify sessions in one process, the leg
+that was OOM-killed at "target coverage: 731" in every
+2026-11-05 attempt) completed at both depths; see the
+GGUF mmap confirmation appended to
+`bench/gguf-mmap-2026-11-05.md` for the RssAnon evidence.
+
+Recording gap, stated again plainly: no `mmv config:
+max_rows=` echo line appears in any captured log, the
+same gap recorded on 2026-11-05. ON/OFF attribution
+rests on the env each driver script exported plus the
+verify-ms separation between arms (below), which is
+large and consistent. The missing echo is a harness
+logging defect, still open.
+
+### Step 3: spec A/B, fresh same-session cleared-card controls
+
+Effective tok/s (generate phase; all-in in parentheses).
+Acceptance was identical per depth in every arm (depth 6:
+32 rounds, 180 proposed, 31 accepted, rate 0.1722;
+depth 1: 38 rounds, 37 proposed, 25 accepted, rate
+0.6757), and resident dispatch counts were identical per
+depth across arms (14,717 at depth 6; 17,393 at depth 1),
+so every difference below is pure timing on identical
+trajectories.
+
+| arm | depth 6 | depth 1 |
+|---|---|---|
+| control (env unset) | 9.09 (9.06) | 16.98 (16.67) |
+| `MMV_MAX_ROWS=16` | **10.27 (10.24)** | **19.26 (18.96)** |
+
+Verify time per round (median of the first 12 rounds,
+`spec.verify.end` diag lines): depth 6, on about 124 ms
+vs control about 159 ms; depth 1, on about 38.5 ms vs
+control 45 ms. Verify is the term K19 exists to shrink,
+and at the top of its band it shrinks: depth 6 effective
++13.0 percent, depth 1 effective +13.4 percent over the
+same-session controls.
+
+For the record, today's cleared-card controls against
+the 2026-11-04/05 pressured-card controls: depth 6 9.09
+vs 9.19-9.21 (same class), depth 1 16.98 vs 14.22-14.60
+(the cleared card lifts the depth 1 control). Phase A
+plain decode inside these runs read 35.38-36.29 tok/s,
+the recorded cleared-card band.
+
+### Step 4: dose-response sweep at depth 1
+
+| `MMV_MAX_ROWS` | effective tok/s | verify median |
+|---|---|---|
+| unset (control) | 16.98 | 45 ms |
+| 4 | 14.71 | about 50 ms |
+| 8 | 15.23 | about 51 ms |
+| 12 | 15.20 | about 50 ms |
+| 16 | 19.26 | about 38.5 ms |
+
+The dose response is **non-monotonic**: caps 4, 8, and
+12 all land BELOW the unset control, with verify
+medians above the control's, while cap 16 lands above
+the control on both measures. This is the in-band cliff
+pattern the research warned about (the strix-llama fork's
+split-column finding) and the pattern this sweep exists
+to catch. Per-batch attribution (which batch sizes in
+the band carry the loss, and which carry the cap-16
+gain) is read from the sweep-harness table and the diag
+exposure run in the same 2026-11-06 session, recorded
+in `bench/mmv-bench-harness-2026-11-05.md` and
+`bench/mmv-q6k-2026-11-05.md`.
+
+### Decision against the prototype note's rule
+
+The rule moves `DEFAULT_MMV_MAX_ROWS` only if identity
+and golden pass in the on position AND depth 6 beats
+its control AND depth 1 beats its control AND the
+dose-response sweep shows no cliff inside the band the
+default would open.
+
+- Identity + golden in the on position: PASS (step 2).
+- Depth 6 beats its control: YES (10.27 vs 9.09).
+- Depth 1 beats its control: YES at cap 16 (19.26 vs
+  16.98).
+- No cliff inside the band: **NOT SHOWN.** Caps 4, 8,
+  and 12 sit below the control at depth 1; the middle
+  of the band loses on this card and driver (Mesa
+  26.0.8) even though the top of the band wins.
+
+**The default stays 1 (off)**, per the rule as written:
+the no-cliff condition is not met, and the rule's own
+fallback applies (the default stays and the sweep table
+is the finding). The finding, precisely: K19's
+register-streaming form is correct everywhere it ran
+(identity + golden at both depths, all caps) and fast
+at batch 16, but a mid-band range of batches runs
+slower through it than through GEMV on RADV, enough to
+drag caps 4-12 below the shipped control at depth 1.
+Any future flip needs a band floor informed by the
+per-batch table (for example, routing only the top of
+the band), which is a new prototype decision, not a
+default change this verdict authorizes. T-9.6's speed
+half remains open: even the winning arm (19.26 tok/s at
+depth 1) is far under the 88.6 tok/s bar, because
+verify is no longer the whole cost once it shrinks;
+the draft and the round overhead dominate what is left.

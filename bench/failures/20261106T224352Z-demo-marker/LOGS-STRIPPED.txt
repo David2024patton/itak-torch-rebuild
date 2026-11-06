@@ -1,0 +1,7 @@
+Demo bundle skeleton: the run logs were removed before commit,
+per the task's size discipline for the committed demo (a real
+failure bundle always keeps its logs; see
+bench/failure-bundles-2026-11-06.md). Removed files:
+
+stdout.log  76 bytes  sha256 1397dad20d8050952b28417a0a591d1e59c4488633e39e01fea352c1790f216f
+stderr.log  0 bytes  sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

@@ -1,0 +1,36 @@
+slug: demo-marker
+verdict: FAIL (failure markers matched: degenerate(1))
+command: bash -c echo\ \"run\ completed\;\ output\ is\ degenerate:\ every\ top-1\ probability\ is\ exactly\ 1.0\"\;\ exit\ 0
+exit_code: 0
+markers_matched: degenerate(1)
+utc_start: 2026-11-06T22:43:52Z
+utc_end: 2026-11-06T22:43:52Z
+local_start: 2026-11-06T22:43:52+0000
+local_end: 2026-11-06T22:43:52+0000
+duration_seconds: 0
+host: htch-runtime
+uname: Linux htch-runtime 7.0.0-43-generic #1 SMP PREEMPT_DYNAMIC Fri Oct 23 11:56:57 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+repo_git_sha: 2f8b3ae1e20a064e6df271bd677aee1d0de3c337
+repo_branch: lane/failure-bundles
+repo_dirty: dirty
+model_path: none detected
+model_size_bytes: 
+model_mtime_epoch: 
+model_sha256: 
+model_hash_cache: none
+ram_available_start_bytes: 4260540416
+ram_available_start_human: 4.0G
+ram_available_end_bytes: 4239396864
+ram_available_end_human: 4.0G
+vram_used_start_bytes: unavailable
+vram_used_start_human: 
+vram_used_end_bytes: unavailable
+vram_used_end_human: 
+outputs_dir: not given
+
+engine environment (also in env.txt):
+(none set)
+
+git status --porcelain at start of run:
+?? bench/failure-bundle.sh
+?? bench/failures/

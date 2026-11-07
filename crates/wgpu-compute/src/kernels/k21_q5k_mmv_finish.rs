@@ -264,7 +264,7 @@ fn finish_shader(shape: &K21Shape, batch: u32) -> String {
             "        {{\n            let row = row0 + {r}u;\n            if (row < params.out_rows) {{\n"
         ));
         body.push_str(
-            "                let bw = (row * params.blocks_per_row + blk) * 44u;\n                let hw = weights[bw];\n                let d = f16_to_f32(hw & 0xffffu);\n                let dmin = f16_to_f32(hw >> 16u);\n                let s16 = (weights[bw + 1u] >> (16u * half)) & 0xffffu;\n                let m16 = (weights[bw + 2u] >> (16u * half)) & 0xffffu;\n                let h16 = (weights[bw + 3u] >> (16u * half)) & 0xffffu;\n                let lo = (m16 << 16u) | s16;\n                let sc_lo = vec4<f32>(unpack4xU8(lo & 0x3f3f3f3fu));\n                let hi = (((h16 << 12u) | h16) & 0x0f0f0f0fu) | ((lo & 0xc0c0c0c0u) >> 2u);\n                let sc_hi = vec4<f32>(unpack4xU8(hi));\n                let qhw = weights[bw + qh_off];\n                let bits_a = vec4<f32>(unpack4xU8((qhw >> (2u * half)) & 0x01010101u));\n                let bits_b = vec4<f32>(unpack4xU8((qhw >> (2u * half + 1u)) & 0x01010101u));\n                let bits_c = vec4<f32>(unpack4xU8((qhw >> (2u * half + 4u)) & 0x01010101u));\n                let bits_d = vec4<f32>(unpack4xU8((qhw >> (2u * half + 5u)) & 0x01010101u));\n                let w0 = weights[bw + w0_off];\n                let w1 = weights[bw + w0_off + 16u];\n                let qa = vec4<f32>(unpack4xU8(w0 & 0x0f0f0f0fu)) + 16.0 * bits_a;\n                let qb = vec4<f32>(unpack4xU8((w0 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_b;\n                let qc = vec4<f32>(unpack4xU8(w1 & 0x0f0f0fu)) + 16.0 * bits_c;\n                let qd = vec4<f32>(unpack4xU8((w1 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_d;\n",
+            "                let bw = (row * params.blocks_per_row + blk) * 44u;\n                let hw = weights[bw];\n                let d = f16_to_f32(hw & 0xffffu);\n                let dmin = f16_to_f32(hw >> 16u);\n                let s16 = (weights[bw + 1u] >> (16u * half)) & 0xffffu;\n                let m16 = (weights[bw + 2u] >> (16u * half)) & 0xffffu;\n                let h16 = (weights[bw + 3u] >> (16u * half)) & 0xffffu;\n                let lo = (m16 << 16u) | s16;\n                let sc_lo = vec4<f32>(unpack4xU8(lo & 0x3f3f3f3fu));\n                let hi = (((h16 << 12u) | h16) & 0x0f0f0f0fu) | ((lo & 0xc0c0c0c0u) >> 2u);\n                let sc_hi = vec4<f32>(unpack4xU8(hi));\n                let qhw = weights[bw + qh_off];\n                let bits_a = vec4<f32>(unpack4xU8((qhw >> (2u * half)) & 0x01010101u));\n                let bits_b = vec4<f32>(unpack4xU8((qhw >> (2u * half + 1u)) & 0x01010101u));\n                let bits_c = vec4<f32>(unpack4xU8((qhw >> (2u * half + 4u)) & 0x01010101u));\n                let bits_d = vec4<f32>(unpack4xU8((qhw >> (2u * half + 5u)) & 0x01010101u));\n                let w0 = weights[bw + w0_off];\n                let w1 = weights[bw + w0_off + 16u];\n                let qa = vec4<f32>(unpack4xU8(w0 & 0x0f0f0f0fu)) + 16.0 * bits_a;\n                let qb = vec4<f32>(unpack4xU8((w0 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_b;\n                let qc = vec4<f32>(unpack4xU8(w1 & 0x0f0f0f0fu)) + 16.0 * bits_c;\n                let qd = vec4<f32>(unpack4xU8((w1 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_d;\n",
         );
         for b in 0..batch {
             let acc_idx = r * batch + b;
@@ -849,11 +849,33 @@ mod tests {
                 assert!(shader.contains("* 44u"));
                 assert!(shader.contains("let qh_off = 4u + l0 / 4u;"));
                 assert!(shader.contains("let w0_off = 12u + 8u * half + l0 / 4u;"));
+                // All four dequant lines pinned
+                // verbatim. Pinning only qa's line let
+                // a truncated 24-bit mask (0x0f0f0fu)
+                // through on qc: it zeroed the fourth
+                // byte's low nibble in every
+                // super-block (bench/
+                // k21f-mask-fix-2026-11-07.md). The
+                // negative pin names the typo class
+                // itself: the six-digit repeating-byte
+                // mask must never appear in this text.
                 assert!(
                     shader.contains(
                         "let qa = vec4<f32>(unpack4xU8(w0 & 0x0f0f0f0fu)) + 16.0 * bits_a;",
                     )
                 );
+                assert!(shader.contains(
+                    "let qb = vec4<f32>(unpack4xU8((w0 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_b;",
+                ));
+                assert!(
+                    shader.contains(
+                        "let qc = vec4<f32>(unpack4xU8(w1 & 0x0f0f0f0fu)) + 16.0 * bits_c;",
+                    )
+                );
+                assert!(shader.contains(
+                    "let qd = vec4<f32>(unpack4xU8((w1 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_d;",
+                ));
+                assert!(!shader.contains("0x0f0f0fu"));
                 // The half conversion is the shared
                 // text (bound from K21's constant, not
                 // a copy): its signature line is

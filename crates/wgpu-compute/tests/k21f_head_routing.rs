@@ -110,7 +110,21 @@ fn q4k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
     }
 }
 
-/// A Q5_K tensor of shape [inn, out], same construction.
+/// A Q5_K tensor of shape [inn, out], same construction,
+/// with one deliberate divergence from the cross-backend
+/// fixture: the twelve scale bytes are full-range, not
+/// masked to `& 0x07`. This tensor is the head, the one
+/// tensor the K21F route dequantizes; the masked fixture
+/// shrank a dropped-nibble dequant error (the qc mask
+/// bug, bench/k21f-mask-fix-2026-11-07.md) far under this
+/// file's 0.5 bar by keeping every 6-bit scale field
+/// tiny. Full-range scales (the k21_finish fixture's
+/// discipline) make a wrong-nibble error land at full
+/// size. The finish still bounds the comparison's
+/// exposure: the logit scale (0.196) and the tanh
+/// softcap compress the logits the bar reads, so the
+/// wider weights do not widen honest reassociation
+/// drift toward the bar.
 fn q5k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
     let blocks = inn * out / 256;
     let mut data = Vec::with_capacity(blocks * 176);
@@ -118,7 +132,7 @@ fn q5k_tensor(rng: &mut Rng, name: &str, inn: usize, out: usize) -> TensorView {
         data.extend_from_slice(&f32_to_f16_bits(0.005).to_le_bytes());
         data.extend_from_slice(&f32_to_f16_bits(0.002).to_le_bytes());
         for _ in 0..12 {
-            data.push(rng.next_u8() & 0x07);
+            data.push(rng.next_u8());
         }
         for _ in 0..32 {
             data.push(rng.next_u8());

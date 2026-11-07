@@ -774,8 +774,25 @@ mod tests {
                 // The dequantized quads fold the qh
                 // fifth bit in, as named register values.
                 assert!(shader.contains("0x01010101u"));
+                // All four dequant lines pinned
+                // verbatim, plus a negative pin for the
+                // truncated 24-bit mask (0x0f0f0fu) that
+                // the finish variant's copy of this text
+                // carried on qc until the 2026-11-07 fix
+                // (bench/k21f-mask-fix-2026-11-07.md):
+                // pinning only qa left the other three
+                // lines unguarded in both files.
                 assert!(shader
                     .contains("let qa = vec4<f32>(unpack4xU8(w0 & 0x0f0f0f0fu)) + 16.0 * bits_a;"));
+                assert!(shader.contains(
+                    "let qb = vec4<f32>(unpack4xU8((w0 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_b;"
+                ));
+                assert!(shader
+                    .contains("let qc = vec4<f32>(unpack4xU8(w1 & 0x0f0f0f0fu)) + 16.0 * bits_c;"));
+                assert!(shader.contains(
+                    "let qd = vec4<f32>(unpack4xU8((w1 >> 4u) & 0x0f0f0f0fu)) + 16.0 * bits_d;"
+                ));
+                assert!(!shader.contains("0x0f0f0fu"));
             }
         }
         // The subgroup variant shuffles inside the

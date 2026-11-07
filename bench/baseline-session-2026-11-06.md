@@ -129,11 +129,40 @@ GPU-side result (three stacks; CPU stack lands below):
   for divergence.
 
 CPU stack: glimmer_generate without --gpu, same 5 prompts,
-running as a background collection on the server (per-prompt
-walls in the 2026-11-05 overnight run were 2,175 to 4,654
-seconds). Its section completes when the collection lands;
-the compare tool re-runs to extend the matrix to four
-stacks.
+run as a background collection on the server starting
+03:09Z (concurrent with the GPU legs; contention disclosed
+in the header). Per-prompt walls: factual_capital rc=0
+2,320 s; arithmetic_add rc=0 2,256 s; continuation_classic
+rc=0 2,656 s; code_python rc=0 4,802 s (peak RSS
+33,944,564 KB in its log). factual_science's first attempt
+was SIGKILLed at 1,055 s (rc=-9, about 04:06Z), consistent
+with OOM while the session's 33 GB-class processes shared
+the box; dmesg is not readable by this user, so the OOM
+cause is stated as consistent-with, not proven. Science
+was re-run alone after the GPU legs and tenant
+restoration: rc=0, wall 2,316 s, complete 16-token output.
+
+Four-stack compare (driver compare re-run with
+stack-ours-cpu.json added):
+
+- Token ids: IDENTICAL across all four stacks (llama-
+  Vulkan, llama-HIP, ours-GPU, ours-CPU) on all 5 prompts,
+  all 16 positions; every pair-prompt cell reports
+  prefix=16, first_div=None. The golden first-8 on
+  factual_capital is reproduced by the CPU stack as well.
+- Max absolute top-1 probability deltas involving the CPU
+  stack (worst prompt): llama-HIP vs ours-CPU 0.0161
+  (factual_science); llama-Vulkan vs ours-CPU 0.0153
+  (factual_science); ours-CPU vs ours-GPU 0.0000 on four
+  prompts and 0.0017 on code_python. All inside the
+  +/-0.03 band, and no pair involving either of our
+  stacks exceeds llama's own cross-backend delta (0.0231).
+- Verdict: the recorded expectation (tokens identical
+  everywhere, deltas near +/-0.03) is CONFIRMED for all
+  four stacks. No divergence, so no failure bundle was
+  owed. Artifacts: stack-ours-cpu.json and the updated
+  four-stack compare-matrix.json are in the lane at
+  bench/results/baseline-agreement-20261107/.
 
 First-attempt failures (invocation errors, all rerun clean
 as leg1b): bundle 20261107T030149Z-leg1-agree-llama-vulkan
@@ -590,5 +619,7 @@ cortex-cortex-embed-1 (both Up, healthy), systemctl
 footprint, against the clear-card residue of 33,271,808
 B during measurement. Production llama-server was never
 touched. The leg-1(c) CPU collection needs no card and
-was still running at restoration time; its remaining
-sections complete below.
+was still running at restoration time; it finished at
+06:49Z and its factual_science re-run (solo, after
+restoration) at about 07:28Z. Results are in section
+1(c) above.

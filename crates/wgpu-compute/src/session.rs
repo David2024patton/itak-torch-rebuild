@@ -361,6 +361,42 @@ fn prefix_switch_refusal(step: &'static str) -> GlimmerError {
     }
 }
 
+/// The prefix seam's KV-format guard: a snapshot moves KV
+/// rows as f32, but a session built with
+/// `WGPU_COMPUTE_KV_F16` stores its KV packed f16
+/// ([`KvStorage::F16`], two values per u32 word). Reading
+/// those buffers as f32 would reinterpret the packed words
+/// at double offsets and write the result to the store as a
+/// checksummed, valid-looking snapshot, poisoning later
+/// sessions (including f32 ones); writing a snapshot's f32
+/// rows into the f16 buffers would write twice the bytes at
+/// f32 offsets. The store's snapshot format carries no
+/// storage-format field and the seam does not convert, so
+/// the only honest composition is a named refusal, decided
+/// here as a pure predicate over the session's one uniform
+/// storage format: `Some` of the `step` refusal when the
+/// format is f16, `None` when the seam may proceed. Every
+/// prefix method checks it BEFORE any byte moves and before
+/// any session state is touched, so the refusal always
+/// leaves the session exactly as it was. See
+/// bench/prefix-f16-guard-2026-11-07.md.
+fn prefix_storage_refusal(step: &'static str, storage: KvStorage) -> Option<GlimmerError> {
+    match storage {
+        KvStorage::F32 => None,
+        KvStorage::F16 => Some(GlimmerError::StepFailed {
+            step,
+            detail: format!(
+                "the session's KV storage is f16 ({}=1): prefix snapshots carry f32 \
+                 rows and the prefix-KV seam does not convert between formats, so \
+                 capturing or installing under f16 storage would corrupt the KV in \
+                 both directions; run with {} unset or off to use the prefix store",
+                crate::compute::KV_F16_ENV,
+                crate::compute::KV_F16_ENV
+            ),
+        }),
+    }
+}
+
 /// Validate a snapshot against a session's geometry, the
 /// caller's required model fingerprint, and the session's
 /// context capacity, returning the token count it would
@@ -4774,23 +4810,29 @@ impl<'a> ResidentSession<'a> {
     /// Gated by the prefix store switch: with the switch off
     /// this refuses by name (see [`prefix_switch_refusal`])
     /// instead of reading anything back. A session at position
-    /// zero has no prefix and refuses by name too.
+    /// zero has no prefix and refuses by name too. A session
+    /// whose KV storage is f16 refuses by name before any
+    /// readback (see [`prefix_storage_refusal`]): the snapshot
+    /// format is f32 and the seam does not convert.
     ///
     /// # Errors
     ///
     /// [`GlimmerError::StepFailed`] under `prefix_capture` for
-    /// the switch-off and empty refusals, under `attention`
-    /// for a layer with no device buffers, and the snapshot's
-    /// own validation refusal if the reassembled rows disagree
-    /// with the geometry (a divergence between the device
-    /// state's shape and the session's position bookkeeping,
-    /// named rather than stored).
+    /// the switch-off, f16-storage, and empty refusals, under
+    /// `attention` for a layer with no device buffers, and the
+    /// snapshot's own validation refusal if the reassembled
+    /// rows disagree with the geometry (a divergence between
+    /// the device state's shape and the session's position
+    /// bookkeeping, named rather than stored).
     pub fn capture_prefix_snapshot(
         &mut self,
         model_fingerprint: &str,
     ) -> Result<itak_kv::KvSnapshot> {
         if !itak_kv::prefix_store_enabled() {
             return Err(prefix_switch_refusal("prefix_capture"));
+        }
+        if let Some(refusal) = prefix_storage_refusal("prefix_capture", self.kv.storage()) {
+            return Err(refusal);
         }
         if self.position == 0 {
             return Err(GlimmerError::StepFailed {
@@ -4850,7 +4892,10 @@ impl<'a> ResidentSession<'a> {
     /// Returns the installed token count.
     ///
     /// Order of operations is the safety contract. The switch
-    /// is checked first; then the snapshot is validated whole
+    /// is checked first, then the KV storage format (an f16
+    /// session refuses by name, see [`prefix_storage_refusal`],
+    /// before the snapshot is even compared); then the
+    /// snapshot is validated whole
     /// ([`validate_prefix_snapshot`]: self-consistency,
     /// geometry against this session, the caller's required
     /// fingerprint, non-empty, within the context capacity)
@@ -4871,12 +4916,12 @@ impl<'a> ResidentSession<'a> {
     /// # Errors
     ///
     /// [`GlimmerError::StepFailed`] under `prefix_install`
-    /// naming the refusal (switch off, inconsistent snapshot,
-    /// geometry mismatch, fingerprint mismatch, empty, or past
-    /// the context capacity), with the session left exactly as
-    /// it was; or a device failure from ensuring the KV
-    /// buffers after validation, which is a hardware refusal,
-    /// not a snapshot refusal.
+    /// naming the refusal (switch off, f16 KV storage,
+    /// inconsistent snapshot, geometry mismatch, fingerprint
+    /// mismatch, empty, or past the context capacity), with
+    /// the session left exactly as it was; or a device failure
+    /// from ensuring the KV buffers after validation, which is
+    /// a hardware refusal, not a snapshot refusal.
     pub fn install_prefix_snapshot(
         &mut self,
         snapshot: &itak_kv::KvSnapshot,
@@ -4884,6 +4929,9 @@ impl<'a> ResidentSession<'a> {
     ) -> Result<usize> {
         if !itak_kv::prefix_store_enabled() {
             return Err(prefix_switch_refusal("prefix_install"));
+        }
+        if let Some(refusal) = prefix_storage_refusal("prefix_install", self.kv.storage()) {
+            return Err(refusal);
         }
         let matched = validate_prefix_snapshot(&self.cfg, expected_fingerprint, snapshot)?;
         self.reset();
@@ -4930,15 +4978,20 @@ impl<'a> ResidentSession<'a> {
     /// `None` is the fallback contract, never a failure: the
     /// switch is off, the session is not at position zero (a
     /// restore is a session-start act; installing mid-sequence
-    /// would reset state the caller is using), the store holds
-    /// no verified prefix of `tokens`, the store refuses its
-    /// read, or the hit fails this session's own install
-    /// validation (geometry, fingerprint, capacity). Each of
-    /// those is named on the diag channel, and in every `None`
-    /// case the session is left exactly as it was, so the
-    /// caller falls back to the normal cold prefill. A device
-    /// failure during an install that already passed
-    /// validation is the one hard error, matching
+    /// would reset state the caller is using), the session's
+    /// KV storage is f16 (snapshots are f32 and the seam does
+    /// not convert, see [`prefix_storage_refusal`]; the
+    /// install half refuses the same combination by name, and
+    /// this flow names it on the diag channel instead of
+    /// surfacing it as an error), the store holds no verified
+    /// prefix of `tokens`, the store refuses its read, or the
+    /// hit fails this session's own install validation
+    /// (geometry, fingerprint, capacity). Each of those is
+    /// named on the diag channel, and in every `None` case the
+    /// session is left exactly as it was, so the caller falls
+    /// back to the normal cold prefill. A device failure during
+    /// an install that already passed validation is the one
+    /// hard error, matching
     /// [`ResidentSession::install_prefix_snapshot`].
     ///
     /// # Errors
@@ -4960,6 +5013,10 @@ impl<'a> ResidentSession<'a> {
                  session-start act and the live sequence is left alone",
                 self.position
             );
+            return Ok(None);
+        }
+        if let Some(refusal) = prefix_storage_refusal("prefix_restore", self.kv.storage()) {
+            dbg_log!("prefix restore skipped: {refusal}; cold prefill serves");
             return Ok(None);
         }
         let geometry = prefix_geometry(&self.cfg);
@@ -6269,6 +6326,39 @@ mod tests {
         let err = validate_prefix_snapshot(&cfg, "model-a", &snapshot)
             .expect_err("an inconsistent snapshot must refuse");
         assert!(err.to_string().contains("inconsistent"), "{err}");
+    }
+
+    #[test]
+    fn prefix_storage_refusal_gates_the_f16_composition() {
+        // f32 storage: the seam may proceed, under every
+        // prefix step name.
+        for step in ["prefix_capture", "prefix_install", "prefix_store"] {
+            assert!(
+                prefix_storage_refusal(step, KvStorage::F32).is_none(),
+                "f32 storage must not refuse under {step}"
+            );
+        }
+        // f16 storage: a named refusal under the caller's own
+        // step, stating the cause (f16 storage), the switch
+        // that selected it, and the remedy (run with the
+        // switch unset or off).
+        for step in ["prefix_capture", "prefix_install", "prefix_store"] {
+            let err = prefix_storage_refusal(step, KvStorage::F16)
+                .expect("f16 storage must refuse the prefix seam");
+            let GlimmerError::StepFailed { step: got, detail } = err else {
+                panic!("the storage refusal is a step failure, got {err:?}");
+            };
+            assert_eq!(got, step);
+            assert!(detail.contains("f16"), "{detail}");
+            assert!(
+                detail.contains(crate::compute::KV_F16_ENV),
+                "the refusal names the selecting switch: {detail}"
+            );
+            assert!(
+                detail.contains("unset or off"),
+                "the refusal names the remedy: {detail}"
+            );
+        }
     }
 
     /// The resident fixture's layer shape: full QKV+gate

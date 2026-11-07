@@ -19,6 +19,16 @@
 //! policy; skips with a printed reason where none qualifies
 //! (the VM has no adapter, so there this file is a compile
 //! and skip check; the card run is the executing proof).
+//!
+//! The second test composes the seam with the OTHER storage
+//! switch (`WGPU_COMPUTE_KV_F16`): an f16-storage session
+//! must refuse capture and install by name, leave its state
+//! untouched, and never write a snapshot to the store (the
+//! critic panel's Category A composition finding; see
+//! bench/prefix-f16-guard-2026-11-07.md). The guard itself is
+//! also pinned device-free in the session module's unit
+//! tests (`prefix_storage_refusal_gates_the_f16_composition`),
+//! which run everywhere.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -602,4 +612,198 @@ fn resident_session_prefix_store_round_trip() {
     std::env::remove_var(itak_kv::DIR_ENV);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&root2);
+}
+
+/// A hand-built, structurally valid snapshot for the fixture
+/// geometry at `tokens` tokens (zeros; its contents never
+/// reach a device buffer in the tests that use it, because
+/// the refusal under test fires before any byte moves).
+fn fixture_snapshot(cfg: &GlimmerConfig, tokens: usize) -> KvSnapshot {
+    let geometry = KvGeometry {
+        layers: cfg
+            .layers
+            .iter()
+            .map(|kind| match kind {
+                LayerKind::Global => attention::LayerKind::Global,
+                LayerKind::SlidingWindow => attention::LayerKind::Windowed { window: 4 },
+            })
+            .collect(),
+        num_kv_heads: 2,
+        head_dim: 128,
+    };
+    let row = geometry.row_floats();
+    let layers = geometry
+        .layers
+        .iter()
+        .map(|kind| {
+            let (first, rows) = match kind {
+                attention::LayerKind::Global => (0, tokens),
+                attention::LayerKind::Windowed { window } => {
+                    let rows = tokens.min(*window);
+                    (tokens - rows, rows)
+                }
+            };
+            itak_kv::LayerSnapshot {
+                first_position: first,
+                keys: vec![0.0; rows * row],
+                values: vec![0.0; rows * row],
+            }
+        })
+        .collect();
+    KvSnapshot {
+        geometry,
+        model_fingerprint: FINGERPRINT.to_string(),
+        token_count: tokens,
+        layers,
+    }
+}
+
+/// The two switches composed: prefix store ON and KV storage
+/// f16. Snapshots are f32 and the seam does not convert, so
+/// capture and install must refuse by name (naming the f16
+/// storage and the remedy), the refusals must leave the
+/// session byte-identical (proven by an exact continuation
+/// match against an untouched twin), the restore flow must
+/// fall back to `None` rather than erroring, and the store
+/// flow must never write a snapshot. Needs a discrete GPU;
+/// skips like the round-trip test where none qualifies.
+#[test]
+fn resident_session_prefix_seam_refuses_f16_storage() {
+    // Both switches are read from the process environment
+    // (the prefix switch per call, the f16 switch at backend
+    // construction), so the choreography is explicit: f16
+    // off while the fixture snapshot is captured, on for the
+    // sessions under test, off again on the way out.
+    std::env::remove_var("WGPU_COMPUTE_KV_F16");
+    std::env::set_var(itak_kv::ENABLE_ENV, "1");
+    let root = temp_root("f16");
+    std::env::set_var(itak_kv::DIR_ENV, &root);
+
+    let Some(_backend32) = backend_or_skip("prefix f16 guard") else {
+        std::env::remove_var(itak_kv::ENABLE_ENV);
+        std::env::remove_var(itak_kv::DIR_ENV);
+        return;
+    };
+    let cfg = fixture_cfg();
+    let weights = fixture_weights(&cfg);
+    let prompt: Vec<u32> = (0..12).map(|i| (i * 37 % 1024) as u32).collect();
+
+    // The valid snapshot the install arm is refused: built
+    // by hand for the fixture geometry (the same shape the
+    // round-trip test's switch-off arm builds), so on an f32
+    // session it would install; only the storage format can
+    // refuse it below. Its contents never reach a device
+    // buffer here.
+    let snapshot = fixture_snapshot(&cfg, 12);
+    std::env::set_var("WGPU_COMPUTE_KV_F16", "1");
+    let backend16 = WgpuCompute::new().expect("f16 backend builds");
+    let mut guarded = ResidentSession::new(&backend16, &cfg, &weights).expect("f16 session builds");
+    let mut twin = ResidentSession::new(&backend16, &cfg, &weights).expect("f16 twin builds");
+    guarded.forward(&prompt).expect("guarded forward");
+    twin.forward(&prompt).expect("twin forward");
+    assert_eq!(guarded.position(), 12);
+
+    // Capture refuses by name: the f16 storage, the switch
+    // that selected it, and the remedy.
+    let err = guarded
+        .capture_prefix_snapshot(FINGERPRINT)
+        .expect_err("f16 capture must refuse");
+    let text = err.to_string();
+    assert!(
+        text.contains("f16"),
+        "capture refusal names the storage: {err}"
+    );
+    assert!(
+        text.contains("WGPU_COMPUTE_KV_F16"),
+        "capture refusal names the switch: {err}"
+    );
+    assert!(
+        text.contains("unset or off"),
+        "capture refusal names the remedy: {err}"
+    );
+    assert!(
+        matches!(&err, GlimmerError::StepFailed { step, .. } if *step == "prefix_capture"),
+        "capture refusal is raised under prefix_capture: {err:?}"
+    );
+    assert_eq!(
+        guarded.position(),
+        12,
+        "capture refusal: position untouched"
+    );
+    assert_eq!(
+        guarded.stats().prefix_captures,
+        0,
+        "capture refusal: no capture counted"
+    );
+
+    // The store flow refuses through the capture and writes
+    // nothing to the store.
+    let mut store = ResidentSession::prefix_store_open()
+        .expect("switch on: the store opens")
+        .expect("store opens cleanly");
+    let err = guarded
+        .capture_and_store_prefix(&mut store, &prompt, FINGERPRINT)
+        .expect_err("f16 store flow must refuse");
+    assert!(err.to_string().contains("f16"), "{err}");
+    assert_eq!(store.stats().entries, 0, "no snapshot reaches the store");
+
+    // Install refuses by name BEFORE its reset: a successful
+    // install would rewind the session to the snapshot's 12
+    // tokens and stamp the restore counters; the refusal
+    // must leave position, match, and counters alone.
+    let err = guarded
+        .install_prefix_snapshot(&snapshot, FINGERPRINT)
+        .expect_err("f16 install must refuse");
+    let text = err.to_string();
+    assert!(
+        text.contains("f16"),
+        "install refusal names the storage: {err}"
+    );
+    assert!(
+        text.contains("unset or off"),
+        "install refusal names the remedy: {err}"
+    );
+    assert!(
+        matches!(&err, GlimmerError::StepFailed { step, .. } if *step == "prefix_install"),
+        "install refusal is raised under prefix_install: {err:?}"
+    );
+    assert_eq!(guarded.position(), 12, "install refusal: no reset happened");
+    assert!(
+        guarded.prefix_match().is_none(),
+        "install refusal: no match"
+    );
+    assert_eq!(guarded.stats().prefix_restores, 0);
+
+    // The restore flow keeps its fallback contract under
+    // f16: even with a real hit in the store it returns
+    // `None` (its diag line names the refusal) instead of
+    // surfacing the install refusal as a hard error.
+    store
+        .put(&prompt, &snapshot, itak_kv::now_unix())
+        .expect("the f32 snapshot is stored directly");
+    assert_eq!(store.stats().entries, 1);
+    let restored = guarded
+        .restore_prefix_from_store(&mut store, &prompt, FINGERPRINT)
+        .expect("restore flow must not hard-fail under f16");
+    assert_eq!(restored, None, "f16 restore falls back to a cold prefill");
+    assert_eq!(guarded.position(), 12);
+    drop(store);
+
+    // Byte-identical state after every refusal: the next
+    // forward matches the untouched twin exactly (same
+    // backend configuration, deterministic fixture, so the
+    // cross-session comparison is exact, the bar the f16
+    // fixture test's determinism arm establishes).
+    let guarded_logits = guarded.forward(&[prompt[0]]).expect("post-refusal forward");
+    let twin_logits = twin.forward(&[prompt[0]]).expect("twin forward");
+    assert_eq!(
+        guarded_logits, twin_logits,
+        "refusals leave the session byte-identical"
+    );
+    assert_eq!(guarded.position(), 13);
+
+    std::env::remove_var("WGPU_COMPUTE_KV_F16");
+    std::env::remove_var(itak_kv::ENABLE_ENV);
+    std::env::remove_var(itak_kv::DIR_ENV);
+    let _ = std::fs::remove_dir_all(&root);
 }

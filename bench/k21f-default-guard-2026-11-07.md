@@ -210,3 +210,55 @@ Still owed to a card session (the fix lane's):
 the three integration arms executing on the card,
 and the reopen criterion above. Nothing in this
 lane ran on the server.
+
+## SUPERSESSION: the default flipped back to on (lane/k21f-default-flip, 2026-11-07)
+
+The reopen criterion written above has been MET
+and this guard's default is superseded. The chain:
+
+1. The root cause was found by the read-only math
+   audit and fixed in lane/k21f-mask-fix: a
+   truncated dequant mask in the K21F shader
+   (`0x0f0f0f` for `0x0f0f0f0f` on the qc line),
+   dropping one nibble in sixteen elements per
+   super-block. Record:
+   bench/k21f-mask-fix-2026-11-07.md. The wave17
+   diagnosis (bench/k21f-divergence-diagnosis-2026-11-07.md)
+   measured the failure at the real geometry and
+   carries the parent reconciliation of its
+   attribution.
+2. The wave18 card retest
+   (bench/k21f-retest-2026-11-07.md) ran this
+   note's reopen protocol against the fixed tree
+   with the switch explicitly on: IDENTITY and
+   GOLDEN PASS at depth 1 and depth 6 in the same
+   runs that show the exposure stamps (criterion
+   items 1-3 above), the kernel gates executing
+   green on the card, and K21F's finished output
+   bit-identical to K3's at the real head
+   geometry. Verdict recorded there: REOPEN
+   CRITERION MET.
+3. Lane `lane/k21f-default-flip` therefore moved
+   the switch's default: unset now resolves ON,
+   in the MMV ceiling flip's shape. New semantic
+   matrix (the matrix above is superseded):
+
+   | value | resolves |
+   |---|---|
+   | unset | ON (the shipped default) |
+   | `1` (trimmed) | ON |
+   | `0` (trimmed) | OFF (the explicit off; the one-variable rollback) |
+   | any other text | OFF, fail-closed, logged by name at construction |
+
+   The switch itself, the combined gate
+   (`k21f_head_admits`: switch AND shared band),
+   the batch-1 floor, and the K3 fused fallback
+   are unchanged; only the unset position moved.
+   The flip is recorded in
+   bench/k21f-default-flip-2026-11-07.md.
+
+Everything above this section stands as the
+historical record of why the guard existed and
+what it demanded. The re-enable recipe section is
+moot (the route is live at the shipped default);
+the rollback now is `WGPU_COMPUTE_K21F_HEAD=0`.

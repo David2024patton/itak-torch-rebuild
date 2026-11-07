@@ -301,7 +301,12 @@ diag dispatch stream on the round markers.
   because band routing is firing in the same forwards.
 - No-leak: the control arms contain zero gate_strided,
   zero swiglu_strided, and zero MMV records in their
-  verify segments. PASS.
+  verify segments. PASS. The protocol's repeat-control
+  step is satisfied by the session's two independent
+  unset depth-1 runs on this tree ((d)'s band-d1-ctrl
+  and (e)'s e-d1-unset): effective 17.39 against 17.44,
+  verify medians 51 against 50, identical streams, zero
+  routed records in both. The control reproduces.
 - The decomposition also fires once in the plain phase,
   in the prefill-chunk forward at rows 6 (+104 dispatches,
   28,480 to 28,584), which is the same mechanism at the

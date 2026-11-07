@@ -142,3 +142,273 @@ missing the trailing /bin, llama-server not found), bundle
 20261107T030318Z-leg1-prefill-profile (prefill_profile
 called without its required prompt argument). No engine
 fault in any of the three.
+
+## Leg 2, queued verdicts
+
+A note on evidence hygiene for this leg: two completion
+reports delivered to the session mid-run did not match the
+server's live state (they described runs and clock times the
+processes on the box contradicted). Every number below was
+re-derived from per-arm log files whose existence and
+timestamps were verified in the same command that read them,
+and process completion was verified by process state, not by
+delivered text. Where a number could not be re-derived that
+way, it is not used.
+
+A note on bundle verdicts for spec runs: every
+spec_generate_gpu bundle in this session records FAIL in
+bench/failures/INDEX.md, because the harness prints
+"SPEED: FAIL (effective ... < bar 88.6)" and "T-9.6:
+CORRECTNESS PASS, SPEED FAIL" on every run and the wrapper
+trips on the FAIL marker. The 88.6 tok/s bar is the standing
+target line, not a leg verdict; every one of those logs
+carries IDENTITY: PASS and GOLDEN: PASS. The FAIL marks are
+recorded here once so the index is not misread later.
+
+### (d) Band routing A/B (bench/mmv-band-routing-2026-11-06.md)
+
+Arms: current main, spec_generate_gpu, 64 tokens, both mode,
+diag timing, control (MMV unset) and caps 4/8/12/16, depths
+1 and 6, no per-cell overrides. IDENTITY and GOLDEN PASS in
+all 10 arms; round counts and acceptance identical across
+arms at each depth (38 rounds depth 1, 32 depth 6); the
+spec stream is byte-identical in every arm.
+
+Effective tok/s (the harness's "spec rates: effective"
+line):
+
+| depth | control | cap 4 | cap 8 | cap 12 | cap 16 |
+|---|---|---|---|---|---|
+| 1 | 17.39 | 19.46 | 19.26 | 19.34 | 21.73 |
+| 6 | 10.14 | 10.15 | 15.06 | 15.25 | 16.33 |
+
+Verify medians (ms, per-round spec.verify.end): depth 1,
+control 51, every routed cap 41. Depth 6, control 153,
+cap 4 153 (equal), caps 8/12/16 82/82/83.
+
+Decision rule, item by item:
+- Every routed cap at or above same-session control: PASS
+  at both depths. The flat-routing cliff does not recur:
+  caps 4/8/12 at depth 1, which flat routing put at
+  14.71/15.23/15.20 against a 16.98 control, all beat this
+  session's control. Cap 4 at depth 6 is a wash (10.15 vs
+  10.14); at that cap almost nothing routes in a depth-6
+  verify (rows run to 7, the cap admits only the KV cells
+  at rows 2 to 4), which the tally confirms.
+- Cap 16 at or above the recorded flat-routing numbers:
+  PASS (21.73 vs recorded 19.26 at depth 1; 16.33 vs
+  recorded 10.27 at depth 6).
+- Verify medians at or under control: PASS.
+- Resident dispatch counts identical across arms: NOT
+  literally true, and the exception is the gated unit's own
+  predicted behavior: where the SwiGLU/gated decomposition
+  fires, it adds dispatches (see (f): +26 per depth-1
+  verify forward, +104 per depth-6 rows-7 forward, +104
+  once in the plain phase's prefill-chunk forward).
+  Acceptance, round counts, streams, and every unrouted
+  kernel tally are identical; the deltas are fully
+  accounted by the decomposition counts in (f).
+- Sweep re-run (bench/mmv-sweep.sh, results in
+  bench/results/mmv-sweep-20261107-035843/ on the server,
+  CSVs copied to the lane): 0 disagreeing cells in all four
+  arms, and the mmv arm's kernel column matches the shipped
+  band table in 99 of 99 cells, including the GEMM
+  threshold at rows 16 (k13/k14 MMQ for Q4_K/Q6_K, k21 for
+  Q5_K whose band includes 16) and GEMV in every unrouted
+  cell.
+
+Verdict: band routing PASSES its card protocol. The shipped
+cells and the global-gate default-off posture stand as the
+lane left them; turning the global gate on by default is a
+separate decision for the parent, and these numbers say
+cap 16 with the shipped table beats control at both depths
+on this session's card.
+
+### (e) Draft routing A/B (bench/draft-mmv-routing-2026-11-06.md)
+
+Step 1: the dflash_session device suite EXECUTED on the
+card (7 passed, 0 failed; no skip line in the log; the
+adapter is the session's 7900 XTX) including
+dflash_session_capped_forward_returns_the_full_prefix.
+Bundle leg2-dflash-tests PASS.
+
+Arms: 3 reps, medians; prompt "The capital of France is",
+both mode, diag timing. All reps IDENTITY and GOLDEN PASS;
+streams byte-identical to the control tree's (sha256 prefix
+fedbbec6d508 for every stream file in (e) and (g)).
+
+| arm | eff tok/s | draft_ms med | verify_ms med |
+|---|---|---|---|
+| d1 unset | 17.44 | 42 | 50 |
+| d1 cap 16 | 22.10 | 32 | 41 |
+| d6 unset | 10.19 | 44 | 152 |
+| d6 cap 16 | 16.47 | 34 | 82 |
+| d1 cap 16 + Q5K_FFN_ROWS=1 (attribution) | 19.29 | 42 | 41 |
+
+- Exposure at cap 16: k21_q5k_mmv at batch 16 appears
+  exactly once per round (38 of 38 rounds at depth 1, 32
+  of 32 at depth 6), and no k19/k20 record exists at
+  batch 16 in any arm; the unset arms show zero k21.
+  PASS, exactly as the protocol's fingerprint reads.
+- The protocol also asks for the draft session's
+  route-decision lines in the log ("cap 16 excludes batch
+  16" style). This build prints no such lines at the
+  default log level: the band table resolves silently in
+  these runs (the construction-log table line exists in
+  the code but did not appear in the spec runs' output).
+  Recorded as a wording gap in the evidence, with the
+  behavior itself proven by the kernel stamps above and
+  the attribution arm below.
+- Attribution: closing the Q5_K ffn cell returns draft_ms
+  to 42, the unset value exactly, while verify_ms stays
+  routed at 41. The head route is the cause of the draft
+  gain. PASS.
+- draft_ms falls 10 ms at both depths (42 to 32, 44 to
+  34), inside the note's predicted 8 to 12 ms band. PASS.
+
+Verdict: draft routing PASSES its card protocol.
+
+### (f) Gated/SwiGLU A/B (bench/gated-swiglu-routing-2026-11-06.md)
+
+Same arms as (d) (control vs cap 16, depths 1 and 6);
+fingerprints counted per verify forward by segmenting the
+diag dispatch stream on the round markers.
+
+- Depth 6, rows-7 verify forwards (29 of 32 rounds):
+  exactly 52 gate_strided + 52 swiglu_strided per forward,
+  +104 total, matching the written prediction exactly.
+  The remaining rounds (rows 3 and 5) show swiglu-only
+  decomposition with zero gate_strided, as the gated
+  site's rows 6-to-7 admission rule requires.
+- Depth 1 (rows 2 every round): gate_strided exactly 0
+  (PASS, the gated site admits only rows 6 to 7), but
+  swiglu_strided counts 26.0 per forward against the
+  predicted +52, and the net dispatch delta per verify
+  forward is +26 (472 vs 446), not +52. The same
+  half-count appears in the depth-6 rows-3 and rows-5
+  forwards (26.0 swiglu_strided each). PREDICTION MISS,
+  recorded plainly: at rows below 6 the decomposition
+  engages half the predicted per-forward count; at rows
+  6 to 7 it matches exactly. Correctness is unaffected
+  (identity, golden, acceptance, and streams all pass and
+  match), and the direction of the timing effect is the
+  predicted one; the note's per-forward arithmetic for
+  small rows is what is off.
+- Verify medians at depth 6 move 153 to 82 in these arms.
+  That is the combined band+gated effect (the arms share
+  one cap, so the gated share is not separable here); it
+  exceeds the note's roughly 8 to 9 ms gated-only estimate
+  because band routing is firing in the same forwards.
+- No-leak: the control arms contain zero gate_strided,
+  zero swiglu_strided, and zero MMV records in their
+  verify segments. PASS.
+- The decomposition also fires once in the plain phase,
+  in the prefill-chunk forward at rows 6 (+104 dispatches,
+  28,480 to 28,584), which is the same mechanism at the
+  same admission rows, not a leak into single-row decode:
+  single-row forwards show no strided records.
+
+Verdict: gated/SwiGLU routing PASSES on correctness,
+exposure shape, and direction, with the small-rows
+fingerprint count at half the written prediction. The
+parent may want the gated note's prediction corrected;
+the code's admission behavior (gate only at rows 6 to 7)
+matches its rule everywhere measured.
+
+### (g) Spec-round economics A/B (bench/spec-round-economics-2026-11-06.md)
+
+Control tree: main a064b5d7 staged at ~/gpu-wave12 (it
+predates bench/failure-bundle.sh, so its arms ran
+unwrapped, outputs tee'd to the same log directory).
+Lane arm: current main. Both MMV cap 16, 3 reps, medians,
+same invocation as (e).
+
+| arm | eff tok/s | draft_ms med | verify_ms med | capped lines/round |
+|---|---|---|---|---|
+| d1 control tree | 17.95 | 47 | 43 | 0 |
+| d1 lane tree | 22.10 | 32 | 41 | 1 (returned=2) |
+| d6 control tree | 11.84 | 48 | 118 | 0 |
+| d6 lane tree | 16.47 | 34 | 82 | 1 (returned=7) |
+
+- The capped engagement line fires exactly once per round
+  in every lane-tree rep and never in the control tree.
+  PASS.
+- Sanity pair, MMV unset, depth 1: control tree 16.89,
+  lane tree 17.44 effective, streams identical (same
+  sha256 as every other arm). Within noise. PASS.
+- Attribution caveat the protocol's framing needs: the
+  control tree predates ALL of speed wave 2, so the
+  tree-to-tree deltas mix the capped readback with the
+  draft head route (priced at 10 ms by (e)'s same-tree
+  arms), the laned argmax, and band+gated verify routing.
+  The draft medians fall 15 ms (depth 1) and 14 ms
+  (depth 6) tree to tree, more than the note's 1.5 to
+  2.5 ms readback-only estimate; that estimate is neither
+  confirmed nor refuted by these arms, because the lane
+  tree's unset arm (draft 42) already contains the
+  readback and argmax work, and against the control
+  tree's unset arm (46) the readback-plus-argmax share
+  reads roughly 4 ms at depth 1 on this session's
+  timings. The verify medians also move (118 to 82 at
+  depth 6), where the protocol expected noise; that is
+  the routing wave in the lane tree, not an economics
+  effect, and it is recorded here so the protocol's
+  step-3 expectation is not misread as a failure of the
+  capped readback itself.
+
+Verdict: the capped readback and laned argmax are live,
+engaged exactly as designed, and token-identical; the
+combined tree-to-tree gain is larger than the unit's
+own estimate because the lane tree carries the whole
+routing wave with it.
+
+### (h) K23 MMQ repack gates (bench/k23-mmq-repack-2026-11-06.md)
+
+Prompt caveat first: this leg's script built its fox
+prompt without the sentence's period, and it tokenized
+to 919 tokens, not the recorded 1,022 (the flash leg
+uses the corrected construction, verified at 1,022).
+Both K23 arms share the 919-token prompt, so every A/B
+below is internally valid; absolutes are 919-token
+numbers and are not compared against the recorded
+1,022-token figures.
+
+- Step 1 correctness: k23_mmq tests PASS on the card
+  (bundle leg2-k23-tests); the resident_session suite
+  passes with WGPU_COMPUTE_K23_MMQ=1 (bundle
+  leg2-k23-resident PASS); the spec run passes IDENTITY
+  and GOLDEN with the switch on. No GEMM-shaped call
+  exists in a 64-token spec run, so no k23 stamp appears
+  there; the stamp proof is the prefill arm below, where
+  k23_q4k_mmq dispatches 2,730 times, exactly k13's
+  dispatch count in the control arm. The K12 quantize
+  counts are identical across arms (same totals, 9,795
+  dispatches each).
+- Step 2 kernel A/B (prefill_profile, diag timing, 919
+  tokens): k23_q4k_mmq totals 7,942.3 ms over 2,730
+  dispatches against k13_q4k_mmq's 3,694.3 ms over the
+  same 2,730 dispatches in the control arm. K14, flash,
+  and every other row are unchanged within noise. The
+  prefill phase wall reads 10,209 ms (K23 on) against
+  5,923 ms (off).
+- Step 3 session wall (glimmer_generate --gpu, same
+  prompt, timing off, 3 runs each): off 5,717 / 5,723 /
+  5,741 (median 5,723); on 9,949 / 9,956 / third run in
+  the leg log (median about 9.95 s). K23 costs roughly
+  74 percent on the prefill wall at this shape.
+- Step 0 autopsy and step 4 no-leak: the autopsy reads
+  are in the filtered single-kernel dump section below
+  (the full-suite dump interleaves under parallel test
+  threads); no-leak is covered by every env-unset arm in
+  this session reproducing control behavior with zero
+  k23 stamps (band controls, prefill off arm).
+
+Verdict against the note's decision rule (flip only on
+an autopsy improvement or a material prefill win with
+correctness green): K23 is correct and decisively
+SLOWER, 2.15x on its own kernel row at identical
+dispatch counts. DO NOT FLIP; the switch stays off. The
+llama-style staging bet loses on this card and driver,
+and the loss is in the kernel itself (its per-dispatch
+rates read 8.7 to 16.8 GB/s in the diag stream against
+K13's roughly 46 GB/s class), not in host overhead.

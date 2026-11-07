@@ -1,34 +1,49 @@
-//! The K21F head-routing pins (bench/k21-finish-2026-11-06.md):
-//! the resident block head's Q5_K product routes to the
-//! finish-carrying MMV form (`k21_q5k_mmv_finish`) when the
-//! shared `WGPU_COMPUTE_MMV_MAX_ROWS` gate admits the block
-//! batch, and stays on the K3 fused call otherwise, with the
-//! finish (the fixture config's logit scale and tanh
-//! softcap, Glimmer's own values) applied identically on
-//! both paths.
+//! The K21F head-routing pins (bench/k21-finish-2026-11-06.md,
+//! guard in bench/k21f-default-guard-2026-11-07.md): the
+//! resident block head's Q5_K product routes to the
+//! finish-carrying MMV form (`k21_q5k_mmv_finish`) only
+//! when BOTH gates admit: the route's own switch
+//! (`WGPU_COMPUTE_K21F_HEAD`, exact `1`, default off) and
+//! the shared `WGPU_COMPUTE_MMV_MAX_ROWS` band at the
+//! block batch. Otherwise the head stays on the K3 fused
+//! call, with the finish (the fixture config's logit
+//! scale and tanh softcap, Glimmer's own values) applied
+//! identically on both paths.
 //!
-//! Two arms, selected by the environment the test binary is
+//! Arms, selected by the environment the test binary is
 //! launched with (the diag smoke / capture-pin discipline:
 //! each test self-skips with a printed reason when its
 //! arm's conditions are not met):
 //!
-//! - Gate closed (the shipped default): launch with
-//!   `WGPU_COMPUTE_DIAG=timing` and
-//!   `WGPU_COMPUTE_MMV_MAX_ROWS` unset (or 1). The block
-//!   head must stamp `k3_q5k_gemv` and never
-//!   `k21_q5k_mmv_finish`.
-//! - Gate open: launch with `WGPU_COMPUTE_DIAG=timing` and
-//!   `WGPU_COMPUTE_MMV_MAX_ROWS=16`. The block head must
-//!   stamp `k21_q5k_mmv_finish` at the block batch, while a
-//!   batch-1 forward's head still stamps `k3_q5k_gemv`
-//!   (the standard head stays K3 by construction).
+//! - Head switch off (the shipped default): launch with
+//!   `WGPU_COMPUTE_DIAG=timing`, `WGPU_COMPUTE_K21F_HEAD`
+//!   unset, and `WGPU_COMPUTE_MMV_MAX_ROWS` unset (the
+//!   backend's shipped ceiling, 16, admits the block
+//!   batch) or explicitly 16. The block head must stamp
+//!   `k3_q5k_gemv` and never `k21_q5k_mmv_finish`: the
+//!   open shared ceiling alone must not open the head
+//!   route. A malformed switch value (anything but the
+//!   exact `1`, e.g. `true` or `0`) lands in this arm by
+//!   construction, which is the fail-closed pin.
+//! - Band closed: launch with
+//!   `WGPU_COMPUTE_MMV_MAX_ROWS=1` (either switch
+//!   position). The block head must stamp `k3_q5k_gemv`
+//!   and never `k21_q5k_mmv_finish`.
+//! - Both gates open: launch with
+//!   `WGPU_COMPUTE_DIAG=timing`,
+//!   `WGPU_COMPUTE_MMV_MAX_ROWS=16`, and
+//!   `WGPU_COMPUTE_K21F_HEAD=1`. The block head must
+//!   stamp `k21_q5k_mmv_finish` at the block batch,
+//!   while a batch-1 forward's head still stamps
+//!   `k3_q5k_gemv` (the standard head stays K3 by
+//!   construction).
 //!
-//! Both arms hold the block logits to the CPU model's
+//! All arms hold the block logits to the CPU model's
 //! block forward at the cross-backend bar (per-row argmax
 //! agreement, max-abs under 0.5): the CPU head applies the
 //! true finish, so a finish the routing dropped, swapped,
 //! or re-ordered on its way into the K21F call cannot pass
-//! the open arm. Both arms need a discrete Vulkan GPU and
+//! the open arm. All arms need a discrete Vulkan GPU and
 //! skip where none qualifies.
 
 use std::collections::HashMap;
@@ -47,6 +62,11 @@ use wgpu_compute::{ResidentSession, WgpuCompute, WgpuError};
 /// `wgpu_compute::compute::MMV_MAX_ROWS_ENV`; not
 /// re-exported at the crate root).
 const MMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_MMV_MAX_ROWS";
+
+/// The K21F head switch's env name (see
+/// `wgpu_compute::compute::K21F_HEAD_ENV`; not
+/// re-exported at the crate root).
+const K21F_HEAD_ENV: &str = "WGPU_COMPUTE_K21F_HEAD";
 
 /// A tiny deterministic byte/float source (the cross-backend
 /// fixture's generator, same seed discipline).
@@ -271,6 +291,15 @@ fn gate_admits_block_batch() -> bool {
         .is_some_and(|max_rows| max_rows >= 16)
 }
 
+/// The resolved head switch this process was launched
+/// with, mirroring the backend's resolver exactly: only
+/// the exact value `1` (after trimming) is on. Unset and
+/// every malformed value read as off, which is what
+/// places them in the switch-off arm.
+fn head_switch_on() -> bool {
+    std::env::var(K21F_HEAD_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
 /// The diag conditions both arms read their exposure from:
 /// timing mode on, and a recorder on the device (a device
 /// that grants no timestamp features records nothing, and
@@ -346,8 +375,44 @@ fn assert_block_matches_cpu(res_block: &[f32], cpu_block: &[f32], vocab: usize) 
     }
 }
 
-/// Gate closed (the shipped default): the block head is
-/// the K3 fused call, exactly as shipped, and no
+/// Head switch off (the shipped default, and every
+/// malformed switch value): even with the shared
+/// ceiling at its shipped open position, the block head
+/// is the K3 fused call and no `k21_q5k_mmv_finish`
+/// stamp appears anywhere. This is the guard's central
+/// pin: default construction must not prepare K21F.
+#[test]
+fn block_head_stays_k3_when_the_head_switch_is_off() {
+    let test = "k21f switch-off routing pin";
+    if head_switch_on() {
+        eprintln!(
+            "skipping {test}: {K21F_HEAD_ENV}=1 resolves the head switch on; \
+             this is the switch-off arm"
+        );
+        return;
+    }
+    let Some(backend) = backend_or_skip(test) else {
+        return;
+    };
+    if !diag_ready(test, &backend) {
+        return;
+    }
+    let (session, res_block, cpu_block) = run_block(&backend);
+    assert_block_matches_cpu(&res_block, &cpu_block, 1024);
+    let names = session.diag_kernel_names();
+    assert!(
+        names.contains(&"k3_q5k_gemv"),
+        "the switch-off block head must stamp the K3 GEMV, saw {names:?}"
+    );
+    assert!(
+        !names.contains(&"k21_q5k_mmv_finish"),
+        "the switch-off position must never stamp the finish form, saw {names:?}"
+    );
+}
+
+/// Band closed: whatever the head switch says, a shared
+/// ceiling that does not admit the block batch keeps the
+/// block head on the K3 fused call, and no
 /// `k21_q5k_mmv_finish` stamp appears anywhere.
 #[test]
 fn block_head_stays_k3_fused_with_the_gate_closed() {
@@ -378,8 +443,9 @@ fn block_head_stays_k3_fused_with_the_gate_closed() {
     );
 }
 
-/// Gate open at the block batch: the block head routes to
-/// the finish form, the batch-1 head stays K3, and the
+/// Both gates open at the block batch (head switch on,
+/// shared band admitting): the block head routes to the
+/// finish form, the batch-1 head stays K3, and the
 /// routed block still carries the fixture's finish
 /// (agreement with the CPU model at the bar).
 #[test]
@@ -389,6 +455,13 @@ fn block_head_routes_to_k21f_with_the_gate_open() {
         eprintln!(
             "skipping {test}: {MMV_MAX_ROWS_ENV} does not admit the block \
              batch (unset, unparsable, or below 16); this is the open arm"
+        );
+        return;
+    }
+    if !head_switch_on() {
+        eprintln!(
+            "skipping {test}: {K21F_HEAD_ENV} does not resolve on (unset or \
+             not the exact \"1\"); the head route needs its own switch too"
         );
         return;
     }

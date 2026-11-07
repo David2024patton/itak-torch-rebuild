@@ -685,6 +685,37 @@ fn resolve_coopmat(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Environment variable naming the K21F finish-carrying
+/// head routing switch: the exact value `1` allows the
+/// resident session's block head to route its Q5_K
+/// product to the finish-carrying MMV form (K21F, see
+/// `crate::kernels::k21_q5k_mmv_finish`) when the shared
+/// MMV band also admits the block batch. Operational
+/// config, not a compiled constant, and deliberately
+/// fail-closed on the K22 pattern: an unset variable,
+/// or any other value, keeps the block head on the K3
+/// fused call entirely. The switch is the head route's
+/// own gate, separate from the shared MMV ceiling
+/// ([`MMV_MAX_ROWS_ENV`]): the route used to ride that
+/// ceiling alone, so when the ceiling's default opened
+/// to 16 the head route went live by default, and the
+/// 2026-11-07 defaults-confirmation session
+/// (bench/defaults-confirmation-2026-11-07.md) proved
+/// speculative identity FAILS on the real file with
+/// the route live (deterministic divergence at stream
+/// index 23, depths 1 and 6). The default is therefore
+/// OFF until the K21F numerics are fixed and the route
+/// re-earns it; the guard is recorded in
+/// bench/k21f-default-guard-2026-11-07.md.
+pub const K21F_HEAD_ENV: &str = "WGPU_COMPUTE_K21F_HEAD";
+
+/// Resolve the K21F head routing switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_k21f_head(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -810,6 +841,17 @@ pub struct WgpuCompute {
     // resident session's block head routing
     // (bench/k21-finish-2026-11-06.md).
     k21_finish: K21FinishPipeline,
+    /// Whether the resident session's block head may
+    /// route to the finish-carrying K21 form at all:
+    /// resolved once at construction from
+    /// [`K21F_HEAD_ENV`], never a constant compiled
+    /// into the routing. `false` (the default) keeps
+    /// the block head on the K3 fused call no matter
+    /// where the shared MMV ceiling sits; the route
+    /// additionally requires the shared band to admit
+    /// the block batch (see
+    /// `session::try_mmv_q5k_finish`).
+    k21f_head: bool,
     mmv_max_rows: u32,
     mmv_bands: MmvBands,
     chunked_gemv_max_rows: u32,
@@ -1023,12 +1065,16 @@ impl WgpuCompute {
         // softcap finish), which is why the 2026-11-06
         // verdict shows K21 firing zero times in the
         // real forward. Built unconditionally like its
-        // sibling, and routed NOWHERE yet: the
-        // session's head sites keep preparing K3 until
-        // the routing change lands under the same MMV
-        // threshold (proof sequence in
-        // bench/k21-finish-2026-11-06.md).
+        // sibling. Only its block-head routing is
+        // config, read here (see K21F_HEAD_ENV): the
+        // route requires BOTH this switch on AND the
+        // shared MMV band admitting the block batch,
+        // and the switch defaults off since the
+        // 2026-11-07 defaults-confirmation identity
+        // failure (bench/k21f-default-guard-2026-11-07.md).
         let k21_finish = K21FinishPipeline::new(&ctx.device)?;
+        let k21f_head = resolve_k21f_head(std::env::var(K21F_HEAD_ENV).ok().as_deref());
+        dbg_log!("k21f head config: enabled={k21f_head} (env {K21F_HEAD_ENV}, only \"1\" enables)");
         let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
         log_mmv_band_fallbacks();
         let mmv_bands = resolve_mmv_bands(|name| std::env::var(name).ok());
@@ -1099,6 +1145,7 @@ impl WgpuCompute {
             k20,
             k21,
             k21_finish,
+            k21f_head,
             mmv_max_rows,
             mmv_bands,
             chunked_gemv_max_rows,
@@ -1422,9 +1469,24 @@ impl WgpuCompute {
     /// sites. Registered at construction; the block
     /// head site routes to it through the session's
     /// finish ladder rung (see
-    /// bench/k21-finish-2026-11-06.md).
+    /// bench/k21-finish-2026-11-06.md), and only when
+    /// [`WgpuCompute::k21f_head`] also allows it.
     pub(crate) fn k21_finish(&self) -> &K21FinishPipeline {
         &self.k21_finish
+    }
+
+    /// Whether the resident session's block head may
+    /// route its Q5_K product to the finish-carrying
+    /// K21 form: config resolved at construction from
+    /// [`K21F_HEAD_ENV`], never a constant compiled
+    /// into the selection seam. `false` (the default)
+    /// leaves the block head on the K3 fused call at
+    /// every shared-MMV-ceiling position; `true` is
+    /// necessary but not sufficient, the shared band
+    /// must also admit the block batch (see
+    /// `session::try_mmv_q5k_finish`).
+    pub(crate) fn k21f_head(&self) -> bool {
+        self.k21f_head
     }
 
     /// The largest batch row count at which the resident
@@ -2397,6 +2459,29 @@ mod tests {
         assert!(!resolve_k23_mmq(Some("true")));
         assert!(!resolve_k23_mmq(Some("")));
         assert!(!resolve_k23_mmq(Some("11")));
+    }
+
+    #[test]
+    fn k21f_head_switch_resolution() {
+        // Unset: off. The block head is the K3 fused
+        // call, exactly as shipped before the route
+        // existed, at every shared-ceiling position:
+        // the defaults-confirmation identity failure
+        // (bench/defaults-confirmation-2026-11-07.md)
+        // is why this switch exists and why its
+        // default is closed.
+        assert!(!resolve_k21f_head(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position: the switch is fail-closed
+        // by design, so a typo keeps the proven head,
+        // not the identity-breaking route.
+        assert!(resolve_k21f_head(Some("1")));
+        assert!(resolve_k21f_head(Some(" 1 ")));
+        assert!(!resolve_k21f_head(Some("0")));
+        assert!(!resolve_k21f_head(Some("true")));
+        assert!(!resolve_k21f_head(Some("")));
+        assert!(!resolve_k21f_head(Some("11")));
+        assert_eq!(K21F_HEAD_ENV, "WGPU_COMPUTE_K21F_HEAD");
     }
 
     #[test]

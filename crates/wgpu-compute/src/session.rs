@@ -1318,12 +1318,32 @@ fn mmv_applies(
 
 /// The MMV band's arithmetic over a resolved threshold:
 /// 2 rows up to `max_rows`. Factored out of
-/// [`mmv_applies`] so the gate the finish form consults
-/// (the head's K21F rung, which has no (family, shape)
-/// cell in the routing table) is testable without a
-/// device, in this module's pure-test idiom.
+/// [`mmv_applies`] so the band half of the gate the
+/// finish form consults (the head's K21F rung, which
+/// has no (family, shape) cell in the routing table)
+/// is testable without a device, in this module's
+/// pure-test idiom.
 fn mmv_band_admits(max_rows: u32, batch: u32) -> bool {
     batch >= 2 && batch <= max_rows
+}
+
+/// Whether the K21F finish form may serve the block
+/// head at `batch`: BOTH halves of its gate must
+/// admit. The first half is the route's own switch
+/// ([`WgpuCompute::k21f_head`], resolved at
+/// construction from `WGPU_COMPUTE_K21F_HEAD`,
+/// default off since the 2026-11-07
+/// defaults-confirmation identity failure; see
+/// bench/k21f-default-guard-2026-11-07.md). The
+/// second half is the shared MMV band's admission
+/// ([`mmv_band_admits`] over the resolved
+/// `mmv_max_rows`): opening the shared ceiling for
+/// the plain MMV products must never again open the
+/// head route as a side effect. Factored as a pure
+/// function over the two resolved values so the
+/// combined gate is unit-pinnable without a device.
+fn k21f_head_admits(head_switch: bool, max_rows: u32, batch: u32) -> bool {
+    head_switch && mmv_band_admits(max_rows, batch)
 }
 
 /// Try the K19 register-streaming form of a plain Q4_K
@@ -1678,17 +1698,19 @@ fn try_mmv_q5k(
 /// K3's fused finish at its store, the finish request
 /// (`mode`, `scale`, `cap`) forwarded to the prepare
 /// verbatim, exactly as the head site hands it to
-/// K3's `prepare_with_finish`. `None` when the batch
-/// is outside the configured band or the prepare
+/// K3's `prepare_with_finish`. `None` when the
+/// route's own head switch is off (the shipped
+/// default; [`k21f_head_admits`]), when the batch is
+/// outside the shared band, or when the prepare
 /// refuses the shape or the finish (logged by name):
 /// the head site then prepares the K3 fused call it
 /// builds today, so a refusal changes the product
 /// engine never and the finish not at all. Batch 1
-/// never reaches the prepare (the gate refuses it),
-/// so the standard head, batch 1 by construction,
-/// stays K3's. This is the fallback ladder's
-/// composition step, at plan-build time; it never
-/// substitutes inside a dispatch.
+/// never reaches the prepare (the band half of the
+/// gate refuses it), so the standard head, batch 1
+/// by construction, stays K3's. This is the fallback
+/// ladder's composition step, at plan-build time; it
+/// never substitutes inside a dispatch.
 #[allow(clippy::too_many_arguments)]
 fn try_mmv_q5k_finish(
     backend: &WgpuCompute,
@@ -1700,7 +1722,7 @@ fn try_mmv_q5k_finish(
     scale: f32,
     cap: f32,
 ) -> Option<ProjCall> {
-    if !mmv_band_admits(backend.mmv_max_rows(), batch) {
+    if !k21f_head_admits(backend.k21f_head(), backend.mmv_max_rows(), batch) {
         return None;
     }
     let ctx = backend.context();
@@ -3809,10 +3831,12 @@ impl ChunkPlan {
         // split at the chunk's full batch. A Q5_K head takes
         // its fused finishing at any batch (K3's contract is
         // [batch, out]): the finish-carrying MMV form (K21F)
-        // prepares it when the shared MMV band admits the
-        // block batch, with the K3 fused call behind any
-        // refusal, so the finish is the same map on both
-        // paths and only the product engine changes; the
+        // prepares it when its own head switch is on AND
+        // the shared MMV band admits the block batch (the
+        // switch defaults off; see k21f_head_admits), with
+        // the K3 fused call behind any refusal, so the
+        // finish is the same map on both paths and only the
+        // product engine changes; the
         // other families take their GEMV form directly
         // rather than prepare_proj's matrix forms, because
         // the head is a GEMV-shaped projection at every size
@@ -3834,11 +3858,12 @@ impl ChunkPlan {
             } else {
                 crate::kernels::k3_q5k_gemv::FINISH_SCALE
             };
-            // The finish form first when the band admits
-            // the block batch; the K3 fused call on None
-            // (gate closed, band refused, prepare refused),
-            // asked for exactly what the finish form was
-            // asked for, so the site's finish request is
+            // The finish form first when its two-part
+            // gate admits the block batch; the K3 fused
+            // call on None (head switch off, band
+            // refused, prepare refused), asked for
+            // exactly what the finish form was asked
+            // for, so the site's finish request is
             // identical on both paths.
             let head = match try_mmv_q5k_finish(
                 backend,
@@ -4971,6 +4996,7 @@ impl<'a> ResidentSession<'a> {
                 ),
                 pair("k22_mmq", backend.k22_mmq().to_string()),
                 pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
+                pair("k21f_head", backend.k21f_head().to_string()),
             ],
             model: None,
             session: vec![
@@ -5405,42 +5431,79 @@ mod tests {
 
     #[test]
     fn mmv_band_never_admits_batch_one_so_the_batch_one_head_stays_k3() {
-        // The head-routing gate, pinned at its floor:
-        // the standard head runs at batch 1 (hardcoded
-        // at its site) and a block chunk can too. At no
-        // resolved threshold does the band admit a
-        // single row, so try_mmv_q5k_finish returns
-        // None there without preparing anything and the
-        // site prepares the K3 fused call: batch-1
-        // heads stay K3 by construction, at every
-        // configuration, which is what keeps decode on
-        // the shipped composition.
+        // The band half of the head-routing gate,
+        // pinned at its floor: the standard head runs
+        // at batch 1 (hardcoded at its site) and a
+        // block chunk can too. At no resolved threshold
+        // does the band admit a single row, so
+        // try_mmv_q5k_finish returns None there without
+        // preparing anything and the site prepares the
+        // K3 fused call: batch-1 heads stay K3 by
+        // construction, at every configuration, which
+        // is what keeps decode on the shipped
+        // composition. The combined gate
+        // (k21f_head_admits) inherits the floor even
+        // with the head switch on.
         for max_rows in [1, 2, 16, 64, u32::MAX] {
             assert!(
                 !mmv_band_admits(max_rows, 1),
                 "batch 1 must stay on the K3 fused head at threshold {max_rows}"
             );
+            assert!(!k21f_head_admits(true, max_rows, 1));
         }
         assert!(!mmv_band_admits(16, 0));
     }
 
     #[test]
     fn mmv_band_admits_the_block_batch_only_when_the_gate_is_open() {
-        // The spec block case, 16 rows: the shipped
-        // default threshold (1) admits nothing, so the
-        // block head prepares K3 exactly as shipped and
-        // the routing is off. Opening the shared gate
-        // to the kernel band's top (16) admits the
-        // block batch and the band floor; a threshold
-        // below the batch, or a batch past the
-        // threshold, closes the gate again (and a batch
-        // past the kernel band itself, admitted by an
-        // over-wide threshold, is refused by the
-        // prepare and falls back at the site).
+        // The band half's arithmetic, the spec block
+        // case at 16 rows: a threshold of 1 admits
+        // nothing (the block head then prepares K3,
+        // exactly the pre-routing composition); opening
+        // the shared gate to the kernel band's top (16)
+        // admits the block batch and the band floor; a
+        // threshold below the batch, or a batch past
+        // the threshold, closes the band again (and a
+        // batch past the kernel band itself, admitted
+        // by an over-wide threshold, is refused by the
+        // prepare and falls back at the site). The
+        // shipped ceiling default is 16 since the
+        // 2026-11-06 flip; the head route no longer
+        // follows from this half alone (see
+        // k21f_head_gate_requires_both_halves).
         assert!(!mmv_band_admits(1, 16));
         assert!(mmv_band_admits(16, 16));
         assert!(mmv_band_admits(16, 2));
         assert!(!mmv_band_admits(8, 16));
         assert!(!mmv_band_admits(16, 17));
+    }
+
+    #[test]
+    fn k21f_head_gate_requires_both_halves() {
+        // The guard this lane adds (bench/k21f-default-
+        // guard-2026-11-07.md): the head route prepares
+        // K21F only when the route's own switch is on
+        // AND the shared band admits the batch.
+        //
+        // Default construction: the switch resolves off
+        // (WGPU_COMPUTE_K21F_HEAD unset), so even at the
+        // shipped ceiling of 16 the block batch is NOT
+        // admitted and the block head stays on the K3
+        // fused call. This is the position the
+        // defaults-confirmation failure demands: the
+        // shared ceiling being open must not open the
+        // head route as a side effect.
+        assert!(!k21f_head_admits(false, 16, 16));
+        assert!(!k21f_head_admits(false, 16, 2));
+        assert!(!k21f_head_admits(false, u32::MAX, 16));
+        // Explicit switch on: the band half governs, so
+        // the fix lane's re-enable recipe (switch on,
+        // ceiling open) admits the block batch and the
+        // band floor, and a closed ceiling still
+        // refuses every batch.
+        assert!(k21f_head_admits(true, 16, 16));
+        assert!(k21f_head_admits(true, 16, 2));
+        assert!(!k21f_head_admits(true, 1, 16));
+        assert!(!k21f_head_admits(true, 8, 16));
     }
 }

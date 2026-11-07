@@ -92,9 +92,13 @@
 //! in the real forward: on the current model file
 //! the Q5_K tensors are the head, and the head sites
 //! prepare a finish this variant now carries. It is
-//! registered at backend construction and routed
-//! nowhere yet; the routing change and its proof
-//! sequence are in bench/k21-finish-2026-11-06.md.
+//! registered at backend construction and routed at
+//! the resident block head only under two gates: its
+//! own switch (`WGPU_COMPUTE_K21F_HEAD`, default off
+//! since the 2026-11-07 defaults-confirmation
+//! identity failure) and the shared MMV band; see
+//! bench/k21-finish-2026-11-06.md and
+//! bench/k21f-default-guard-2026-11-07.md.
 //!
 //! K20 is the Q6_K register-streaming small-batch
 //! product: K18's Q6_K band (2..=16 rows, one weight

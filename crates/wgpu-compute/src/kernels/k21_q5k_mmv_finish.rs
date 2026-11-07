@@ -102,19 +102,24 @@
 //!   finish dispatch appears or disappears (the Q5_K
 //!   head never paid one).
 //!
-//! Routing is deliberately NOT in this module, and
-//! no session code prepares this pipeline yet: the
-//! backend registers it at construction
-//! (`WgpuCompute::k21_finish`) and that is all. The
-//! session change that routes the block-head site to
-//! it (a `try_mmv_q5k_finish` beside `try_mmv_q5k`,
-//! gated on the family's shared
-//! `WGPU_COMPUTE_MMV_MAX_ROWS` threshold, falling
-//! back to K3 on any refusal) is a separate lane; the
-//! proof sequence that earns it is in
-//! bench/k21-finish-2026-11-06.md. Consistent with
-//! the family, this module adds no env var of its
-//! own.
+//! Routing is deliberately NOT in this module: the
+//! backend registers the pipeline at construction
+//! (`WgpuCompute::k21_finish`), and the session's
+//! block-head site prepares it through
+//! `try_mmv_q5k_finish` (beside `try_mmv_q5k`),
+//! falling back to K3 on any refusal. The route is
+//! governed by TWO gates, not the family threshold
+//! alone: the backend's dedicated head switch
+//! (`WGPU_COMPUTE_K21F_HEAD`, exact `1`, resolved in
+//! compute.rs; default off since the 2026-11-07
+//! defaults-confirmation identity failure, see
+//! bench/k21f-default-guard-2026-11-07.md) AND the
+//! family's shared `WGPU_COMPUTE_MMV_MAX_ROWS` band
+//! admitting the block batch. Consistent with the
+//! family, this module adds no env var of its own;
+//! the switch is the backend's, not the kernel's.
+//! The proof sequence that governs the route is in
+//! bench/k21-finish-2026-11-06.md.
 //!
 //! The generator below mirrors K21's `mmv_shader`
 //! structure line for line (the crate's per-kernel

@@ -188,11 +188,26 @@ const MMV_MAX_ROWS_FALLBACK: u32 = 1;
 /// Resolve the MMV row threshold from the raw
 /// environment value: a plain u32; the shipped default
 /// when unset; the closed fallback when present but
-/// unparsable.
+/// unparsable. Production resolution goes through
+/// [`resolve_mmv_max_rows_with_profile`]; this is the
+/// tests' handle on the env layer alone.
+#[cfg(test)]
 fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
+    resolve_mmv_max_rows_with_profile(raw, None)
+}
+
+/// Resolve the MMV row threshold with the calibration
+/// profile's layer in its precedence place: an env
+/// value, when present, decides on its own (a present
+/// but unparsable value still falls to the closed
+/// fallback, never to the profile: a typo must not
+/// widen routing through any layer); with the env
+/// unset, the loaded profile's ceiling applies when
+/// it states one; only then the shipped default.
+fn resolve_mmv_max_rows_with_profile(raw: Option<&str>, profile_ceiling: Option<u32>) -> u32 {
     match raw {
         Some(s) => s.trim().parse::<u32>().unwrap_or(MMV_MAX_ROWS_FALLBACK),
-        None => DEFAULT_MMV_MAX_ROWS,
+        None => profile_ceiling.unwrap_or(DEFAULT_MMV_MAX_ROWS),
     }
 }
 
@@ -220,7 +235,7 @@ impl MmvFamily {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             MmvFamily::Q4K => 0,
             MmvFamily::Q5K => 1,
@@ -258,7 +273,7 @@ impl MmvShape {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             MmvShape::Attn => 0,
             MmvShape::Ffn => 1,
@@ -478,12 +493,37 @@ pub(crate) fn default_mmv_bands() -> MmvBands {
 /// so at construction instead of routing silently.
 /// `get` is the env lookup, passed in so tests
 /// resolve against a table of their own.
+#[cfg(test)]
 fn resolve_mmv_bands(get: impl Fn(&str) -> Option<String>) -> MmvBands {
+    resolve_mmv_bands_with_profile(get, None)
+}
+
+/// Resolve the routing table with the calibration
+/// profile's layer in its precedence place: each cell
+/// comes from its env override when set and parsable,
+/// else from the loaded profile's cell for the pair
+/// when it states one and it parses, else the shipped
+/// cell. The layers share one parse path, so a cell
+/// means the same thing whichever layer stated it;
+/// an unparsable value at any layer falls through to
+/// the next rather than disabling or widening the
+/// cell, and the fallbacks are logged at construction
+/// ([`log_mmv_band_fallbacks`],
+/// [`log_mmv_profile_cell_fallbacks`]).
+fn resolve_mmv_bands_with_profile(
+    get: impl Fn(&str) -> Option<String>,
+    profile: Option<&crate::profile::CalibrationProfile>,
+) -> MmvBands {
     let mut cells: [[Vec<(u32, u32)>; 3]; 3] = Default::default();
     for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
         for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
             let parsed = get(mmv_band_env(family, shape))
                 .and_then(|raw| parse_mmv_band(&raw))
+                .or_else(|| {
+                    profile
+                        .and_then(|p| p.band_cell(family, shape))
+                        .and_then(parse_mmv_band)
+                })
                 .or_else(|| parse_mmv_band(default_mmv_band(family, shape)));
             cells[family.index()][shape.index()] =
                 parsed.expect("the shipped MMV band cells parse");
@@ -493,22 +533,104 @@ fn resolve_mmv_bands(get: impl Fn(&str) -> Option<String>) -> MmvBands {
 }
 
 /// Log, per cell, when an env override is present
-/// but unparsable and the shipped cell therefore
+/// but unparsable and a lower layer therefore
 /// applies: a silent fallback in a routing table
-/// is how a typo becomes a mystery cliff.
-fn log_mmv_band_fallbacks() {
+/// is how a typo becomes a mystery cliff. The line
+/// names the layer that actually governs the cell,
+/// the profile's cell when a loaded profile states
+/// one, else the shipped cell.
+fn log_mmv_band_fallbacks(profile: Option<&crate::profile::CalibrationProfile>) {
     for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
         for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
             let env = mmv_band_env(family, shape);
             if let Ok(raw) = std::env::var(env) {
                 if parse_mmv_band(&raw).is_none() {
+                    match profile.and_then(|p| p.band_cell(family, shape)) {
+                        Some(cell) => dbg_log!(
+                            "mmv band env {env}={raw:?} is unparsable; \
+                             the profile cell ({cell}) applies"
+                        ),
+                        None => dbg_log!(
+                            "mmv band env {env}={raw:?} is unparsable; \
+                             the shipped cell ({}) applies",
+                            default_mmv_band(family, shape)
+                        ),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Log, per cell, when a loaded profile states a
+/// cell the band parser refuses and the shipped cell
+/// therefore applies: a profile is hand-editable, so
+/// its typos get the same named-fallback treatment
+/// as the env's.
+fn log_mmv_profile_cell_fallbacks(profile: Option<&crate::profile::CalibrationProfile>) {
+    let Some(profile) = profile else {
+        return;
+    };
+    for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+        for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
+            if let Some(cell) = profile.band_cell(family, shape) {
+                if parse_mmv_band(cell).is_none() {
                     dbg_log!(
-                        "mmv band env {env}={raw:?} is unparsable; \
+                        "mmv profile cell {} {} ({cell:?}) is unparsable; \
                          the shipped cell ({}) applies",
+                        family.name(),
+                        shape.name(),
                         default_mmv_band(family, shape)
                     );
                 }
             }
+        }
+    }
+}
+
+/// Load the calibration profile for this context's
+/// adapter at construction, and state the outcome on
+/// the diag channel either way: the loaded profile
+/// (with its key, which the backend keeps for the
+/// capture manifest), or `None` with the reason
+/// logged (no path resolves, no file there, or a file
+/// that failed verification). A rejected profile is
+/// never half-applied: the shipped defaults govern,
+/// exactly as on an uncalibrated machine.
+fn load_construction_profile(
+    ctx: &crate::device::GpuContext,
+) -> (Option<crate::profile::CalibrationProfile>, Option<String>) {
+    use crate::profile::{load_profile, profile_path, AdapterKey, ProfileLoad};
+    let key = AdapterKey::from_facts(&ctx.adapter);
+    let Some(path) = profile_path() else {
+        dbg_log!(
+            "mmv profile: no profile path resolves (no {}, \
+             XDG_CONFIG_HOME, or HOME); shipped defaults apply",
+            crate::profile::PROFILE_PATH_ENV
+        );
+        return (None, None);
+    };
+    match load_profile(&path, &key) {
+        ProfileLoad::Loaded(profile) => {
+            let profile = *profile;
+            dbg_log!(
+                "mmv profile: loaded [{}] from {}",
+                profile.key.describe(),
+                path.display()
+            );
+            let describe = profile.key.describe();
+            (Some(profile), Some(describe))
+        }
+        ProfileLoad::Absent => {
+            dbg_log!(
+                "mmv profile: none at {}; shipped defaults apply",
+                path.display()
+            );
+            (None, None)
+        }
+        ProfileLoad::Rejected(why) => {
+            dbg_log!("mmv profile: {why}; shipped defaults apply");
+            (None, None)
         }
     }
 }
@@ -937,6 +1059,16 @@ pub struct WgpuCompute {
     k21f_head: bool,
     mmv_max_rows: u32,
     mmv_bands: MmvBands,
+    /// The calibration profile that governed this
+    /// backend's MMV resolution, as its adapter key's
+    /// one-line description, or `None` when no profile
+    /// loaded (uncalibrated machine, or a profile that
+    /// failed verification): kept so the capture
+    /// manifest can state which profile a run ran
+    /// under, or that none did. The profile's values
+    /// themselves are already folded into
+    /// `mmv_max_rows` and `mmv_bands` at construction.
+    mmv_profile_key: Option<String>,
     chunked_gemv_max_rows: u32,
     weights: RefCell<HashMap<String, CachedWeights>>,
     kv: RefCell<Option<GpuKvState>>,
@@ -1168,13 +1300,28 @@ impl WgpuCompute {
             "k21f head config: enabled={k21f_head} (env {K21F_HEAD_ENV}, \
              \"1\" or unset enables, \"0\" disables)"
         );
-        let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
-        log_mmv_band_fallbacks();
-        let mmv_bands = resolve_mmv_bands(|name| std::env::var(name).ok());
+        // The calibration profile for this adapter
+        // (see crate::profile): measured routing values
+        // from a prior calibration run on this exact
+        // card and driver, loaded before the MMV policy
+        // resolves so they take their precedence place
+        // under the env overrides and over the shipped
+        // table. No profile (the uncalibrated machine)
+        // resolves exactly as before.
+        let (mmv_profile, mmv_profile_key) = load_construction_profile(&ctx);
+        let mmv_max_rows = resolve_mmv_max_rows_with_profile(
+            std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref(),
+            mmv_profile.as_ref().and_then(|p| p.mmv_max_rows),
+        );
+        log_mmv_band_fallbacks(mmv_profile.as_ref());
+        log_mmv_profile_cell_fallbacks(mmv_profile.as_ref());
+        let mmv_bands =
+            resolve_mmv_bands_with_profile(|name| std::env::var(name).ok(), mmv_profile.as_ref());
         dbg_log!(
             "mmv config: max_rows={mmv_max_rows} (env {MMV_MAX_ROWS_ENV}, \
-             default {DEFAULT_MMV_MAX_ROWS}); k19 shape {}, k20 shape {}, \
-             k21 shape {}; bands {}",
+             default {DEFAULT_MMV_MAX_ROWS}); profile {}; k19 shape {}, \
+             k20 shape {}, k21 shape {}; bands {}",
+            mmv_profile_key.as_deref().unwrap_or("none"),
             k19.shape().name(),
             k20.shape().name(),
             k21.shape().name(),
@@ -1241,6 +1388,7 @@ impl WgpuCompute {
             k21f_head,
             mmv_max_rows,
             mmv_bands,
+            mmv_profile_key,
             chunked_gemv_max_rows,
             weights: RefCell::new(HashMap::new()),
             kv: RefCell::new(None),
@@ -1632,6 +1780,17 @@ impl WgpuCompute {
     /// state the run it claims to describe.
     pub(crate) fn mmv_bands_describe(&self) -> String {
         self.mmv_bands.describe()
+    }
+
+    /// The calibration profile that governed this
+    /// backend's MMV resolution, as the one-line
+    /// description of its adapter key, or `None` when
+    /// no profile loaded: the capture manifest states
+    /// it (as `"none"` when absent) beside the resolved
+    /// bands, so a run's governing table is never a
+    /// mystery. See [`crate::profile`].
+    pub(crate) fn mmv_profile_key(&self) -> Option<&str> {
+        self.mmv_profile_key.as_deref()
     }
 
     /// The largest batch row count at which the resident
@@ -2285,6 +2444,72 @@ mod tests {
             (name == mmv_band_env(MmvFamily::Q5K, MmvShape::Attn)).then(|| "1".to_string())
         });
         assert!(!bands.routes(16, MmvFamily::Q5K, MmvShape::Attn, 7));
+    }
+
+    #[test]
+    fn mmv_profile_layer_sits_between_env_and_shipped() {
+        use crate::profile::{AdapterKey, CalibrationProfile};
+        // A profile measured on some other sweep: it
+        // opens Q4_K KV at batch 12 (a batch the
+        // shipped cell "2-3" leaves closed), narrows
+        // Q4_K attention to "2-3" (the shipped cell is
+        // "6-12"), and states an unparsable Q5_K KV
+        // cell, which must fall through to the shipped
+        // "16" rather than poison the table.
+        let mut profile = CalibrationProfile::new(AdapterKey {
+            name: "test adapter".to_string(),
+            backend: "Vulkan".to_string(),
+            driver: "test driver".to_string(),
+            driver_info: "test driver info".to_string(),
+        });
+        profile.set_band_cell(MmvFamily::Q4K, MmvShape::Kv, "12".to_string());
+        profile.set_band_cell(MmvFamily::Q4K, MmvShape::Attn, "2-3".to_string());
+        profile.set_band_cell(MmvFamily::Q5K, MmvShape::Kv, "junk".to_string());
+
+        // No env: the profile governs the cells it
+        // states, the shipped table the rest.
+        let bands = resolve_mmv_bands_with_profile(|_| None, Some(&profile));
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Kv, 12));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Kv, 4));
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 2));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(bands.routes(16, MmvFamily::Q5K, MmvShape::Kv, 16));
+        assert!(!bands.routes(16, MmvFamily::Q5K, MmvShape::Kv, 2));
+        assert!(bands.routes(16, MmvFamily::Q6K, MmvShape::Attn, 6));
+
+        // An env override beats the profile for the
+        // same cell, and only that cell.
+        let bands = resolve_mmv_bands_with_profile(
+            |name| {
+                (name == mmv_band_env(MmvFamily::Q4K, MmvShape::Attn)).then(|| "6-9".to_string())
+            },
+            Some(&profile),
+        );
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 2));
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Kv, 12));
+
+        // An unparsable env value falls through to the
+        // profile layer, not past it: the profile is
+        // the next statement of the cell's value.
+        let bands = resolve_mmv_bands_with_profile(
+            |name| {
+                (name == mmv_band_env(MmvFamily::Q4K, MmvShape::Attn)).then(|| "junk".to_string())
+            },
+            Some(&profile),
+        );
+        assert!(bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 2));
+        assert!(!bands.routes(16, MmvFamily::Q4K, MmvShape::Attn, 6));
+
+        // The ceiling resolves in the same precedence:
+        // env over profile over shipped, and a present
+        // but unparsable env value still lands on the
+        // closed fallback without ever reaching the
+        // profile.
+        assert_eq!(resolve_mmv_max_rows_with_profile(None, Some(4)), 4);
+        assert_eq!(resolve_mmv_max_rows_with_profile(None, None), 16);
+        assert_eq!(resolve_mmv_max_rows_with_profile(Some("9"), Some(4)), 9);
+        assert_eq!(resolve_mmv_max_rows_with_profile(Some("junk"), Some(4)), 1);
     }
 
     #[test]

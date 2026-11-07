@@ -1594,6 +1594,10 @@ impl<'a> DflashSession<'a> {
                 pair("mmv_max_rows", backend.mmv_max_rows().to_string()),
                 pair("mmv_bands", backend.mmv_bands_describe()),
                 pair(
+                    "mmv_profile",
+                    backend.mmv_profile_key().unwrap_or("none").to_string(),
+                ),
+                pair(
                     "chunked_gemv_max_rows",
                     backend.chunked_gemv_max_rows().to_string(),
                 ),

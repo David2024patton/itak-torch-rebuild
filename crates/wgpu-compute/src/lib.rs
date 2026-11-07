@@ -79,6 +79,7 @@ pub mod dflash_session;
 pub mod diag;
 pub mod error;
 pub mod kernels;
+pub mod profile;
 pub mod session;
 pub mod timestamps;
 
@@ -123,6 +124,9 @@ pub use kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, K8Pipeline, ARGMAX_GROUPS,
 };
 pub use kernels::k9_attn_prep::{K9Pipeline, K9PrepCall, PrepArgs};
+pub use profile::{
+    AdapterKey, CalibrationProfile, ProfileLoad, PROFILE_FORMAT_VERSION, PROFILE_PATH_ENV,
+};
 pub use session::{ProjBench, ProjBenchCall, ResidentSession, SessionStats};
 pub use timestamps::{
     argmax_of, build_git, build_version, capture_sidecar_path, diff_capture_records,

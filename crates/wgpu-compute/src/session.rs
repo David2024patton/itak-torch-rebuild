@@ -656,9 +656,13 @@ enum ProjCall {
     },
     /// K12 quantize + K23 (Q4_K coopmat MMQ, the
     /// cooperative-matrix product) dispatches. Constructed
-    /// only when the backend's coopmat switch is on and a
-    /// bridged device supplied the pipeline; at shipped
-    /// defaults this variant never appears in a plan.
+    /// only when the backend's coopmat switch is on, its
+    /// v2 selector is off, and a bridged device supplied
+    /// the pipeline; at shipped defaults the v2 form
+    /// below serves the rung instead (the selector
+    /// defaults on since the wave20 verdict flip), so
+    /// this variant appears only behind the rollback or
+    /// as the v2 form's fallback.
     MmqCoopmatQ4K {
         /// The activation quantize dispatch, or `None` when
         /// this projection reads its layer's shared `h`
@@ -671,8 +675,9 @@ enum ProjCall {
     /// register-resident form of K23) dispatches.
     /// Constructed only when the backend's coopmat switch
     /// is on, its v2 selector is on, and a bridged device
-    /// supplied the pipeline; at shipped defaults this
-    /// variant never appears in a plan.
+    /// supplied the pipeline; at shipped defaults both
+    /// switches are on (the wave20 verdict flip), so on a
+    /// bridged device this variant is the rung's plan.
     MmqCoopmatV2Q4K {
         /// The activation quantize dispatch, or `None` when
         /// this projection reads its layer's shared `h`
@@ -1188,9 +1193,15 @@ impl ProjBenchCall {
 /// [`crate::compute::MMQ_SPLITK_ENV`]); the split is a
 /// property of the standard product, not a rung above
 /// the prototypes, so it never stacks on an unproven
-/// form. With every switch off (the shipped defaults)
-/// the ladder is the shipped ladder exactly: the opt-in
-/// rungs are skipped without being consulted. `None` when no pipeline
+/// form. At shipped defaults the coopmat rung leads the
+/// ladder (its switch and selector both default on
+/// since the wave20 verdict flip,
+/// bench/coopmat-default-flip-2026-11-07.md) and the
+/// opt-in prototype rungs behind it are skipped without
+/// being consulted; on a device without a coopmat
+/// pipeline the rung refuses by name here and the
+/// ladder below serves exactly as it did before the
+/// flip. `None` when no pipeline
 /// exists or every prepare refuses: the caller then
 /// takes the GEMM form. Every refusal is logged by name;
 /// the choice is made here, at plan-build time, and

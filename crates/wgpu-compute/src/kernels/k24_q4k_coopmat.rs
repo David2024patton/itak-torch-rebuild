@@ -57,9 +57,15 @@
 //! the proof on the target card, and the routing
 //! stays behind the coopmat flag with the v2
 //! selector on top (see `WGPU_COMPUTE_COOPMAT_V2` in
-//! `crate::compute`), default off: K23 remains the
-//! A/B reference and K13 keeps serving until the
-//! card protocol in the bench note says otherwise.
+//! `crate::compute`). Both switches shipped default
+//! off until the card protocol in the bench note
+//! discharged its decision rule (wave20: the mapping
+//! proven numerically, the kernel line about 2.3x
+//! faster than K13's, identity intact); the flip
+//! (bench/coopmat-default-flip-2026-11-07.md) made
+//! K24 the shipped default inside the rung, with K23
+//! remaining the A/B reference and fallback behind
+//! the selector's `0`.
 //!
 //! The shader is GLSL, not WGSL, for the same reason
 //! as K23's: wgpu 27 has no cooperative matrix

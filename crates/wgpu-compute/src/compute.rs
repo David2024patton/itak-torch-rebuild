@@ -784,28 +784,112 @@ fn resolve_k23_mmq(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
-/// Environment variable naming the K23 (Q4_K coopmat
-/// MMQ) routing switch: the exact value `1` makes the
-/// resident session prefer the cooperative-matrix
-/// product over every other Q4_K MMQ form. Operational
-/// config, not a compiled constant, and deliberately
-/// fail-closed on the K22 pattern: an unset variable,
-/// or any other value, keeps K23 out of the ladder
-/// entirely. The pipeline itself exists only on a
-/// device opened through the coopmat bridge
-/// ([`crate::coopmat_bridge`], its own switch); with
-/// the routing on but no pipeline present, the session
-/// logs the refusal by name at plan build and the
-/// standard ladder serves. The server proof that can
-/// move this switch's default is sequenced in
-/// bench/coopmat-build-2026-11-06.md.
+/// Environment variable naming the coopmat (Q4_K
+/// cooperative-matrix MMQ) routing switch: it makes
+/// the resident session prefer the cooperative-matrix
+/// product over every other Q4_K MMQ form, the form
+/// inside the rung chosen by the v2 selector
+/// ([`COOPMAT_V2_ENV`]: K24 by shipped default, K23
+/// the fallback behind it). Operational config, not a
+/// compiled constant. The rung is the DEFAULT: an
+/// unset variable resolves to on (see
+/// [`DEFAULT_COOPMAT`]), and the exact value `1`
+/// (after trimming) also resolves to on, so a value
+/// that meant on before the default flip still means
+/// on. The exact value `0` is the explicit off and
+/// the one-variable rollback to the standard ladder.
+/// Any other value fails closed to off
+/// ([`COOPMAT_FALLBACK`]), with the refusal logged by
+/// name at construction: a typo must never silently
+/// select a route. The pipelines themselves exist
+/// only on a device opened through the coopmat bridge
+/// ([`crate::coopmat_bridge`]); with the routing on
+/// but no pipeline present, the session logs the
+/// refusal by name at plan build and the standard
+/// ladder serves, so a machine without coopmat runs
+/// the shipped ladder exactly, with the refusal on
+/// record. The switch originally shipped fail-closed
+/// off (bench/coopmat-build-2026-11-06.md); the
+/// wave20 card verdict (bench/wave20-session-2026-11-07.md,
+/// leg 2: the K24 decision rule from
+/// bench/coopmat-v2-2026-11-07.md met, kernel line
+/// 1,737.2 / 1,751.9 ms against K13's 4,021.0 /
+/// 4,046.5 ms over 2,912 dispatches at the 1,022-token
+/// prefill shape, walls about 36 percent lower,
+/// identity and golden PASS with the rung engaged)
+/// is what moved the default to on; the flip itself
+/// is recorded in bench/coopmat-default-flip-2026-11-07.md.
 pub const COOPMAT_ENV: &str = "WGPU_COMPUTE_COOPMAT";
 
-/// Resolve the K23 coopmat routing switch from the raw
-/// environment value: only the exact value `1` (after
-/// trimming) enables it; everything else is off.
-fn resolve_coopmat(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
+/// Whether the coopmat routing rung is live when the
+/// environment does not override it: on. The rung
+/// shipped off behind an exact-"1" switch while both
+/// coopmat kernels were unproven on the card; the
+/// wave20 session discharged the v2 note's written
+/// decision rule (material kernel-line win over K13
+/// with identity intact), and David's standing order
+/// of 2026-11-07 ("anything that makes sense engine
+/// go faster should be set to on") plus that verdict
+/// moved the default. Rollback is one env value:
+/// `WGPU_COMPUTE_COOPMAT=0` restores the pre-flip
+/// ladder composition exactly.
+pub const DEFAULT_COOPMAT: bool = true;
+
+/// The coopmat routing switch position a present but
+/// unrecognized env value resolves to: off, closed.
+/// The fallback is deliberately NOT the shipped
+/// default: a typo in the environment must never
+/// widen routing, so the malformed case keeps the
+/// fail-closed value it resolved to while the
+/// switch's default was off.
+const COOPMAT_FALLBACK: bool = false;
+
+/// Resolve the coopmat routing switch from the raw
+/// environment value: unset is ON (the shipped
+/// default, [`DEFAULT_COOPMAT`]), the exact value
+/// `1` (after trimming) is ON, the exact value `0` is
+/// the explicit OFF, and any other value fails closed
+/// to OFF ([`COOPMAT_FALLBACK`]). The caller logs
+/// the refusal for an unrecognized value at
+/// construction ([`log_coopmat_fallback`]), so the
+/// fail-closed position is visible in the run log,
+/// never silent. `pub(crate)`: the coopmat bridge
+/// reads the unset position to decide whether the
+/// routing default implies a bridged device (see
+/// `crate::coopmat_bridge::coopmat_bridge_requested`).
+pub(crate) fn resolve_coopmat(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None => DEFAULT_COOPMAT,
+        Some("1") => true,
+        Some("0") => false,
+        Some(_) => COOPMAT_FALLBACK,
+    }
+}
+
+/// Whether a raw coopmat routing env value is one the
+/// resolver recognizes (`1` or `0` after trimming, or
+/// unset). An unrecognized value resolves off; the
+/// construction log names it, following the flash
+/// staged fallback pattern: a silent fallback in a
+/// routing switch is how a typo becomes a mystery
+/// regression.
+fn coopmat_value_recognized(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("1") | Some("0"))
+}
+
+/// Log, at construction, when the coopmat routing env
+/// value is present but unrecognized and the switch
+/// therefore fails closed to off.
+fn log_coopmat_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !coopmat_value_recognized(raw) {
+            dbg_log!(
+                "mmq coopmat env {COOPMAT_ENV}={value:?} is not a recognized \
+                 value (\"1\" or unset enables, \"0\" disables); failing closed, \
+                 the coopmat rung is OFF"
+            );
+        }
+    }
 }
 
 /// Environment variable naming the MMQ split-K routing
@@ -925,31 +1009,109 @@ pub(crate) fn mmq_splitk_factor(mode: MmqSplitK, tiles: u32, blocks_per_row: u32
 
 /// Environment variable naming the K24 (Q4_K coopmat
 /// MMQ v2) selector: when the coopmat routing switch
-/// ([`COOPMAT_ENV`]) is on, the exact value `1` makes
-/// the resident session prefer the v2 register-resident
-/// product (K24) over the v1 product (K23); any other
-/// value, or an unset variable, keeps K23 as the
-/// coopmat form, so the v1 kernel stays intact as the
-/// A/B reference behind the same routing flag.
-/// Operational config, not a compiled constant, and
-/// deliberately fail-closed on the K22 pattern: the
-/// selector alone never routes anything (the coopmat
-/// switch must also be on), and the K24 pipeline itself
-/// exists only on a device opened through the coopmat
-/// bridge; with the selector on but no pipeline
-/// present, the session logs the refusal by name at
-/// plan build and the standard ladder serves. The
+/// ([`COOPMAT_ENV`]) is on, it chooses the form inside
+/// the rung: the v2 register-resident product (K24)
+/// over the v1 product (K23). Operational config, not
+/// a compiled constant. K24 is the DEFAULT inside the
+/// rung: an unset variable resolves to selected (see
+/// [`DEFAULT_COOPMAT_V2`]), and the exact value `1`
+/// (after trimming) also resolves to selected, so a
+/// value that meant selected before the default flip
+/// still means selected. The exact value `0` is the
+/// explicit deselect and the one-variable rollback to
+/// K23 inside the rung (the v1 kernel stays intact
+/// behind the same routing flag, the A/B reference
+/// and the fallback when a K24 prepare refuses). Any
+/// other value fails closed to deselected
+/// ([`COOPMAT_V2_FALLBACK`]), with the refusal logged
+/// by name at construction: a typo must never
+/// silently select a form. The selector alone never
+/// routes anything (the coopmat switch must also be
+/// on), and the K24 pipeline itself exists only on a
+/// device opened through the coopmat bridge; with the
+/// selector on but no pipeline present, the session
+/// logs the refusal by name at plan build and the v1
+/// form, then the standard ladder, serves. The
 /// resolved pair is named in the sessions' diag
-/// manifests (`coopmat`, `coopmat_v2`). The server
-/// proof that can move this selector's default is
-/// sequenced in bench/coopmat-v2-2026-11-07.md.
+/// manifests (`coopmat`, `coopmat_v2`). The selector
+/// originally shipped fail-closed off with its
+/// default-moving proof sequenced in
+/// bench/coopmat-v2-2026-11-07.md; the wave20 card
+/// verdict (bench/wave20-session-2026-11-07.md, leg
+/// 2) discharged that decision rule, and the flip is
+/// recorded in bench/coopmat-default-flip-2026-11-07.md.
 pub const COOPMAT_V2_ENV: &str = "WGPU_COMPUTE_COOPMAT_V2";
 
+/// Whether the K24 v2 form is the coopmat rung's form
+/// when the environment does not override the
+/// selector: selected. The selector shipped off while
+/// K24's wave64 accumulator element mapping rested on
+/// Mesa source reading; the wave20 numeric gates
+/// proved the mapping on the card (K24 against the
+/// host reference at relative error at most 1.158e-6,
+/// against K13 at most 2.9e-7), the kernel line beat
+/// K13 by about 2.3x with identity intact, and the
+/// decision rule written in
+/// bench/coopmat-v2-2026-11-07.md was met, so the
+/// default moved together with the rung's
+/// ([`DEFAULT_COOPMAT`]): defaulting only one of the
+/// two switches would ship either a rung serving the
+/// 4x-slower v1 kernel or a selector behind a closed
+/// rung. Rollback is one env value:
+/// `WGPU_COMPUTE_COOPMAT_V2=0` restores K23 as the
+/// rung's form exactly.
+pub const DEFAULT_COOPMAT_V2: bool = true;
+
+/// The K24 v2 selector position a present but
+/// unrecognized env value resolves to: deselected,
+/// closed. The fallback is deliberately NOT the
+/// shipped default: a typo in the environment must
+/// never widen routing, so the malformed case keeps
+/// the fail-closed value it resolved to while the
+/// selector's default was off (K23 serves the rung).
+const COOPMAT_V2_FALLBACK: bool = false;
+
 /// Resolve the K24 coopmat v2 selector from the raw
-/// environment value: only the exact value `1` (after
-/// trimming) enables it; everything else is off.
+/// environment value: unset is SELECTED (the shipped
+/// default, [`DEFAULT_COOPMAT_V2`]), the exact value
+/// `1` (after trimming) is SELECTED, the exact value
+/// `0` is the explicit DESELECT, and any other value
+/// fails closed to DESELECTED ([`COOPMAT_V2_FALLBACK`]).
+/// The caller logs the refusal for an unrecognized
+/// value at construction ([`log_coopmat_v2_fallback`]),
+/// so the fail-closed position is visible in the run
+/// log, never silent.
 fn resolve_coopmat_v2(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
+    match raw.map(str::trim) {
+        None => DEFAULT_COOPMAT_V2,
+        Some("1") => true,
+        Some("0") => false,
+        Some(_) => COOPMAT_V2_FALLBACK,
+    }
+}
+
+/// Whether a raw K24 v2 selector env value is one the
+/// resolver recognizes (`1` or `0` after trimming, or
+/// unset). An unrecognized value resolves deselected;
+/// the construction log names it, following the flash
+/// staged fallback pattern.
+fn coopmat_v2_value_recognized(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("1") | Some("0"))
+}
+
+/// Log, at construction, when the K24 v2 selector env
+/// value is present but unrecognized and the selector
+/// therefore fails closed to deselected.
+fn log_coopmat_v2_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !coopmat_v2_value_recognized(raw) {
+            dbg_log!(
+                "mmq coopmat v2 env {COOPMAT_V2_ENV}={value:?} is not a recognized \
+                 value (\"1\" or unset selects K24, \"0\" selects K23); failing \
+                 closed, K23 serves the coopmat rung"
+            );
+        }
+    }
 }
 
 /// Environment variable naming the K21F finish-carrying
@@ -1435,14 +1597,21 @@ impl WgpuCompute {
         // extension), so it is built from the context's
         // coopmat record rather than unconditionally;
         // its routing switch is read here (see
-        // COOPMAT_ENV), default off.
+        // COOPMAT_ENV). The rung is the shipped default
+        // since the wave20 verdict flip
+        // (bench/coopmat-default-flip-2026-11-07.md);
+        // on a stock device the pipeline is absent and
+        // the rung refuses by name at plan build.
         let k23_coopmat = match &ctx.coopmat {
             Some(info) => K23CoopmatPipeline::for_device(&ctx.device, info)?,
             None => None,
         };
-        let coopmat = resolve_coopmat(std::env::var(COOPMAT_ENV).ok().as_deref());
+        let coopmat_raw = std::env::var(COOPMAT_ENV).ok();
+        let coopmat = resolve_coopmat(coopmat_raw.as_deref());
+        log_coopmat_fallback(coopmat_raw.as_deref());
         dbg_log!(
-            "mmq coopmat config: enabled={coopmat} (env {COOPMAT_ENV}, only \"1\" enables); \
+            "mmq coopmat config: enabled={coopmat} (env {COOPMAT_ENV}, \
+             \"1\" or unset enables, \"0\" disables); \
              k23_coopmat={}",
             k23_coopmat.is_some()
         );
@@ -1465,17 +1634,22 @@ impl WgpuCompute {
         // The K24 Q4_K coopmat MMQ v2: built beside K23
         // from the same bridge record, under the same
         // gates; its selector is read here (see
-        // COOPMAT_V2_ENV), default off, so with shipped
-        // defaults the coopmat rung keeps serving K23
-        // exactly and this pipeline is never consulted.
+        // COOPMAT_V2_ENV). K24 is the rung's shipped
+        // form since the wave20 verdict flip
+        // (bench/coopmat-default-flip-2026-11-07.md);
+        // the selector is consulted only when the
+        // coopmat switch is on.
         let k24_coopmat = match &ctx.coopmat {
             Some(info) => K24CoopmatPipeline::for_device(&ctx.device, info)?,
             None => None,
         };
-        let coopmat_v2 = resolve_coopmat_v2(std::env::var(COOPMAT_V2_ENV).ok().as_deref());
+        let coopmat_v2_raw = std::env::var(COOPMAT_V2_ENV).ok();
+        let coopmat_v2 = resolve_coopmat_v2(coopmat_v2_raw.as_deref());
+        log_coopmat_v2_fallback(coopmat_v2_raw.as_deref());
         dbg_log!(
             "mmq coopmat v2 config: selected={coopmat_v2} (env {COOPMAT_V2_ENV}, \
-             only \"1\" selects; consulted only when the coopmat switch is on); \
+             \"1\" or unset selects K24, \"0\" selects K23; consulted only when \
+             the coopmat switch is on); \
              k24_coopmat={}",
             k24_coopmat.is_some()
         );
@@ -1882,12 +2056,15 @@ impl WgpuCompute {
         self.k23_coopmat.as_ref()
     }
 
-    /// Whether the resident session prefers the K23
+    /// Whether the resident session prefers the
     /// coopmat product over the other Q4_K MMQ forms:
     /// config resolved at construction from
     /// [`COOPMAT_ENV`], never a constant compiled into
-    /// the selection seam. `false` (the default) leaves
-    /// the shipped ladder untouched.
+    /// the selection seam. `true` is the shipped
+    /// default since the wave20 verdict flip
+    /// (bench/coopmat-default-flip-2026-11-07.md);
+    /// `false` (the env's explicit `0`, the rollback)
+    /// leaves the standard ladder untouched.
     pub(crate) fn coopmat(&self) -> bool {
         self.coopmat
     }
@@ -1923,8 +2100,11 @@ impl WgpuCompute {
     /// when the coopmat routing switch is on: config
     /// resolved at construction from [`COOPMAT_V2_ENV`],
     /// never a constant compiled into the selection
-    /// seam. `false` (the default) leaves the coopmat
-    /// rung serving K23 exactly.
+    /// seam. `true` is the shipped default since the
+    /// wave20 verdict flip
+    /// (bench/coopmat-default-flip-2026-11-07.md);
+    /// `false` (the env's explicit `0`, the rollback)
+    /// leaves the coopmat rung serving K23 exactly.
     pub(crate) fn coopmat_v2(&self) -> bool {
         self.coopmat_v2
     }
@@ -3212,18 +3392,57 @@ mod tests {
 
     #[test]
     fn coopmat_switch_resolution() {
-        // Unset: off. The shipped ladder is the ladder
-        // with K23 nowhere in it.
-        assert!(!resolve_coopmat(None));
-        // The exact value "1" (trimmed) is the only
-        // enabling position: fail-closed, like every
-        // routing switch in this backend.
+        // Unset: ON (the shipped default). The rung
+        // earned the default in the wave20 card session
+        // (bench/wave20-session-2026-11-07.md, leg 2):
+        // with the rung engaged and K24 selected, the
+        // Q4_K kernel line ran 1,737.2 / 1,751.9 ms
+        // against K13's 4,021.0 / 4,046.5 ms over 2,912
+        // dispatches at the 1,022-token prefill shape
+        // (about 2.3x), walls about 36 percent lower,
+        // and identity and golden PASSED, discharging
+        // the decision rule written in
+        // bench/coopmat-v2-2026-11-07.md. Before that
+        // proof the default was off (the switch shipped
+        // fail-closed in bench/coopmat-build-2026-11-06.md).
+        // (This assertion also pins DEFAULT_COOPMAT
+        // itself: the unset arm returns the constant.)
+        assert!(resolve_coopmat(None));
+        // The exact value "1" (trimmed) is on: the
+        // value that meant on before the flip still
+        // means on after it.
         assert!(resolve_coopmat(Some("1")));
         assert!(resolve_coopmat(Some(" 1 ")));
+        // The exact value "0" (trimmed) is the
+        // explicit off: the one-variable rollback to
+        // the standard ladder.
         assert!(!resolve_coopmat(Some("0")));
+        assert!(!resolve_coopmat(Some(" 0 ")));
+        // Anything else fails closed to the fallback,
+        // never to the shipped default: a typo must
+        // not silently widen routing.
+        // (These arms pin COOPMAT_FALLBACK the same
+        // way: the unrecognized arm returns it.)
         assert!(!resolve_coopmat(Some("true")));
         assert!(!resolve_coopmat(Some("")));
         assert!(!resolve_coopmat(Some("11")));
+        assert!(!resolve_coopmat(Some("on")));
+        assert_eq!(COOPMAT_ENV, "WGPU_COMPUTE_COOPMAT");
+    }
+
+    #[test]
+    fn coopmat_value_recognition() {
+        // The recognized positions are exactly the
+        // ones the resolver gives a non-fallback
+        // meaning: unset, "1", "0" (each trimmed).
+        // The construction log names the rest.
+        assert!(coopmat_value_recognized(None));
+        assert!(coopmat_value_recognized(Some("1")));
+        assert!(coopmat_value_recognized(Some(" 0 ")));
+        assert!(!coopmat_value_recognized(Some("true")));
+        assert!(!coopmat_value_recognized(Some("")));
+        assert!(!coopmat_value_recognized(Some("11")));
+        assert!(!coopmat_value_recognized(Some("on")));
     }
 
     #[test]
@@ -3296,19 +3515,56 @@ mod tests {
 
     #[test]
     fn coopmat_v2_selector_resolution() {
-        // Unset: off. The coopmat rung serves K23
-        // exactly, the v1 kernel intact as the A/B
-        // reference.
-        assert!(!resolve_coopmat_v2(None));
-        // The exact value "1" (trimmed) is the only
-        // selecting position: fail-closed, like the
-        // routing switch it refines.
+        // Unset: SELECTED (the shipped default inside
+        // the rung). The wave20 numeric gates proved
+        // K24's wave64 accumulator element mapping on
+        // the card (against the host reference at
+        // relative error at most 1.158e-6; against K13
+        // at most 2.9e-7), the kernel line beat K13 by
+        // about 2.3x with identity intact, and the
+        // decision rule in bench/coopmat-v2-2026-11-07.md
+        // was met; the selector flipped together with
+        // the rung it refines
+        // (bench/coopmat-default-flip-2026-11-07.md).
+        // Before that proof the default was off and
+        // the rung served K23.
+        // (This assertion also pins DEFAULT_COOPMAT_V2
+        // itself: the unset arm returns the constant.)
+        assert!(resolve_coopmat_v2(None));
+        // The exact value "1" (trimmed) is selected:
+        // the value that meant selected before the
+        // flip still means selected after it.
         assert!(resolve_coopmat_v2(Some("1")));
         assert!(resolve_coopmat_v2(Some(" 1 ")));
+        // The exact value "0" (trimmed) is the
+        // explicit deselect: the one-variable rollback
+        // to K23 as the rung's form.
         assert!(!resolve_coopmat_v2(Some("0")));
+        assert!(!resolve_coopmat_v2(Some(" 0 ")));
+        // Anything else fails closed to the fallback
+        // (deselected), never to the shipped default.
+        // (These arms pin COOPMAT_V2_FALLBACK the same
+        // way: the unrecognized arm returns it.)
         assert!(!resolve_coopmat_v2(Some("true")));
         assert!(!resolve_coopmat_v2(Some("")));
         assert!(!resolve_coopmat_v2(Some("11")));
+        assert!(!resolve_coopmat_v2(Some("on")));
+        assert_eq!(COOPMAT_V2_ENV, "WGPU_COMPUTE_COOPMAT_V2");
+    }
+
+    #[test]
+    fn coopmat_v2_value_recognition() {
+        // The recognized positions are exactly the
+        // ones the resolver gives a non-fallback
+        // meaning: unset, "1", "0" (each trimmed).
+        // The construction log names the rest.
+        assert!(coopmat_v2_value_recognized(None));
+        assert!(coopmat_v2_value_recognized(Some("1")));
+        assert!(coopmat_v2_value_recognized(Some(" 0 ")));
+        assert!(!coopmat_v2_value_recognized(Some("true")));
+        assert!(!coopmat_v2_value_recognized(Some("")));
+        assert!(!coopmat_v2_value_recognized(Some("11")));
+        assert!(!coopmat_v2_value_recognized(Some("on")));
     }
 
     #[test]

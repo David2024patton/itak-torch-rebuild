@@ -27,20 +27,24 @@
 //! must not remove anything from this list, but you may
 //! add to it."
 //!
-//! Gating: the bridge is entered only when the
+//! Gating: the bridge is entered when the
 //! environment names it ([`COOPMAT_BRIDGE_ENV`], exact
-//! value `1`). With the variable unset or any other
-//! value, `GpuContext::open` runs the shipped
-//! `request_device` path untouched. The bridge is
-//! fail-closed in the other direction too: every probe
-//! below (extension exposed, feature bit true, the
-//! s8 x s8 to s32 16x16x16 subgroup property row
-//! present) must pass before any device is created, and
-//! any refusal is returned as a named string; the
-//! caller logs it on the diag channel and opens the
-//! stock device instead, so a machine without coopmat
-//! serves exactly as it did before this module existed,
-//! with the refusal on record. The coopmat kernel
+//! value `1`), or when the variable is unset and the
+//! coopmat routing default implies it (the default
+//! flipped on in bench/coopmat-default-flip-2026-11-07.md;
+//! a present bridge value decides on its own, so an
+//! explicit `0` still names a deliberate stock-device
+//! run). With neither in force, `GpuContext::open`
+//! runs the shipped `request_device` path untouched.
+//! The bridge is fail-closed in the other direction
+//! too: every probe below (extension exposed, feature
+//! bit true, the s8 x s8 to s32 16x16x16 subgroup
+//! property row present) must pass before any device
+//! is created, and any refusal is returned as a named
+//! string; the caller logs it on the diag channel and
+//! opens the stock device instead, so a machine
+//! without coopmat serves exactly as it did before
+//! this module existed, with the refusal on record. The coopmat kernel
 //! module reads [`GpuContext::coopmat`] and exists only
 //! when this bridge actually delivered a device: a
 //! routing request against a stock device refuses by
@@ -65,12 +69,18 @@ use crate::diag::dbg_log;
 /// device through the bridge in this module (ash
 /// device creation with VK_KHR_cooperative_matrix
 /// enabled, handed to wgpu through its hal interop).
-/// Operational config, not a compiled constant, and
-/// deliberately fail-closed: an unset variable, or any
-/// other value, keeps the shipped `request_device`
-/// path byte-for-byte, so every existing proof ran on
-/// the device it thinks it ran on. The server proof
-/// that can move this switch's default is sequenced in
+/// Operational config, not a compiled constant. The
+/// explicit switch is fail-closed: the exact value `1`
+/// opens the bridge and any other present value keeps
+/// the shipped `request_device` path, so a deliberate
+/// stock-device run stays nameable. An UNSET variable
+/// no longer decides alone: it defers to the coopmat
+/// routing default ([`coopmat_bridge_requested`]),
+/// which the wave20 card verdict flipped on
+/// (bench/coopmat-default-flip-2026-11-07.md). The
+/// server proof that moved the routing default is
+/// bench/wave20-session-2026-11-07.md, leg 2; the
+/// bridge's own build record is
 /// bench/coopmat-build-2026-11-06.md.
 pub const COOPMAT_BRIDGE_ENV: &str = "WGPU_COMPUTE_COOPMAT_BRIDGE";
 
@@ -81,9 +91,40 @@ pub fn resolve_coopmat_bridge(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
-/// Whether this process asked for the bridged device.
+/// Whether this process asked for the bridged device:
+/// the bridge is explicitly named by
+/// [`COOPMAT_BRIDGE_ENV`], or the coopmat routing
+/// default implies it (see
+/// [`crate::compute::DEFAULT_COOPMAT`]). The explicit
+/// position keeps its exact meaning: a present value
+/// decides the bridge on its own (`1` opens it,
+/// anything else refuses it, logged by name however
+/// the decision lands), so
+/// `WGPU_COMPUTE_COOPMAT_BRIDGE=0` stays a deliberate
+/// stock-device run even with the routing default on.
+/// With the variable unset, the implied position
+/// follows the one routing question the bridge exists
+/// to serve: with the coopmat rung's default ON the
+/// device opens through the bridge so the rung can
+/// engage, and the bridge's own probes still decide
+/// whether a coopmat device exists at all; with the
+/// routing default OFF (`WGPU_COMPUTE_COOPMAT=0`)
+/// nothing asks for a bridged device and the stock
+/// open serves, byte-for-byte as before the flip.
+/// The flip that made the routing default is
+/// recorded in bench/coopmat-default-flip-2026-11-07.md.
 pub fn coopmat_bridge_requested() -> bool {
-    resolve_coopmat_bridge(std::env::var(COOPMAT_BRIDGE_ENV).ok().as_deref())
+    match std::env::var(COOPMAT_BRIDGE_ENV).ok() {
+        Some(raw) => {
+            let requested = resolve_coopmat_bridge(Some(raw.as_str()));
+            dbg_log!(
+                "coopmat bridge env {COOPMAT_BRIDGE_ENV}={raw:?} present: the explicit \
+                 value decides, bridge requested={requested}"
+            );
+            requested
+        }
+        None => crate::compute::resolve_coopmat(None),
+    }
 }
 
 /// What the bridge probe confirmed about the device it

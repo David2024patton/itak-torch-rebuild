@@ -36,9 +36,15 @@
 //! stock devices at all, not even to fail early.
 //!
 //! Routing is config (see `WGPU_COMPUTE_COOPMAT` in
-//! `crate::compute`): the shipped default keeps K23 out
-//! of the Q4_K ladder and K13 serving, on the K22
-//! precedent. The shape contract is narrower than
+//! `crate::compute`): K23 originally shipped out of
+//! the Q4_K ladder by default, on the K22 precedent.
+//! Since the wave20 verdict flip
+//! (bench/coopmat-default-flip-2026-11-07.md) the
+//! coopmat rung is on by default but its v2 selector
+//! names K24 as the rung's form, so this kernel
+//! serves as the fallback behind a K24 refusal and
+//! as the rung's form only behind the selector's
+//! explicit `0`. The shape contract is narrower than
 //! K13's: the batch stays capped at
 //! [`MMQ_MAX_BATCH`], and the input width must be a
 //! whole number of super-blocks per staged chunk

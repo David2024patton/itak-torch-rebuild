@@ -104,16 +104,22 @@ impl GpuContext {
             required_limits: adapter.limits(),
             ..Default::default()
         };
-        // The coopmat bridge is entered only when its
-        // switch names it (coopmat_bridge): the bridged
-        // open asks for the same features plus
-        // passthrough shaders, on a device carrying
-        // VK_KHR_cooperative_matrix. Any bridge refusal
-        // is named on the diag channel and the stock
-        // device serves instead, so a machine without
-        // coopmat behaves exactly as it did before the
-        // bridge existed. With the switch off, the
-        // request below is the shipped one, unchanged.
+        // The coopmat bridge is entered when its
+        // switch names it, or when the switch is unset
+        // and the coopmat routing default implies it
+        // (coopmat_bridge::coopmat_bridge_requested;
+        // the routing default flipped on in
+        // bench/coopmat-default-flip-2026-11-07.md):
+        // the bridged open asks for the same features
+        // plus passthrough shaders, on a device
+        // carrying VK_KHR_cooperative_matrix. Any
+        // bridge refusal is named on the diag channel
+        // and the stock device serves instead, so a
+        // machine without coopmat behaves exactly as
+        // it did before the bridge existed. With the
+        // switch explicitly off and the routing switch
+        // closed, the request below is the shipped
+        // one, unchanged.
         let mut coopmat = None;
         let (device, queue) = if crate::coopmat_bridge::coopmat_bridge_requested() {
             let bridged_features = required_features

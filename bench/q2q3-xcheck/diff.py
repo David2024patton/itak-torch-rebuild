@@ -10,6 +10,10 @@ which parses back to the exact f32 values.
 Reports: value count, bit-exact match count, signed-zero-only mismatch
 count (bit differs, value compares equal), NaN mismatch count, max abs
 diff, and the worst block (256 values per block) by max abs diff.
+
+The verdict is bit-exact, as the harness framing claims ("byte for
+byte"): the exit status is 0 only when every value's bits match, so a
+signed-zero-only difference fails just as a NaN bit difference does.
 """
 import struct
 import sys
@@ -66,7 +70,7 @@ def main():
           f"max_abs_diff={max_diff:.6g}")
     for blk, d in worst:
         print(f"  worst block {blk}: max_abs_diff={d:.6g}")
-    return 0 if (nan_mismatch == 0 and max_diff == 0.0) else 1
+    return 0 if (nan_mismatch == 0 and max_diff == 0.0 and zero_sign == 0) else 1
 
 
 if __name__ == "__main__":

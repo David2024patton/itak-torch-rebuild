@@ -183,6 +183,11 @@ def judge(our, ref):
         and var_rel <= 1e-2
         and w_mean_shift <= 1e-2
         and w_var_rel <= 1e-2
+        # The reading rule's "first values tracking": the first
+        # values gate at the same band as the other criteria. This
+        # is the only per-element check the comparator has; without
+        # it a permutation passes as a match.
+        and first_rel <= 1e-2
     )
     return ok, {
         "mean_shift_std": mean_shift,
@@ -204,10 +209,12 @@ def main():
     print(f"{'stage':16s} {'verdict':9s} {'last mean shift (std)':>22s} "
           f"{'last var rel':>13s} {'whole var rel':>14s} {'first diff':>11s}")
     first_div = None
+    no_ref = False
     prev_ok = True
     for stage in order:
         if stage not in ref:
             print(f"{stage:16s} {'NO REF':9s}")
+            no_ref = True
             continue
         ok, mt = judge(ours[stage], ref[stage])
         verdict = "match" if ok else "DIVERGENT"
@@ -228,7 +235,10 @@ def main():
     if logits_info is not None:
         top, val, p = logits_info
         print(f"reference logits: top-1 id={top} logit={val:.4f} prob={p:.4f}")
+    # The verdict is also the exit status: 1 on any divergence or on
+    # a stage with no reference, 0 only on a full match.
+    return 1 if (first_div is not None or no_ref) else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

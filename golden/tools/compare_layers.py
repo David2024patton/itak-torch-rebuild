@@ -66,8 +66,16 @@ def load_llama(d, stem, manifest):
 
 def stats(a, b):
     d = np.abs(a - b)
-    denom = np.linalg.norm(a) * np.linalg.norm(b)
-    cos = float(np.dot(a.ravel(), b.ravel()) / denom) if denom > 0 else 1.0
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0.0 or nb == 0.0:
+        # Cosine against a zero tensor is undefined; report 1.0 only
+        # when both sides are all zeros (identical dead tensors),
+        # 0.0 when exactly one side is dead, so a dead-vs-live
+        # checkpoint can never print a perfect cosine.
+        cos = 1.0 if na == nb else 0.0
+    else:
+        cos = float(np.dot(a.ravel(), b.ravel()) / (na * nb))
     return float(d.max()), float(d.mean()), cos
 
 
@@ -126,6 +134,11 @@ def main():
             flag = "  <-- DIVERGENT"
             if first_div is None:
                 first_div = stem
+        if not a.any() and not b.any():
+            # stats() reports cosine 1.0 for two all-zero tensors;
+            # say so on the line so the 1.0 is not read as agreement
+            # between live activations.
+            flag += "  (both sides all zeros)"
         print(f"{stem:22s} {mx:12.6f} {mean:12.6f} {cos:10.6f}{flag}")
     print(f"\nfirst divergent checkpoint: {first_div}")
 
@@ -156,6 +169,11 @@ def main():
             mx0, _, _ = stats(ref[0], ours[0])
             print(f"        position 0 alone: max_abs={mx0:.6f}")
 
+    # The verdict is also the exit status: 1 when any checkpoint
+    # diverged, 0 only on a full match. (The per-position and RoPE
+    # sections above are diagnostics and do not gate.)
+    return 1 if first_div is not None else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

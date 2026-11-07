@@ -48,7 +48,9 @@
 //! by the factor and folds f32 partials through
 //! [`crate::kernels::splitk_reduce`]; routing and the
 //! factor rule live in the backend's `WGPU_COMPUTE_MMQ_SPLITK`
-//! resolution (default off; bench/splitk-mmq-2026-11-07.md).
+//! resolution (shipped default fixed factor 4 since the
+//! wave20 verdict; bench/splitk-mmq-2026-11-07.md,
+//! bench/splitk-default-flip-2026-11-07.md).
 //!
 //! The activation transform (the gated output projection,
 //! the SwiGLU-fused down projection) is NOT here: it is

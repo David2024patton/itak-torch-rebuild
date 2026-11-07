@@ -1201,7 +1201,10 @@ impl ProjBenchCall {
 /// being consulted; on a device without a coopmat
 /// pipeline the rung refuses by name here and the
 /// ladder below serves exactly as it did before the
-/// flip. `None` when no pipeline
+/// flip. The standard rung itself serves in split or
+/// unsplit form per the backend's split-K config
+/// (shipped default fixed factor 4).
+/// `None` when no pipeline
 /// exists or every prepare refuses: the caller then
 /// takes the GEMM form. Every refusal is logged by name;
 /// the choice is made here, at plan-build time, and

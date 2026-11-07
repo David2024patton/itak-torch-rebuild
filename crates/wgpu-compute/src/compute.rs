@@ -900,16 +900,26 @@ fn log_coopmat_fallback(raw: Option<&str>) {
 /// narrow output whose plain grid cannot fill the card
 /// (the 256-wide Q6_K KV projections: 4 tiles walking 26
 /// super-blocks each) still parallelizes. Values:
-/// `off` (and unset) keeps the shipped unsplit products;
-/// `1`..=`8` fixes the split factor; `auto` picks the
-/// factor per projection from its tile count (see
+/// unset resolves to the shipped default
+/// ([`DEFAULT_MMQ_SPLITK`], fixed factor 4); `off`
+/// keeps the unsplit products; `1`..=`8` fixes the
+/// split factor; `auto` picks the factor per
+/// projection from its tile count (see
 /// [`mmq_splitk_factor`]). Operational config, not a
 /// compiled constant, and deliberately fail-closed on
 /// the K22 pattern: any other value resolves to
-/// [`MmqSplitK::Off`] and is named in the construction
-/// log. The default is OFF: the dispatch shape is
-/// unproven on the card, and the verdict that can move
-/// it is sequenced in bench/splitk-mmq-2026-11-07.md.
+/// [`MMQ_SPLITK_FALLBACK`] (off), never to the shipped
+/// default, and is named in the construction log. The
+/// default shipped OFF while the dispatch shape was
+/// unproven on the card; the wave20 card session
+/// (bench/wave20-session-2026-11-07.md, leg 1)
+/// discharged the flip criterion written in
+/// bench/splitk-mmq-2026-11-07.md at fixed factor 4,
+/// and the default moved there on 2026-11-07
+/// (bench/splitk-default-flip-2026-11-07.md).
+/// Rollback is one env value:
+/// `WGPU_COMPUTE_MMQ_SPLITK=off` restores the pre-flip
+/// unsplit ladder exactly.
 pub const MMQ_SPLITK_ENV: &str = "WGPU_COMPUTE_MMQ_SPLITK";
 
 /// The resolved MMQ split-K mode (see [`MMQ_SPLITK_ENV`]).
@@ -936,19 +946,63 @@ impl MmqSplitK {
     }
 }
 
+/// The MMQ split-K mode when the environment does not
+/// override it: fixed factor 4. The mode shipped OFF
+/// under the wide-MMQ and K18 precedent, that an
+/// unproven dispatch shape does not enter the ladder
+/// by default. The wave20 card session
+/// (bench/wave20-session-2026-11-07.md, leg 1)
+/// discharged the flip criterion written in
+/// bench/splitk-mmq-2026-11-07.md at this factor:
+/// interleaved prefill walls fell about 18% at 1,022
+/// tokens and about 14% at 8,202 against the unsplit
+/// control, the split forms beat the plain kernels on
+/// the wide shapes too (K13 split 59.1 GB/s vs plain
+/// 47.9; K14 split 64.0 vs 35.6, so no unsplit-shape
+/// regression), the split GPU legs executed with
+/// reassociation-class drift, identity and golden
+/// held, and the family autopsy showed no new spills.
+/// Factor 8 was measured in the same session and is
+/// DISQUALIFIED (+50% / +88% walls; the reduction
+/// alone took 27.5 s at 8,202 tokens): it stays an
+/// explicit operator choice, never a default. The
+/// auto rule was marginal (about -3.5% / -2%) and is
+/// likewise not the default. The default moved to
+/// fixed 4 on 2026-11-07
+/// (bench/splitk-default-flip-2026-11-07.md) under
+/// David's standing order that anything the evidence
+/// shows makes the engine faster is set on.
+/// Rollback is one env value:
+/// `WGPU_COMPUTE_MMQ_SPLITK=off` restores the pre-flip
+/// unsplit ladder exactly.
+pub(crate) const DEFAULT_MMQ_SPLITK: MmqSplitK = MmqSplitK::Fixed(4);
+
+/// The MMQ split-K mode a present but unrecognized
+/// env value resolves to: off, closed. The fallback
+/// is deliberately NOT the shipped default: a typo in
+/// the environment must never widen routing, so the
+/// malformed case keeps the fail-closed value it
+/// resolved to before the default moved.
+const MMQ_SPLITK_FALLBACK: MmqSplitK = MmqSplitK::Off;
+
 /// Resolve the MMQ split-K config from the raw
-/// environment value: unset or `off` is off, `auto` is
-/// the auto rule, an integer in 1..=8 is a fixed factor,
-/// and anything else fails closed to off.
+/// environment value: unset is the shipped default
+/// ([`DEFAULT_MMQ_SPLITK`]), `off` is off, `auto` is
+/// the auto rule, an integer in 1..=8 is a fixed
+/// factor, and anything else fails closed to off
+/// ([`MMQ_SPLITK_FALLBACK`]). The caller logs the
+/// refusal for an unrecognized value at construction
+/// ([`log_mmq_splitk_fallback`]).
 fn resolve_mmq_splitk(raw: Option<&str>) -> MmqSplitK {
     match raw.map(str::trim) {
-        None | Some("off") => MmqSplitK::Off,
+        None => DEFAULT_MMQ_SPLITK,
+        Some("off") => MmqSplitK::Off,
         Some("auto") => MmqSplitK::Auto,
         Some(value) => match value.parse::<u32>() {
             Ok(n) if (1..=crate::kernels::splitk_reduce::SPLITK_MAX).contains(&n) => {
                 MmqSplitK::Fixed(n)
             }
-            _ => MmqSplitK::Off,
+            _ => MMQ_SPLITK_FALLBACK,
         },
     }
 }
@@ -970,13 +1024,16 @@ fn mmq_splitk_value_recognized(raw: Option<&str>) -> bool {
 
 /// Log, at construction, when the MMQ split-K env value
 /// is present but unrecognized and the config therefore
-/// fails closed to off.
+/// fails closed to off ([`MMQ_SPLITK_FALLBACK`]), NOT
+/// to the shipped default: the fail-closed position is
+/// visible in the run log, never silent.
 fn log_mmq_splitk_fallback(raw: Option<&str>) {
     if let Some(value) = raw {
         if !mmq_splitk_value_recognized(raw) {
             dbg_log!(
                 "mmq splitk env {MMQ_SPLITK_ENV}={value:?} is not a recognized value \
-                 (\"off\", \"auto\", or 1..=8); failing closed, split-K is OFF"
+                 (\"off\", \"auto\", or 1..=8); failing closed to off, \
+                 NOT the shipped default fixed:4"
             );
         }
     }
@@ -1620,15 +1677,16 @@ impl WgpuCompute {
         // routing switch; the split pipelines themselves
         // were built inside K13/K14 above regardless of
         // the mode, so a defect in either form fails at
-        // construction. Default off (unproven dispatch
-        // shape; the card verdict is sequenced in
-        // bench/splitk-mmq-2026-11-07.md).
+        // construction. Default fixed 4 (the wave20
+        // card verdict; bench/wave20-session-2026-11-07.md
+        // leg 1, bench/splitk-default-flip-2026-11-07.md).
         let mmq_splitk_raw = std::env::var(MMQ_SPLITK_ENV).ok();
         log_mmq_splitk_fallback(mmq_splitk_raw.as_deref());
         let mmq_splitk = resolve_mmq_splitk(mmq_splitk_raw.as_deref());
         dbg_log!(
-            "mmq splitk config: mode={} (env {MMQ_SPLITK_ENV}: \"off\"/unset is off, \
-             \"auto\" is the tile-count rule, 1..=8 a fixed factor)",
+            "mmq splitk config: mode={} (env {MMQ_SPLITK_ENV}: unset is the shipped \
+             default fixed:4, \"off\" disables, \"auto\" is the tile-count rule, \
+             1..=8 a fixed factor; rollback {MMQ_SPLITK_ENV}=off)",
             mmq_splitk.describe()
         );
         // The K24 Q4_K coopmat MMQ v2: built beside K23
@@ -2072,8 +2130,10 @@ impl WgpuCompute {
     /// The MMQ split-K routing config: config resolved
     /// at construction from [`MMQ_SPLITK_ENV`], never a
     /// constant compiled into the selection seam.
-    /// [`MmqSplitK::Off`] (the default) leaves the
-    /// shipped ladder untouched.
+    /// The shipped default is [`DEFAULT_MMQ_SPLITK`]
+    /// (fixed factor 4); [`MmqSplitK::Off`] is the
+    /// explicit-off position and restores the unsplit
+    /// ladder.
     pub(crate) fn mmq_splitk(&self) -> MmqSplitK {
         self.mmq_splitk
     }
@@ -3447,26 +3507,45 @@ mod tests {
 
     #[test]
     fn mmq_splitk_resolution() {
-        // Unset: off. The default keeps the shipped
-        // unsplit products (unproven dispatch shape).
-        assert_eq!(resolve_mmq_splitk(None), MmqSplitK::Off);
+        // Unset: the shipped default, fixed factor 4.
+        // The wave20 card session (bench/wave20-session-
+        // 2026-11-07.md, leg 1) discharged the flip
+        // criterion in bench/splitk-mmq-2026-11-07.md at
+        // this factor: prefill walls -18% at 1,022
+        // tokens and -14% at 8,202, the split forms
+        // faster than plain on the wide shapes too,
+        // identity and golden held, no new spills.
+        assert_eq!(resolve_mmq_splitk(None), DEFAULT_MMQ_SPLITK);
+        assert_eq!(DEFAULT_MMQ_SPLITK, MmqSplitK::Fixed(4));
+        // The explicit off (the one-variable rollback to
+        // the pre-flip unsplit ladder).
         assert_eq!(resolve_mmq_splitk(Some("off")), MmqSplitK::Off);
         assert_eq!(resolve_mmq_splitk(Some(" off ")), MmqSplitK::Off);
-        // The auto rule.
+        // The auto rule (measured marginal in wave20,
+        // about -3.5% / -2%: an operator choice, not
+        // the default).
         assert_eq!(resolve_mmq_splitk(Some("auto")), MmqSplitK::Auto);
         assert_eq!(resolve_mmq_splitk(Some(" auto ")), MmqSplitK::Auto);
-        // Fixed factors across the admitted range.
+        // Fixed factors across the admitted range keep
+        // their meaning. Factor 8 stays admissible as
+        // an explicit choice; wave20 disqualified it as
+        // a default (+50% / +88% walls), which is a
+        // defaults judgment, not a resolver refusal.
         assert_eq!(resolve_mmq_splitk(Some("1")), MmqSplitK::Fixed(1));
         assert_eq!(resolve_mmq_splitk(Some("4")), MmqSplitK::Fixed(4));
         assert_eq!(resolve_mmq_splitk(Some(" 8 ")), MmqSplitK::Fixed(8));
-        // Everything else fails closed to off: zero, past
-        // the ceiling, booleans, words, empty.
-        assert_eq!(resolve_mmq_splitk(Some("0")), MmqSplitK::Off);
-        assert_eq!(resolve_mmq_splitk(Some("9")), MmqSplitK::Off);
-        assert_eq!(resolve_mmq_splitk(Some("true")), MmqSplitK::Off);
-        assert_eq!(resolve_mmq_splitk(Some("on")), MmqSplitK::Off);
-        assert_eq!(resolve_mmq_splitk(Some("")), MmqSplitK::Off);
-        assert_eq!(resolve_mmq_splitk(Some("-2")), MmqSplitK::Off);
+        // Everything else fails closed to the fallback
+        // (off), NEVER to the shipped default: zero,
+        // past the ceiling, booleans, words, empty. A
+        // typo must not silently widen routing to
+        // fixed:4 (the MMV flip's deliberate split).
+        assert_eq!(MMQ_SPLITK_FALLBACK, MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("0")), MMQ_SPLITK_FALLBACK);
+        assert_eq!(resolve_mmq_splitk(Some("9")), MMQ_SPLITK_FALLBACK);
+        assert_eq!(resolve_mmq_splitk(Some("true")), MMQ_SPLITK_FALLBACK);
+        assert_eq!(resolve_mmq_splitk(Some("on")), MMQ_SPLITK_FALLBACK);
+        assert_eq!(resolve_mmq_splitk(Some("")), MMQ_SPLITK_FALLBACK);
+        assert_eq!(resolve_mmq_splitk(Some("-2")), MMQ_SPLITK_FALLBACK);
         assert_eq!(MMQ_SPLITK_ENV, "WGPU_COMPUTE_MMQ_SPLITK");
     }
 

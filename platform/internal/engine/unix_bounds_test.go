@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -29,6 +30,11 @@ func scriptedEngine(t *testing.T, mode string) string {
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	// The real engine pins its socket to 0600 after binding, and
+	// the platform refuses to dial anything looser; model that.
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod socket: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
@@ -131,9 +137,10 @@ func dialScripted(t *testing.T, mode string) *engine.UnixClient {
 
 // TestOversizedReplyFrameRefusedByName is the Wave 1 client bound:
 // a peer streaming past the 4 MiB frame cap is refused with
-// ErrFrameTooLarge, not buffered into memory. (DebugInfo returns
-// exchange errors directly; Health folds them into its Detail,
-// asserted as the secondary surface.)
+// ErrFrameTooLarge, not buffered into memory. The oversized frame's
+// unread tail stays in the stream, so the exchange also retires
+// the connection (the stale-frame rule): Health afterwards reports
+// the client closed rather than consuming the tail as a reply.
 func TestOversizedReplyFrameRefusedByName(t *testing.T) {
 	c := dialScripted(t, "huge")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -146,8 +153,8 @@ func TestOversizedReplyFrameRefusedByName(t *testing.T) {
 		t.Fatalf("DebugInfo err = %v, must not be mislabeled a handshake failure", err)
 	}
 	h, herr := c.Health(ctx)
-	if herr != nil || h.OK || !strings.Contains(h.Detail, "frame exceeds") {
-		t.Fatalf("Health = %+v, %v; want not-OK with the frame-cap name in the detail", h, herr)
+	if herr != nil || h.OK || h.Detail != "client closed" {
+		t.Fatalf("Health = %+v, %v; want not-OK, client closed (the oversized frame's tail must never be consumed)", h, herr)
 	}
 }
 

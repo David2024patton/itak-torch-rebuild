@@ -60,6 +60,14 @@ var (
 	// size cap without terminating it. The read refuses by name
 	// instead of buffering without bound.
 	ErrFrameTooLarge = errors.New("engine: frame exceeds the maximum size")
+	// ErrUntrustedSocket means the socket file at the dial path is
+	// not provably the engine's own: its owner is not this process's
+	// uid, or its permissions are wider than owner-only (0600). The
+	// dial refuses before connecting, because anything answering on
+	// an unverified socket could be a squatter that receives prompt
+	// traffic and forges replies; the handshake alone cannot tell
+	// the real engine from an impostor that speaks the protocol.
+	ErrUntrustedSocket = errors.New("engine: socket is not owned by this process with owner-only permissions")
 )
 
 // GenerateRequest is one completion job handed to the engine. The

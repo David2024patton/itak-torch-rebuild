@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -32,12 +33,17 @@ func TestUnavailableRefusesEverything(t *testing.T) {
 }
 
 // fakeEngine serves the socket protocol with configurable replies.
+// The socket is pinned to 0600 after binding, as the real engine
+// pins its own: the platform refuses to dial anything looser.
 func fakeEngine(t *testing.T, ackProto int, ackOp string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "engine.sock")
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod socket: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
@@ -312,6 +318,9 @@ func capturingEngine(t *testing.T) (string, func() map[string]any) {
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod socket: %v", err)
+	}
 	t.Cleanup(func() { _ = ln.Close() })
 	var mu sync.Mutex
 	var lastGen map[string]any
@@ -426,6 +435,9 @@ func noTemplateEngine(t *testing.T) string {
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		t.Fatalf("listen: %v", err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod socket: %v", err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {

@@ -62,6 +62,11 @@ func runFakeEngine(socketPath string) {
 	if err != nil {
 		os.Exit(2)
 	}
+	// Like the real engine: the socket is pinned to 0600 after
+	// binding, and the platform refuses to dial anything looser.
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		os.Exit(2)
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -28,22 +29,24 @@ const maxFrameBytes = 4 << 20
 // readFrame reads one newline-terminated frame from r, refusing
 // past maxFrameBytes. bufio.Reader.ReadBytes would accumulate
 // without bound; ReadSlice fragments are assembled here under the
-// cap instead.
-func readFrame(r *bufio.Reader) ([]byte, error) {
-	var buf []byte
+// cap instead. It reports whether the reply arrived whole (complete
+// is false only when a partial frame was consumed before the read
+// failed): callers use that to decide whether the connection's
+// frame alignment survived the error.
+func readFrame(r *bufio.Reader) (buf []byte, complete bool, err error) {
 	for {
 		chunk, err := r.ReadSlice('\n')
 		buf = append(buf, chunk...)
 		if len(buf) > maxFrameBytes {
-			return nil, fmt.Errorf("%w: more than %d bytes without a complete frame", ErrFrameTooLarge, maxFrameBytes)
+			return nil, false, fmt.Errorf("%w: more than %d bytes without a complete frame", ErrFrameTooLarge, maxFrameBytes)
 		}
 		switch {
 		case err == nil:
-			return buf, nil
+			return buf, true, nil
 		case errors.Is(err, bufio.ErrBufferFull):
 			continue
 		default:
-			return nil, err
+			return nil, len(buf) > 0, err
 		}
 	}
 }
@@ -121,8 +124,11 @@ type UnixClient struct {
 }
 
 // DialUnix connects to the engine socket and performs the handshake.
-// A peer that does not answer hello_ack for our protocol version is
-// rejected with ErrHandshake; a missing socket wraps ErrUnavailable.
+// The socket file is authenticated first (checkSocketTrust): a peer
+// that answers on an unverified socket is refused by name before any
+// byte is sent. A peer that does not answer hello_ack for our
+// protocol version is rejected with ErrHandshake; a missing socket
+// wraps ErrUnavailable.
 func DialUnix(ctx context.Context, socketPath string) (*UnixClient, error) {
 	conn, err := dialRaw(ctx, socketPath)
 	if err != nil {
@@ -136,7 +142,16 @@ func DialUnix(ctx context.Context, socketPath string) (*UnixClient, error) {
 	return c, nil
 }
 
+// dialRaw verifies the socket file, then connects. Both the control
+// dial and Generate's per-call dial go through here, so no code path
+// reaches the peer without the trust check. A failed check is a
+// trust refusal (ErrUntrustedSocket), never ErrUnavailable: the
+// supervisor's dial loop retries either way, but the operator's log
+// must say which one it was.
 func dialRaw(ctx context.Context, socketPath string) (net.Conn, error) {
+	if err := checkSocketTrust(socketPath, os.Getuid()); err != nil {
+		return nil, err
+	}
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", socketPath)
 	if err != nil {
@@ -180,13 +195,55 @@ func (c *UnixClient) exchangeAnyLocked(ctx context.Context, send any) ([]byte, e
 		return nil, fmt.Errorf("engine: marshal frame: %w", err)
 	}
 	if _, err := c.conn.Write(append(line, '\n')); err != nil {
+		c.poisonLocked()
 		return nil, fmt.Errorf("%w: write frame: %w", ErrHandshake, err)
 	}
-	raw, err := readFrame(c.r)
+	raw, complete, err := readFrame(c.r)
 	if err != nil {
+		// A failed read can leave the connection desynchronized: a
+		// timeout means the reply may still be in flight, a partial
+		// frame means its remainder is, and an oversized frame means
+		// its tail is. In every case the next frame read could
+		// consume bytes that answer THIS request and present them as
+		// the next caller's result (the panel's stale-frame finding:
+		// a healthy engine reported down, and a timed-out Embed's
+		// late vectors returned to the next Embed caller). Discard
+		// the connection; callers after this one get ErrClosed and
+		// the supervisor redials a fresh, aligned connection. Only a
+		// clean refusal with nothing consumed (the engine hung up
+		// between requests) leaves the connection usable.
+		if complete || errors.Is(err, ErrFrameTooLarge) || isTimeoutErr(err) {
+			c.poisonLocked()
+		}
 		return nil, classifyReplyErr(err)
 	}
 	return raw, nil
+}
+
+// poisonLocked retires the control connection after a failure that
+// may have desynchronized its frame stream. The caller holds c.mu
+// (the exchange lock or Close's lock). Later exchanges refuse with
+// ErrClosed; Health reports the client closed. The supervisor owns
+// the replacement: it drops a closed client when the incarnation
+// dies and redials on the next launch.
+func (c *UnixClient) poisonLocked() {
+	if c.closed {
+		return
+	}
+	c.closed = true
+	_ = c.conn.Close()
+}
+
+// isTimeoutErr reports whether err is a deadline expiry, direct or
+// wrapped: a net.Error timeout, or the exchange context's own
+// deadline (which surfaces as context.DeadlineExceeded when the
+// socket read is interrupted by it).
+func isTimeoutErr(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 // roundTripLocked sends one frame and validates the op of the reply.
@@ -333,7 +390,7 @@ func (c *UnixClient) streamGenerate(ctx context.Context, out chan<- TokenEvent, 
 		}
 	}
 	for {
-		raw, err := readFrame(c.r)
+		raw, _, err := readFrame(c.r)
 		if err != nil {
 			// An oversized frame keeps its own name; every other
 			// read failure means the connection died under the

@@ -224,3 +224,22 @@ failure bundles):
 4. Run the routing test file's arms on the card with a
    profile present, so the profile layer is exercised
    under the device-gated tests as well.
+
+## Card exercise (wave19, 2026-11-07)
+
+The calibrator ran end to end on the 7900 XTX and wrote a
+profile keyed [AMD Radeon RX 7900 XTX (RADV NAVI31) |
+Vulkan | radv | Mesa 26.0.8-1ubuntu0.3] with ceiling 16.
+3 of 9 band cells match the shipped table exactly, and
+q4k attn matches on every routable batch (its batch-1
+entry is a measurement artifact of two sequential arms
+timing the identical GEMV path). 5 cells genuinely
+differ: q4k ffn row 3 gained, q4k kv reshaped to
+2,4-6,16, q5k ffn rows 1-2 gained, q5k kv inverted to
+closed, q6k kv widened to 4-12. The calibrator publishes
+no per-cell medians, so any future shipped-table change
+needs a sweep CSV beside it. The profile-governed spec
+run passed IDENTITY and GOLDEN with the manifest naming
+the profile key and resolving the profile's cells over
+shipped defaults in every differing cell. Full record:
+bench/wave19-session-2026-11-07.md.

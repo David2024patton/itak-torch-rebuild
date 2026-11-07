@@ -335,3 +335,46 @@ byte-for-byte the pre-lane ladder.
 - Q5_K has no MMQ product in this tree's prompt path,
   so there is no Q5_K split form; inventing one was
   out of scope by the tasking.
+
+## Supersession (2026-11-07): the default moved to fixed factor 4
+
+This note's history stands; its config section's
+"default OFF" statement and the flip criterion's
+closing position ("until then the shipped ladder
+with the env unset is byte-for-byte the pre-lane
+ladder") are superseded as follows.
+
+The wave20 consolidated card session
+(bench/wave20-session-2026-11-07.md, leg 1) ran this
+note's verdict protocol and read against the flip
+criterion: fixed factor 4 shows a real prefill win
+at BOTH lengths (interleaved walls about -18% at
+1,022 tokens, about -14% at 8,202) with the split
+forms faster than plain on the wide shapes too (no
+unsplit-shape regression in the kernel lines), the
+split GPU legs executed with reassociation-class
+drift, identity + golden held at `auto` and at
+`=8`, and the family autopsy showed no new spills
+(per-form attribution by name was not isolated;
+the session scoped that leg partial). Fixed 8 is
+disqualified by its own numbers (+50% / +88%
+walls), and auto's win is marginal (about -3.5% /
+-2%) with its factor-8 pick for the KV shape
+implicated in the factor-8 collapse.
+
+Under David's standing order (2026-11-07) that
+anything the evidence shows makes the engine faster
+is set on, the shipped default moved to fixed
+factor 4 in lane `lane/splitk-default-flip`: unset
+now resolves to `fixed:4` (`DEFAULT_MMQ_SPLITK`);
+explicit values keep their meanings (`off` closes
+it and is the rollback, `1`..=`8` fix the factor,
+`auto` selects the per-projection rule, whose
+arithmetic is unchanged); a present but
+unrecognized value still fails closed to off
+(`MMQ_SPLITK_FALLBACK`), never to the new default.
+The flip is recorded in
+bench/splitk-default-flip-2026-11-07.md, which
+carries the full semantics matrix. Factor 8's
+disqualification is recorded there so it is not
+re-proposed as a default without new evidence.

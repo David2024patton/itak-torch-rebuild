@@ -1029,10 +1029,8 @@ def is_letter_cp(cp: Int) -> Bool:
         return True
     if 0x16B40 <= cp and cp <= 0x16B43:
         return True  # Pahawh Hmong
-    if 0x16C80 <= cp and cp <= 0x16CAD:
-        return True  # Tangut components are not letters; skip
     if 0x18800 <= cp and cp <= 0x18CD5:
-        return True  # Tangut (Lo)
+        return True  # Tangut components (Lo)
     if 0x1AFF0 <= cp and cp <= 0x1AFFB:
         return True
     if 0x1AFFD <= cp and cp <= 0x1AFFE:

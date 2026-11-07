@@ -33,7 +33,6 @@
 from std.collections import Dict
 
 from tokenizer.byte_level import (
-    append_utf8,
     byte_token_name,
     bytes_of_codepoints,
     string_from_codepoints,

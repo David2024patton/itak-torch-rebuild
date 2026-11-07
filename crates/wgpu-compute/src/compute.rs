@@ -739,11 +739,9 @@ pub struct WgpuCompute {
     k19: K19Pipeline,
     k20: K20Pipeline,
     k21: K21Pipeline,
-    // Registered at construction, routed nowhere
-    // yet: the routing lane (bench/k21-finish-
-    // 2026-11-06.md) is its first reader. Remove
-    // this allowance when that lane lands.
-    #[allow(dead_code)]
+    // The finish-carrying K21 pipeline: read by the
+    // resident session's block head routing
+    // (bench/k21-finish-2026-11-06.md).
     k21_finish: K21FinishPipeline,
     mmv_max_rows: u32,
     mmv_bands: MmvBands,
@@ -1314,15 +1312,10 @@ impl WgpuCompute {
     /// register-streaming small-batch product with
     /// K3's fused head finish at its reduction's final
     /// store), for the resident session's Q5_K head
-    /// sites. Registered at construction and routed to
-    /// by nothing yet: no session code prepares it in
-    /// this change (see the construction note in
-    /// [`WgpuCompute::from_context`] and
-    /// bench/k21-finish-2026-11-06.md). The
-    /// `dead_code` allowance beside it and on the
-    /// field is the registration marker: remove both
-    /// when the routing lane lands.
-    #[allow(dead_code)]
+    /// sites. Registered at construction; the block
+    /// head site routes to it through the session's
+    /// finish ladder rung (see
+    /// bench/k21-finish-2026-11-06.md).
     pub(crate) fn k21_finish(&self) -> &K21FinishPipeline {
         &self.k21_finish
     }

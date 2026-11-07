@@ -114,6 +114,7 @@ use crate::kernels::k19_q4k_mmv::K19Call;
 use crate::kernels::k1_q4k_gemv::{K1ActGeom, K1Call, K1Weights};
 use crate::kernels::k20_q6k_mmv::K20Call;
 use crate::kernels::k21_q5k_mmv::K21Call;
+use crate::kernels::k21_q5k_mmv_finish::K21FinishCall;
 use crate::kernels::k22_q4k_mmq::K22Call;
 use crate::kernels::k23_q4k_mmq::K23Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
@@ -456,6 +457,14 @@ enum ProjCall {
     /// one dispatch, no quantize (the MMV form reads the
     /// f32 input directly, like the GEMV).
     MmvQ5K(K21Call),
+    /// K21F (Q5_K register-streaming small-batch with the
+    /// head's fused finish) dispatch: one dispatch, no
+    /// quantize (the MMV form reads the f32 input
+    /// directly, like the GEMV), carrying K3's finish
+    /// (logit scale, tanh softcap) at its reduction's
+    /// final store. Only the block head site prepares
+    /// it; its dispatch count is the K3 fused head's.
+    MmvQ5KFinish(K21FinishCall),
     /// K20 (Q6_K register-streaming small-batch) dispatch:
     /// a single dispatch, no quantize in front of it (the
     /// kernel consumes the f32 rows directly, so its
@@ -558,6 +567,7 @@ impl ProjCall {
             }
             ProjCall::MmvQ4K(c) => c.encode_into(pass),
             ProjCall::MmvQ5K(c) => c.encode_into(pass),
+            ProjCall::MmvQ5KFinish(c) => c.encode_into(pass),
             ProjCall::MmvQ6K(c) => c.encode_into(pass),
             ProjCall::ChunkedQ4K(calls) => {
                 for c in calls {
@@ -633,6 +643,7 @@ impl ProjCall {
             ProjCall::MmvQ4K(_) => "k19_q4k_mmv",
             ProjCall::MmvQ6K(_) => "k20_q6k_mmv",
             ProjCall::MmvQ5K(_) => "k21_q5k_mmv",
+            ProjCall::MmvQ5KFinish(_) => "k21_q5k_mmv_finish",
             ProjCall::ChunkedQ4K(_) => "k1_q4k_gemv",
             ProjCall::ChunkedQ6K(_) => "k2_q6k_gemv",
             ProjCall::ChunkedQ5K(_) => "k3_q5k_gemv",
@@ -657,6 +668,7 @@ impl ProjCall {
             | ProjCall::MmvQ4K(_)
             | ProjCall::MmvQ6K(_)
             | ProjCall::MmvQ5K(_)
+            | ProjCall::MmvQ5KFinish(_)
             | ProjCall::ChunkedQ4K(_)
             | ProjCall::ChunkedQ6K(_)
             | ProjCall::ChunkedQ5K(_) => false,
@@ -1261,6 +1273,16 @@ fn mmv_applies(
     false
 }
 
+/// The MMV band's arithmetic over a resolved threshold:
+/// 2 rows up to `max_rows`. Factored out of
+/// [`mmv_applies`] so the gate the finish form consults
+/// (the head's K21F rung, which has no (family, shape)
+/// cell in the routing table) is testable without a
+/// device, in this module's pure-test idiom.
+fn mmv_band_admits(max_rows: u32, batch: u32) -> bool {
+    batch >= 2 && batch <= max_rows
+}
+
 /// Try the K19 register-streaming form of a plain Q4_K
 /// projection: one dispatch over the f32 input rows
 /// themselves, no quantize in front of it. `None` when
@@ -1603,6 +1625,52 @@ fn try_mmv_q5k(
         Ok(c) => Some(ProjCall::MmvQ5K(c)),
         Err(e) => {
             dbg_log!("mmv q5k refused at the product prepare: {e}; the ladder continues");
+            None
+        }
+    }
+}
+
+/// Try the K21F finish-carrying form of a Q5_K head
+/// projection: K21's register-streaming product with
+/// K3's fused finish at its store, the finish request
+/// (`mode`, `scale`, `cap`) forwarded to the prepare
+/// verbatim, exactly as the head site hands it to
+/// K3's `prepare_with_finish`. `None` when the batch
+/// is outside the configured band or the prepare
+/// refuses the shape or the finish (logged by name):
+/// the head site then prepares the K3 fused call it
+/// builds today, so a refusal changes the product
+/// engine never and the finish not at all. Batch 1
+/// never reaches the prepare (the gate refuses it),
+/// so the standard head, batch 1 by construction,
+/// stays K3's. This is the fallback ladder's
+/// composition step, at plan-build time; it never
+/// substitutes inside a dispatch.
+#[allow(clippy::too_many_arguments)]
+fn try_mmv_q5k_finish(
+    backend: &WgpuCompute,
+    weights: &K3Weights,
+    input: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: u32,
+    mode: u32,
+    scale: f32,
+    cap: f32,
+) -> Option<ProjCall> {
+    if !mmv_band_admits(backend.mmv_max_rows(), batch) {
+        return None;
+    }
+    let ctx = backend.context();
+    match backend
+        .k21_finish()
+        .prepare_with_finish(ctx, weights, input, output, batch, mode, scale, cap)
+    {
+        Ok(c) => Some(ProjCall::MmvQ5KFinish(c)),
+        Err(e) => {
+            dbg_log!(
+                "mmv q5k finish refused at the product prepare: {e}; \
+                 the k3 fused form serves it"
+            );
             None
         }
     }
@@ -3697,12 +3765,17 @@ impl ChunkPlan {
         // The block head segment: the standard head's family
         // split at the chunk's full batch. A Q5_K head takes
         // its fused finishing at any batch (K3's contract is
-        // [batch, out]); the other families take their GEMV
-        // form directly rather than prepare_proj's matrix
-        // forms, because the head is a GEMV-shaped projection
-        // at every size the standard head runs (one row), and
-        // the block tail must not change the head's arithmetic
-        // family as the batch grows.
+        // [batch, out]): the finish-carrying MMV form (K21F)
+        // prepares it when the shared MMV band admits the
+        // block batch, with the K3 fused call behind any
+        // refusal, so the finish is the same map on both
+        // paths and only the product engine changes; the
+        // other families take their GEMV form directly
+        // rather than prepare_proj's matrix forms, because
+        // the head is a GEMV-shaped projection at every size
+        // the standard head runs (one row), and the block
+        // tail must not change the head's arithmetic family
+        // as the batch grows.
         let block_final_norm = backend.k4().prepare_rms_norm(
             ctx,
             &scratch.stream_a,
@@ -3718,20 +3791,38 @@ impl ChunkPlan {
             } else {
                 crate::kernels::k3_q5k_gemv::FINISH_SCALE
             };
-            let head = backend
-                .k3()
-                .prepare_with_finish(
-                    ctx,
-                    w,
-                    &scratch.block_head_in,
-                    &scratch.block_logits,
-                    rows as u32,
-                    mode,
-                    cfg.logit_scale,
-                    cfg.logit_softcap,
-                )
-                .map(ProjCall::Q5K)
-                .map_err(|e| we(e, "lm_head"))?;
+            // The finish form first when the band admits
+            // the block batch; the K3 fused call on None
+            // (gate closed, band refused, prepare refused),
+            // asked for exactly what the finish form was
+            // asked for, so the site's finish request is
+            // identical on both paths.
+            let head = match try_mmv_q5k_finish(
+                backend,
+                w,
+                &scratch.block_head_in,
+                &scratch.block_logits,
+                rows as u32,
+                mode,
+                cfg.logit_scale,
+                cfg.logit_softcap,
+            ) {
+                Some(c) => c,
+                None => backend
+                    .k3()
+                    .prepare_with_finish(
+                        ctx,
+                        w,
+                        &scratch.block_head_in,
+                        &scratch.block_logits,
+                        rows as u32,
+                        mode,
+                        cfg.logit_scale,
+                        cfg.logit_softcap,
+                    )
+                    .map(ProjCall::Q5K)
+                    .map_err(|e| we(e, "lm_head"))?,
+            };
             (head, None)
         } else {
             let head = match output {
@@ -5267,5 +5358,46 @@ mod tests {
         let shared = [1, 1, 1, 1, 2, 1, 1, 2];
         assert_eq!(layer_dispatch_count(shape, own, 0), 23);
         assert_eq!(layer_dispatch_count(shape, shared, 2), 19);
+    }
+
+    #[test]
+    fn mmv_band_never_admits_batch_one_so_the_batch_one_head_stays_k3() {
+        // The head-routing gate, pinned at its floor:
+        // the standard head runs at batch 1 (hardcoded
+        // at its site) and a block chunk can too. At no
+        // resolved threshold does the band admit a
+        // single row, so try_mmv_q5k_finish returns
+        // None there without preparing anything and the
+        // site prepares the K3 fused call: batch-1
+        // heads stay K3 by construction, at every
+        // configuration, which is what keeps decode on
+        // the shipped composition.
+        for max_rows in [1, 2, 16, 64, u32::MAX] {
+            assert!(
+                !mmv_band_admits(max_rows, 1),
+                "batch 1 must stay on the K3 fused head at threshold {max_rows}"
+            );
+        }
+        assert!(!mmv_band_admits(16, 0));
+    }
+
+    #[test]
+    fn mmv_band_admits_the_block_batch_only_when_the_gate_is_open() {
+        // The spec block case, 16 rows: the shipped
+        // default threshold (1) admits nothing, so the
+        // block head prepares K3 exactly as shipped and
+        // the routing is off. Opening the shared gate
+        // to the kernel band's top (16) admits the
+        // block batch and the band floor; a threshold
+        // below the batch, or a batch past the
+        // threshold, closes the gate again (and a batch
+        // past the kernel band itself, admitted by an
+        // over-wide threshold, is refused by the
+        // prepare and falls back at the site).
+        assert!(!mmv_band_admits(1, 16));
+        assert!(mmv_band_admits(16, 16));
+        assert!(mmv_band_admits(16, 2));
+        assert!(!mmv_band_admits(8, 16));
+        assert!(!mmv_band_admits(16, 17));
     }
 }

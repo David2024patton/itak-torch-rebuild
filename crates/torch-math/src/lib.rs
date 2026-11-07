@@ -141,22 +141,66 @@ static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
 /// When on, every public function logs its operation name, shapes, and
 /// configuration values under a `[torch-math]` prefix. Off by default;
 /// this is the crate's diagnostic seam, per the project rule that every
-/// module ships with a way to pull its bug information out.
+/// module ships with a way to pull its bug information out. The
+/// `TORCH_MATH_DEBUG` environment variable is the flag's env twin
+/// (checked on every [`debug_enabled`] call, the gguf shape), so a
+/// shipped binary can turn the seam on with no code change.
 pub fn set_debug(enabled: bool) {
     DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Whether debug logging is currently enabled. See [`set_debug`].
+/// Whether debug logging is currently enabled: the explicit flag,
+/// or `TORCH_MATH_DEBUG` present in the environment (any value
+/// other than `0` or empty). See [`set_debug`].
 #[must_use]
 pub fn debug_enabled() -> bool {
-    DEBUG_ENABLED.load(Ordering::Relaxed)
+    if DEBUG_ENABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    match std::env::var("TORCH_MATH_DEBUG") {
+        Ok(v) => v != "0" && !v.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Emit one already-formatted diagnostic line: the `dbg_log`
+/// macro's single output path, so test builds capture exactly what
+/// stderr receives and can prove the seam fired.
+pub(crate) fn emit_debug(formatted: &str) {
+    #[cfg(test)]
+    capture(&format!("[torch-math] {formatted}"));
+    eprintln!("[torch-math] {formatted}");
+}
+
+/// Test-only capture of emitted debug lines, so unit tests can prove
+/// the seam actually fired instead of trusting that the macro call is
+/// present in the source (the gguf channel's shape). Lines are the
+/// exact formatted output; tests assert on their own probe strings,
+/// which are unique per test, so parallel tests sharing this buffer
+/// cannot satisfy each other's assertions.
+#[cfg(test)]
+static CAPTURED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn capture(line: &str) {
+    CAPTURED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(line.to_string());
+}
+
+/// The debug lines captured since the process started (test builds
+/// only).
+#[cfg(test)]
+pub(crate) fn captured_lines() -> Vec<String> {
+    CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 /// Internal logging macro: silent unless the debug flag is on.
 macro_rules! dbg_log {
     ($($arg:tt)*) => {
         if $crate::debug_enabled() {
-            eprintln!("[torch-math] {}", format!($($arg)*));
+            $crate::emit_debug(&::std::format!($($arg)*));
         }
     };
 }
@@ -188,5 +232,60 @@ pub(crate) mod test_util {
         for (a, e) in actual.iter().zip(expected.iter()) {
             assert_close(*a, *e, tol);
         }
+    }
+}
+
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    /// Serializes the diag tests: the flag and the env var are
+    /// process-global, so two tests flipping them in parallel would
+    /// satisfy (or break) each other's assertions.
+    static DIAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn env_twin_enables_debug() {
+        let _guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        set_debug(false);
+        std::env::remove_var("TORCH_MATH_DEBUG");
+        assert!(!debug_enabled());
+        std::env::set_var("TORCH_MATH_DEBUG", "1");
+        assert!(
+            debug_enabled(),
+            "TORCH_MATH_DEBUG=1 must enable debug (the gguf env-twin contract)"
+        );
+        std::env::set_var("TORCH_MATH_DEBUG", "0");
+        assert!(!debug_enabled(), "TORCH_MATH_DEBUG=0 must not enable debug");
+        std::env::set_var("TORCH_MATH_DEBUG", "");
+        assert!(
+            !debug_enabled(),
+            "an empty TORCH_MATH_DEBUG must not enable debug"
+        );
+        std::env::remove_var("TORCH_MATH_DEBUG");
+        assert!(!debug_enabled());
+    }
+
+    #[test]
+    fn seam_fires_when_on_and_is_silent_when_off() {
+        let _guard = DIAG_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        std::env::remove_var("TORCH_MATH_DEBUG");
+        set_debug(false);
+        crate::dbg_log!("silent probe torch_math_off_probe");
+        assert!(
+            !captured_lines()
+                .iter()
+                .any(|l| l.contains("torch_math_off_probe")),
+            "the seam must stay silent while debug is off"
+        );
+        set_debug(true);
+        crate::dbg_log!("firing probe torch_math_on_probe");
+        set_debug(false);
+        assert!(
+            captured_lines()
+                .iter()
+                .any(|l| l.contains("[torch-math]") && l.contains("torch_math_on_probe")),
+            "the seam must emit its prefixed line while debug is on"
+        );
     }
 }

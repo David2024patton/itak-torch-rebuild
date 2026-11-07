@@ -121,7 +121,7 @@
 
 mod byte_level;
 mod data;
-mod diag;
+pub mod diag;
 mod error;
 mod pretokenize;
 mod spm;

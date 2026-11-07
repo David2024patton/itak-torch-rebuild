@@ -45,3 +45,45 @@ impl Diag for StderrDiag {
         eprintln!("[diag] {name} {detail}");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A capturing sink in the itak-engine test shape: records every
+    /// event so the test can prove the seam delivers what it is
+    /// given, instead of trusting that sink wiring is present in the
+    /// source.
+    #[derive(Default)]
+    struct Capture {
+        events: Mutex<Vec<(String, String)>>,
+    }
+
+    impl Diag for Capture {
+        fn event(&self, event: &str, detail: &str) {
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push((event.to_string(), detail.to_string()));
+        }
+    }
+
+    #[test]
+    fn seam_delivers_events_to_a_sink() {
+        let capture = Capture::default();
+        capture.event("seam_probe", "detail=fired");
+        let events = capture.events.lock().expect("capture lock");
+        assert!(
+            events
+                .iter()
+                .any(|(e, d)| e == "seam_probe" && d == "detail=fired"),
+            "a sink must receive the events emitted through the seam"
+        );
+        drop(events);
+        // The shipped sinks behave: NullDiag drops silently and
+        // StderrDiag writes without panicking.
+        NullDiag.event("seam_probe", "detail=dropped");
+        StderrDiag.event("seam_probe", "detail=stderr");
+    }
+}

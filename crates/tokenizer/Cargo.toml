@@ -6,11 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "Tokenizer for the iTaK Torch rebuild: byte-level BPE and SentencePiece BPE families over GGUF vocab/merges/scores, correct encode and decode out."
 
-[features]
-default = []
-# Emit diagnostic lines (loads, refusals, fallbacks) to stderr.
-debug-log = []
-
 # The library stays decoupled from the GGUF parser (see src/lib.rs).
 # Examples and tests may use it: the conformance harness adapts
 # gguf::TokenizerInfo into TokenizerData.

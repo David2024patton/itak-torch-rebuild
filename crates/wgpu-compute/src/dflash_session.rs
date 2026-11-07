@@ -1604,6 +1604,7 @@ impl<'a> DflashSession<'a> {
                 pair("k22_mmq", backend.k22_mmq().to_string()),
                 pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
                 pair("k21f_head", backend.k21f_head().to_string()),
+                pair("flash_staged", backend.flash_staged().to_string()),
                 pair("mmq_splitk", backend.mmq_splitk().describe()),
                 pair("coopmat", backend.coopmat().to_string()),
                 pair("coopmat_v2", backend.coopmat_v2().to_string()),

@@ -252,6 +252,20 @@ impl Metadata {
         }
     }
 
+    /// Optional array read: `Ok(None)` when absent, error when
+    /// present with the wrong type. The array sibling of the
+    /// `opt_*` scalar reads, for optional array probes (a draft
+    /// model's sliding-window pattern, for example) whose absence
+    /// is a legitimate answer and must not build the strict
+    /// getter's missing-key refusal.
+    pub fn opt_array(&self, key: &str) -> Result<Option<&Vec<MetadataValue>>> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(MetadataValue::Array(v)) => Ok(Some(v)),
+            Some(_) => Err(self.mismatch(key, "array")),
+        }
+    }
+
     /// Array read: the raw element list.
     pub fn get_array(&self, key: &str) -> Result<&Vec<MetadataValue>> {
         match self.require(key)? {
@@ -402,6 +416,7 @@ mod tests {
         assert_eq!(md.opt_f32("lane_opt_probe.absent").unwrap(), None);
         assert_eq!(md.opt_u32("lane_opt_probe.absent").unwrap(), None);
         assert_eq!(md.opt_string("lane_opt_probe.absent").unwrap(), None);
+        assert_eq!(md.opt_array("lane_opt_probe.absent").unwrap(), None);
         assert!(
             !diag::captured_errors()
                 .iter()
@@ -430,6 +445,54 @@ mod tests {
             diag::captured_errors().iter().any(|l| {
                 l.contains("event=metadata_type_mismatch")
                     && l.contains("key=lane_opt_probe.wrong_type")
+            }),
+            "the wrong-type refusal must emit its diag event"
+        );
+    }
+
+    #[test]
+    fn opt_array_round_trips_a_present_array() {
+        // The present-and-correct case: the elements come back
+        // untouched, in file order.
+        let md = Metadata::from_entries(vec![(
+            "lane_opt_probe.pattern".to_string(),
+            MetadataValue::Array(vec![
+                MetadataValue::Bool(true),
+                MetadataValue::Bool(false),
+                MetadataValue::Bool(true),
+            ]),
+        )]);
+        let items = md
+            .opt_array("lane_opt_probe.pattern")
+            .unwrap()
+            .expect("a present array reads as Some");
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], MetadataValue::Bool(true)));
+        assert!(matches!(items[1], MetadataValue::Bool(false)));
+        assert!(matches!(items[2], MetadataValue::Bool(true)));
+    }
+
+    #[test]
+    fn opt_array_still_refuses_a_wrong_type_loudly() {
+        // The array sibling of the scalar rule above: silence is
+        // for absence only. A present key holding a non-array
+        // value refuses through the mismatch seam, event
+        // included. The probe key is unique to this test.
+        let md = Metadata::from_entries(vec![(
+            "lane_opt_probe.wrong_type_array".to_string(),
+            MetadataValue::String("not an array".to_string()),
+        )]);
+        let err = md
+            .opt_array("lane_opt_probe.wrong_type_array")
+            .expect_err("a string value is not an array");
+        assert!(
+            matches!(err, GgufError::MetadataTypeMismatch { .. }),
+            "error: {err}"
+        );
+        assert!(
+            diag::captured_errors().iter().any(|l| {
+                l.contains("event=metadata_type_mismatch")
+                    && l.contains("key=lane_opt_probe.wrong_type_array")
             }),
             "the wrong-type refusal must emit its diag event"
         );

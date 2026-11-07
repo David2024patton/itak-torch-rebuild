@@ -2476,6 +2476,18 @@ mod tests {
             resolved_config: vec![
                 ("diag".to_string(), "capture".to_string()),
                 ("mmv_max_rows".to_string(), "16".to_string()),
+                // The staged-flash resolution rides the sample
+                // because it rides both sessions' real manifests
+                // (ResidentSession::capture_manifest and its
+                // DflashSession mirror stamp `flash_staged`
+                // beside the other switch pairs): the defaults-
+                // confirmation session (bench/defaults-
+                // confirmation-2026-11-07.md, leg 2) found the
+                // resolution observable nowhere in the manifest
+                // or any shipped log line, and this pair is the
+                // fix. The pin keeps the rendered-field shape
+                // honest for the key the sessions now emit.
+                ("flash_staged".to_string(), "true".to_string()),
             ],
             model: None,
             session: vec![
@@ -2502,6 +2514,7 @@ mod tests {
         assert_eq!(lookup("adapter.driver"), Some("radv"));
         assert_eq!(lookup("adapter.driver_info"), Some("Mesa 26.0.8"));
         assert_eq!(lookup("resolved_config.mmv_max_rows"), Some("16"));
+        assert_eq!(lookup("resolved_config.flash_staged"), Some("true"));
         assert_eq!(lookup("session.layers"), Some("52"));
         assert_eq!(lookup("model"), Some("null"));
         // Identical manifests diff to nothing.

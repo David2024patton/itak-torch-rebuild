@@ -5,7 +5,10 @@
 //! module's measured inventory, not the writer's opinion.
 
 use gguf::{GgufFile, MetadataValue};
-use itak_loader::{coverage, load_config, load_weights, GgufTensorSource, LoaderError};
+use itak_loader::{
+    coverage, load_config, load_dflash_config, load_weights, DflashMetadata, GgufTensorSource,
+    LoaderError,
+};
 use muse_glimmer::layer::SWA_PATTERN_KEY;
 use muse_glimmer::{Dtype, GlimmerError, LayerKind, PatternSource, TensorSource};
 
@@ -409,5 +412,125 @@ fn wrong_architecture_is_refused() {
     match err {
         GlimmerError::WrongArchitecture { found } => assert_eq!(found, "llama"),
         other => panic!("expected WrongArchitecture, got {other:?}"),
+    }
+}
+
+// ---------- tiny DFlash fixture ----------
+
+/// The one bool-array key the dflash config reads, spelled as
+/// it appears in the real file (the dflash module keeps the
+/// constant private; the wiring test spells it the way the
+/// file does).
+const DFLASH_PATTERN_KEY: &str = "dflash.attention.sliding_window_pattern";
+
+/// A complete tiny DFlash metadata set: every key
+/// `DflashConfig::from_metadata` requires, at toy sizes.
+/// The optional keys (`general.name`, `dflash.hidden_act`,
+/// `dflash.attention.causal`) are absent on purpose: absence
+/// is a legitimate answer for them.
+fn tiny_dflash_metadata() -> Vec<(String, MetadataValue)> {
+    let s = |v: &str| MetadataValue::String(v.to_string());
+    let u = MetadataValue::UInt32;
+    let f = MetadataValue::Float32;
+    let tokens: Vec<MetadataValue> = (0..4).map(|i| s(&format!("t{i}"))).collect();
+    vec![
+        ("general.architecture".into(), s("dflash")),
+        ("dflash.block_count".into(), u(2)),
+        ("dflash.context_length".into(), u(1024)),
+        ("dflash.embedding_length".into(), u(256)),
+        ("dflash.feed_forward_length".into(), u(512)),
+        ("dflash.attention.head_count".into(), u(4)),
+        ("dflash.attention.head_count_kv".into(), u(2)),
+        ("dflash.attention.key_length".into(), u(128)),
+        ("dflash.attention.value_length".into(), u(128)),
+        ("dflash.rope.freq_base".into(), f(500_000.0)),
+        ("dflash.attention.layer_norm_rms_epsilon".into(), f(1e-5)),
+        ("dflash.block_size".into(), u(16)),
+        (
+            "dflash.target_layers".into(),
+            MetadataValue::Array(vec![u(0), u(1)]),
+        ),
+        ("dflash.attention.sliding_window".into(), u(2048)),
+        (
+            DFLASH_PATTERN_KEY.into(),
+            MetadataValue::Array(vec![MetadataValue::Bool(true), MetadataValue::Bool(false)]),
+        ),
+        ("tokenizer.ggml.tokens".into(), MetadataValue::Array(tokens)),
+        ("tokenizer.ggml.mask_token_id".into(), u(3)),
+    ]
+}
+
+fn tiny_dflash_file() -> GgufFile {
+    let md = tiny_dflash_metadata();
+    GgufFile::from_bytes(build(&refs(&md), &[])).expect("tiny dflash file parses")
+}
+
+#[test]
+fn dflash_config_loads_end_to_end_from_gguf_bytes() {
+    // Fixture sanity: the complete tiny set loads, and the
+    // bool array round-trips through the adapter.
+    let file = tiny_dflash_file();
+    let cfg = load_dflash_config(&file).expect("dflash config loads");
+    assert_eq!(cfg.block_count, 2);
+    assert_eq!(cfg.block_size, 16);
+    assert_eq!(cfg.target_layers, vec![0, 1]);
+    assert_eq!(cfg.sliding_pattern, vec![true, false]);
+    assert_eq!(cfg.sliding_window, 2048);
+    assert_eq!(cfg.vocab_size, 4);
+}
+
+#[test]
+fn absent_dflash_bool_array_key_probes_none_quietly() {
+    use dflash::Metadata as _;
+
+    // The adapter-level probe of an absent optional key
+    // answers None. Quiet is by construction: the probe
+    // routes through gguf's `opt_array`, which returns
+    // Ok(None) for absence without building the strict
+    // getter's MissingMetadata refusal (the refusal and its
+    // missing_metadata diag event are what the scalar fix
+    // removed for the Glimmer adapter; the gguf crate's own
+    // tests pin opt_array's silence and its wrong-type
+    // loudness against the captured diag events).
+    let file = tiny_dflash_file();
+    let meta = DflashMetadata::new(&file);
+    assert_eq!(meta.get_bool_array("dflash.attention.no_such_key"), None);
+    // And through the config path, absence of the pattern
+    // key surfaces as the config's own named refusal, not
+    // as an adapter-level error.
+    let md: Vec<(String, MetadataValue)> = tiny_dflash_metadata()
+        .into_iter()
+        .filter(|(k, _)| k != DFLASH_PATTERN_KEY)
+        .collect();
+    let file = GgufFile::from_bytes(build(&refs(&md), &[])).unwrap();
+    let err = load_dflash_config(&file).unwrap_err();
+    match err {
+        dflash::DflashError::MissingMetadata { key } => assert_eq!(key, DFLASH_PATTERN_KEY),
+        other => panic!("expected MissingMetadata naming the pattern key, got {other:?}"),
+    }
+}
+
+#[test]
+fn wrong_typed_dflash_pattern_key_refuses_by_name() {
+    // A present pattern key holding a non-array value must
+    // refuse, and the refusal names the key: the adapter
+    // returns None (the gguf opt read logs the type mismatch
+    // at its own seam), and the config converts None into
+    // its MissingMetadata refusal for exactly this key.
+    let mut md = tiny_dflash_metadata();
+    for (k, v) in &mut md {
+        if k == DFLASH_PATTERN_KEY {
+            *v = MetadataValue::String("not an array".to_string());
+        }
+    }
+    let file = GgufFile::from_bytes(build(&refs(&md), &[])).unwrap();
+    let err = load_dflash_config(&file).unwrap_err();
+    assert!(
+        err.to_string().contains(DFLASH_PATTERN_KEY),
+        "the refusal must name the key in its message too: {err}"
+    );
+    match err {
+        dflash::DflashError::MissingMetadata { key } => assert_eq!(key, DFLASH_PATTERN_KEY),
+        other => panic!("expected MissingMetadata naming the pattern key, got {other:?}"),
     }
 }

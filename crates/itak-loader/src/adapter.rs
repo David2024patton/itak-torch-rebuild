@@ -290,8 +290,18 @@ impl dflash::Metadata for DflashMetadata<'_> {
     }
 
     fn get_bool_array(&self, key: &str) -> Option<Vec<bool>> {
-        match self.file.metadata().get_array(key) {
-            Ok(items) => {
+        // Through the `opt_*` read, like the scalar fix on
+        // [`GgufMetadata`]: the strict `get_array` builds its
+        // refusal through `require`, which logs a
+        // `missing_metadata` error event for a merely absent
+        // key, and absence is a legitimate answer to this probe
+        // (the caller turns `None` into its own named refusal).
+        // A present key holding a non-array value still refuses
+        // inside the `opt_*` read, logged there and noted here;
+        // a non-bool element earns the diag line below.
+        match self.file.metadata().opt_array(key) {
+            Ok(None) => None,
+            Ok(Some(items)) => {
                 let mut out = Vec::with_capacity(items.len());
                 for item in items {
                     match item {

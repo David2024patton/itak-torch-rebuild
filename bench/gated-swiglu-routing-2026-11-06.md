@@ -321,3 +321,88 @@ Pass criteria, per depth:
   arms, a repeat control run reproduces the first
   control's dispatch counts and stream exactly (the
   shipped-default byte-identity claim, on the card).
+
+## Correction (2026-11-07): the small-rows dispatch prediction
+
+Appended by the hygiene-bundle lane, 2026-11-07. The
+sections above are the lane's record as written and are
+not edited; this section corrects one prediction in the
+server protocol, on the baseline session's measurement
+(bench/baseline-session-2026-11-06.md, leg (f)).
+
+**What was predicted.** Depth 1: only the down site
+routes, so +52 dispatches per verify forward, 52
+`swiglu_strided` records, zero `gate_strided`. Depth 6:
+both sites route on all 52 layers, +104 per verify
+forward (52 gate + 52 swiglu).
+
+**What was measured.** Depth 6, rows-7 verify forwards:
+exactly 52 gate_strided + 52 swiglu_strided per
+forward, +104 total. That half of the prediction was
+exact. Depth 1 (rows 2 every round): gate_strided
+exactly 0, but swiglu_strided counts **26.0 per
+forward** against the predicted 52, and the net
+dispatch delta is +26 (472 vs 446), not +52. The same
+half-count appears in the depth-6 rows-3 and rows-5
+forwards (26.0 swiglu_strided each), and the
+decomposition's one plain-phase firing, a prefill
+chunk at rows 6, added the full +104.
+
+**The corrected rule, from the session code.** The
+decomposition fires per layer, and the layer's own
+down-tensor family decides admission:
+`prepare_swiglu_proj` (crates/wgpu-compute/src/
+session.rs) matches on the down weights' family; its
+Q4_K arm consults the routed ladder for
+`MmvFamily::Q4K` and its Q6_K arm for
+`MmvFamily::Q6K`. The down shape (in 19,968, out
+6,656) classifies as attn under `mmv_shape_of`, so
+the Q6_K arm admits batches 2..=12 and the Q4_K arm
+admits batches 6..=12, per the shipped band table.
+This note's own cell-table caveat stated the rule
+correctly ("a Q4_K down tensor would take the Q4_K
+arm and its cell 6-12 instead: rows 6, 7 only. The
+code routes by the family it is handed, per layer.");
+the protocol prediction then applied the Q6_K row to
+all 52 layers anyway.
+
+**Why the prediction went wrong.** The cell table's
+census line took the down family from
+bench/dflash-e3-2026-10-30.md, which is the DFlash
+draft file's census (5 layers, `ffn_down` Q6_K on
+every one). The target file's down tensors are mixed:
+**26 layers carry Q6_K down and 26 carry Q4_K
+down.** The split is pinned arithmetically by the
+defaults-confirmation session's prefill summaries
+(bench/results/defaults-confirmation-20261107/
+leg2-default.csv and leg2-off.csv; identical counts
+in both arms): 16 chunk forwards at 64 rows carry
+2,912 `k13_q4k_mmq` dispatches, 182 per chunk, which
+is the 3-per-layer Q4_K base (attention batch, gated
+output, FFN gate+up pair: 156) plus exactly 26 Q4_K
+down products; and 832 `k14_q6k_mmq`, 52 per chunk,
+which is 26 Q6_K down products plus the 26 Q6_K V
+products of the partial-batch layers (the same half
+of the file whose V is Q6_K; see the plan builder's
+comment in session.rs).
+
+**Corrected per-forward arithmetic** (verify forwards,
+batch = depth + 1, one K7 materialization added per
+firing layer, the product staying one dispatch):
+
+| batch | gate_strided | swiglu_strided | net delta |
+|---|---|---|---|
+| 2..=5 | 0 | 26 (Q6_K-down layers only) | +26 |
+| 6..=7 | 52 | 52 | +104 |
+
+So: depth 1 adds +26 per verify forward, not +52;
+depth-6 full rounds (batch 7) add +104, as predicted;
+depth-6 tail rounds (batch 3 and 5) add +26. The
+rows-6 prefill chunk's +104 is the same rule at
+batch 6, not a separate case. No timing claim in
+this note changes: the depth-6 recovery estimate was
+computed at rows 7, where the prediction was exact,
+and no millisecond figure was promised at depth 1.
+Correctness was never in question: identity, golden,
+acceptance, and streams passed in both arms of the
+baseline session's A/B.

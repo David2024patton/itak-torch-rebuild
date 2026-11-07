@@ -188,6 +188,13 @@ Adjusted, with reasons:
   +8 new in this lane).
 - `go test -race ./internal/engine/ ./internal/supervisor/`:
   clean.
+- `golangci-lint run ./...` (the README's gate, config
+  `.golangci.yml`): 0 issues. One gosec G703 taint note on the
+  supervisor test fake's new chmod was resolved with a scoped
+  `//nolint:gosec` carrying the same justification as the
+  adjacent `os.Remove` (test-controlled path from the test's own
+  env).
+- `govulncheck ./...`: no vulnerabilities found.
 - Cross-builds of the touched package (windows, darwin, freebsd):
   all build, so the non-unix fallback path compiles.
 - `cargo check --workspace`: clean (the tree is shared; no Rust

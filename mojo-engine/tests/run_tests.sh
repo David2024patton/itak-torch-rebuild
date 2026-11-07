@@ -18,7 +18,7 @@ fail() { echo "run_tests: FAIL: $*" >&2; exit 1; }
 # runner is std.testing.TestSuite, discovered and run by each
 # test file's main() under `mojo run`.
 echo "== TestSuite files (clean env, seam off) =="
-for t in tests/test_diag.mojo tests/test_config.mojo tests/test_k1_cpu.mojo tests/test_loader.mojo; do
+for t in tests/test_diag.mojo tests/test_config.mojo tests/test_k1_cpu.mojo tests/test_loader.mojo tests/test_loader_full.mojo; do
     env -u MOJO_ENGINE_DEBUG -u MOJO_ENGINE_MODEL_PATH \
         -u MOJO_ENGINE_CONTEXT_LEN \
         mojo run -I src "$t" || fail "TestSuite $t (seam off)"

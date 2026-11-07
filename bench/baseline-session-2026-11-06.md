@@ -412,3 +412,178 @@ llama-style staging bet loses on this card and driver,
 and the loss is in the kernel itself (its per-dispatch
 rates read 8.7 to 16.8 GB/s in the diag stream against
 K13's roughly 46 GB/s class), not in host overhead.
+
+### (h) step 0 autopsy, completed (filtered single-family dumps)
+
+The full-suite dump interleaves under parallel test
+threads, so the autopsy was re-read from filtered
+single-thread runs (the bench/shader-autopsy.sh family
+isolation pattern), cross-checked against the in-situ
+dump of a live session, where the same blocks reappear
+with identical numbers.
+
+| kernel | VGPRs | spilled VGPRs | scratch | LDS |
+|---|---|---|---|---|
+| K13 (k12_k14 family dump, block 6) | 256 | 0 | 0 | 41,984 |
+| K23 (isolated k23 dump, block 3) | 256 | 248 | 25,088 | 22,528 |
+
+K23's staging design did what it promised on LDS
+(22,528 against K13's 41,984, and exactly the note's
+predicted 22,528 staged bytes), and the register
+allocator paid for it: VGPRs still at the 256 cap, 248
+VGPR spills and 25,088 bytes of scratch per workgroup
+where K13 has none. The spill traffic is the measured
+2.15x kernel loss's mechanism. Autopsy improvement on
+the LDS axis alone does not change the (h) verdict.
+
+### (i) Flash staged gates (bench/flash-rework-2026-11-06.md)
+
+- Step 0 autopsy: the compile tests do not construct the
+  staged pipeline, so the read comes from an in-situ dump
+  (spec_generate_gpu with the switch on, private shader
+  cache). The staged variants are the five blocks present
+  in the session dump and absent from the K4-to-K8
+  compile-test dump: VGPRs 60 (rule: at most 128, PASS),
+  spilled VGPRs 0, scratch 0 (PASS), LDS 16,384 per
+  workgroup as the driver reports it. The WGSL staging
+  constant is 21,632; bench/shader-autopsy.sh's own
+  header warns that in-situ LDS values differ from the
+  WGSL constants by driver packing, and the 16,384 figure
+  is exactly one 32x128 f32 staging block. Recorded with
+  that caveat.
+- Step 1 correctness: the k6_flash_staged exactness test
+  passes on the card (bundle leg2-flash-exact); the
+  resident_session suite passes with
+  WGPU_COMPUTE_FLASH_STAGED=1 (bundle leg2-flash-resident
+  PASS); spec IDENTITY and GOLDEN pass at depths 1 and 6
+  with the switch on (their bundles carry the standing
+  SPEED-bar FAIL artifact described at the top of this
+  leg). PASS.
+- Step 2 prefill A/B at 1,022 tokens (diag timing):
+  k6_attn_flash totals 972.9 ms over 832 dispatches
+  (control) against k6_attn_flash_staged 605.9 ms over
+  832 (on): the kernel row improves 37.7 percent and
+  clears the decision bar (at most 760 ms, 25 percent
+  under the recorded 1,013.1) with room. Every other
+  kernel row is unchanged within noise (K13 3,970.1 vs
+  3,972.9; K14 1,248.0 vs 1,250.2). BUT the prefill phase
+  wall moves the wrong way: 6,383 ms off against 6,558 ms
+  on. Roughly 540 ms of non-kernel time appears with the
+  switch on at this prompt length, against a 367 ms
+  kernel saving. The decision rule requires both the row
+  bar and a same-session wall improvement: at 1,022
+  tokens the wall clause FAILS.
+- Step 3 long context (fox prompt x820, prompt_tokens
+  8,202, at or above the 8,192 the protocol demands):
+  flash row 47,360.9 ms (off) against 22,820.3 ms (on),
+  a 51.8 percent kernel improvement; phase wall 93,509
+  ms against 66,704 ms, a 28.7 percent wall improvement.
+  At long context the staged kernel wins row and wall
+  together, decisively.
+- Step 4 no-leak: the control arm's CSV contains zero
+  k6_attn_flash_staged rows, and single-row decode never
+  routes staged (no staged record appears in any
+  single-row context in the session). Decode with the
+  switch on (glimmer_generate --gpu, 128 tokens) reads a
+  mean step of 26.04 ms (38.4 tok/s) against this
+  session's plain control reading of 34.21 ms (29.2
+  tok/s) from leg 1(b) and 30.01 ms (33.3 tok/s) from the
+  (j) tax arm: the glimmer step clock scatters widely
+  under this session's parallel CPU collection, so the
+  recorded 35.5 to 35.7 band is neither reproduced nor
+  refuted on that surface. On the stable surface (the
+  resident spec harness's plain decode line) the session
+  reads 34.08 to 34.62 tok/s across arms. The staged
+  path provably does not touch single-row forwards, so
+  no decode effect is attributable to it either way.
+
+Verdict: staged flash is CORRECT everywhere and much
+faster where attention dominates (long context), but at
+the standard 1,022-token prefill shape the wall clause
+of its own decision rule fails despite the kernel win.
+DO NOT FLIP on this evidence; the flip question the
+parent has to weigh is whether the long-context win
+justifies a length-gated default, and where the roughly
+540 ms of non-kernel time at 1,022 tokens comes from.
+That host-side cost is the one open thread this leg
+leaves, and it is named here rather than smoothed over.
+
+### (j) Diag capture checklist (bench/diag-capture-2026-11-06.md)
+
+- Capture run, glimmer_generate: WGPU_COMPUTE_DIAG=
+  capture produced cap-a.csv (timing aggregate),
+  cap-a.csv.capture.csv (16 forward records), and
+  cap-a.csv.manifest.json. The manifest names the
+  adapter exactly ("AMD Radeon RX 7900 XTX (RADV
+  NAVI31)", driver radv, Mesa 26.0.8-1ubuntu0.3),
+  prints the resolved band table verbatim
+  (q4k[attn 6-12 ffn 2,4-12 kv 2-3] q5k[...] q6k[...]),
+  and the session geometry (52 layers, hidden 6656,
+  vocab 202048). Two honest gaps against the note's
+  schema claims: the manifest's build.git reads
+  "unknown" (the staging tree is a git archive extract
+  with no .git, so the build embedded no SHA), and its
+  model field is null in both the resident and the
+  dflash manifests this session produced.
+- Capture run, one spec phase: produced the same three
+  sidecars. The surviving capture file is the DFlash
+  session's (32 block records, one per round): capture
+  files overwrite per session in one process, exactly
+  like the timing CSVs, so the target session's records
+  (including the spec_round kind) do not survive to
+  disk in spec_generate_gpu runs. The checklist item is
+  satisfied for the draft session; the spec_round
+  record's on-disk survival is a real limitation this
+  session found in the capture wiring, recorded for the
+  parent.
+- Same-build diff: diag_diff on runs A and B (same
+  build, same config) prints "manifests: identical"
+  and "capture records: identical (16 compared)", exit
+  0, bundle leg2-diagdiff-same PASS. Zero divergence,
+  as required.
+- Cross-config diff: run C at MMV cap 16 against run A.
+  diag_diff reports the manifest difference as exactly
+  one field (resolved_config.mmv_max_rows: 1 != 16) and
+  the first record divergence at seq 0, field hash:
+  the prefill forward, the first place routing engages.
+  The divergence is localized to the intended change.
+  (Its bundle records FAIL because divergence is a
+  failure-marker outcome by design; the divergence is
+  the expected result.)
+- Capture tax: decode 128 tokens, timing-only against
+  capture, same session: mean step 30.01 ms against
+  30.16 ms, about +0.5 percent. The capture path's cost
+  on this surface is negligible; the note's isolated
+  1.60 ms per vocab forward does not show up as a
+  visible decode tax here.
+- PIPELINE_STATISTICS_QUERY readout: the lane's
+  adapter_features probe (commit 26fe63d) reports the
+  feature OFFERED on this adapter (timestamp_query and
+  pipeline_statistics_query both true), and a probe
+  device opened with the feature created a
+  pipeline-statistics query set successfully (all three
+  enumerated adapters answered the same; adapter[0] is
+  the 7900 XTX). Per the checklist's terms: a session
+  could be built that reads per-pipeline counters
+  without disturbing the verdict path; building it is
+  future work, not this session's.
+- RGP trace: ABSENT this session. bench/gpu-trace-
+  2026-11-06.md makes the first traced run conditional
+  on a shellcheck pass over bench/gpu-trace.sh and
+  bench/failure-bundle.sh on the server, and shellcheck
+  is not installed on ubuntu-server. Recorded as the
+  checklist itself instructs (file name or absence):
+  absence, with the reason.
+
+## Tenant restoration
+
+All GPU legs finished at about 04:20Z. The tenants were
+then restored: docker start cortex-cortex-chat-1 and
+cortex-cortex-embed-1 (both Up, healthy), systemctl
+--user start cortex-embed.service. VRAM settled at
+8,932,196,352 B (about 8.9 GB), the normal tenant
+footprint, against the clear-card residue of 33,271,808
+B during measurement. Production llama-server was never
+touched. The leg-1(c) CPU collection needs no card and
+was still running at restoration time; its remaining
+sections complete below.

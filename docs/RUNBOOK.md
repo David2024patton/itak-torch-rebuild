@@ -94,7 +94,7 @@ There is no automated deploy for this stack, and production Glimmer serving is d
 
 ## Verify
 
-The gates, as plain commands (there are no gate scripts; do not invent any):
+The gates, as plain commands (do not invent gate scripts; the one exception is `bench/gate.sh`, below):
 
 ```bash
 cargo test --workspace
@@ -103,6 +103,8 @@ cargo fmt --all -- --check
 cargo deny check
 (cd platform && go build ./... && go vet ./... && go test ./... && govulncheck ./...)
 ```
+
+The Rust test suite has one scripted wrapper: `bench/gate.sh` runs `cargo test --workspace` (the first command above) with per-test output captured, and prints a summary line counting passed, failed, and ignored tests plus both skip counts: adapter skips (tests that passed vacuously because no qualifying GPU adapter is present) and other skips (named exceptions, counted but never gated). It fails the gate when any test fails, and on a machine with a qualifying adapter it also fails when any adapter skip occurs; on an adapterless machine the adapter skips are expected and reported beside the pass count, with a printed note when their number drifts from the enumerated expectation in the script's header. The remaining gates stay plain commands, run beside the wrapper, not through it.
 
 Under the pinned go1.26.10 toolchain, govulncheck reports no vulnerabilities in the platform (this closes the panel's GO-2026-6809 finding, which was a standard library advisory against the older toolchain). After a serving change, repeat the smoke from SERVING.md and compare against bench/serving-smoke-2026-10-30.md. Benchmarks: compare new runs against docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md and the bench/ notes for the same harness shape; anchors are harness-relative (DECISIONS.md, 2026-10-30), so a result more than a few percent off the recorded numbers for the same harness is a finding, not a rounding error. Accuracy: bench/accuracy-prompts.md at temp 0; empty content means the reasoning default trap is back.
 

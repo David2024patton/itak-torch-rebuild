@@ -45,6 +45,26 @@
 //!   `0` restores the shipped flash), and the shipped
 //!   flash remains the single-row form in every switch
 //!   position.
+//! - **Flash over f16 KV**: both flash forms have an f16
+//!   twin ([`FLASH_F16_SHADER`], [`FLASH_STAGED_F16_SHADER`])
+//!   serving layers whose KV is stored as packed f16
+//!   ([`KvStorage::F16`], selected per state at
+//!   construction from `WGPU_COMPUTE_KV_F16` in
+//!   `crate::compute`; default off). The twins bind the
+//!   K/V buffers as `array<u32>` (two f16 values per word)
+//!   and convert on read: the staged twin unpacks each
+//!   staged element once into the same f32 workgroup tile
+//!   the f32 form uses, so its workgroup-memory set is
+//!   byte-identical; the shipped twin unpacks per load in
+//!   its dot and reduce loops. Everything downstream of
+//!   the unpack is the f32 form's operation sequence. The
+//!   two-pass form has no f16 twin: it serves the trait
+//!   path, whose state is f32 by construction, and its
+//!   prepares refuse an f16 layer by name. The write-side
+//!   conversion lives in K9's f16 preparation form (see
+//!   `crate::kernels::k9_attn_prep`). Design, precision
+//!   analysis, and the card gate that can move the
+//!   default: bench/f16-kv-2026-11-07.md.
 //!
 //! KV state: like `cpu-compute`, this backend owns its KV
 //! storage, because the `Cache` trait the forward hands over is
@@ -571,6 +591,328 @@ fn flash_staged_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// Load one element from a packed-f16 KV buffer (two f16
+/// values per u32 word, the even element in the low half),
+/// shared by both f16 flash shaders below as shader text:
+/// `KV_LOAD_WGSL` is spliced into each so the two copies
+/// cannot drift (the same composition K21F uses for its
+/// dequant text). The conversion is WGSL's
+/// `unpack2x16float`, the exact inverse of the
+/// `pack2x16float` K9's f16 preparation writes with. Two
+/// functions, one per binding, because they read the
+/// shaders' globals directly: a pointer-to-storage
+/// function parameter is legal WGSL but Naga's validator
+/// rejects its access mode, and the globals cost nothing.
+const KV_LOAD_WGSL: &str = r#"
+fn kv_load_keys(i: u32) -> f32 {
+    let pair = unpack2x16float(keys[i >> 1u]);
+    return select(pair.y, pair.x, (i & 1u) == 0u);
+}
+
+fn kv_load_values(i: u32) -> f32 {
+    let pair = unpack2x16float(values[i >> 1u]);
+    return select(pair.y, pair.x, (i & 1u) == 0u);
+}
+"#;
+
+/// [`FLASH_F16_SHADER`] with [`KV_LOAD_WGSL`] spliced in
+/// at its marker: the text the pipeline build and the
+/// shader tests actually consume.
+fn flash_f16_source() -> String {
+    FLASH_F16_SHADER.replace("// __KV_LOAD__", KV_LOAD_WGSL)
+}
+
+/// [`FLASH_STAGED_F16_SHADER`] with [`KV_LOAD_WGSL`]
+/// spliced in at its marker, like [`flash_f16_source`].
+fn flash_staged_f16_source() -> String {
+    FLASH_STAGED_F16_SHADER.replace("// __KV_LOAD__", KV_LOAD_WGSL)
+}
+
+/// The flash shader over f16 KV: [`FLASH_SHADER`] with its
+/// K and V bindings packed f16 and every KV load converted
+/// on read through [`KV_LOAD_WGSL`]. Everything else (the
+/// mask, the dot order, the online-softmax sequence, the
+/// sentinel) is the shipped form's, operation for
+/// operation; the only numeric difference from the f32
+/// form is the stored values themselves, which carry the
+/// f16 rounding the write side applied (see the precision
+/// analysis in bench/f16-kv-2026-11-07.md). Built and
+/// routed only for layers whose storage is
+/// [`KvStorage::F16`]; an f32 layer never binds it.
+const FLASH_F16_SHADER: &str = r#"
+struct FlashParams {
+    rows: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    stored: u32,
+    first_pos: u32,
+    start_pos: u32,
+    window: u32,
+    ring: u32,
+    scale: f32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<u32>;
+@group(0) @binding(2) var<storage, read> values: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> params: FlashParams;
+
+var<workgroup> tile: array<f32, 256>;
+// __KV_LOAD__
+
+@compute @workgroup_size(256)
+fn flash_f16_main(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat_wg = wid.y * params.grid_x + wid.x;
+    let head = flat_wg % params.q_heads;
+    let row = flat_wg / params.q_heads;
+    let lane = lid.x;
+    let kv_head = head / (params.q_heads / params.kv_heads);
+    let q_base = (row * params.q_heads + head) * params.head_dim;
+    let p = params.start_pos + row;
+
+    var m = -1.0e30;
+    var sum = 0.0;
+    var acc = 0.0;
+    for (var t0 = 0u; t0 < params.stored; t0 += 256u) {
+        // Score phase: lane l takes stored key t0 + l.
+        let idx = t0 + lane;
+        var sc = -1.0e30;
+        if (idx < params.stored) {
+            let kp = params.first_pos + idx;
+            var visible = kp <= p;
+            if (params.window != 0u && kp + params.window <= p) {
+                visible = false;
+            }
+            if (visible) {
+                var slot = kp;
+                if (params.ring != 0u) {
+                    slot = kp % params.ring;
+                }
+                let k_base = (slot * params.kv_heads + kv_head) * params.head_dim;
+                var s = 0.0;
+                for (var dd = 0u; dd < params.head_dim; dd++) {
+                    s += q[q_base + dd] * kv_load_keys(k_base + dd);
+                }
+                sc = s * params.scale;
+            }
+        }
+        tile[lane] = sc;
+        workgroupBarrier();
+        // Reduce phase: the reduce kernel's loop over the
+        // tile, ascending, state carried across tiles.
+        if (lane < params.head_dim) {
+            let tile_len = min(256u, params.stored - t0);
+            for (var j = 0u; j < tile_len; j++) {
+                let s2 = tile[j];
+                if (s2 <= -1.0e29) {
+                    continue;
+                }
+                if (s2 > m) {
+                    let corr = exp(m - s2);
+                    acc *= corr;
+                    sum *= corr;
+                    m = s2;
+                }
+                let w = exp(s2 - m);
+                let kp = params.first_pos + t0 + j;
+                var slot = kp;
+                if (params.ring != 0u) {
+                    slot = kp % params.ring;
+                }
+                let v = kv_load_values(
+                    (slot * params.kv_heads + kv_head) * params.head_dim + lane);
+                acc += w * v;
+                sum += w;
+            }
+        }
+        workgroupBarrier();
+    }
+    if (lane < params.head_dim) {
+        out[q_base + lane] = acc / sum;
+    }
+}
+"#;
+
+/// The staged flash shader over f16 KV:
+/// [`FLASH_STAGED_SHADER`] with its K and V bindings
+/// packed f16. The conversion happens exactly once per
+/// staged element, at the staging loads, through
+/// [`KV_LOAD_WGSL`]: the block lands in the same f32
+/// workgroup tile the f32 form stages into, so the
+/// staged set's bytes ([`FLASH_STAGED_LDS_BYTES`]) and
+/// every downstream operation are the f32 form's. Built
+/// under the same workgroup-storage grant as the staged
+/// form and routed only for layers whose storage is
+/// [`KvStorage::F16`].
+const FLASH_STAGED_F16_SHADER: &str = r#"
+struct FlashParams {
+    rows: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    stored: u32,
+    first_pos: u32,
+    start_pos: u32,
+    window: u32,
+    ring: u32,
+    scale: f32,
+    grid_x: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q: array<f32>;
+@group(0) @binding(1) var<storage, read> keys: array<u32>;
+@group(0) @binding(2) var<storage, read> values: array<u32>;
+@group(0) @binding(3) var<storage, read_write> out: array<f32>;
+@group(0) @binding(4) var<uniform> params: FlashParams;
+
+// The K/V block tile: 32 keys at a padded (head_dim + 1)
+// stride, sized at the head-dim bound of 128.
+var<workgroup> kv_tile: array<f32, 4128>;
+// The query block tile: 8 rows at the head-dim bound.
+var<workgroup> q_tile: array<f32, 1024>;
+// The score tile: 8 rows x 32 keys.
+var<workgroup> s_tile: array<f32, 256>;
+// __KV_LOAD__
+
+@compute @workgroup_size(256)
+fn flash_staged_f16_main(@builtin(workgroup_id) wid: vec3<u32>,
+                         @builtin(local_invocation_id) lid: vec3<u32>) {
+    let flat_wg = wid.y * params.grid_x + wid.x;
+    let head = flat_wg % params.q_heads;
+    let row_block = flat_wg / params.q_heads;
+    let kv_head = head / (params.q_heads / params.kv_heads);
+    let tid = lid.x;
+    let row_in_block = tid / 32u;
+    let lane = tid % 32u;
+    let row = row_block * 8u + row_in_block;
+    let p = params.start_pos + row;
+    let hd = params.head_dim;
+    let stride = hd + 1u;
+
+    // Stage the query block once: rows past the call's row
+    // count stage as zeros (they compute and never write
+    // out, keeping every barrier uniform).
+    for (var e = tid; e < 8u * hd; e += 256u) {
+        let r = e / hd;
+        let d = e % hd;
+        let grow = row_block * 8u + r;
+        var v = 0.0;
+        if (grow < params.rows) {
+            v = q[(grow * params.q_heads + head) * hd + d];
+        }
+        q_tile[r * hd + d] = v;
+    }
+    workgroupBarrier();
+
+    var m = -1.0e30;
+    var sum = 0.0;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
+    for (var t0 = 0u; t0 < params.stored; t0 += 32u) {
+        let block_len = min(32u, params.stored - t0);
+        // Stage this block's K rows, converting on read:
+        // the one unpack per element, into the f32 tile.
+        for (var e = tid; e < block_len * hd; e += 256u) {
+            let j = e / hd;
+            let d = e % hd;
+            let kp = params.first_pos + t0 + j;
+            var slot = kp;
+            if (params.ring != 0u) {
+                slot = kp % params.ring;
+            }
+            kv_tile[j * stride + d] = kv_load_keys(
+                (slot * params.kv_heads + kv_head) * hd + d);
+        }
+        workgroupBarrier();
+        // Score phase: lane j scores key t0 + j for this
+        // thread's row, the shipped mask and dot order.
+        var sc = -1.0e30;
+        if (lane < block_len) {
+            let kp = params.first_pos + t0 + lane;
+            var visible = kp <= p;
+            if (params.window != 0u && kp + params.window <= p) {
+                visible = false;
+            }
+            if (visible) {
+                var s = 0.0;
+                for (var d = 0u; d < hd; d++) {
+                    s += q_tile[row_in_block * hd + d] * kv_tile[lane * stride + d];
+                }
+                sc = s * params.scale;
+            }
+        }
+        s_tile[row_in_block * 32u + lane] = sc;
+        workgroupBarrier();
+        // Stage this block's V rows into the same tile,
+        // converting on read like the K staging above.
+        for (var e = tid; e < block_len * hd; e += 256u) {
+            let j = e / hd;
+            let d = e % hd;
+            let kp = params.first_pos + t0 + j;
+            var slot = kp;
+            if (params.ring != 0u) {
+                slot = kp % params.ring;
+            }
+            kv_tile[j * stride + d] = kv_load_values(
+                (slot * params.kv_heads + kv_head) * hd + d);
+        }
+        workgroupBarrier();
+        // Reduce phase: the shipped online-softmax loop over
+        // the block, ascending, state carried across blocks;
+        // lane l accumulates channels l, l + 32, l + 64,
+        // l + 96 of its row, reading V from the tile.
+        for (var j = 0u; j < block_len; j++) {
+            let s2 = s_tile[row_in_block * 32u + j];
+            if (s2 <= -1.0e29) {
+                continue;
+            }
+            if (s2 > m) {
+                let corr = exp(m - s2);
+                acc0 *= corr;
+                acc1 *= corr;
+                acc2 *= corr;
+                acc3 *= corr;
+                sum *= corr;
+                m = s2;
+            }
+            let w = exp(s2 - m);
+            let vbase = j * stride + lane;
+            acc0 += w * kv_tile[vbase];
+            if (lane + 32u < hd) {
+                acc1 += w * kv_tile[vbase + 32u];
+            }
+            if (lane + 64u < hd) {
+                acc2 += w * kv_tile[vbase + 64u];
+            }
+            if (lane + 96u < hd) {
+                acc3 += w * kv_tile[vbase + 96u];
+            }
+            sum += w;
+        }
+        workgroupBarrier();
+    }
+    if (row < params.rows) {
+        let out_base = (row * params.q_heads + head) * hd + lane;
+        out[out_base] = acc0 / sum;
+        if (lane + 32u < hd) {
+            out[out_base + 32u] = acc1 / sum;
+        }
+        if (lane + 64u < hd) {
+            out[out_base + 64u] = acc2 / sum;
+        }
+        if (lane + 96u < hd) {
+            out[out_base + 96u] = acc3 / sum;
+        }
+    }
+}
+"#;
+
 /// The shape a [`GpuKvState`] was built from; the same discipline
 /// as `cpu-compute`'s (a backend instance serves one model shape;
 /// a different one arriving later is a refusal, not a rebuild).
@@ -595,8 +937,78 @@ impl CacheShape {
     }
 }
 
+/// The element format a KV state's buffers store:
+/// plain f32, or packed f16 (two values per u32 word,
+/// the even element in the low half, converted on write
+/// by K9's f16 preparation form and on read inside the
+/// f16 flash forms). A state's format is fixed at its
+/// construction and never changes across growth (the
+/// growth copy is a raw byte copy, layout-preserving
+/// under either format). Selected for the resident
+/// session from `WGPU_COMPUTE_KV_F16` in `crate::compute`
+/// (default [`KvStorage::F32`], the shipped behavior);
+/// the trait path's state is f32 by construction. See
+/// bench/f16-kv-2026-11-07.md for the design and the
+/// precision analysis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvStorage {
+    /// One f32 per element: the original layout.
+    F32,
+    /// One f16 per element, packed two per u32 word:
+    /// half the bytes, half the attention read traffic.
+    F16,
+}
+
+impl KvStorage {
+    /// Bytes per stored element under this format.
+    #[must_use]
+    pub fn elem_bytes(self) -> usize {
+        match self {
+            KvStorage::F32 => 4,
+            KvStorage::F16 => 2,
+        }
+    }
+
+    /// The format's short name, for logs and refusals.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            KvStorage::F32 => "f32",
+            KvStorage::F16 => "f16",
+        }
+    }
+}
+
+/// The total KV bytes a model of `cfg`'s shape holds at
+/// full context under `storage`: every layer's capacity
+/// rows (the context length for a global layer, the
+/// sliding window for a windowed one) times the row's
+/// K and V elements (`kv_heads` by `key_length` plus
+/// `kv_heads` by `value_length`) times the format's
+/// element bytes. Computed from the config, never a
+/// hardcoded figure; the Glimmer values it produces are
+/// pinned in the crate tests (3,653,238,784 bytes f32,
+/// exactly half, 1,826,619,392, in f16: 13 global layers
+/// at 131,072 rows plus 39 windowed layers at 2,048,
+/// 2 KV heads at head dim 128 on each side).
+#[must_use]
+pub fn full_context_kv_bytes(cfg: &GlimmerConfig, storage: KvStorage) -> u64 {
+    let rows: u64 = cfg
+        .layers
+        .iter()
+        .map(|kind| match kind {
+            LayerKind::Global => u64::from(cfg.context_length),
+            LayerKind::SlidingWindow => u64::from(cfg.sliding_window),
+        })
+        .sum();
+    rows * u64::from(cfg.kv_heads)
+        * u64::from(cfg.key_length + cfg.value_length)
+        * storage.elem_bytes() as u64
+}
+
 /// One layer's resident device KV: a K buffer and a V buffer of
-/// `capacity` rows each, one row being `[kv_heads][head_dim]`.
+/// `capacity` rows each, one row being `[kv_heads][head_dim]`
+/// elements in the state's [`KvStorage`] format.
 #[derive(Debug)]
 pub struct LayerKv {
     /// Resident keys, slot-addressed (see the module docs).
@@ -605,6 +1017,13 @@ pub struct LayerKv {
     pub v: wgpu::Buffer,
     /// Rows the buffers currently hold.
     pub capacity: usize,
+    /// The element format both buffers store, fixed by
+    /// the owning [`DeviceKv`] at allocation: the
+    /// prepare seams read it to select the kernel form
+    /// that can read the buffers (the flash forms have
+    /// an f16 twin each; the two-pass form refuses f16
+    /// by name).
+    pub storage: KvStorage,
 }
 
 /// The device half of the KV design, factored out of
@@ -620,6 +1039,7 @@ pub struct LayerKv {
 pub struct DeviceKv {
     kinds: Vec<AttnLayerKind>,
     ring: usize,
+    storage: KvStorage,
     layers: Vec<Option<LayerKv>>,
 }
 
@@ -630,12 +1050,26 @@ impl DeviceKv {
     /// sliding window itself for a step-at-a-time driver (the
     /// trait state), or the window plus chunk headroom for a
     /// chunked driver (the resident session; see
-    /// [`AttendGeom::ring`] for why the two differ).
+    /// [`AttendGeom::ring`] for why the two differ). The
+    /// storage format is [`KvStorage::F32`]: the original
+    /// layout, and the only one the trait path ever runs.
     #[must_use]
     pub fn new(pattern: &[AttnLayerKind], ring: usize) -> Self {
+        Self::new_with_storage(pattern, ring, KvStorage::F32)
+    }
+
+    /// Build the storage like [`DeviceKv::new`], with an
+    /// explicit element format for every layer's buffers.
+    /// The format is fixed for the state's life: growth
+    /// reallocates in the same format and byte-copies the
+    /// old contents across, so a layer's format can never
+    /// change under a prepared plan.
+    #[must_use]
+    pub fn new_with_storage(pattern: &[AttnLayerKind], ring: usize, storage: KvStorage) -> Self {
         DeviceKv {
             kinds: pattern.to_vec(),
             ring,
+            storage,
             layers: (0..pattern.len()).map(|_| None).collect(),
         }
     }
@@ -644,6 +1078,12 @@ impl DeviceKv {
     #[must_use]
     pub fn ring(&self) -> usize {
         self.ring
+    }
+
+    /// The element format every layer's buffers store.
+    #[must_use]
+    pub fn storage(&self) -> KvStorage {
+        self.storage
     }
 
     /// Make sure layer `layer`'s device buffers hold at least
@@ -671,6 +1111,22 @@ impl DeviceKv {
                 format!("layer {layer} is outside the KV state's layer pattern"),
             )
         })?;
+        // Packed f16 stores two elements per word, so a
+        // row of odd width has no packing: refuse by
+        // name here, at allocation, rather than letting
+        // a kernel write past the row. (Every shape this
+        // engine serves has an even KV width: the head
+        // dim itself is even by the K9 bound and the KV
+        // head count multiplies it.)
+        if self.storage == KvStorage::F16 && kv_width % 2 != 0 {
+            return Err(step_failed(
+                step,
+                format!(
+                    "f16 kv storage packs two elements per word and needs an even \
+                     kv row width; layer {layer} was asked for width {kv_width}"
+                ),
+            ));
+        }
         let needed = match kind {
             AttnLayerKind::Global => appended_total,
             AttnLayerKind::Windowed { .. } => self.ring,
@@ -688,11 +1144,12 @@ impl DeviceKv {
             } else {
                 needed.max(current.saturating_mul(2)).max(256)
             };
-            let bytes = (new_capacity * kv_width * 4) as u64;
+            let elem_bytes = self.storage.elem_bytes();
+            let bytes = (new_capacity * kv_width * elem_bytes) as u64;
             let k = ctx.scratch_buffer(&format!("kv keys layer {layer}"), bytes);
             let v = ctx.scratch_buffer(&format!("kv values layer {layer}"), bytes);
             if let Some(old) = slot.as_ref() {
-                let old_bytes = (old.capacity * kv_width * 4) as u64;
+                let old_bytes = (old.capacity * kv_width * elem_bytes) as u64;
                 let mut encoder =
                     ctx.device
                         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -703,12 +1160,15 @@ impl DeviceKv {
                 ctx.queue.submit([encoder.finish()]);
             }
             dbg_log!(
-                "kv layer {layer}: capacity {current} -> {new_capacity} rows ({bytes} bytes per buffer)"
+                "kv layer {layer}: capacity {current} -> {new_capacity} rows ({bytes} bytes \
+                 per buffer, {} storage)",
+                self.storage.name()
             );
             *slot = Some(LayerKv {
                 k,
                 v,
                 capacity: new_capacity,
+                storage: self.storage,
             });
         }
         Ok(slot.as_ref().expect("the layer was just ensured"))
@@ -1128,6 +1588,18 @@ pub struct K6Pipeline {
     /// backend's config (see `WGPU_COMPUTE_FLASH_STAGED` in
     /// `crate::compute`), never this struct's decision.
     flash_staged: Option<wgpu::ComputePipeline>,
+    /// The shipped flash form over f16 KV (see
+    /// [`FLASH_F16_SHADER`]): serves layers whose storage
+    /// is [`KvStorage::F16`], selected per layer at
+    /// prepare time from the layer's own format, so an
+    /// f32 layer can never bind it (and vice versa).
+    flash_f16: wgpu::ComputePipeline,
+    /// The staged flash form over f16 KV (see
+    /// [`FLASH_STAGED_F16_SHADER`]); `None` under exactly
+    /// the staged form's workgroup-storage condition (its
+    /// staging set is the same f32 tile, so the same
+    /// [`FLASH_STAGED_LDS_BYTES`] bound applies).
+    flash_staged_f16: Option<wgpu::ComputePipeline>,
 }
 
 impl K6Pipeline {
@@ -1154,13 +1626,26 @@ impl K6Pipeline {
         let scores = build(SCORES_SHADER, "scores_main", "k6 attention scores");
         let reduce = build(REDUCE_SHADER, "reduce_main", "k6 attention reduce");
         let flash = build(FLASH_SHADER, "flash_main", "k6 attention flash");
+        // The f16 flash twin: built unconditionally like
+        // its f32 sibling (its only workgroup memory is
+        // the same 256-float score tile), so a defect in
+        // the packed-load path fails at construction,
+        // not on first f16 use. It serves only layers
+        // whose storage is f16; building it costs one
+        // shader compile and changes nothing about the
+        // f32 path.
+        let flash_f16_src = flash_f16_source();
+        let flash_f16 = build(&flash_f16_src, "flash_f16_main", "k6 attention flash f16");
         // The staged flash form is optional on the K13
         // terms: a device granting less workgroup storage
         // than its staging set does not build it, and the
         // session keeps the shipped flash form there. A
         // device that does grant the set builds it
         // unconditionally, so a shader defect fails at
-        // construction, not on first routed use.
+        // construction, not on first routed use. The
+        // staged f16 twin shares the condition: its
+        // staging set is the same f32 tile, so the same
+        // bound applies.
         let granted = device.limits().max_compute_workgroup_storage_size;
         let flash_staged = if granted >= FLASH_STAGED_LDS_BYTES {
             Some(build(
@@ -1175,12 +1660,24 @@ impl K6Pipeline {
             );
             None
         };
+        let flash_staged_f16 = if granted >= FLASH_STAGED_LDS_BYTES {
+            let src = flash_staged_f16_source();
+            Some(build(
+                &src,
+                "flash_staged_f16_main",
+                "k6 attention flash staged f16",
+            ))
+        } else {
+            None
+        };
         dbg_log!("k6 pipelines built");
         Ok(K6Pipeline {
             scores,
             reduce,
             flash,
             flash_staged,
+            flash_f16,
+            flash_staged_f16,
         })
     }
 
@@ -1230,6 +1727,28 @@ impl K6Pipeline {
         Ok(())
     }
 
+    /// Refuse a two-pass prepare over a layer whose KV
+    /// is stored f16: the scores and reduce shaders read
+    /// `array<f32>` KV and have no f16 twin, by design.
+    /// The two-pass form serves the trait path, whose
+    /// state is f32 by construction, so an f16 layer can
+    /// only arrive here through a wiring mistake; naming
+    /// it beats binding a packed buffer to an f32 shader
+    /// and reading garbage. The flash forms are the f16
+    /// readers (see [`FLASH_F16_SHADER`]).
+    fn check_two_pass_storage(kv: &LayerKv, form: &str) -> Result<()> {
+        if kv.storage == KvStorage::F16 {
+            return Err(WgpuError::InvalidTensor {
+                name: format!("k6 attention {form}"),
+                detail: "the layer's kv is stored f16; the two-pass form reads f32 kv \
+                         only. f16 kv is served by the flash forms (prepare_flash and \
+                         prepare_flash_staged)"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Prepare a scores dispatch: `q` (device buffer, `[rows,
     /// q_width]`) against the layer's resident keys, writing the
     /// `[rows, q_heads, stored]` scores into the caller's
@@ -1238,7 +1757,9 @@ impl K6Pipeline {
     ///
     /// # Errors
     ///
-    /// [`WgpuError::InvalidTensor`] on an unusable geometry.
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry,
+    /// or on a layer whose KV is stored f16 (see
+    /// [`Self::check_two_pass_storage`]).
     pub fn prepare_scores(
         &self,
         ctx: &GpuContext,
@@ -1248,6 +1769,7 @@ impl K6Pipeline {
         geom: &AttendGeom,
     ) -> Result<K6ScoresCall> {
         Self::check_geom(geom)?;
+        Self::check_two_pass_storage(kv, "scores")?;
         let params_buf = ctx.uniform_buffer("k6 scores params", &[0u8; 48]);
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k6 scores bind group"),
@@ -1340,7 +1862,9 @@ impl K6Pipeline {
     ///
     /// # Errors
     ///
-    /// [`WgpuError::InvalidTensor`] on an unusable geometry.
+    /// [`WgpuError::InvalidTensor`] on an unusable geometry,
+    /// or on a layer whose KV is stored f16 (see
+    /// [`Self::check_two_pass_storage`]).
     pub fn prepare_reduce(
         &self,
         ctx: &GpuContext,
@@ -1350,6 +1874,7 @@ impl K6Pipeline {
         geom: &AttendGeom,
     ) -> Result<K6ReduceCall> {
         Self::check_geom(geom)?;
+        Self::check_two_pass_storage(kv, "reduce")?;
         let total_wg = (geom.rows * geom.q_heads) as u64;
         let grid = crate::kernels::k1_q4k_gemv::grid_dims(total_wg);
         let params_buf = ctx.uniform_buffer("k6 reduce params", &[0u8; 32]);
@@ -1407,7 +1932,11 @@ impl K6Pipeline {
     /// into the caller's `out` buffer in the one fused kernel
     /// (see [`FLASH_SHADER`]). The resident session picks this
     /// form at every shape; the two-pass form remains for the
-    /// trait path's step-at-a-time calls.
+    /// trait path's step-at-a-time calls. The layer's own
+    /// storage format selects the shader: an f16 layer runs
+    /// [`FLASH_F16_SHADER`] (diag stamp `k6_attn_flash_f16`),
+    /// an f32 layer the shipped form, so the two layouts can
+    /// never be read through each other's shader.
     ///
     /// # Errors
     ///
@@ -1420,15 +1949,23 @@ impl K6Pipeline {
         out: &wgpu::Buffer,
         geom: &AttendGeom,
     ) -> Result<K6FlashCall> {
+        let (pipeline, kernel, bind_label) = match kv.storage {
+            KvStorage::F32 => (&self.flash, "k6_attn_flash", "k6 flash bind group"),
+            KvStorage::F16 => (
+                &self.flash_f16,
+                "k6_attn_flash_f16",
+                "k6 flash f16 bind group",
+            ),
+        };
         self.prepare_flash_form(
             ctx,
             q,
             kv,
             out,
             geom,
-            &self.flash,
-            "k6_attn_flash",
-            "k6 flash bind group",
+            pipeline,
+            kernel,
+            bind_label,
             (geom.rows * geom.q_heads) as u64,
         )
     }
@@ -1436,7 +1973,9 @@ impl K6Pipeline {
     /// Prepare a staged flash dispatch: the same contract,
     /// bindings, params, and output as [`Self::prepare_flash`],
     /// run through the staged shader (see
-    /// [`FLASH_STAGED_SHADER`]): one workgroup per block of
+    /// [`FLASH_STAGED_SHADER`], or its f16 twin
+    /// [`FLASH_STAGED_F16_SHADER`] when the layer's storage
+    /// is f16): one workgroup per block of
     /// 8 query rows and Q head, K/V walked in staged blocks
     /// of 32 keys. The session routes here only when the
     /// backend's flash-staged switch is on and the call has
@@ -1462,9 +2001,28 @@ impl K6Pipeline {
         out: &wgpu::Buffer,
         geom: &AttendGeom,
     ) -> Result<K6FlashCall> {
-        let Some(pipeline) = &self.flash_staged else {
+        // The layer's storage format selects the twin, on
+        // the same terms as prepare_flash: an f16 layer
+        // runs the f16 staged form (diag stamp
+        // k6_attn_flash_staged_f16), an f32 layer the
+        // f32 one; both share the availability condition.
+        let (pipeline, kernel, bind_label, form_name) = match kv.storage {
+            KvStorage::F32 => (
+                self.flash_staged.as_ref(),
+                "k6_attn_flash_staged",
+                "k6 flash staged bind group",
+                "k6 attention flash staged",
+            ),
+            KvStorage::F16 => (
+                self.flash_staged_f16.as_ref(),
+                "k6_attn_flash_staged_f16",
+                "k6 flash staged f16 bind group",
+                "k6 attention flash staged f16",
+            ),
+        };
+        let Some(pipeline) = pipeline else {
             return Err(WgpuError::InvalidTensor {
-                name: "k6 attention flash staged".to_string(),
+                name: form_name.to_string(),
                 detail: format!(
                     "the staged flash pipeline was not built on this device: \
                      its staging set needs {FLASH_STAGED_LDS_BYTES} bytes of \
@@ -1479,8 +2037,8 @@ impl K6Pipeline {
             out,
             geom,
             pipeline,
-            "k6_attn_flash_staged",
-            "k6 flash staged bind group",
+            kernel,
+            bind_label,
             ((geom.rows.div_ceil(8)) * geom.q_heads) as u64,
         )
     }
@@ -1606,6 +2164,8 @@ mod tests {
         assert!(REDUCE_SHADER.contains("fn reduce_main"));
         assert!(FLASH_SHADER.contains("fn flash_main"));
         assert!(FLASH_STAGED_SHADER.contains("fn flash_staged_main"));
+        assert!(flash_f16_source().contains("fn flash_f16_main"));
+        assert!(flash_staged_f16_source().contains("fn flash_staged_f16_main"));
         // The mask sentinel and its guard must agree: scores
         // writes -1e30, the reduce skips anything at that depth.
         assert!(SCORES_SHADER.contains("-1.0e30"));
@@ -1614,6 +2174,76 @@ mod tests {
         assert!(FLASH_SHADER.contains("-1.0e29"));
         assert!(FLASH_STAGED_SHADER.contains("-1.0e30"));
         assert!(FLASH_STAGED_SHADER.contains("-1.0e29"));
+        assert!(flash_f16_source().contains("-1.0e30"));
+        assert!(flash_f16_source().contains("-1.0e29"));
+        assert!(flash_staged_f16_source().contains("-1.0e30"));
+        assert!(flash_staged_f16_source().contains("-1.0e29"));
+    }
+
+    #[test]
+    fn f16_flash_shaders_bind_packed_kv_and_unpack_on_read() {
+        // The f16 twins bind K and V as packed words and
+        // route every KV load through the shared unpack
+        // helper; the f32 forms must never carry the
+        // packed bindings (a swapped shader constant
+        // would otherwise compile and read garbage).
+        for src in [flash_f16_source(), flash_staged_f16_source()] {
+            assert!(src.contains("var<storage, read> keys: array<u32>;"));
+            assert!(src.contains("var<storage, read> values: array<u32>;"));
+            assert!(src.contains("fn kv_load_keys("));
+            assert!(src.contains("fn kv_load_values("));
+            assert!(src.contains("unpack2x16float"));
+            assert!(src.contains("kv_load_keys("));
+            assert!(src.contains("kv_load_values("));
+            assert!(!src.contains("__KV_LOAD__"));
+        }
+        for src in [FLASH_SHADER, FLASH_STAGED_SHADER] {
+            assert!(src.contains("var<storage, read> keys: array<f32>;"));
+            assert!(!src.contains("unpack2x16float"));
+        }
+        // The staged twin stages into the same f32 tile
+        // as the f32 form: the LDS set (and the pipeline
+        // availability bound) is shared, not doubled.
+        let staged_f16 = flash_staged_f16_source();
+        assert!(staged_f16.contains("var<workgroup> kv_tile: array<f32, 4128>;"));
+        assert!(staged_f16.contains("var<workgroup> q_tile: array<f32, 1024>;"));
+        assert!(staged_f16.contains("var<workgroup> s_tile: array<f32, 256>;"));
+    }
+
+    #[test]
+    fn f16_flash_shaders_validate_under_naga() {
+        // The adapterless-machine shader gate, on the
+        // spliced text the pipeline build consumes (see
+        // staged_shader_validates_under_naga for what
+        // this does and does not prove).
+        for (label, src) in [
+            ("flash f16", flash_f16_source()),
+            ("flash staged f16", flash_staged_f16_source()),
+        ] {
+            let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+                panic!("{label} WGSL parse failed: {}", e.emit_to_string(&src))
+            });
+            naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{label} Naga validation failed: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn kv_storage_defaults_and_byte_math() {
+        // The element sizes the whole format stands on.
+        assert_eq!(KvStorage::F32.elem_bytes(), 4);
+        assert_eq!(KvStorage::F16.elem_bytes(), 2);
+        // A state built through the plain constructor is
+        // f32: the trait path's construction, unchanged.
+        let pattern = [AttnLayerKind::Global, AttnLayerKind::Windowed { window: 8 }];
+        let state = DeviceKv::new(&pattern, 8);
+        assert_eq!(state.storage(), KvStorage::F32);
+        let state16 = DeviceKv::new_with_storage(&pattern, 8, KvStorage::F16);
+        assert_eq!(state16.storage(), KvStorage::F16);
     }
 
     #[test]

@@ -20,7 +20,7 @@ use wgpu_compute::kernels::k2_q6k_gemv::{shipped_shape as k2_shipped, K2Pipeline
 use wgpu_compute::kernels::k3_q5k_gemv::{K3Pipeline, FINISH_SCALE, FINISH_SOFTCAP};
 use wgpu_compute::kernels::k4_rmsnorm::K4Pipeline;
 use wgpu_compute::kernels::k5_rope_kv::K5Pipeline;
-use wgpu_compute::kernels::k6_attention::{AttendGeom, K6Pipeline, LayerKv};
+use wgpu_compute::kernels::k6_attention::{AttendGeom, K6Pipeline, KvStorage, LayerKv};
 use wgpu_compute::kernels::k8_head::K8Pipeline;
 use wgpu_compute::kernels::k9_attn_prep::{K9Pipeline, PrepArgs};
 use wgpu_compute::{WgpuCompute, WgpuError};
@@ -244,6 +244,7 @@ fn fused_prep_separate(gpu: &WgpuCompute, case: &PrepCase) -> (Vec<f32>, Vec<f32
                 q_out: &q_out,
                 kv_k: &kv_k,
                 kv_v: &kv_v,
+                kv_f16: false,
                 rows: case.rows,
                 q_heads: case.q_heads,
                 kv_heads: case.kv_heads,
@@ -311,6 +312,7 @@ fn fused_prep_concat(gpu: &WgpuCompute, case: &PrepCase) -> (Vec<f32>, Vec<f32>,
                 q_out: &q_out,
                 kv_k: &kv_k,
                 kv_v: &kv_v,
+                kv_f16: false,
                 rows: case.rows,
                 q_heads: case.q_heads,
                 kv_heads: case.kv_heads,
@@ -378,6 +380,7 @@ fn fused_prep_split(gpu: &WgpuCompute, case: &PrepCase) -> (Vec<f32>, Vec<f32>, 
                 q_out: &q_out,
                 kv_k: &kv_k,
                 kv_v: &kv_v,
+                kv_f16: false,
                 rows: case.rows,
                 q_heads: case.q_heads,
                 kv_heads: case.kv_heads,
@@ -455,6 +458,7 @@ fn check_flash(geom: AttendGeom, seed: u64) {
         k: ctx.upload_f32("flash kv k", &lcg(seed + 1, capacity * kv_width)),
         v: ctx.upload_f32("flash kv v", &lcg(seed + 2, capacity * kv_width)),
         capacity,
+        storage: KvStorage::F32,
     };
     let scores_buf = ctx.scratch_buffer(
         "flash scores",
@@ -652,6 +656,7 @@ fn check_flash_staged(geom: AttendGeom, seed: u64, two_pass: bool) {
         k: ctx.upload_f32("staged flash kv k", &lcg(seed + 1, capacity * kv_width)),
         v: ctx.upload_f32("staged flash kv v", &lcg(seed + 2, capacity * kv_width)),
         capacity,
+        storage: KvStorage::F32,
     };
     let out_flash = ctx.scratch_buffer("staged flash out fused", (geom.rows * q_width * 4) as u64);
     let out_staged =

@@ -49,6 +49,15 @@
 //! and stays the executable reference this fusion is proven
 //! against (the resident-session cross-path test and the
 //! crate's fused-kernel test both compare the two).
+//!
+//! An f16 form of the same preparation ([`PREP_F16_SHADER`])
+//! serves layers whose KV storage is packed f16
+//! ([`crate::kernels::k6_attention::KvStorage::F16`], selected at the backend from
+//! `WGPU_COMPUTE_KV_F16`, default off): identical norms,
+//! rotation, and slot law, with the KV writes converting
+//! on write through `pack2x16float`. K5's append has no
+//! f16 form: it writes the trait path's KV, which is f32
+//! by construction.
 
 use crate::device::GpuContext;
 use crate::error::{Result, WgpuError};
@@ -223,6 +232,214 @@ fn prep_main(@builtin(workgroup_id) wid: vec3<u32>,
 }
 "#;
 
+/// The f16 preparation shader: [`PREP_SHADER`] with the
+/// two KV bindings packed f16 (`array<u32>`, two values
+/// per word) and the three KV write sites converting on
+/// write through WGSL's `pack2x16float`. Everything else
+/// (the norms, the rotation, the slot law, the params) is
+/// the f32 form's, operation for operation; the Q output
+/// stays f32 in both forms. The write sites, per segment:
+///
+/// - The rotation path already computes each adjacent
+///   pair in one lane, so that lane packs its pair
+///   directly: `pack2x16float(vec2(r0, r1))` at word
+///   `(k_base + 2 * pair) / 2`.
+/// - The non-rotated K path and the V path produce one
+///   element per lane, so the head row is staged through
+///   the workgroup `vals` array (the same array the
+///   rotation path stages through) and the even lanes
+///   pack the pairs. Head dim is even and at most 128
+///   (this kernel's bound), so a pair never straddles a
+///   head row or a workgroup.
+///
+/// Word indices divide the element index by two, which
+/// is exact because every base is even: `kv_width` is
+/// even (refused by name at KV allocation, see
+/// [`crate::kernels::k6_attention::DeviceKv`]) and
+/// `head_dim` is even (this kernel's own prepare bound).
+/// Routed per layer from [`PrepArgs::kv_f16`]; an f32
+/// layer never binds it. Design and precision analysis:
+/// bench/f16-kv-2026-11-07.md.
+const PREP_F16_SHADER: &str = r#"
+struct PrepParams {
+    rows: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    start_pos: u32,
+    ring: u32,
+    rotate: u32,
+    base: f32,
+    eps: f32,
+    grid_x: u32,
+    q_stride: u32,
+    q_off: u32,
+    kv_stride: u32,
+    k_off: u32,
+    v_off: u32,
+    v_stride: u32,
+}
+
+@group(0) @binding(0) var<storage, read> q_in: array<f32>;
+@group(0) @binding(1) var<storage, read> k_in: array<f32>;
+@group(0) @binding(2) var<storage, read> v_in: array<f32>;
+@group(0) @binding(3) var<storage, read> q_w: array<f32>;
+@group(0) @binding(4) var<storage, read> k_w: array<f32>;
+@group(0) @binding(5) var<storage, read_write> q_out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> kv_k: array<u32>;
+@group(0) @binding(7) var<storage, read_write> kv_v: array<u32>;
+@group(0) @binding(8) var<uniform> params: PrepParams;
+
+var<workgroup> partials: array<f32, 256>;
+var<workgroup> inv_shared: f32;
+var<workgroup> vals: array<f32, 128>;
+
+@compute @workgroup_size(256)
+fn prep_f16_main(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let seg = wid.y * params.grid_x + wid.x;
+    let lane = lid.x;
+    let total_q = params.rows * params.q_heads;
+    let total_kv = params.rows * params.kv_heads;
+    // Whole-workgroup early out: every lane shares `seg`, so
+    // the exit is uniform and the barriers below stay legal.
+    if (seg >= total_q + 2u * total_kv) {
+        return;
+    }
+    let d = lane;
+    let kv_width = params.kv_heads * params.head_dim;
+
+    if (seg >= total_q + total_kv) {
+        // V segment: stage the head row through workgroup
+        // memory, then the even lanes pack each pair (the
+        // f32 form copies element-wise; the packed form
+        // cannot, since a word carries two elements).
+        let s2 = seg - total_q - total_kv;
+        let row = s2 / params.kv_heads;
+        let head = s2 % params.kv_heads;
+        if (d < params.head_dim) {
+            vals[d] = v_in[row * params.v_stride + params.v_off
+                + head * params.head_dim + d];
+        }
+        workgroupBarrier();
+        if (d < params.head_dim && d % 2u == 0u) {
+            let position = params.start_pos + row;
+            var slot = position;
+            if (params.ring != 0u) {
+                slot = position % params.ring;
+            }
+            let word = (slot * kv_width + head * params.head_dim + d) / 2u;
+            kv_v[word] = pack2x16float(vec2<f32>(vals[d], vals[d + 1u]));
+        }
+        return;
+    }
+
+    let is_q = seg < total_q;
+    var row = 0u;
+    var head = 0u;
+    var src_base = 0u;
+    if (is_q) {
+        row = seg / params.q_heads;
+        head = seg % params.q_heads;
+        src_base = row * params.q_stride + params.q_off + head * params.head_dim;
+    } else {
+        let s2 = seg - total_q;
+        row = s2 / params.kv_heads;
+        head = s2 % params.kv_heads;
+        src_base = row * params.kv_stride + params.k_off + head * params.head_dim;
+    }
+
+    // The norm, K4's distribution and tree for a row of
+    // head_dim: lane d holds channel d (lanes past the width
+    // hold zero), partials reduce 128, 64, ..., 1.
+    var x = 0.0;
+    if (d < params.head_dim) {
+        x = q_in[src_base + d];
+        if (!is_q) {
+            x = k_in[src_base + d];
+        }
+    }
+    partials[lane] = x * x;
+    workgroupBarrier();
+    var stride = 128u;
+    while (stride > 0u) {
+        if (lane < stride) {
+            partials[lane] += partials[lane + stride];
+        }
+        workgroupBarrier();
+        stride >>= 1u;
+    }
+    if (lane == 0u) {
+        inv_shared = inverseSqrt(partials[0] / f32(params.head_dim) + params.eps);
+    }
+    workgroupBarrier();
+    let inv = inv_shared;
+    var y = 0.0;
+    if (d < params.head_dim) {
+        var w = q_w[d];
+        if (!is_q) {
+            w = k_w[d];
+        }
+        y = x * inv * w;
+    }
+
+    let position = params.start_pos + row;
+    var slot = position;
+    if (params.ring != 0u) {
+        slot = position % params.ring;
+    }
+    let q_base = (row * params.q_heads + head) * params.head_dim;
+    let k_base = slot * kv_width + head * params.head_dim;
+
+    if (params.rotate == 1u) {
+        if (d < params.head_dim) {
+            vals[d] = y;
+        }
+        workgroupBarrier();
+        // One lane per adjacent pair: K5's rotation, its angle
+        // law and pairing, over the norm's own outputs. The
+        // pair lane packs both rotated elements into one
+        // word: the packed form of the f32 form's two
+        // element writes at the same addresses.
+        let pair = lane;
+        if (pair < params.head_dim / 2u) {
+            let angle = f32(position)
+                * pow(params.base, -2.0 * f32(pair) / f32(params.head_dim));
+            let c = cos(angle);
+            let s = sin(angle);
+            let a = vals[2u * pair];
+            let b = vals[2u * pair + 1u];
+            let r0 = a * c - b * s;
+            let r1 = a * s + b * c;
+            if (is_q) {
+                q_out[q_base + 2u * pair] = r0;
+                q_out[q_base + 2u * pair + 1u] = r1;
+            } else {
+                kv_k[(k_base + 2u * pair) / 2u] =
+                    pack2x16float(vec2<f32>(r0, r1));
+            }
+        }
+        return;
+    }
+    if (is_q) {
+        if (d < params.head_dim) {
+            q_out[q_base + d] = y;
+        }
+    } else {
+        // Non-rotated K: stage the normed row and pack
+        // pairs from the even lanes, like the V segment.
+        if (d < params.head_dim) {
+            vals[d] = y;
+        }
+        workgroupBarrier();
+        if (d < params.head_dim && d % 2u == 0u) {
+            kv_k[(k_base + d) / 2u] =
+                pack2x16float(vec2<f32>(vals[d], vals[d + 1u]));
+        }
+    }
+}
+"#;
+
 /// The buffers and geometry one fused preparation dispatch
 /// binds. Sources carry a row stride and a segment offset so
 /// one kernel serves separate projection buffers and a
@@ -260,6 +477,16 @@ pub struct PrepArgs<'a> {
     pub kv_k: &'a wgpu::Buffer,
     /// The layer's resident KV value buffer (written at slots).
     pub kv_v: &'a wgpu::Buffer,
+    /// Whether the KV buffers are packed f16
+    /// ([`crate::kernels::k6_attention::KvStorage::F16`]): selects the f16 preparation
+    /// form ([`PREP_F16_SHADER`], diag stamp
+    /// `k9_attn_prep_f16`), whose KV writes convert on
+    /// write. `false` runs the shipped form exactly; the
+    /// two forms share params, grid, and every non-KV
+    /// write. The caller takes this from the layer's own
+    /// storage (`LayerKv::storage`), so a buffer can
+    /// never be written through the wrong form.
+    pub kv_f16: bool,
     /// Chunk rows.
     pub rows: usize,
     /// Query head count.
@@ -343,33 +570,44 @@ impl K9PrepCall {
     }
 }
 
-/// The compiled K9 pipeline (one shader, one entry point).
+/// The compiled K9 pipelines (the shipped preparation
+/// and its f16 KV form; one shader and entry point each).
 #[derive(Debug)]
 pub struct K9Pipeline {
     prep: wgpu::ComputePipeline,
+    /// The f16 preparation form (see [`PREP_F16_SHADER`]),
+    /// built unconditionally like its sibling so a shader
+    /// defect fails at construction, not on first f16
+    /// use; it serves only calls whose [`PrepArgs::kv_f16`]
+    /// is set.
+    prep_f16: wgpu::ComputePipeline,
 }
 
 impl K9Pipeline {
-    /// Compile the K9 pipeline on `device`.
+    /// Compile the K9 pipelines on `device`.
     ///
     /// # Errors
     ///
-    /// [`WgpuError::Pipeline`] when wgpu rejects the shader.
+    /// [`WgpuError::Pipeline`] when wgpu rejects a shader.
     pub fn new(device: &wgpu::Device) -> Result<Self> {
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("k9 attention prep shader"),
-            source: wgpu::ShaderSource::Wgsl(PREP_SHADER.into()),
-        });
-        let prep = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("k9 attention prep pipeline"),
-            layout: None,
-            module: &module,
-            entry_point: Some("prep_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
-        dbg_log!("k9 pipeline built");
-        Ok(K9Pipeline { prep })
+        let build = |source: &str, entry: &'static str, label: &'static str| {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            })
+        };
+        let prep = build(PREP_SHADER, "prep_main", "k9 attention prep");
+        let prep_f16 = build(PREP_F16_SHADER, "prep_f16_main", "k9 attention prep f16");
+        dbg_log!("k9 pipelines built");
+        Ok(K9Pipeline { prep, prep_f16 })
     }
 
     /// Prepare a fused preparation dispatch over device
@@ -431,9 +669,19 @@ impl K9Pipeline {
         ];
         let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
         let params_buf = ctx.uniform_buffer("k9 prep params", &param_bytes);
+        // The args' storage flag picks the form: the two
+        // pipelines' bind group layouts differ only in
+        // the KV bindings' element type, and each layout
+        // is taken from its own pipeline, so a packed
+        // buffer can only ever bind to the packed shader.
+        let (pipeline, kernel) = if args.kv_f16 {
+            (&self.prep_f16, "k9_attn_prep_f16")
+        } else {
+            (&self.prep, "k9_attn_prep")
+        };
         let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("k9 prep bind group"),
-            layout: &self.prep.get_bind_group_layout(0),
+            layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -474,12 +722,12 @@ impl K9Pipeline {
             ],
         });
         Ok(K9PrepCall {
-            pipeline: self.prep.clone(),
+            pipeline: pipeline.clone(),
             bind_group,
             params: params_buf,
             grid,
             diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
-                kernel: "k9_attn_prep",
+                kernel,
                 rows: args.rows as u64,
                 cols: (args.q_heads * args.head_dim) as u64,
                 quant: "",
@@ -526,6 +774,55 @@ mod tests {
         assert!(PREP_SHADER.contains("slot = position % params.ring"));
         // The norm's inverse-RMS form is K4's.
         assert!(PREP_SHADER.contains("inverseSqrt(partials[0] / f32(params.head_dim)"));
+    }
+
+    #[test]
+    fn f16_shader_carries_the_same_laws_with_packed_writes() {
+        assert!(PREP_F16_SHADER.contains("fn prep_f16_main"));
+        // The shared laws, verbatim: the NORM pairing,
+        // the slot law, the norm's inverse-RMS form.
+        assert!(PREP_F16_SHADER.contains("2u * pair"));
+        assert!(PREP_F16_SHADER.contains("slot = position % params.ring"));
+        assert!(PREP_F16_SHADER.contains("inverseSqrt(partials[0] / f32(params.head_dim)"));
+        // The packed bindings and all three converting
+        // write sites: the rotation pair pack, the
+        // staged non-rotated K pack, and the staged V
+        // pack. The Q output stays an f32 element write
+        // in both forms.
+        assert!(PREP_F16_SHADER.contains("var<storage, read_write> kv_k: array<u32>;"));
+        assert!(PREP_F16_SHADER.contains("var<storage, read_write> kv_v: array<u32>;"));
+        assert!(PREP_F16_SHADER.contains("pack2x16float(vec2<f32>(r0, r1))"));
+        assert_eq!(
+            PREP_F16_SHADER
+                .matches("pack2x16float(vec2<f32>(vals[d], vals[d + 1u]))")
+                .count(),
+            2
+        );
+        assert!(PREP_F16_SHADER.contains("q_out[q_base + 2u * pair] = r0;"));
+        // The f32 form must never carry the packed
+        // bindings (a swapped constant would compile
+        // and silently corrupt the cache).
+        assert!(!PREP_SHADER.contains("pack2x16float"));
+        assert!(PREP_SHADER.contains("var<storage, read_write> kv_k: array<f32>;"));
+    }
+
+    #[test]
+    fn f16_shader_validates_under_naga() {
+        // The adapterless-machine shader gate (see the
+        // staged-flash test in k6_attention for what
+        // this does and does not prove).
+        let module = naga::front::wgsl::parse_str(PREP_F16_SHADER).unwrap_or_else(|e| {
+            panic!(
+                "prep f16 WGSL parse failed: {}",
+                e.emit_to_string(PREP_F16_SHADER)
+            )
+        });
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("prep f16 Naga validation failed: {e:?}"));
     }
 
     #[test]

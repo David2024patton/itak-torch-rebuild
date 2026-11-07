@@ -1032,6 +1032,66 @@ fn log_k21f_head_fallback(raw: Option<&str>) {
     }
 }
 
+/// Environment variable naming the resident session's
+/// f16 KV storage switch: the exact value `1` makes
+/// the resident session store its per-layer K and V
+/// buffers as packed f16 (two values per u32 word)
+/// instead of f32, halving the KV bytes and the
+/// attention read traffic (see
+/// `crate::kernels::k6_attention::KvStorage` and
+/// bench/f16-kv-2026-11-07.md). Operational config,
+/// not a compiled constant, and deliberately
+/// fail-closed on the K23 pattern: an unset variable,
+/// or any other value, keeps the storage f32. The
+/// default stays OFF until the card identity gate
+/// sequenced in the bench note passes (identity and
+/// golden on the real file with the switch on); the
+/// flip, when it comes, is a later decision recorded
+/// the same way the flash and K21F flips were. The
+/// switch governs the resident session only: the trait
+/// path's [`GpuKvState`](crate::kernels::k6_attention::GpuKvState)
+/// is f32 by construction, and the DFlash session owns
+/// separate KV buffers this switch does not reach.
+pub const KV_F16_ENV: &str = "WGPU_COMPUTE_KV_F16";
+
+/// Resolve the f16 KV storage switch from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off,
+/// including unset (the default is off in this lane;
+/// see [`KV_F16_ENV`]). The caller logs the refusal
+/// for an unrecognized value at construction
+/// ([`log_kv_f16_fallback`]), so the fail-closed
+/// position is visible in the run log, never silent.
+fn resolve_kv_f16(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
+/// Whether a raw f16 KV env value is one the resolver
+/// recognizes (`1` or `0` after trimming, or unset).
+/// An unrecognized value resolves off; the
+/// construction log names it, following the MMV band
+/// fallback pattern: a silent fallback in a storage
+/// switch is how a typo becomes a mystery precision
+/// change.
+fn kv_f16_value_recognized(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("1") | Some("0"))
+}
+
+/// Log, at construction, when the f16 KV env value is
+/// present but unrecognized and the switch therefore
+/// fails closed to off.
+fn log_kv_f16_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !kv_f16_value_recognized(raw) {
+            dbg_log!(
+                "kv f16 env {KV_F16_ENV}={value:?} is not a recognized \
+                 value (only \"1\" enables, \"0\" or unset keeps f32); \
+                 failing closed, KV storage is F32"
+            );
+        }
+    }
+}
+
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
 fn step_failed(step: &'static str, detail: impl Into<String>) -> GlimmerError {
     GlimmerError::StepFailed {
@@ -1180,6 +1240,20 @@ pub struct WgpuCompute {
     /// the block batch (see
     /// `session::try_mmv_q5k_finish`).
     k21f_head: bool,
+    /// Whether the resident session stores its KV as
+    /// packed f16 instead of f32: resolved once at
+    /// construction from [`KV_F16_ENV`], never a
+    /// constant compiled into the storage. `false` is
+    /// the shipped default (unset, explicit `0`, or a
+    /// fail-closed unrecognized value): the session's
+    /// buffers and dispatch shapes are then exactly
+    /// the f32 composition. `true` (the exact value
+    /// `1` only) selects f16 storage at session
+    /// construction; the conversion happens on write
+    /// in K9's f16 preparation form and on read inside
+    /// K6's f16 flash forms (see
+    /// bench/f16-kv-2026-11-07.md).
+    kv_f16: bool,
     mmv_max_rows: u32,
     mmv_bands: MmvBands,
     /// The calibration profile that governed this
@@ -1439,6 +1513,22 @@ impl WgpuCompute {
             "k21f head config: enabled={k21f_head} (env {K21F_HEAD_ENV}, \
              \"1\" or unset enables, \"0\" disables)"
         );
+        // The resident session's KV storage format:
+        // config only, read here (see KV_F16_ENV); the
+        // pipelines for both formats were built inside
+        // the K6 and K9 sets above, so a shader defect
+        // in the f16 forms fails at construction, not on
+        // first use. The default is off: f16 storage
+        // ships behind this switch until the card
+        // identity gate in bench/f16-kv-2026-11-07.md
+        // passes.
+        let kv_f16_raw = std::env::var(KV_F16_ENV).ok();
+        let kv_f16 = resolve_kv_f16(kv_f16_raw.as_deref());
+        log_kv_f16_fallback(kv_f16_raw.as_deref());
+        dbg_log!(
+            "kv storage config: f16={kv_f16} (env {KV_F16_ENV}, only \"1\" enables; \
+             unset or \"0\" keeps f32)"
+        );
         // The calibration profile for this adapter
         // (see crate::profile): measured routing values
         // from a prior calibration run on this exact
@@ -1526,6 +1616,7 @@ impl WgpuCompute {
             k21,
             k21_finish,
             k21f_head,
+            kv_f16,
             mmv_max_rows,
             mmv_bands,
             mmv_profile_key,
@@ -1888,6 +1979,23 @@ impl WgpuCompute {
     /// call at every shared-MMV-ceiling position.
     pub(crate) fn k21f_head(&self) -> bool {
         self.k21f_head
+    }
+
+    /// Whether the resident session stores its KV as
+    /// packed f16 instead of f32: config resolved at
+    /// construction from [`KV_F16_ENV`], never a
+    /// constant compiled into the storage seam.
+    /// `false` (the shipped default: unset, the exact
+    /// `0`, or a fail-closed unrecognized value) keeps
+    /// the session's KV buffers and dispatch shapes
+    /// byte-identical to the f32 composition; `true`
+    /// (the exact value `1` only) selects f16 storage
+    /// when a resident session is constructed on this
+    /// backend. The DFlash session and the trait path
+    /// never consult this switch (their KV is separate,
+    /// and f32 by construction).
+    pub(crate) fn kv_f16(&self) -> bool {
+        self.kv_f16
     }
 
     /// The largest batch row count at which the resident
@@ -2992,6 +3100,44 @@ mod tests {
         assert!(!k21f_head_value_recognized(Some("")));
         assert!(!k21f_head_value_recognized(Some("11")));
         assert!(!k21f_head_value_recognized(Some("on")));
+    }
+
+    #[test]
+    fn kv_f16_switch_resolution() {
+        // Unset: OFF. Unlike the flash and K21F routing
+        // switches, unset does NOT enable here: f16 KV
+        // storage ships default-off until the card
+        // identity gate in bench/f16-kv-2026-11-07.md
+        // passes, and the flip is a later decision.
+        assert!(!resolve_kv_f16(None));
+        // The exact value "1" (trimmed) is the only
+        // enabling position: the switch is fail-closed
+        // by design, so a typo keeps the proven f32
+        // storage, never the new format.
+        assert!(resolve_kv_f16(Some("1")));
+        assert!(resolve_kv_f16(Some(" 1 ")));
+        assert!(!resolve_kv_f16(Some("0")));
+        assert!(!resolve_kv_f16(Some(" 0 ")));
+        assert!(!resolve_kv_f16(Some("true")));
+        assert!(!resolve_kv_f16(Some("")));
+        assert!(!resolve_kv_f16(Some("11")));
+        assert!(!resolve_kv_f16(Some("on")));
+        assert_eq!(KV_F16_ENV, "WGPU_COMPUTE_KV_F16");
+    }
+
+    #[test]
+    fn kv_f16_value_recognition() {
+        // The recognized positions are exactly the
+        // ones the resolver gives a non-fallback
+        // meaning: unset, "1", "0" (each trimmed).
+        // The construction log names the rest.
+        assert!(kv_f16_value_recognized(None));
+        assert!(kv_f16_value_recognized(Some("1")));
+        assert!(kv_f16_value_recognized(Some(" 0 ")));
+        assert!(!kv_f16_value_recognized(Some("true")));
+        assert!(!kv_f16_value_recognized(Some("")));
+        assert!(!kv_f16_value_recognized(Some("11")));
+        assert!(!kv_f16_value_recognized(Some("on")));
     }
 
     #[test]

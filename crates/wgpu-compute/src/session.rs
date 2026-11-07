@@ -121,7 +121,7 @@ use crate::kernels::k23_q4k_mmq::K23Call;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
-use crate::kernels::k6_attention::{AttendGeom, DeviceKv, K6FlashCall};
+use crate::kernels::k6_attention::{AttendGeom, DeviceKv, K6FlashCall, KvStorage};
 use crate::kernels::k7_swiglu::K7Call;
 use crate::kernels::k8_head::{
     K8ArgmaxCall, K8FinishCall, K8GatherRowsCall, ARGMAX_GROUPS, GATHER_NORM_MAX_WIDTH,
@@ -3312,6 +3312,7 @@ impl ChunkPlan {
                             q_out: &scratch.q_normed,
                             kv_k: &kv_layer.k,
                             kv_v: &kv_layer.v,
+                            kv_f16: kv_layer.storage == KvStorage::F16,
                             rows,
                             q_heads: cfg.q_heads as usize,
                             kv_heads: cfg.kv_heads as usize,
@@ -3378,6 +3379,7 @@ impl ChunkPlan {
                             q_out: &scratch.q_normed,
                             kv_k: &kv_layer.k,
                             kv_v: &kv_layer.v,
+                            kv_f16: kv_layer.storage == KvStorage::F16,
                             rows,
                             q_heads: cfg.q_heads as usize,
                             kv_heads: cfg.kv_heads as usize,
@@ -4327,6 +4329,22 @@ impl<'a> ResidentSession<'a> {
             "session chunk config: cap={chunk_cap} rows (env {CHUNK_ROWS_ENV}, \
              default {DEFAULT_CHUNK_ROWS}, ceiling {MAX_CHUNK_ROWS})"
         );
+        // The KV storage format is the backend's
+        // resolved switch (WGPU_COMPUTE_KV_F16, see
+        // crate::compute): f32 unless the exact value
+        // "1" opened it. The session names its resolved
+        // format here as well as in the capture manifest,
+        // so a run log shows which layout the plans were
+        // built against.
+        let kv_storage = if backend.kv_f16() {
+            KvStorage::F16
+        } else {
+            KvStorage::F32
+        };
+        dbg_log!(
+            "session kv storage: {} (env WGPU_COMPUTE_KV_F16 resolved on the backend)",
+            kv_storage.name()
+        );
         dbg_log!(
             "session built: layers={} resident weight bytes={} vocab={} hidden={}",
             layers.len(),
@@ -4392,7 +4410,7 @@ impl<'a> ResidentSession<'a> {
             final_norm,
             output,
             layers,
-            kv: DeviceKv::new(&pattern, ring_capacity(cfg, chunk_cap)),
+            kv: DeviceKv::new_with_storage(&pattern, ring_capacity(cfg, chunk_cap), kv_storage),
             chunk_cap,
             position: 0,
             plans: HashMap::new(),
@@ -4434,7 +4452,15 @@ impl<'a> ResidentSession<'a> {
                 },
             })
             .collect();
-        self.kv = DeviceKv::new(&pattern, ring_capacity(&self.cfg, self.chunk_cap));
+        self.kv = DeviceKv::new_with_storage(
+            &pattern,
+            ring_capacity(&self.cfg, self.chunk_cap),
+            if self.backend.kv_f16() {
+                KvStorage::F16
+            } else {
+                KvStorage::F32
+            },
+        );
         self.plans.clear();
         self.position = 0;
         dbg_log!("session reset: kv cleared, position 0");
@@ -5088,6 +5114,7 @@ impl<'a> ResidentSession<'a> {
                 pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
                 pair("k21f_head", backend.k21f_head().to_string()),
                 pair("mmq_splitk", backend.mmq_splitk().describe()),
+                pair("kv_f16", backend.kv_f16().to_string()),
             ],
             model: None,
             session: vec![

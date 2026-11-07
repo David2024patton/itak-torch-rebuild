@@ -1,8 +1,13 @@
 # Mojo/MAX engine: design
 
 Status: Wave A landed, 2026-11-07, branch `mojo-max-engine`,
-engine version 1.2. The full record is
-`bench/mojo-engine-wave-a-2026-11-07.md`.
+engine version 1.2. Wave B is INTEGRATED BUT NOT CLOSED: the
+KV cache, attention, model forward, and generation loop are
+built and unit-proven, and the end-to-end golden verdict is
+still outstanding (see bench/mojo-engine-wave-b-2026-11-07.md
+for exactly what remains). The version stays 1.2 until the
+golden lands; the bump to 1.3 is part of that close. The full
+Wave A record is `bench/mojo-engine-wave-a-2026-11-07.md`.
 This branch starts the engine over on Mojo and MAX, on David's
 order ("pause rust and golang.. create a new branch and let's
 start over with Max and Mojo"). The Rust and Go trees are paused,
@@ -50,14 +55,25 @@ Each step lands as its own lane on this branch, proves parity
    The elementwise ops (norms, RoPE, SwiGLU, residual, softmax,
    final-logit transform, embedding gather) also landed
    (Lane A4), and the tokenizer (Lane A5, 16/16 prompt parity).
-3. **Attention.** Scores, masking, the sliding-window and global
-   layer split Glimmer needs, flash-style staging.
-4. **One full layer, then all layers.** Norms, projections,
-   MLP, residuals, proven per layer against the reference.
-5. **Generation loop.** Prefill and decode over the KV cache,
-   token-identical to the recorded golden.
-6. **Sampler.** Greedy first (the parity surface), then the
-   temperature/top-k/top-p family.
+3. **Attention. BUILT (Wave B, Lane B2), GPU-proven.** Scores,
+   masking, the sliding-window and global layer split, a
+   flash-style decoding kernel (online softmax, no
+   materialized score row); shared-memory K/V tile staging
+   and split-KV parallelism are still owed.
+4. **One full layer, then all layers. BUILT (Wave B, Lane
+   B3).** The full 52-layer forward runs per position on the
+   CPU path; rung 1 (synthetic, both layer kinds, Float64
+   reference) passes. Real-model rungs 2-3 were in flight at
+   the Wave B note; the layer is not called proven on the
+   real file until those land.
+5. **Generation loop. BUILT (Wave B, Lanes B1 + B4); GOLDEN
+   VERDICT OUTSTANDING.** Prefill and decode over the KV
+   cache, mock-proven; token-identity to the recorded golden
+   [13796, 26, 1573, 373, 290, 2167, 26899, 1212] is the
+   rung that closes the wave and has not landed yet.
+6. **Sampler. GREEDY LANDED (Wave B, Lane B4).** First-max
+   tie-break, EOS excluded per engine.rs. The
+   temperature/top-k/top-p family is still to come.
 7. **Serving seam.** Socket protocol parity with the paused
    platform, or MAX Serve; decided when step 6 lands.
 

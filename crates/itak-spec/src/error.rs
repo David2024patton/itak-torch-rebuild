@@ -8,15 +8,18 @@ use muse_glimmer::GlimmerError;
 /// Every way session creation or a round can refuse, named.
 #[derive(Debug)]
 pub enum SpecError {
-    /// The chosen drafting mode's machinery does not exist in this build.
-    /// N-gram needs its own state machinery and Medusa needs its heads
-    /// loader; neither is in this crate yet, and asking for either refuses
-    /// here instead of silently running something else.
+    /// The chosen drafting mode's machinery is not available on this
+    /// session. Medusa needs its heads loader, which is not in this
+    /// crate yet. N-gram's machinery exists ([`crate::NgramProposer`])
+    /// but is attached only through `SpecSession::new_ngram`; asking
+    /// the DFlash constructor for mode `ngram` refuses here instead of
+    /// silently running something else.
     ModeUnavailable {
         /// The mode name as it appears in configuration (`ngram`, `medusa`).
         mode: &'static str,
     },
-    /// DFlash mode was selected but no draft model was loaded.
+    /// A drafting mode was selected but no draft source was attached:
+    /// no draft model for DFlash mode, no proposer for n-gram mode.
     DraftNotLoaded,
     /// The attached draft declares an architecture other than `dflash`.
     DraftArchMismatch {

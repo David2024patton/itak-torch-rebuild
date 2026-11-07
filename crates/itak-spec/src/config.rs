@@ -15,8 +15,11 @@ pub enum SpecMode {
     Off,
     /// DFlash block drafting (the mode this crate implements).
     Dflash,
-    /// N-gram prompt-lookup drafting: named in the spec, machinery not in
-    /// this crate; selecting it refuses with `ModeUnavailable`.
+    /// N-gram prompt-lookup drafting: implemented by
+    /// [`crate::NgramProposer`], attached through
+    /// `SpecSession::new_ngram`. Selecting it through the DFlash
+    /// constructor (`SpecSession::new`) refuses with
+    /// `ModeUnavailable`, because the proposer is not attached there.
     Ngram,
     /// Medusa tree drafting: named in the spec, machinery not in this
     /// crate; selecting it refuses with `ModeUnavailable`.
@@ -31,6 +34,19 @@ impl SpecMode {
             SpecMode::Dflash => "dflash",
             SpecMode::Ngram => "ngram",
             SpecMode::Medusa => "medusa",
+        }
+    }
+
+    /// Parse the stable name back into a mode: the vocabulary the
+    /// runners' mode switches accept, [`DraftBackend::parse`]'s twin.
+    /// Unknown text returns `None`; the caller refuses by name.
+    pub fn parse(text: &str) -> Option<SpecMode> {
+        match text {
+            "off" => Some(SpecMode::Off),
+            "dflash" => Some(SpecMode::Dflash),
+            "ngram" => Some(SpecMode::Ngram),
+            "medusa" => Some(SpecMode::Medusa),
+            _ => None,
         }
     }
 }
@@ -175,5 +191,20 @@ mod tests {
         assert_eq!(DraftBackend::parse(""), None);
         assert_eq!(DraftBackend::Cpu.name(), "cpu");
         assert_eq!(DraftBackend::Gpu.name(), "gpu");
+    }
+
+    #[test]
+    fn spec_mode_names_round_trip_through_parse() {
+        for mode in [
+            SpecMode::Off,
+            SpecMode::Dflash,
+            SpecMode::Ngram,
+            SpecMode::Medusa,
+        ] {
+            assert_eq!(SpecMode::parse(mode.name()), Some(mode));
+        }
+        assert_eq!(SpecMode::parse("NGRAM"), None);
+        assert_eq!(SpecMode::parse(""), None);
+        assert_eq!(SpecMode::parse("prompt-lookup"), None);
     }
 }

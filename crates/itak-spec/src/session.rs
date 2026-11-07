@@ -21,13 +21,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
+use muse_glimmer::LayerInputCapture;
+
 use crate::config::{OnVerifyError, SpecConfig, SpecMode};
 use crate::diag::Diag;
 use crate::driver::{CpuTarget, TargetDriver};
 use crate::error::{Result, SpecError};
+use crate::ngram::NgramProposer;
 use crate::rng::Rng;
 use crate::sampler;
-use crate::speculator::{cache_refused, DflashSpeculator, DraftArm, Speculator};
+use crate::speculator::{cache_refused, DflashSpeculator, DraftArm, Proposal, Speculator};
 
 /// Cumulative session statistics, pullable at any time (the
 /// `spec_stats()` readout of SPEC-itak-spec Section 6.4).
@@ -91,12 +94,76 @@ pub struct RoundOutcome {
     pub stopped: bool,
 }
 
+/// The draft source attached to a session: the seam that admits a
+/// second proposer next to the DFlash speculator. The round loop
+/// drives either source through this one dispatch shape (the
+/// inherent `propose_block` both types carry, plus the
+/// [`Speculator`] trait's commit and capture calls), so the loop
+/// itself never learns which drafter it runs. Private on purpose:
+/// construction goes through `SpecSession::new` (DFlash) and
+/// `SpecSession::new_ngram` (n-gram), which each validate their
+/// own pairing of mode and source.
+enum DraftSource {
+    /// The DFlash block drafter (a separate draft model).
+    Dflash(DflashSpeculator),
+    /// The n-gram prompt-lookup proposer (no model; see
+    /// [`crate::ngram`]).
+    Ngram(NgramProposer),
+}
+
+impl DraftSource {
+    /// Maximum draft tokens one block can propose.
+    fn max_depth(&self) -> usize {
+        match self {
+            DraftSource::Dflash(spec) => spec.max_depth(),
+            DraftSource::Ngram(prop) => prop.max_depth(),
+        }
+    }
+
+    /// Propose up to `n` tokens after `pending` (see
+    /// `DflashSpeculator::propose_block` for the row contract).
+    fn propose_block(
+        &mut self,
+        pending: u32,
+        n: usize,
+        arm: DraftArm,
+        rng: &mut dyn FnMut() -> f64,
+    ) -> Result<Proposal> {
+        match self {
+            DraftSource::Dflash(spec) => spec.propose_block(pending, n, arm, rng),
+            DraftSource::Ngram(prop) => prop.propose_block(pending, n, arm, rng),
+        }
+    }
+
+    /// Hand the source the target rows a forward captured. The
+    /// n-gram source keeps the trait default (captures ignored):
+    /// it conditions on tokens only.
+    fn note_captures(
+        &mut self,
+        base_position: usize,
+        captures: &[LayerInputCapture],
+    ) -> Result<()> {
+        match self {
+            DraftSource::Dflash(spec) => spec.note_captures(base_position, captures),
+            DraftSource::Ngram(prop) => prop.note_captures(base_position, captures),
+        }
+    }
+
+    /// Tell the source exactly the newly committed tokens.
+    fn commit(&mut self, tokens: &[u32]) -> Result<()> {
+        match self {
+            DraftSource::Dflash(spec) => spec.commit(tokens),
+            DraftSource::Ngram(prop) => prop.commit(tokens),
+        }
+    }
+}
+
 /// A speculative decoding session over one target model, driven
 /// through the [`TargetDriver`] seam. The default driver is the
 /// CPU target path ([`CpuTarget`]).
 pub struct SpecSession<D: TargetDriver = CpuTarget> {
     driver: D,
-    speculator: Option<DflashSpeculator>,
+    speculator: Option<DraftSource>,
     capture_layers: Vec<usize>,
     config: SpecConfig,
     diag: Arc<dyn Diag>,
@@ -126,6 +193,38 @@ impl<D: TargetDriver> SpecSession<D> {
         config: SpecConfig,
         diag: Arc<dyn Diag>,
     ) -> Result<Self> {
+        Self::new_inner(driver, draft.map(DraftSource::Dflash), config, diag)
+    }
+
+    /// Create a session drafting with the n-gram prompt-lookup
+    /// proposer instead of a draft model (SPEC-itak-spec Section
+    /// 6.2, mode `ngram`): the no-training self-drafting arm. Same
+    /// validation discipline as [`Self::new`]: the proposer must be
+    /// present and agree with the target's vocabulary, and depth
+    /// must fit the proposer's maximum proposals and the round
+    /// bound. There are no capture layers: the proposer conditions
+    /// on tokens only. The DFlash constructor keeps refusing mode
+    /// `ngram` with `ModeUnavailable`; the proposer is attached
+    /// here, not there.
+    pub fn new_ngram(
+        driver: D,
+        draft: Option<NgramProposer>,
+        config: SpecConfig,
+        diag: Arc<dyn Diag>,
+    ) -> Result<Self> {
+        Self::new_inner(driver, draft.map(DraftSource::Ngram), config, diag)
+    }
+
+    /// Shared creation: validate the mode against the attached
+    /// draft source, then the source's geometry against the
+    /// target. Mode `off` needs no source and validates nothing
+    /// about one.
+    fn new_inner(
+        driver: D,
+        draft: Option<DraftSource>,
+        config: SpecConfig,
+        diag: Arc<dyn Diag>,
+    ) -> Result<Self> {
         let refuse = |err: SpecError| -> SpecError {
             diag.event("spec.refused", &format!("error={err}"));
             err
@@ -133,19 +232,61 @@ impl<D: TargetDriver> SpecSession<D> {
         if config.grammar_active {
             return Err(refuse(SpecError::GrammarConflict));
         }
-        match config.mode {
-            SpecMode::Ngram | SpecMode::Medusa => {
-                return Err(refuse(SpecError::ModeUnavailable {
-                    mode: config.mode.name(),
-                }));
-            }
-            SpecMode::Off | SpecMode::Dflash => {}
+        if config.mode == SpecMode::Medusa {
+            return Err(refuse(SpecError::ModeUnavailable {
+                mode: config.mode.name(),
+            }));
         }
         let mut capture_layers: Vec<usize> = Vec::new();
+        if config.mode == SpecMode::Ngram {
+            match &draft {
+                Some(DraftSource::Ngram(prop)) => {
+                    let tcfg = driver.config();
+                    if prop.vocab_size() != tcfg.vocab_size as usize {
+                        return Err(refuse(SpecError::DraftTargetMismatch {
+                            field: "vocab_size",
+                            expected: tcfg.vocab_size as usize,
+                            actual: prop.vocab_size(),
+                        }));
+                    }
+                    if config.depth == 0 || config.depth > prop.max_depth() {
+                        return Err(refuse(SpecError::DepthOutOfRange {
+                            n_max: config.depth,
+                            block_size: prop.max_depth() + 1,
+                        }));
+                    }
+                    if config.depth + 1 > config.max_round_tokens {
+                        return Err(refuse(SpecError::RoundBoundTooSmall {
+                            depth: config.depth,
+                            max_round_tokens: config.max_round_tokens,
+                        }));
+                    }
+                }
+                // The n-gram machinery is attached through
+                // new_ngram only; a DFlash speculator under mode
+                // ngram means the mode is not available on this
+                // session, the constructor's historical refusal.
+                Some(DraftSource::Dflash(_)) => {
+                    return Err(refuse(SpecError::ModeUnavailable {
+                        mode: config.mode.name(),
+                    }));
+                }
+                None => return Err(refuse(SpecError::DraftNotLoaded)),
+            }
+        }
         if config.mode == SpecMode::Dflash {
-            let spec = draft
-                .as_ref()
-                .ok_or_else(|| refuse(SpecError::DraftNotLoaded))?;
+            let spec = match &draft {
+                Some(DraftSource::Dflash(spec)) => spec,
+                Some(DraftSource::Ngram(_)) => {
+                    return Err(refuse(SpecError::SessionState {
+                        detail: "mode dflash needs a DFlash speculator; the attached draft \
+                                 source is an n-gram proposer (build the session through \
+                                 new_ngram with mode ngram)"
+                            .to_string(),
+                    }));
+                }
+                None => return Err(refuse(SpecError::DraftNotLoaded)),
+            };
             let dcfg = spec.config();
             let tcfg = driver.config();
             if dcfg.vocab_size != tcfg.vocab_size {
@@ -276,7 +417,7 @@ impl<D: TargetDriver> SpecSession<D> {
             });
         }
         let logits = match self.speculator.as_mut() {
-            Some(spec) if self.config.mode == SpecMode::Dflash => {
+            Some(DraftSource::Dflash(spec)) if self.config.mode == SpecMode::Dflash => {
                 let (logits, captures) = self
                     .driver
                     .forward_capturing(prompt, &self.capture_layers)
@@ -285,6 +426,20 @@ impl<D: TargetDriver> SpecSession<D> {
                     })?;
                 spec.note_captures(0, &captures)?;
                 spec.commit(prompt)?;
+                logits
+            }
+            Some(DraftSource::Ngram(prop)) if self.config.mode == SpecMode::Ngram => {
+                // No captures exist to stage: the proposer
+                // conditions on tokens only, so begin is a plain
+                // prefill plus the prompt commit that seeds its
+                // lookup history with exactly the prompt.
+                let logits = self
+                    .driver
+                    .forward(prompt)
+                    .map_err(|e| SpecError::TargetRefused {
+                        source: Box::new(e),
+                    })?;
+                prop.commit(prompt)?;
                 logits
             }
             _ => self

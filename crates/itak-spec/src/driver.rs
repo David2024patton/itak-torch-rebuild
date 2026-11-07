@@ -429,6 +429,59 @@ mod tests {
         assert_eq!(spec.cache_position(), PROMPT.len() + 15);
     }
 
+    /// The same seam carries the n-gram proposer: a session built
+    /// through `new_ngram` over the stub stays token-identical to
+    /// the plain stub session, and because the stub's stream is a
+    /// deterministic successor iteration (eventually periodic),
+    /// the proposer both speaks and gets accepted once the orbit
+    /// repeats a pair. This is the acceptance shape to expect on
+    /// repetitive real text; the fixture-target numbers live in
+    /// `bench/ngram-spec-2026-11-07.md`.
+    #[test]
+    fn stub_driver_carries_ngram_with_greedy_identity() {
+        let config = SpecConfig {
+            mode: crate::config::SpecMode::Ngram,
+            depth: 4,
+            ..SpecConfig::default()
+        };
+        let (stub, _) = StubTarget::new();
+        let proposer = crate::NgramProposer::new(crate::NgramConfig::default(), testkit::VOCAB)
+            .expect("proposer builds");
+        let mut spec =
+            SpecSession::new_ngram(stub, Some(proposer), config.clone(), Arc::new(NullDiag))
+                .expect("n-gram session over stub builds");
+        spec.begin(PROMPT).expect("begin");
+        let stream = spec.generate(300, &[]).expect("spec generate");
+
+        let (plain_stub, _) = StubTarget::new();
+        let mut plain = SpecSession::new(
+            plain_stub,
+            None,
+            SpecConfig {
+                mode: crate::config::SpecMode::Off,
+                ..config
+            },
+            Arc::new(NullDiag),
+        )
+        .expect("plain session over stub builds");
+        plain.begin(PROMPT).expect("begin");
+        let plain_stream = plain.generate(300, &[]).expect("plain generate");
+
+        assert_eq!(
+            stream, plain_stream,
+            "n-gram greedy identity through the driver seam"
+        );
+        assert_eq!(stream.len(), 300);
+        let stats = spec.stats();
+        assert!(stats.proposed > 0, "the proposer spoke through the seam");
+        assert!(
+            stats.accepted > 0,
+            "the periodic stub stream accepts n-gram proposals"
+        );
+        assert!(stats.accepted <= stats.proposed);
+        assert_eq!(spec.cache_position(), PROMPT.len() + 299);
+    }
+
     /// Rewind correctness and acceptance accounting, observed at
     /// the seam: after every round the stub's KV length equals
     /// the session's committed position and the round outcome's

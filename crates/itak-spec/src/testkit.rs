@@ -410,6 +410,22 @@ pub fn build_session(config: SpecConfig, block_size: u32) -> SpecSession {
     .expect("fixture session builds")
 }
 
+/// Build a session over the standard fixture target drafting with
+/// the n-gram proposer under `ngram` config. The caller's
+/// `SpecConfig` carries mode `ngram` and the depth.
+pub fn build_ngram_session(config: SpecConfig, ngram: crate::NgramConfig) -> SpecSession {
+    let compute = Rc::new(CpuCompute::new());
+    let fixture = build_target(Box::new(SharedCompute(compute.clone())));
+    let proposer = crate::NgramProposer::new(ngram, VOCAB).expect("fixture proposer builds");
+    SpecSession::new_ngram(
+        CpuTarget::new(fixture.model, compute),
+        Some(proposer),
+        config,
+        Arc::new(NullDiag),
+    )
+    .expect("fixture n-gram session builds")
+}
+
 /// A compute that delegates to a shared [`CpuCompute`] but, while armed,
 /// fails exactly the next attention call and then disarms itself. Used to
 /// force a one-shot verify refusal mid-round.

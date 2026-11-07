@@ -1,6 +1,9 @@
 //! itak-spec: the speculative decoding loop of the iTaK Torch engine
-//! (SPEC-itak-spec). A [`SpecSession`] runs DFlash block drafting against
-//! the Glimmer target with exact-output verification.
+//! (SPEC-itak-spec). A [`SpecSession`] runs block drafting against
+//! the Glimmer target with exact-output verification: DFlash block
+//! drafting from a separate draft model, or n-gram prompt-lookup
+//! drafting ([`NgramProposer`]) from the sequence itself, with no
+//! draft model at all.
 //!
 //! One round, per the spec's Section 4: the draft proposes up to `depth`
 //! tokens from the last committed position; the target verifies the whole
@@ -23,9 +26,9 @@
 //! configuration, never a constant. Diagnostics and cumulative stats are
 //! built in from birth ([`diag`], [`SpecStats`]).
 //!
-//! Known gaps, named rather than papered over: N-gram and Medusa drafting
-//! refuse with `ModeUnavailable` (their machinery is not in this crate);
-//! grammar-constrained speculation refuses with `GrammarConflict`. The
+//! Known gaps, named rather than papered over: Medusa drafting
+//! refuses with `ModeUnavailable` (its machinery is not in this
+//! crate); grammar-constrained speculation refuses with `GrammarConflict`. The
 //! loop drives its target through the [`driver::TargetDriver`] seam:
 //! the CPU driver ([`CpuTarget`]) proves the mechanism, and the
 //! GPU-resident driver ([`ResidentTarget`], TODO T-9.6) runs the
@@ -41,6 +44,7 @@ pub mod config;
 pub mod diag;
 pub mod driver;
 pub mod error;
+pub mod ngram;
 pub mod resident;
 pub mod rng;
 pub mod sampler;
@@ -55,6 +59,7 @@ pub use config::{DraftBackend, OnVerifyError, SpecConfig, SpecMode};
 pub use diag::{Diag, NullDiag, StderrDiag};
 pub use driver::{CpuTarget, TargetDriver};
 pub use error::{Result, SpecError};
+pub use ngram::{NgramConfig, NgramProposer};
 pub use resident::ResidentTarget;
 pub use rng::Rng;
 pub use session::{RoundOutcome, SpecSession, SpecStats};

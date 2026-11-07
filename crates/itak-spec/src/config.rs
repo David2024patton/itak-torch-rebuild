@@ -207,4 +207,28 @@ mod tests {
         assert_eq!(SpecMode::parse(""), None);
         assert_eq!(SpecMode::parse("prompt-lookup"), None);
     }
+
+    #[test]
+    fn runner_drafter_vocabulary_accepts_only_dflash_and_ngram() {
+        // The runners' `--drafter` guard (both `spec_generate`
+        // and `spec_generate_gpu`): parse with the shared
+        // parser, then admit exactly the two implemented
+        // draft sources. Modes that parse but are not draft
+        // sources on a runner (`off`, `medusa`), the GPU
+        // runner's separate `--draft` backend vocabulary
+        // (`gpu`, `cpu`), and unknown text all refuse by name
+        // in the runners; this pins the parse half of that
+        // guard beside the round-trip coverage above.
+        let admitted = |text: &str| {
+            matches!(
+                SpecMode::parse(text),
+                Some(SpecMode::Dflash | SpecMode::Ngram)
+            )
+        };
+        assert!(admitted("dflash"));
+        assert!(admitted("ngram"));
+        for refused in ["off", "medusa", "gpu", "cpu", "", "NGRAM", "prompt-lookup"] {
+            assert!(!admitted(refused), "--drafter={refused:?} must refuse");
+        }
+    }
 }

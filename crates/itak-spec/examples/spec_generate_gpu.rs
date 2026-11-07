@@ -4,7 +4,7 @@
 //! session, checked against a plain greedy run of the same
 //! resident session in the same process.
 //!
-//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>] [--draft=<gpu|cpu>] [--kv-capacity=<positions>]`
+//! Usage: `spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] [mode] [stream_file] [--bar=<tok/s>] [--draft=<gpu|cpu>] [--drafter=<dflash|ngram>] [--kv-capacity=<positions>]`
 //!
 //! `mode` is `both` (default), `plain` (run only phase A and write
 //! the stream to `stream_file`), or `spec` (run only phase B,
@@ -26,6 +26,21 @@
 //! side is the resident GPU forward throughout. See
 //! `bench/dflash-gpu-2026-11-03.md` for the draft GPU design.
 //!
+//! `--drafter` selects phase B's draft source (the `SpecMode`
+//! name, parsed by `SpecMode::parse`, in the CPU runner
+//! `spec_generate`'s style): `dflash` (default) loads the draft
+//! file and drafts with the DFlash model on the `--draft`
+//! device path; `ngram` never opens the draft file (the
+//! positional path is still required; pass any placeholder)
+//! and drafts with the n-gram prompt-lookup proposer through
+//! `SpecSession::new_ngram` over the same resident target, so
+//! the same IDENTITY, GOLDEN, and SPEED verdicts and the same
+//! round accounting measure the no-training self-drafting arm
+//! against the DFlash arms. `--draft` and `--kv-capacity`
+//! configure the DFlash arm only; in ngram mode they are still
+//! parsed and validated by name, and the run prints that they
+//! do not apply.
+//!
 //! The T-9.6 bar, printed as verdicts: the speculative stream is
 //! token-identical to the plain GPU stream at temperature 0
 //! (IDENTITY), the default prompt's first eight tokens match
@@ -42,6 +57,10 @@
 //! Server run (the GPU must be free; the resident session takes
 //! the card):
 //! `cargo run --release -p itak-spec --example spec_generate_gpu -- /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf /mnt/models/Muse-Glimmer-30B/dflash-Muse-Glimmer-30B-Q4_K_M.gguf 64 6`
+//!
+//! The n-gram arm needs no draft file (any placeholder stands
+//! in the positional slot):
+//! `cargo run --release -p itak-spec --example spec_generate_gpu -- /mnt/models/Muse-Glimmer-30B/Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf unused.gguf 64 6 "The capital of France is" both plain_stream.txt --drafter=ngram`
 
 use std::io::Write;
 use std::path::Path;
@@ -51,7 +70,8 @@ use std::time::Instant;
 
 use dflash::{DflashModel, StderrDiag as DflashStderrDiag, TensorSource as _};
 use itak_spec::{
-    sampler, DflashSpeculator, DraftBackend, ResidentTarget, SpecConfig, SpecSession, StderrDiag,
+    sampler, DflashSpeculator, DraftBackend, NgramConfig, NgramProposer, ResidentTarget,
+    SpecConfig, SpecMode, SpecSession, StderrDiag,
 };
 use muse_glimmer::TensorSource as GlimmerTensorSource;
 use tokenizer::{TokenType, Tokenizer, TokenizerData};
@@ -75,7 +95,7 @@ fn main() -> ExitCode {
     let (Some(target_path), Some(draft_path)) = (args.get(1), args.get(2)) else {
         eprintln!(
             "usage: spec_generate_gpu <target.gguf> <draft.gguf> [n_tokens] [depth] [prompt] \
-             [mode] [stream_file] [--bar=<tok/s>]"
+             [mode] [stream_file] [--bar=<tok/s>] [--drafter=<dflash|ngram>]"
         );
         return ExitCode::from(2);
     };
@@ -108,6 +128,20 @@ fn main() -> ExitCode {
             }
         },
     };
+    // The draft source: the CPU runner's `--drafter` flag,
+    // parsed by the shared `SpecMode::parse` (no second
+    // parser). An unknown or unimplemented value refuses by
+    // name before any model loads.
+    let drafter = match args.iter().find_map(|a| a.strip_prefix("--drafter=")) {
+        Some(text) => match SpecMode::parse(text) {
+            Some(m @ (SpecMode::Dflash | SpecMode::Ngram)) => m,
+            _ => {
+                eprintln!("FAIL: --drafter must be dflash or ngram, got {text:?}");
+                return ExitCode::from(2);
+            }
+        },
+        None => SpecMode::Dflash,
+    };
     // The GPU draft's resident KV capacity, in positions:
     // session config with the DflashSessionConfig default,
     // raised here for runs whose committed length outgrows
@@ -129,6 +163,7 @@ fn main() -> ExitCode {
         &stream_file,
         bar,
         draft_backend,
+        drafter,
         kv_capacity,
     ) {
         Ok(true) => ExitCode::SUCCESS,
@@ -215,38 +250,60 @@ fn run(
     stream_file: &str,
     bar: f64,
     draft_backend: DraftBackend,
+    drafter: SpecMode,
     kv_capacity: usize,
 ) -> Result<bool, String> {
     let total = Instant::now();
 
-    // Load the draft config (coverage gate enforced) and the
-    // target config. The draft WEIGHTS load inside phase B, in
-    // the selected arm's own form (f32 for the CPU arm, raw
-    // views for the GPU arm), so a GPU run never pays the CPU
-    // dequantization and a CPU run never uploads.
+    // Load the draft config (coverage gate enforced, dflash
+    // arm only) and the target config. The draft WEIGHTS load
+    // inside phase B, in the selected arm's own form (f32 for
+    // the CPU arm, raw views for the GPU arm), so a GPU run
+    // never pays the CPU dequantization and a CPU run never
+    // uploads. The n-gram arm never opens the draft file, the
+    // CPU runner's precedent: the positional path is still
+    // required by the usage line (pass any placeholder), and
+    // the run says out loud that the file is not loaded and
+    // that `--draft` / `--kv-capacity` do not apply to it.
     let t = Instant::now();
-    let draft_file = gguf::GgufFile::open(Path::new(draft_path)).map_err(|e| e.to_string())?;
-    let dcfg = itak_loader::load_dflash_config(&draft_file).map_err(|e| e.to_string())?;
-    let report = itak_loader::coverage_dflash(&draft_file, &dcfg);
-    println!(
-        "draft coverage: expected={} found={} missing={}",
-        report.expected_count(),
-        report.found_count(),
-        report.missing().len()
-    );
-    report.require_complete().map_err(|e| e.to_string())?;
+    let (draft_file, dcfg) = if drafter == SpecMode::Ngram {
+        println!(
+            "drafter: ngram prompt-lookup (draft file {draft_path} not loaded; \
+             --draft and --kv-capacity configure the dflash arm only)"
+        );
+        (None, None)
+    } else {
+        let draft_file = gguf::GgufFile::open(Path::new(draft_path)).map_err(|e| e.to_string())?;
+        let dcfg = itak_loader::load_dflash_config(&draft_file).map_err(|e| e.to_string())?;
+        let report = itak_loader::coverage_dflash(&draft_file, &dcfg);
+        println!(
+            "draft coverage: expected={} found={} missing={}",
+            report.expected_count(),
+            report.found_count(),
+            report.missing().len()
+        );
+        report.require_complete().map_err(|e| e.to_string())?;
+        (Some(draft_file), Some(dcfg))
+    };
 
     let target_file = gguf::GgufFile::open(Path::new(target_path)).map_err(|e| e.to_string())?;
     let gcfg = itak_loader::load_config(&target_file).map_err(|e| e.to_string())?;
-    println!(
-        "draft: block_size={} target_layers={:?} mask={} | target: layers={} hidden={} vocab={}",
-        dcfg.block_size,
-        dcfg.target_layers,
-        dcfg.mask_token_id,
-        gcfg.block_count,
-        gcfg.hidden,
-        gcfg.vocab_size
-    );
+    if let Some(dcfg) = &dcfg {
+        println!(
+            "draft: block_size={} target_layers={:?} mask={} | target: layers={} hidden={} vocab={}",
+            dcfg.block_size,
+            dcfg.target_layers,
+            dcfg.mask_token_id,
+            gcfg.block_count,
+            gcfg.hidden,
+            gcfg.vocab_size
+        );
+    } else {
+        println!(
+            "drafter: ngram prompt-lookup | target: layers={} hidden={} vocab={}",
+            gcfg.block_count, gcfg.hidden, gcfg.vocab_size
+        );
+    }
 
     let info = target_file.tokenizer().map_err(|e| e.to_string())?;
     let tok_model = target_file
@@ -268,7 +325,14 @@ fn run(
     }
     println!("prompt {prompt:?} -> ids {prompt_ids:?}");
     let eos: Vec<u32> = info.eos_token_id.into_iter().collect();
-    phase("load draft + tokenizer", t);
+    phase(
+        if drafter == SpecMode::Ngram {
+            "load target + tokenizer"
+        } else {
+            "load draft + tokenizer"
+        },
+        t,
+    );
 
     // ---- Phase A: plain greedy on the resident session (skipped in
     // spec-only mode, where the expected stream is read from the
@@ -329,69 +393,111 @@ fn run(
     }
 
     // ---- Phase B: the speculative session over the resident driver,
-    // temperature 0, the draft on the selected device path behind
-    // the Speculator seam.
+    // temperature 0. The dflash arm drafts with the DFlash model on
+    // the selected device path behind the Speculator seam; the
+    // n-gram arm drafts with the prompt-lookup proposer through
+    // `SpecSession::new_ngram` over the same resident target, with
+    // no draft model built at all.
     let t = Instant::now();
     let spec_stream = {
         // One leaked backend serves both residents (the
         // runner's memory discipline, as in phase A).
         let backend: &'static WgpuCompute =
             Box::leak(Box::new(WgpuCompute::new().map_err(|e| e.to_string())?));
-        let speculator = match draft_backend {
-            DraftBackend::Cpu => {
-                let dweights = itak_loader::load_dflash_weights(&draft_file, &dcfg)
+        let session = resident_session_on(backend, &target_file, &gcfg)?;
+        let (mut session, prefill_kind) = match drafter {
+            SpecMode::Ngram => {
+                let proposer = NgramProposer::new(NgramConfig::default(), gcfg.vocab_size as usize)
                     .map_err(|e| e.to_string())?;
-                let draft =
-                    DflashModel::with_diag(dcfg.clone(), dweights, Arc::new(DflashStderrDiag));
-                let source = itak_loader::DflashTensorSource::new(&target_file);
-                let embedding = source
-                    .tensor("token_embd.weight")
-                    .map_err(|e| e.to_string())?;
-                let output_head = source.tensor("output.weight").map_err(|e| e.to_string())?;
-                println!("draft backend: cpu (reference implementation)");
-                DflashSpeculator::new(draft, embedding, output_head)
-            }
-            DraftBackend::Gpu => {
-                let draft_source = itak_loader::GgufTensorSource::new(&draft_file);
-                let raw =
-                    DflashRawWeights::load(&draft_source, &dcfg).map_err(|e| e.to_string())?;
-                let target_source = itak_loader::GgufTensorSource::new(&target_file);
-                let embedding = GlimmerTensorSource::tensor(&target_source, "token_embd.weight")
-                    .map_err(|e| e.to_string())?;
-                let output_head = GlimmerTensorSource::tensor(&target_source, "output.weight")
-                    .map_err(|e| e.to_string())?;
-                let draft_session = DflashSession::with_diag(
-                    backend,
-                    &dcfg,
-                    &raw,
-                    Some(&embedding),
-                    Some(&output_head),
-                    DflashSessionConfig { kv_capacity },
-                    Arc::new(DflashStderrDiag),
+                let config = SpecConfig {
+                    mode: SpecMode::Ngram,
+                    depth,
+                    eos_tokens: eos,
+                    ..SpecConfig::default()
+                };
+                println!("drafter: ngram prompt-lookup (default proposer config)");
+                let session = SpecSession::new_ngram(
+                    ResidentTarget::new(session),
+                    Some(proposer),
+                    config,
+                    Arc::new(StderrDiag),
                 )
                 .map_err(|e| e.to_string())?;
-                println!("draft backend: gpu (resident draft session, kv_capacity={kv_capacity})");
-                DflashSpeculator::gpu(draft_session)
+                (session, "plain + proposer commit")
+            }
+            _ => {
+                let draft_file = draft_file
+                    .as_ref()
+                    .expect("the dflash arm loaded the draft file");
+                let dcfg = dcfg
+                    .as_ref()
+                    .expect("the dflash arm loaded the draft config");
+                let speculator = match draft_backend {
+                    DraftBackend::Cpu => {
+                        let dweights = itak_loader::load_dflash_weights(draft_file, dcfg)
+                            .map_err(|e| e.to_string())?;
+                        let draft = DflashModel::with_diag(
+                            dcfg.clone(),
+                            dweights,
+                            Arc::new(DflashStderrDiag),
+                        );
+                        let source = itak_loader::DflashTensorSource::new(&target_file);
+                        let embedding = source
+                            .tensor("token_embd.weight")
+                            .map_err(|e| e.to_string())?;
+                        let output_head =
+                            source.tensor("output.weight").map_err(|e| e.to_string())?;
+                        println!("draft backend: cpu (reference implementation)");
+                        DflashSpeculator::new(draft, embedding, output_head)
+                    }
+                    DraftBackend::Gpu => {
+                        let draft_source = itak_loader::GgufTensorSource::new(draft_file);
+                        let raw = DflashRawWeights::load(&draft_source, dcfg)
+                            .map_err(|e| e.to_string())?;
+                        let target_source = itak_loader::GgufTensorSource::new(&target_file);
+                        let embedding =
+                            GlimmerTensorSource::tensor(&target_source, "token_embd.weight")
+                                .map_err(|e| e.to_string())?;
+                        let output_head =
+                            GlimmerTensorSource::tensor(&target_source, "output.weight")
+                                .map_err(|e| e.to_string())?;
+                        let draft_session = DflashSession::with_diag(
+                            backend,
+                            dcfg,
+                            &raw,
+                            Some(&embedding),
+                            Some(&output_head),
+                            DflashSessionConfig { kv_capacity },
+                            Arc::new(DflashStderrDiag),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        println!(
+                            "draft backend: gpu (resident draft session, \
+                             kv_capacity={kv_capacity})"
+                        );
+                        DflashSpeculator::gpu(draft_session)
+                    }
+                };
+                let config = SpecConfig {
+                    depth,
+                    draft_backend,
+                    eos_tokens: eos,
+                    ..SpecConfig::default()
+                };
+                let session = SpecSession::new(
+                    ResidentTarget::new(session),
+                    Some(speculator),
+                    config,
+                    Arc::new(StderrDiag),
+                )
+                .map_err(|e| e.to_string())?;
+                (session, "capturing")
             }
         };
-        let session = resident_session_on(backend, &target_file, &gcfg)?;
-        let config = SpecConfig {
-            depth,
-            draft_backend,
-            eos_tokens: eos,
-            ..SpecConfig::default()
-        };
-        let mut session = SpecSession::new(
-            ResidentTarget::new(session),
-            Some(speculator),
-            config,
-            Arc::new(StderrDiag),
-        )
-        .map_err(|e| e.to_string())?;
         let tp = Instant::now();
         let pending = session.begin(&prompt_ids).map_err(|e| e.to_string())?;
         let prefill_s = tp.elapsed().as_secs_f64();
-        println!("spec prefill (resident, capturing): {prefill_s:.3}s, pending={pending}");
+        println!("spec prefill (resident, {prefill_kind}): {prefill_s:.3}s, pending={pending}");
         let _ = std::io::stdout().flush();
         let tg = Instant::now();
         let stream = session.generate(n_tokens, &[]).map_err(|e| e.to_string())?;

@@ -42,6 +42,11 @@ use crate::hash;
 
 /// Snapshot format magic.
 const MAGIC: &[u8; 4] = b"ITKV";
+/// Bytes one layer header costs on the wire: kind tag (1),
+/// reserved (3), window (8), first_position (8), row_count (8).
+/// The decoder bounds the declared layer count against this
+/// before the count is allowed to size an allocation.
+const LAYER_HEADER_LEN: usize = 28;
 /// The snapshot format version this build writes and reads.
 pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
 
@@ -66,30 +71,52 @@ impl KvGeometry {
         self.num_kv_heads * self.head_dim
     }
 
+    /// The row width as a checked product. `num_kv_heads` and
+    /// `head_dim` arrive from file bytes on the decode path, and
+    /// their product can overflow `usize`; every consumer that
+    /// trusts the width against stored data (the decoder, the
+    /// validator) goes through here and refuses by name instead
+    /// of wrapping in release builds or panicking in debug
+    /// builds. [`KvGeometry::row_floats`] stays for geometry
+    /// built from a live cache, whose fields the cache itself
+    /// already bounded.
+    fn row_floats_checked(&self) -> Result<usize, KvError> {
+        self.num_kv_heads
+            .checked_mul(self.head_dim)
+            .ok_or_else(|| KvError::InconsistentSnapshot {
+                detail: format!(
+                    "KV row width overflows: {} heads of dim {} have no usize product",
+                    self.num_kv_heads, self.head_dim
+                ),
+            })
+    }
+
     /// Payload bytes one token of prefix adds before any window
     /// saturates: every layer stores one K row and one V row per
-    /// token.
+    /// token. Saturating: this is a sizing estimate over geometry
+    /// fields, and a foreign geometry must saturate the estimate,
+    /// never wrap or panic it.
     #[must_use]
     pub fn bytes_per_token(&self) -> u64 {
-        let per_layer = 2 * self.row_floats() as u64 * 4;
-        per_layer * self.layers.len() as u64
+        let per_layer = (self.row_floats() as u64).saturating_mul(8);
+        per_layer.saturating_mul(self.layers.len() as u64)
     }
 
     /// Payload bytes a snapshot of a `tokens`-long prefix carries
     /// under this geometry: global layers store every row,
-    /// windowed layers store at most `window` rows.
+    /// windowed layers store at most `window` rows. Saturating,
+    /// for the same reason as [`KvGeometry::bytes_per_token`].
     #[must_use]
     pub fn stored_bytes_for(&self, tokens: usize) -> u64 {
-        let per_row = 2 * self.row_floats() as u64 * 4;
-        let rows: u64 = self
-            .layers
-            .iter()
-            .map(|kind| match kind {
+        let per_row = (self.row_floats() as u64).saturating_mul(8);
+        let rows: u64 = self.layers.iter().fold(0_u64, |total, kind| {
+            let layer_rows = match kind {
                 LayerKind::Global => tokens as u64,
                 LayerKind::Windowed { window } => tokens.min(*window) as u64,
-            })
-            .sum();
-        rows * per_row
+            };
+            total.saturating_add(layer_rows)
+        });
+        rows.saturating_mul(per_row)
     }
 
     /// The geometry of a live cache.
@@ -171,7 +198,7 @@ impl KvSnapshot {
                 "geometry has a zero KV head count or head dimension".to_string(),
             ));
         }
-        let row = geometry.row_floats();
+        let row = geometry.row_floats_checked()?;
         for (index, (kind, layer)) in geometry.layers.iter().zip(&self.layers).enumerate() {
             let expected_rows = match kind {
                 LayerKind::Global => self.token_count,
@@ -185,8 +212,18 @@ impl KvSnapshot {
                     layer.first_position, self.token_count
                 )));
             }
-            if layer.keys.len() != expected_rows * row || layer.values.len() != expected_rows * row
-            {
+            // Checked: token_count and the row width both arrive
+            // from file bytes, and their product can reach 2^64,
+            // where an unchecked multiply wrapped release builds
+            // to a length that matched the stored rows (accepting
+            // a forged snapshot) and panicked debug builds.
+            let expected_floats = expected_rows.checked_mul(row).ok_or_else(|| {
+                inconsistent(format!(
+                    "layer {index}: {expected_rows} rows of {row} floats overflow \
+                     the float count"
+                ))
+            })?;
+            if layer.keys.len() != expected_floats || layer.values.len() != expected_floats {
                 return Err(inconsistent(format!(
                     "layer {index}: holds {} key and {} value floats but {expected_rows} rows \
                      of {row} floats were expected",
@@ -408,6 +445,21 @@ impl KvSnapshot {
         let num_kv_heads = reader.u32()? as usize;
         let head_dim = reader.u32()? as usize;
         let layer_count = reader.u32()? as usize;
+        // Every layer header costs LAYER_HEADER_LEN bytes on the
+        // wire, so a count that cannot fit in the bytes remaining
+        // is impossible (the same argument the GGUF parser uses
+        // for metadata arrays). The refusal must land here, before
+        // the count sizes any allocation: an unvalidated count of
+        // u32::MAX otherwise demands tens of gigabytes up front
+        // and aborts the process, which no error handler can
+        // catch, ahead of every other trust check in the format.
+        if layer_count > reader.remaining() / LAYER_HEADER_LEN {
+            return Err(inconsistent(format!(
+                "snapshot declares {layer_count} layers but only {} bytes remain, \
+                 not enough for the layer headers alone",
+                reader.remaining()
+            )));
+        }
         let mut kinds = Vec::with_capacity(layer_count);
         let mut blocks = Vec::with_capacity(layer_count);
         for _ in 0..layer_count {
@@ -445,7 +497,7 @@ impl KvSnapshot {
             num_kv_heads,
             head_dim,
         };
-        let row = geometry.row_floats();
+        let row = geometry.row_floats_checked()?;
         let mut layers = Vec::with_capacity(layer_count);
         for (first_position, row_count) in blocks {
             let floats =
@@ -693,6 +745,100 @@ mod tests {
         snapshot
             .restore_checked(&geometry(), "model-a")
             .expect("matching checks restore");
+    }
+
+    #[test]
+    fn decode_refuses_a_layer_count_that_cannot_fit_the_buffer() {
+        // Critic panel regression (security seat, executed probe):
+        // a 32-byte header declaring layer_count = u32::MAX made
+        // the decoder pre-allocate ~68.7 GB from the unvalidated
+        // count and the process ABORTED (an allocation failure is
+        // not a catchable error). The count must be refused by
+        // name before it sizes any allocation: every layer header
+        // costs 28 bytes on the wire, so a count larger than the
+        // remaining bytes divided by 28 is impossible.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // fingerprint len
+        bytes.extend_from_slice(&0_u64.to_le_bytes()); // token count
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // KV heads
+        bytes.extend_from_slice(&1_u32.to_le_bytes()); // head dim
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // layer count
+        assert_eq!(bytes.len(), 32);
+        let error = KvSnapshot::from_bytes(&bytes).expect_err("must refuse by name");
+        assert!(
+            matches!(error, KvError::InconsistentSnapshot { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn decode_refuses_geometry_whose_row_products_overflow() {
+        // Critic panel regression (failure seat, executed probe):
+        // token_count 2^32 with heads x dim = 2^32 and zero stored
+        // rows was ACCEPTED by release builds (the expected-rows
+        // product in validate() wrapped to exactly the stored
+        // length) and PANICKED debug builds ("attempt to multiply
+        // with overflow"), so the two profiles disagreed about
+        // validity. Both profiles must refuse by name: the row
+        // width and the expected float counts are checked
+        // products, never wrapped ones.
+        let build = |heads: u32, dim: u32, token_count: u64| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(MAGIC);
+            bytes.extend_from_slice(&SNAPSHOT_FORMAT_VERSION.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes()); // fingerprint len
+            bytes.push(b'x');
+            bytes.extend_from_slice(&token_count.to_le_bytes());
+            bytes.extend_from_slice(&heads.to_le_bytes());
+            bytes.extend_from_slice(&dim.to_le_bytes());
+            bytes.extend_from_slice(&1_u32.to_le_bytes()); // one layer
+            bytes.push(0); // global layer
+            bytes.extend_from_slice(&[0, 0, 0]); // reserved
+            bytes.extend_from_slice(&0_u64.to_le_bytes()); // window
+            bytes.extend_from_slice(&0_u64.to_le_bytes()); // first position
+            bytes.extend_from_slice(&0_u64.to_le_bytes()); // row count
+            let sum = crate::hash::checksum(&bytes);
+            bytes.extend_from_slice(&sum.to_le_bytes());
+            bytes
+        };
+        // expected_rows * row = 2^32 * 2^32 = 2^64 overflows.
+        let error =
+            KvSnapshot::from_bytes(&build(65536, 65536, 1 << 32)).expect_err("must refuse by name");
+        assert!(
+            matches!(error, KvError::InconsistentSnapshot { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_geometry_whose_row_width_overflows() {
+        // The row width itself: two u32 wire fields cannot
+        // overflow a 64-bit usize product, but a snapshot built
+        // in memory (the fields are public, and validate() is
+        // the gate restore() trusts) can carry heads x dim with
+        // no usize product. validate() must refuse that by name
+        // too, not wrap (release) or panic (debug).
+        let foreign = KvSnapshot {
+            geometry: KvGeometry {
+                layers: vec![LayerKind::Global],
+                num_kv_heads: 1 << 32,
+                head_dim: 1 << 32,
+            },
+            model_fingerprint: "x".to_string(),
+            token_count: 0,
+            layers: vec![LayerSnapshot {
+                first_position: 0,
+                keys: Vec::new(),
+                values: Vec::new(),
+            }],
+        };
+        let error = foreign.validate().expect_err("must refuse by name");
+        assert!(
+            matches!(error, KvError::InconsistentSnapshot { .. }),
+            "{error}"
+        );
     }
 
     #[test]

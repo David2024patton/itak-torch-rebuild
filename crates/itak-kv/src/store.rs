@@ -589,11 +589,12 @@ fn parse_preamble(bytes: &[u8]) -> Result<Preamble, KvError> {
         detail: "entry token count does not fit in usize".to_string(),
     })?;
     let tokens_bytes = field(48);
-    if tokens_bytes != (token_count as u64).saturating_mul(4) {
+    let expected_tokens_bytes = (token_count as u64).saturating_mul(4);
+    if tokens_bytes != expected_tokens_bytes {
         return Err(KvError::InconsistentSnapshot {
             detail: format!(
-                "entry tokens_bytes is {tokens_bytes} but token count {token_count} implies {}",
-                token_count * 4
+                "entry tokens_bytes is {tokens_bytes} but token count {token_count} \
+                 implies {expected_tokens_bytes}"
             ),
         });
     }
@@ -695,6 +696,30 @@ mod tests {
             max_bytes: cap,
         })
         .expect("store opens")
+    }
+
+    #[test]
+    fn open_refuses_a_planted_garbage_entry_by_name() {
+        // Critic panel regression (failure seat): a planted
+        // 72-byte entry whose token_count is u64::MAX and whose
+        // tokens_bytes disagrees made parse_preamble's refusal
+        // message evaluate token_count * 4 unchecked, which
+        // PANICKED debug builds during open/rescan (release
+        // wrapped and printed a wrong number). The message now
+        // formats the saturating product the check already
+        // computed, so both profiles refuse the entry by name and
+        // the store opens with it unindexed.
+        let root = temp_root("planted");
+        fs::create_dir_all(&root).expect("root");
+        let mut bytes = vec![0_u8; PREAMBLE_LEN];
+        bytes[0..8].copy_from_slice(ENTRY_MAGIC);
+        bytes[8..12].copy_from_slice(&ENTRY_FORMAT_VERSION.to_le_bytes());
+        bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes()); // token count
+        bytes[48..56].copy_from_slice(&0_u64.to_le_bytes()); // tokens_bytes: disagrees
+        fs::write(root.join("planted.kv"), &bytes).expect("plant");
+        let store = open_store(&root, 1 << 30);
+        assert!(store.entries().is_empty());
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

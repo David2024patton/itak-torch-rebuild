@@ -1,0 +1,34 @@
+ITAK-TOKREF-1
+cases 8
+3
+the
+ids 1
+513
+4
+ the
+ids 1
+514
+5
+hello
+ids 4
+515 108 108 111
+3
+a a
+ids 2
+97 516
+7
+1234567
+ids 7
+49 50 51 52 53 54 55
+5
+café
+ids 5
+99 97 102 195 169
+20
+hi<|end_of_text|>bye
+ids 6
+104 105 518 98 121 101
+5
+don't
+ids 5
+100 111 110 39 116

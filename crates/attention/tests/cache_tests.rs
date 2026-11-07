@@ -214,3 +214,109 @@ fn empty_view_is_empty_and_indexes_to_none() {
     assert_eq!(view.key(0, 0), None);
     assert_eq!(view.window(), Some(8));
 }
+
+#[test]
+fn bulk_restore_matches_append_replay_bitwise() {
+    // The bulk constructor must land a windowed layer in exactly
+    // the state the append replay (zero rows for evicted
+    // positions, then the stored rows) produces: same views,
+    // same appended count, continuations identical.
+    let pattern = [
+        LayerKind::windowed(4).unwrap(),
+        LayerKind::Global,
+        LayerKind::windowed(4).unwrap(),
+    ];
+    let (kv_heads, head_dim) = (2usize, 3usize);
+    let row_len = kv_heads * head_dim;
+    let tokens = 9usize;
+    let rows_for = |layer: usize, position: usize| {
+        let k: Vec<f32> = (0..row_len)
+            .map(|i| (position * 100 + layer * 10 + i) as f32 / 7.0)
+            .collect();
+        let v: Vec<f32> = (0..row_len)
+            .map(|i| -((position * 50 + layer * 5 + i) as f32) / 3.0)
+            .collect();
+        (k, v)
+    };
+    // Replay: append every position in order.
+    let mut replay = KvCache::new(&pattern, kv_heads, head_dim).unwrap();
+    for position in 0..tokens {
+        for layer in 0..pattern.len() {
+            let (k, v) = rows_for(layer, position);
+            replay.append(layer, &k, &v, position).unwrap();
+        }
+    }
+    // Bulk: per layer, the visible rows only (windowed layers
+    // carry the last 4, tagged with their first position).
+    let mut bulk = KvCache::new(&pattern, kv_heads, head_dim).unwrap();
+    for (layer, kind) in pattern.iter().enumerate() {
+        let (first, count) = match kind {
+            LayerKind::Global => (0, tokens),
+            LayerKind::Windowed { window } => (tokens - tokens.min(*window), tokens.min(*window)),
+        };
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+        for position in first..first + count {
+            let (k, v) = rows_for(layer, position);
+            keys.extend_from_slice(&k);
+            values.extend_from_slice(&v);
+        }
+        bulk.restore_bulk(layer, first, &keys, &values).unwrap();
+    }
+    for layer in 0..pattern.len() {
+        assert_eq!(bulk.next_position(layer).unwrap(), tokens);
+        let want = replay.view(layer).unwrap();
+        let got = bulk.view(layer).unwrap();
+        assert_eq!(got.len(), want.len(), "layer {layer} visible rows");
+        for slot in 0..want.len() {
+            assert_eq!(got.position_at(slot), want.position_at(slot));
+            for head in 0..kv_heads {
+                assert_eq!(got.key(slot, head), want.key(slot, head));
+                assert_eq!(got.value(slot, head), want.value(slot, head));
+            }
+        }
+        // Both continue identically.
+        let (k, v) = rows_for(layer, tokens);
+        replay.append(layer, &k, &v, tokens).unwrap();
+        bulk.append(layer, &k, &v, tokens).unwrap();
+    }
+}
+
+#[test]
+fn bulk_restore_refusals_are_named() {
+    let pattern = [LayerKind::windowed(4).unwrap(), LayerKind::Global];
+    let mut cache = KvCache::new(&pattern, 1, 2).unwrap();
+    // More rows than the window holds.
+    let err = cache
+        .restore_bulk(0, 0, &[0.0; 10], &[0.0; 10])
+        .expect_err("too many windowed rows must refuse");
+    assert!(matches!(err, AttentionError::ShapeMismatch { .. }), "{err}");
+    // A global layer whose rows do not start at position zero.
+    let err = cache
+        .restore_bulk(1, 3, &[0.0; 4], &[0.0; 4])
+        .expect_err("global bulk restore must start at zero");
+    assert!(matches!(err, AttentionError::ShapeMismatch { .. }), "{err}");
+    // A non-fresh layer refuses, and the refusal names it.
+    cache
+        .append(0, &row(1, 2, 1.0), &row(1, 2, 1.0), 0)
+        .unwrap();
+    let err = cache
+        .restore_bulk(0, 0, &[0.0; 2], &[0.0; 2])
+        .expect_err("bulk restore into a used layer must refuse");
+    assert!(
+        matches!(
+            err,
+            AttentionError::BulkRestoreNotFresh {
+                layer: 0,
+                appended: 1
+            }
+        ),
+        "{err}"
+    );
+    // Mismatched key/value lengths refuse.
+    let mut fresh = KvCache::new(&pattern, 1, 2).unwrap();
+    let err = fresh
+        .restore_bulk(0, 0, &[0.0; 4], &[0.0; 2])
+        .expect_err("mismatched row sets must refuse");
+    assert!(matches!(err, AttentionError::ShapeMismatch { .. }), "{err}");
+}

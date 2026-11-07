@@ -473,6 +473,109 @@ impl KvCache {
         Ok(())
     }
 
+    /// Bulk-restore one layer from a snapshot's stored rows: the
+    /// rows for absolute positions
+    /// `first_position..first_position + rows` are installed
+    /// directly into their storage slots in one pass, and the
+    /// layer's appended count is set to `first_position + rows`.
+    /// This is the constructor a snapshot restore uses instead of
+    /// replaying [`KvCache::append`] once per position: a replay
+    /// must first append zero rows for every position a windowed
+    /// layer has already evicted (129,024 positions for a
+    /// full-context Glimmer snapshot, roughly 160 MB of host-side
+    /// zero traffic at a 4k-token prefix), while the bulk form
+    /// writes only the rows the snapshot actually carries.
+    ///
+    /// The installed state is exactly the replay's state. A
+    /// windowed layer's rows are `min(appended, window)` in
+    /// count, so when `first_position > 0` the stored rows fill
+    /// every ring slot (their count equals the window), and when
+    /// `first_position == 0` no position was ever evicted; in
+    /// both cases every slot a view can reach holds a stored
+    /// row, and the appended count lands where the replay's
+    /// last append put it. Slots a view cannot reach keep the
+    /// fresh layer's zeros, exactly as a replay leaves them.
+    ///
+    /// The layer must be fresh (nothing appended yet): a bulk
+    /// install overwrites slots unconditionally, so a layer with
+    /// existing positions is refused by name
+    /// ([`AttentionError::BulkRestoreNotFresh`]) rather than
+    /// silently merged. `keys` and `values` are the stored rows
+    /// flattened oldest first, each `num_kv_heads * head_dim`
+    /// long per row, and must agree in length.
+    ///
+    /// Refusals: an out-of-range layer
+    /// ([`AttentionError::InvalidLayer`]), mismatched or
+    /// non-row-multiple key/value lengths
+    /// ([`AttentionError::ShapeMismatch`]), a windowed layer
+    /// offered more rows than its window holds (a snapshot of
+    /// that layer can never carry them), or a non-fresh layer.
+    pub fn restore_bulk(
+        &mut self,
+        layer: usize,
+        first_position: usize,
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<(), AttentionError> {
+        let row = self.num_kv_heads * self.head_dim;
+        if keys.len() != values.len() || keys.len() % row != 0 {
+            return Err(AttentionError::ShapeMismatch {
+                what: "bulk restore rows",
+                expected: values.len(),
+                actual: keys.len(),
+            });
+        }
+        let rows = keys.len() / row;
+        let lc = self.layer_mut(layer)?;
+        if lc.appended != 0 {
+            return Err(AttentionError::BulkRestoreNotFresh {
+                layer,
+                appended: lc.appended,
+            });
+        }
+        match lc.kind {
+            LayerKind::Global => {
+                // A global layer stores every row from position
+                // zero; a snapshot of one always starts there.
+                if first_position != 0 {
+                    return Err(AttentionError::ShapeMismatch {
+                        what: "bulk restore first position (global layer)",
+                        expected: 0,
+                        actual: first_position,
+                    });
+                }
+                lc.keys.extend_from_slice(keys);
+                lc.values.extend_from_slice(values);
+            }
+            LayerKind::Windowed { window } => {
+                if rows > window {
+                    return Err(AttentionError::ShapeMismatch {
+                        what: "bulk restore rows (windowed layer)",
+                        expected: window,
+                        actual: rows,
+                    });
+                }
+                for r in 0..rows {
+                    let position = first_position + r;
+                    let slot = position % window;
+                    let start = slot * row;
+                    lc.keys[start..start + row].copy_from_slice(&keys[r * row..(r + 1) * row]);
+                    lc.values[start..start + row].copy_from_slice(&values[r * row..(r + 1) * row]);
+                    lc.slot_position[slot] = Some(position);
+                }
+            }
+        }
+        lc.appended = first_position + rows;
+        crate::diag!(
+            "bulk restore layer={} first_position={} rows={} appended={}",
+            layer,
+            first_position,
+            rows,
+            lc.appended
+        );
+        Ok(())
+    }
+
     /// A read view over one layer's currently visible positions,
     /// oldest first. This is what attention consumes.
     pub fn view(&self, layer: usize) -> Result<CacheView<'_>, AttentionError> {

@@ -298,6 +298,30 @@ impl GpuContext {
     ///
     /// [`WgpuError::Readback`] when the map fails or never fires.
     pub fn read_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Result<Vec<f32>> {
+        self.read_f32_at(buffer, 0, count)
+    }
+
+    /// Read `count` f32 values back from a storage buffer,
+    /// starting at element `first_float`: the ranged form of
+    /// [`GpuContext::read_f32`], for callers whose data does
+    /// not start at the buffer's head (the resident session's
+    /// KV capture reads a windowed layer's visible rows out of
+    /// the middle of its ring buffer). Same staging, copy, and
+    /// map path; a zero `count` reads nothing and submits
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::Readback`] when the map fails or never fires.
+    pub fn read_f32_at(
+        &self,
+        buffer: &wgpu::Buffer,
+        first_float: usize,
+        count: usize,
+    ) -> Result<Vec<f32>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         let bytes = (count * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback staging"),
@@ -310,7 +334,7 @@ impl GpuContext {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback copy"),
             });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
+        encoder.copy_buffer_to_buffer(buffer, (first_float * 4) as u64, &staging, 0, bytes);
         self.queue.submit([encoder.finish()]);
         self.map_staging(&staging, count)
     }

@@ -264,14 +264,18 @@ impl KvSnapshot {
         Ok(snapshot)
     }
 
-    /// Restore the snapshot into a fresh cache. Windowed layers
-    /// replay zero rows for the evicted positions ahead of the
-    /// first stored row, so every ring slot and the layer's
-    /// appended count end exactly where a cache that ran the
-    /// prefix itself would have put them; the zeros land only in
-    /// slots the stored rows are about to overwrite (or in slots
-    /// whose positions are already outside the window and never
-    /// read). The fresh cache is returned only on full success.
+    /// Restore the snapshot into a fresh cache. Each layer is
+    /// installed through the attention crate's bulk-restore
+    /// constructor ([`KvCache::restore_bulk`]), which writes the
+    /// stored rows directly into their ring slots: no append
+    /// replay, and in particular no zero rows replayed for the
+    /// positions a windowed layer has already evicted (the
+    /// replay this replaces cost roughly 160 MB of host-side
+    /// zero traffic at a 4k-token Glimmer prefix, and
+    /// seconds-scale work at full context). The bulk state is
+    /// exactly the replay's state (see the constructor's own
+    /// contract), and the fresh cache is returned only on full
+    /// success.
     ///
     /// # Errors
     ///
@@ -281,22 +285,8 @@ impl KvSnapshot {
         self.validate()?;
         let geometry = &self.geometry;
         let mut cache = KvCache::new(&geometry.layers, geometry.num_kv_heads, geometry.head_dim)?;
-        let row = geometry.row_floats();
-        let zero_row = vec![0.0_f32; row];
         for (index, layer) in self.layers.iter().enumerate() {
-            for position in 0..layer.first_position {
-                cache.append(index, &zero_row, &zero_row, position)?;
-            }
-            let rows = layer.rows(row);
-            for r in 0..rows {
-                let start = r * row;
-                cache.append(
-                    index,
-                    &layer.keys[start..start + row],
-                    &layer.values[start..start + row],
-                    layer.first_position + r,
-                )?;
-            }
+            cache.restore_bulk(index, layer.first_position, &layer.keys, &layer.values)?;
         }
         crate::diag!(
             "snapshot restored tokens={} layers={}",

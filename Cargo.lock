@@ -1057,6 +1057,7 @@ dependencies = [
  "cpu-compute",
  "dflash",
  "gguf",
+ "itak-kv",
  "muse-glimmer",
  "naga",
  "pollster",

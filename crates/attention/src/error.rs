@@ -98,6 +98,18 @@ pub enum AttentionError {
         /// The first position outside the checkpoint's saved range.
         limit: usize,
     },
+    /// A bulk restore was offered to a layer that already holds
+    /// appended positions. Bulk restore installs a snapshot's rows
+    /// directly into storage slots (no append replay), which is
+    /// only defined on a fresh layer: a non-empty layer's slots
+    /// and positions could not be told apart from the rows being
+    /// installed. Build a fresh cache (or a fresh layer) instead.
+    BulkRestoreNotFresh {
+        /// The layer being restored into.
+        layer: usize,
+        /// Positions the layer has already appended.
+        appended: usize,
+    },
     /// A rewind target outside `[base, appended]` for a layer: below
     /// the checkpoint's recorded base, or ahead of what the layer has
     /// actually appended. The rewind is refused whole; no layer is
@@ -181,6 +193,10 @@ impl fmt::Display for AttentionError {
             } => write!(
                 f,
                 "layer {layer} append at position {position} is outside the live checkpoint's saved range (first unsaved position {limit}); refusing so a later rewind cannot meet a slot it cannot restore"
+            ),
+            Self::BulkRestoreNotFresh { layer, appended } => write!(
+                f,
+                "layer {layer} already holds {appended} appended positions; bulk restore installs into a fresh layer only"
             ),
             Self::RewindOutOfRange {
                 layer,

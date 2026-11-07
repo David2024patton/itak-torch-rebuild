@@ -1794,6 +1794,26 @@ impl DiagAccumulator {
         self.manifest.as_ref().map(RunManifest::render_json)
     }
 
+    /// Stamp one (name, value) pair into the begun manifest's
+    /// session section, replacing an existing pair of the same
+    /// name: the post-construction reporting seam for session
+    /// events the construction-time manifest cannot know yet
+    /// (the prefix store's restored token count is the first
+    /// consumer). Capture-gated like every entry point in this
+    /// impl: outside capture mode, or before a manifest was
+    /// begun, it records nothing.
+    pub fn note_session_pair(&mut self, name: &str, value: String) {
+        if !self.is_capture() {
+            return;
+        }
+        if let Some(manifest) = &mut self.manifest {
+            match manifest.session.iter_mut().find(|(n, _)| n == name) {
+                Some(pair) => pair.1 = value,
+                None => manifest.session.push((name.to_string(), value)),
+            }
+        }
+    }
+
     /// The capture records recorded so far, in order.
     #[must_use]
     pub fn capture_records(&self) -> &[CaptureRecord] {

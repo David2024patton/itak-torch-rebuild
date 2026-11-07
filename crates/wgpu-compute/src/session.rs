@@ -73,6 +73,15 @@
 //! position, and the ring headroom bounds how far back a
 //! rewind may reach (see the method's own contract).
 //!
+//! The prefix-KV store seam (the `itak-kv` crate) hangs off
+//! the same facts: a snapshot's rows are in absolute-position
+//! order while the device ring is in slot order, so capture
+//! and install both route through the slot-remapping runs
+//! ([`prefix_slot_runs`]) rather than copying buffers. The
+//! seam is gated by itak-kv's fail-closed switch; with it off
+//! no session flow consults the store, captures, or installs,
+//! and construction is unchanged.
+//!
 //! Buffer discipline: activations ping-pong between two
 //! stream buffers, one chunk of rows at a time. The fused
 //! post-norm entry (K4) is what closes each half-layer: it
@@ -239,6 +248,188 @@ fn ring_capacity(cfg: &GlimmerConfig, chunk_cap: usize) -> usize {
     cfg.sliding_window as usize + chunk_cap - 1
 }
 
+/// The itak-kv snapshot geometry a session with `cfg` captures
+/// into and installs from: the config's layer pattern in
+/// `attention` kinds (a sliding layer's window is the config's
+/// sliding window, NOT the device ring capacity; the snapshot
+/// stores attention-visible rows, and the ring's chunk headroom
+/// is a device-side storage detail), with the session's KV row
+/// width (`kv_heads * key_length`; the session refuses configs
+/// whose key and value lengths differ, so one width serves
+/// both).
+fn prefix_geometry(cfg: &GlimmerConfig) -> itak_kv::KvGeometry {
+    let layers = cfg
+        .layers
+        .iter()
+        .map(|kind| match kind {
+            LayerKind::Global => attention::LayerKind::Global,
+            LayerKind::SlidingWindow => attention::LayerKind::Windowed {
+                window: cfg.sliding_window as usize,
+            },
+        })
+        .collect();
+    itak_kv::KvGeometry {
+        layers,
+        num_kv_heads: cfg.kv_heads as usize,
+        head_dim: cfg.key_length as usize,
+    }
+}
+
+/// The snapshot-visible range of one layer at session position
+/// `position`, as `(first_position, rows)`: every row for a
+/// global layer, the last `window` rows for a sliding one.
+/// This is the snapshot format's own rule
+/// ([`itak_kv::KvSnapshot::validate`] pins it), stated here so
+/// capture and install share one spelling.
+fn prefix_visible_range(kind: &LayerKind, window: usize, position: usize) -> (usize, usize) {
+    match kind {
+        LayerKind::Global => (0, position),
+        LayerKind::SlidingWindow => {
+            let rows = position.min(window);
+            (position - rows, rows)
+        }
+    }
+}
+
+/// One maximal run of consecutive device slots in a layer's
+/// stored rows: snapshot row `row` lands at device slot `slot`,
+/// and the run covers `count` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlotRun {
+    /// Index of the run's first stored (snapshot) row.
+    row: usize,
+    /// Device slot the run's first row lands in.
+    slot: usize,
+    /// Rows in the run.
+    count: usize,
+}
+
+/// Split one layer's stored rows into their device slot runs.
+/// A global layer addresses rows by absolute position, so its
+/// rows are always one run. A windowed layer slots position
+/// `p` at `p % ring` (the ring being `window + chunk_cap - 1`,
+/// see [`ring_capacity`]), so a stored range is at most two
+/// runs: the slots climb to the ring's end, wrap to zero, and
+/// climb again, because the stored count never exceeds the
+/// window and the window never exceeds the ring. This mapping
+/// is the whole install/capture correctness story: the host
+/// snapshot's rows are in absolute-position order, the device
+/// ring is in slot order, and copying one order into the
+/// other without this remap is the corruption the prefix-KV
+/// foundation note names.
+fn prefix_slot_runs(
+    kind: &LayerKind,
+    first_position: usize,
+    rows: usize,
+    ring: usize,
+) -> Vec<SlotRun> {
+    let mut runs: Vec<SlotRun> = Vec::new();
+    for r in 0..rows {
+        let position = first_position + r;
+        let slot = match kind {
+            LayerKind::Global => position,
+            LayerKind::SlidingWindow => position % ring,
+        };
+        if let Some(last) = runs.last_mut() {
+            if last.slot + last.count == slot {
+                last.count += 1;
+                continue;
+            }
+        }
+        runs.push(SlotRun {
+            row: r,
+            slot,
+            count: 1,
+        });
+    }
+    runs
+}
+
+/// The prefix seam's off position, as a named refusal under
+/// `step`: itak-kv's master switch is fail-closed (exact `1`
+/// enables), and a caller that reaches a prefix method with
+/// the switch off gets this refusal, never a silent no-op
+/// that looks like a miss.
+fn prefix_switch_refusal(step: &'static str) -> GlimmerError {
+    GlimmerError::StepFailed {
+        step,
+        detail: format!(
+            "the prefix store switch {} is not \"1\"; the prefix-KV seam is off \
+             (itak-kv config, fail-closed) and no prefix work happens",
+            itak_kv::ENABLE_ENV
+        ),
+    }
+}
+
+/// Validate a snapshot against a session's geometry, the
+/// caller's required model fingerprint, and the session's
+/// context capacity, returning the token count it would
+/// install. Pure (no session state is touched), so an install
+/// runs it BEFORE its reset: every refusal it can produce
+/// leaves the session exactly as it was. Refusals are the
+/// snapshot's own validation first (a self-disagreeing
+/// snapshot is refused before it is compared to anything),
+/// then geometry, then fingerprint, then the empty and
+/// oversized positions.
+fn validate_prefix_snapshot(
+    cfg: &GlimmerConfig,
+    expected_fingerprint: &str,
+    snapshot: &itak_kv::KvSnapshot,
+) -> Result<usize> {
+    snapshot.validate().map_err(|e| GlimmerError::StepFailed {
+        step: "prefix_install",
+        detail: e.to_string(),
+    })?;
+    let expected = prefix_geometry(cfg);
+    if snapshot.geometry != expected {
+        return Err(GlimmerError::StepFailed {
+            step: "prefix_install",
+            detail: itak_kv::KvError::GeometryMismatch {
+                detail: format!(
+                    "snapshot geometry ({} layers, {} KV heads, head dim {}) differs from \
+                     the session geometry ({} layers, {} KV heads, head dim {})",
+                    snapshot.geometry.layers.len(),
+                    snapshot.geometry.num_kv_heads,
+                    snapshot.geometry.head_dim,
+                    expected.layers.len(),
+                    expected.num_kv_heads,
+                    expected.head_dim,
+                ),
+            }
+            .to_string(),
+        });
+    }
+    if snapshot.model_fingerprint != expected_fingerprint {
+        return Err(GlimmerError::StepFailed {
+            step: "prefix_install",
+            detail: itak_kv::KvError::FingerprintMismatch {
+                expected: expected_fingerprint.to_string(),
+                actual: snapshot.model_fingerprint.clone(),
+            }
+            .to_string(),
+        });
+    }
+    if snapshot.token_count == 0 {
+        return Err(GlimmerError::StepFailed {
+            step: "prefix_install",
+            detail: "snapshot covers zero tokens; an empty prefix installs nothing and \
+                     is refused rather than resetting the session to no effect"
+                .to_string(),
+        });
+    }
+    if snapshot.token_count > cfg.context_length as usize {
+        return Err(GlimmerError::StepFailed {
+            step: "prefix_install",
+            detail: format!(
+                "snapshot covers {} tokens, past the session's context capacity of {} \
+                 positions; the prefix can never have been produced by this model",
+                snapshot.token_count, cfg.context_length
+            ),
+        });
+    }
+    Ok(snapshot.token_count)
+}
+
 /// Wrap a backend failure in the model's step-failure shape,
 /// under the same step names the trait path reports, so a
 /// refusal reads identically whichever path raised it.
@@ -296,6 +487,15 @@ pub struct SessionStats {
     pub dispatches: u64,
     /// Tokens forwarded.
     pub tokens: u64,
+    /// Prefix snapshots installed from the prefix store
+    /// (see [`ResidentSession::install_prefix_snapshot`]).
+    pub prefix_restores: u64,
+    /// Tokens those installs restored, in total: the prefill
+    /// work the store saved this session.
+    pub prefix_restored_tokens: u64,
+    /// Prefix snapshots this session captured (see
+    /// [`ResidentSession::capture_prefix_snapshot`]).
+    pub prefix_captures: u64,
 }
 
 /// A projection matrix after the session's one-time upload:
@@ -4280,6 +4480,10 @@ pub struct ResidentSession<'a> {
     chunk_cap: usize,
     /// Tokens forwarded so far (the KV's next position).
     position: usize,
+    /// The token count of the most recent prefix-store
+    /// install, when one happened: the receipt the store flow
+    /// reports (see [`ResidentSession::prefix_match`]).
+    prefix_match: Option<usize>,
     /// Cached chunk plans by row count.
     plans: HashMap<usize, ChunkPlan>,
     /// Accumulated counters.
@@ -4458,6 +4662,7 @@ impl<'a> ResidentSession<'a> {
             kv: DeviceKv::new_with_storage(&pattern, ring_capacity(cfg, chunk_cap), kv_storage),
             chunk_cap,
             position: 0,
+            prefix_match: None,
             plans: HashMap::new(),
             stats: SessionStats::default(),
             diag_acc,
@@ -4509,6 +4714,369 @@ impl<'a> ResidentSession<'a> {
         self.plans.clear();
         self.position = 0;
         dbg_log!("session reset: kv cleared, position 0");
+    }
+
+    /// Open the persistent prefix store from the environment,
+    /// when the seam is enabled: `None` when itak-kv's
+    /// fail-closed switch ([`itak_kv::ENABLE_ENV`]) is off, in
+    /// which case NO store is opened and no store directory is
+    /// created; `Some` of the open result when it is on. This
+    /// is the only door through which a session flow reaches
+    /// the store, so the switch-off path provably touches no
+    /// disk state.
+    pub fn prefix_store_open() -> Option<std::result::Result<itak_kv::PrefixStore, itak_kv::KvError>>
+    {
+        if !itak_kv::prefix_store_enabled() {
+            return None;
+        }
+        Some(itak_kv::PrefixStore::open(&itak_kv::StoreConfig::from_env()))
+    }
+
+    /// The token count the most recent prefix install restored
+    /// into this session, or `None` when no install has
+    /// happened: the store flow's receipt, also stamped into
+    /// the diag manifest's session section at install time
+    /// (capture level) as `prefix_restored_tokens`.
+    #[must_use]
+    pub fn prefix_match(&self) -> Option<usize> {
+        self.prefix_match
+    }
+
+    /// Capture the session's current device KV into an itak-kv
+    /// snapshot: the prefix-KV store's input, read back from
+    /// the device at the session's current position.
+    ///
+    /// Per layer, the snapshot carries exactly the visible
+    /// rows ([`prefix_visible_range`]): every row for a global
+    /// layer, the last `sliding_window` rows for a windowed
+    /// one, tagged with the first stored row's absolute
+    /// position. Windowed rows are read out of the device ring
+    /// (capacity `sliding_window + chunk_cap - 1`) through
+    /// [`prefix_slot_runs`], so the rows come back in absolute
+    /// position order, not slot order: the readback is a
+    /// slot-remapping read, one ranged read per contiguous
+    /// slot run (at most two runs per windowed layer).
+    ///
+    /// Gated by the prefix store switch: with the switch off
+    /// this refuses by name (see [`prefix_switch_refusal`])
+    /// instead of reading anything back. A session at position
+    /// zero has no prefix and refuses by name too.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `prefix_capture` for
+    /// the switch-off and empty refusals, under `attention`
+    /// for a layer with no device buffers, and the snapshot's
+    /// own validation refusal if the reassembled rows disagree
+    /// with the geometry (a divergence between the device
+    /// state's shape and the session's position bookkeeping,
+    /// named rather than stored).
+    pub fn capture_prefix_snapshot(
+        &mut self,
+        model_fingerprint: &str,
+    ) -> Result<itak_kv::KvSnapshot> {
+        if !itak_kv::prefix_store_enabled() {
+            return Err(prefix_switch_refusal("prefix_capture"));
+        }
+        if self.position == 0 {
+            return Err(GlimmerError::StepFailed {
+                step: "prefix_capture",
+                detail: "session position is 0; there is no prefix to capture".to_string(),
+            });
+        }
+        let ctx = self.backend.context();
+        let row = self.cfg.k_width() as usize;
+        let ring = ring_capacity(&self.cfg, self.chunk_cap);
+        let window = self.cfg.sliding_window as usize;
+        let mut layers = Vec::with_capacity(self.cfg.layers.len());
+        for (index, kind) in self.cfg.layers.iter().enumerate() {
+            let layer_kv = self.kv.layer(index, "attention")?;
+            let (first, rows) = prefix_visible_range(kind, window, self.position);
+            let mut keys = Vec::with_capacity(rows * row);
+            let mut values = Vec::with_capacity(rows * row);
+            for run in prefix_slot_runs(kind, first, rows, ring) {
+                keys.extend_from_slice(
+                    &ctx.read_f32_at(&layer_kv.k, run.slot * row, run.count * row)
+                        .map_err(|e| we(e, "attention"))?,
+                );
+                values.extend_from_slice(
+                    &ctx.read_f32_at(&layer_kv.v, run.slot * row, run.count * row)
+                        .map_err(|e| we(e, "attention"))?,
+                );
+            }
+            layers.push(itak_kv::LayerSnapshot {
+                first_position: first,
+                keys,
+                values,
+            });
+        }
+        let snapshot = itak_kv::KvSnapshot {
+            geometry: prefix_geometry(&self.cfg),
+            model_fingerprint: model_fingerprint.to_string(),
+            token_count: self.position,
+            layers,
+        };
+        snapshot.validate().map_err(|e| GlimmerError::StepFailed {
+            step: "prefix_capture",
+            detail: e.to_string(),
+        })?;
+        self.stats.prefix_captures += 1;
+        dbg_log!(
+            "prefix capture: {} tokens, {} layers, fingerprint {}",
+            snapshot.token_count,
+            snapshot.layers.len(),
+            snapshot.model_fingerprint
+        );
+        Ok(snapshot)
+    }
+
+    /// Install a verified prefix snapshot into the device KV
+    /// and set the session position to its token count, so the
+    /// next forward continues at the first unmatched token.
+    /// Returns the installed token count.
+    ///
+    /// Order of operations is the safety contract. The switch
+    /// is checked first; then the snapshot is validated whole
+    /// ([`validate_prefix_snapshot`]: self-consistency,
+    /// geometry against this session, the caller's required
+    /// fingerprint, non-empty, within the context capacity)
+    /// while the session is still untouched. Only a snapshot
+    /// that passes every check reaches the reset: the session
+    /// resets (fresh [`DeviceKv`], chunk plans dropped, since
+    /// plans bind the old KV buffers), each layer's buffers are
+    /// ensured for the installed count, and the stored rows
+    /// are uploaded through the queue's buffer-write path at
+    /// their remapped slots ([`prefix_slot_runs`]): global
+    /// rows at slots `0..n` in one run, windowed rows at
+    /// `position % ring_capacity` in at most two runs, where
+    /// the ring is `sliding_window + chunk_cap - 1`, NOT the
+    /// host cache's exact window. The writes ride the queue in
+    /// order ahead of the next forward's submission, so no
+    /// flush or readback is needed here.
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `prefix_install`
+    /// naming the refusal (switch off, inconsistent snapshot,
+    /// geometry mismatch, fingerprint mismatch, empty, or past
+    /// the context capacity), with the session left exactly as
+    /// it was; or a device failure from ensuring the KV
+    /// buffers after validation, which is a hardware refusal,
+    /// not a snapshot refusal.
+    pub fn install_prefix_snapshot(
+        &mut self,
+        snapshot: &itak_kv::KvSnapshot,
+        expected_fingerprint: &str,
+    ) -> Result<usize> {
+        if !itak_kv::prefix_store_enabled() {
+            return Err(prefix_switch_refusal("prefix_install"));
+        }
+        let matched = validate_prefix_snapshot(&self.cfg, expected_fingerprint, snapshot)?;
+        self.reset();
+        let ctx = self.backend.context();
+        let row = self.cfg.k_width() as usize;
+        let ring = ring_capacity(&self.cfg, self.chunk_cap);
+        for (index, layer_snap) in snapshot.layers.iter().enumerate() {
+            let kind = self.cfg.layers[index];
+            self.kv
+                .ensure_layer(ctx, index, row, snapshot.token_count, "attention")?;
+            let layer_kv = self.kv.layer(index, "attention")?;
+            let rows = layer_snap.rows(row);
+            for run in prefix_slot_runs(&kind, layer_snap.first_position, rows, ring) {
+                let k_slice = &layer_snap.keys[run.row * row..(run.row + run.count) * row];
+                let k_bytes: Vec<u8> = k_slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+                ctx.queue
+                    .write_buffer(&layer_kv.k, (run.slot * row * 4) as u64, &k_bytes);
+                let v_slice = &layer_snap.values[run.row * row..(run.row + run.count) * row];
+                let v_bytes: Vec<u8> = v_slice.iter().flat_map(|v| v.to_le_bytes()).collect();
+                ctx.queue
+                    .write_buffer(&layer_kv.v, (run.slot * row * 4) as u64, &v_bytes);
+            }
+        }
+        self.position = matched;
+        self.prefix_match = Some(matched);
+        self.stats.prefix_restores += 1;
+        self.stats.prefix_restored_tokens += matched as u64;
+        if let Some(acc) = &mut self.diag_acc {
+            acc.note_session_pair("prefix_restored_tokens", matched.to_string());
+        }
+        dbg_log!(
+            "prefix install: restored {matched} tokens (fingerprint {}); session position \
+             is {matched}, the next forward continues at the first unmatched token",
+            snapshot.model_fingerprint
+        );
+        Ok(matched)
+    }
+
+    /// Look `tokens` up in the prefix store and install the
+    /// longest verified hit: the session-level restore flow.
+    /// Returns the installed token count, or `None` when the
+    /// store does not serve this sequence.
+    ///
+    /// `None` is the fallback contract, never a failure: the
+    /// switch is off, the session is not at position zero (a
+    /// restore is a session-start act; installing mid-sequence
+    /// would reset state the caller is using), the store holds
+    /// no verified prefix of `tokens`, the store refuses its
+    /// read, or the hit fails this session's own install
+    /// validation (geometry, fingerprint, capacity). Each of
+    /// those is named on the diag channel, and in every `None`
+    /// case the session is left exactly as it was, so the
+    /// caller falls back to the normal cold prefill. A device
+    /// failure during an install that already passed
+    /// validation is the one hard error, matching
+    /// [`ResidentSession::install_prefix_snapshot`].
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] only for a device failure
+    /// during the install phase.
+    pub fn restore_prefix_from_store(
+        &mut self,
+        store: &mut itak_kv::PrefixStore,
+        tokens: &[u32],
+        model_fingerprint: &str,
+    ) -> Result<Option<usize>> {
+        if !itak_kv::prefix_store_enabled() {
+            return Ok(None);
+        }
+        if self.position != 0 {
+            dbg_log!(
+                "prefix restore skipped: session position is {}, not 0; a restore is a \
+                 session-start act and the live sequence is left alone",
+                self.position
+            );
+            return Ok(None);
+        }
+        let geometry = prefix_geometry(&self.cfg);
+        let hit = match store.lookup(
+            tokens,
+            Some(&geometry),
+            Some(model_fingerprint),
+            itak_kv::now_unix(),
+        ) {
+            Ok(hit) => hit,
+            Err(e) => {
+                dbg_log!("prefix restore skipped: store lookup refused: {e}; cold prefill serves");
+                return Ok(None);
+            }
+        };
+        let Some(hit) = hit else {
+            return Ok(None);
+        };
+        if hit.token_count == 0 {
+            return Ok(None);
+        }
+        if let Err(e) = validate_prefix_snapshot(&self.cfg, model_fingerprint, &hit.snapshot) {
+            dbg_log!("prefix restore skipped: the store hit fails install validation: {e}; cold prefill serves");
+            return Ok(None);
+        }
+        let matched = self.install_prefix_snapshot(&hit.snapshot, model_fingerprint)?;
+        Ok(Some(matched))
+    }
+
+    /// Capture the session's current prefix and store it under
+    /// `tokens`: the store flow's write half, called after a
+    /// cold prefill of exactly `tokens` completed. The session
+    /// position must equal the token count (the snapshot covers
+    /// positions `0..position` by construction, so storing it
+    /// under any other token list would file one sequence's KV
+    /// under another's key: refused by name).
+    ///
+    /// # Errors
+    ///
+    /// [`GlimmerError::StepFailed`] under `prefix_store` for
+    /// the switch-off, position, capture, and store refusals.
+    pub fn capture_and_store_prefix(
+        &mut self,
+        store: &mut itak_kv::PrefixStore,
+        tokens: &[u32],
+        model_fingerprint: &str,
+    ) -> Result<()> {
+        if !itak_kv::prefix_store_enabled() {
+            return Err(prefix_switch_refusal("prefix_store"));
+        }
+        if self.position != tokens.len() {
+            return Err(GlimmerError::StepFailed {
+                step: "prefix_store",
+                detail: format!(
+                    "session position {} does not equal the {} tokens to store under; a \
+                     snapshot covers exactly the forwarded prefix, so any other token \
+                     list would file one sequence's KV under another's key",
+                    self.position,
+                    tokens.len()
+                ),
+            });
+        }
+        let snapshot = self.capture_prefix_snapshot(model_fingerprint)?;
+        store
+            .put(tokens, &snapshot, itak_kv::now_unix())
+            .map_err(|e| GlimmerError::StepFailed {
+                step: "prefix_store",
+                detail: e.to_string(),
+            })?;
+        dbg_log!(
+            "prefix store: stored {} tokens under fingerprint {model_fingerprint}",
+            tokens.len()
+        );
+        Ok(())
+    }
+
+    /// Run one forward over `tokens` with the prefix store in
+    /// the loop: the whole session-level flow in one call.
+    ///
+    /// At session start (position zero, switch on) the longest
+    /// stored prefix of `tokens` is installed and only the
+    /// unmatched suffix is forwarded. A hit covering the whole
+    /// prompt is installed in full, then rewound by one
+    /// position and its last token re-forwarded, because a
+    /// forward's logits are produced by that token's forward
+    /// and no snapshot carries logits; the re-forward costs
+    /// one token and reproduces exactly the cold run's last
+    /// step. After the forward completes, the full prefix is
+    /// captured and stored (hit or miss), so a later session
+    /// can restore it; a capture or store failure there is
+    /// named on the diag channel and never fails a forward
+    /// whose logits are already computed.
+    ///
+    /// With the switch off, or mid-sequence, this is exactly
+    /// [`ResidentSession::forward`]: no store is consulted, no
+    /// capture happens, and the encode path is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// The same validation and step failures as
+    /// [`ResidentSession::forward`], plus a device failure
+    /// during a prefix install.
+    pub fn forward_with_prefix_store(
+        &mut self,
+        store: &mut itak_kv::PrefixStore,
+        tokens: &[u32],
+        model_fingerprint: &str,
+    ) -> Result<Vec<f32>> {
+        if !itak_kv::prefix_store_enabled() || self.position != 0 {
+            return self.forward(tokens);
+        }
+        let matched = self
+            .restore_prefix_from_store(store, tokens, model_fingerprint)?
+            .unwrap_or(0);
+        let logits = if matched > 0 && matched == tokens.len() {
+            // The whole prompt was restored; rewind one
+            // position and re-forward the last token so the
+            // returned logits are that token's forward product,
+            // exactly as the cold path computes them.
+            self.rewind_to(matched - 1)?;
+            self.forward(&tokens[matched - 1..])?
+        } else {
+            self.forward(&tokens[matched..])?
+        };
+        if let Err(e) = self.capture_and_store_prefix(store, tokens, model_fingerprint) {
+            dbg_log!(
+                "prefix store: post-forward capture/store failed: {e}; the forward's \
+                 result stands"
+            );
+        }
+        Ok(logits)
     }
 
     /// Run one forward over `tokens` and return the finished
@@ -5162,6 +5730,7 @@ impl<'a> ResidentSession<'a> {
                 pair("kv_f16", backend.kv_f16().to_string()),
                 pair("coopmat", backend.coopmat().to_string()),
                 pair("coopmat_v2", backend.coopmat_v2().to_string()),
+                pair("prefix_store", itak_kv::prefix_store_enabled().to_string()),
             ],
             model: None,
             session: vec![
@@ -5476,6 +6045,215 @@ mod tests {
         assert_eq!(ring_capacity(&cfg, 1), 2048);
         cfg.sliding_window = 4;
         assert_eq!(ring_capacity(&cfg, 64), 67);
+    }
+
+    /// A small config for the prefix seam's pure tests: two
+    /// layers (one sliding at window 4, one global), KV width
+    /// 2 heads x 3 = 6 floats, context 256.
+    fn prefix_cfg() -> GlimmerConfig {
+        GlimmerConfig {
+            name: None,
+            block_count: 2,
+            context_length: 256,
+            hidden: 512,
+            ffn_hidden: 1024,
+            q_heads: 32,
+            kv_heads: 2,
+            key_length: 3,
+            value_length: 3,
+            rope_freq_base: 500_000.0,
+            rope_freq_base_swa: 500_000.0,
+            rms_eps: 1e-5,
+            sliding_window: 4,
+            logit_softcap: 20.0,
+            logit_scale: 0.196_116_13,
+            vocab_size: 1024,
+            layers: vec![LayerKind::SlidingWindow, LayerKind::Global],
+            pattern_source: PatternSource::MeasuredFallback,
+        }
+    }
+
+    /// A self-consistent snapshot over `prefix_cfg`'s geometry
+    /// (or `geometry` when given) covering `tokens` positions.
+    fn prefix_snapshot(
+        tokens: usize,
+        geometry: Option<itak_kv::KvGeometry>,
+        fingerprint: &str,
+    ) -> itak_kv::KvSnapshot {
+        let geometry = geometry.unwrap_or_else(|| prefix_geometry(&prefix_cfg()));
+        let row = geometry.row_floats();
+        let layers = geometry
+            .layers
+            .iter()
+            .map(|kind| {
+                let (first, rows) = match kind {
+                    attention::LayerKind::Global => (0, tokens),
+                    attention::LayerKind::Windowed { window } => {
+                        let rows = tokens.min(*window);
+                        (tokens - rows, rows)
+                    }
+                };
+                itak_kv::LayerSnapshot {
+                    first_position: first,
+                    keys: vec![0.25; rows * row],
+                    values: vec![-0.5; rows * row],
+                }
+            })
+            .collect();
+        itak_kv::KvSnapshot {
+            geometry,
+            model_fingerprint: fingerprint.to_string(),
+            token_count: tokens,
+            layers,
+        }
+    }
+
+    #[test]
+    fn prefix_visible_range_is_the_snapshot_rule() {
+        // Global layers store everything from position zero.
+        assert_eq!(prefix_visible_range(&LayerKind::Global, 4, 0), (0, 0));
+        assert_eq!(prefix_visible_range(&LayerKind::Global, 4, 70), (0, 70));
+        // Windowed layers store the last `window` rows, tagged
+        // with the first stored row's absolute position.
+        assert_eq!(
+            prefix_visible_range(&LayerKind::SlidingWindow, 4, 3),
+            (0, 3)
+        );
+        assert_eq!(
+            prefix_visible_range(&LayerKind::SlidingWindow, 4, 4),
+            (0, 4)
+        );
+        assert_eq!(
+            prefix_visible_range(&LayerKind::SlidingWindow, 4, 70),
+            (66, 4)
+        );
+    }
+
+    #[test]
+    fn prefix_slot_runs_remap_the_windowed_ring() {
+        // Global: absolute addressing is one run, always.
+        assert_eq!(
+            prefix_slot_runs(&LayerKind::Global, 0, 70, 67),
+            vec![SlotRun {
+                row: 0,
+                slot: 0,
+                count: 70
+            }]
+        );
+        // Windowed, no wrap: positions 10..14 at ring 67.
+        assert_eq!(
+            prefix_slot_runs(&LayerKind::SlidingWindow, 10, 4, 67),
+            vec![SlotRun {
+                row: 0,
+                slot: 10,
+                count: 4
+            }]
+        );
+        // Windowed, the corruption case: a 70-token prefix at
+        // window 4 and ring 67 stores positions 66..70, whose
+        // slots wrap the ring end (66, 0, 1, 2). A naive slot
+        // order copy would put row 66 at slot 0; the runs put
+        // it at slot 66, alone, then the wrapped run at 0.
+        assert_eq!(
+            prefix_slot_runs(&LayerKind::SlidingWindow, 66, 4, 67),
+            vec![
+                SlotRun {
+                    row: 0,
+                    slot: 66,
+                    count: 1
+                },
+                SlotRun {
+                    row: 1,
+                    slot: 0,
+                    count: 3
+                },
+            ]
+        );
+        // Every windowed stored range at any position is at
+        // most two runs and covers its rows exactly, for any
+        // ring the chunk caps can produce.
+        for cap in [1usize, 4, 32, 64] {
+            let ring = 4 + cap - 1;
+            for position in 0..300usize {
+                let (first, rows) = prefix_visible_range(&LayerKind::SlidingWindow, 4, position);
+                let runs = prefix_slot_runs(&LayerKind::SlidingWindow, first, rows, ring);
+                assert!(runs.len() <= 2, "cap {cap} position {position}: {runs:?}");
+                assert_eq!(
+                    runs.iter().map(|r| r.count).sum::<usize>(),
+                    rows,
+                    "cap {cap} position {position}"
+                );
+                // Slots are exactly the positions' slots, in
+                // position order.
+                let slots: Vec<usize> = runs
+                    .iter()
+                    .flat_map(|r| (0..r.count).map(move |i| r.slot + i))
+                    .collect();
+                let want: Vec<usize> = (first..first + rows).map(|p| p % ring).collect();
+                assert_eq!(slots, want, "cap {cap} position {position}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_geometry_comes_from_the_config() {
+        let geometry = prefix_geometry(&prefix_cfg());
+        assert_eq!(
+            geometry.layers,
+            vec![
+                attention::LayerKind::Windowed { window: 4 },
+                attention::LayerKind::Global,
+            ]
+        );
+        assert_eq!(geometry.num_kv_heads, 2);
+        assert_eq!(geometry.head_dim, 3);
+        assert_eq!(geometry.row_floats(), 6);
+    }
+
+    #[test]
+    fn validate_prefix_snapshot_accepts_and_refuses_by_name() {
+        let cfg = prefix_cfg();
+        let snapshot = prefix_snapshot(10, None, "model-a");
+        assert_eq!(
+            validate_prefix_snapshot(&cfg, "model-a", &snapshot).expect("valid snapshot"),
+            10
+        );
+        // Fingerprint mismatch refuses and names both sides.
+        let err = validate_prefix_snapshot(&cfg, "model-b", &snapshot)
+            .expect_err("fingerprint mismatch must refuse");
+        assert!(err.to_string().contains("fingerprint"), "{err}");
+        // A self-consistent foreign geometry refuses as a
+        // geometry mismatch (head dim 9 instead of 3).
+        let foreign = itak_kv::KvGeometry {
+            layers: vec![
+                attention::LayerKind::Windowed { window: 4 },
+                attention::LayerKind::Global,
+            ],
+            num_kv_heads: 2,
+            head_dim: 9,
+        };
+        let snapshot = prefix_snapshot(10, Some(foreign), "model-a");
+        let err = validate_prefix_snapshot(&cfg, "model-a", &snapshot)
+            .expect_err("foreign geometry must refuse");
+        assert!(err.to_string().contains("geometry"), "{err}");
+        // Oversized: 300 tokens against a 256-position context.
+        let snapshot = prefix_snapshot(300, None, "model-a");
+        let err = validate_prefix_snapshot(&cfg, "model-a", &snapshot)
+            .expect_err("past the context capacity must refuse");
+        assert!(err.to_string().contains("context capacity"), "{err}");
+        // Empty refuses.
+        let snapshot = prefix_snapshot(0, None, "model-a");
+        let err = validate_prefix_snapshot(&cfg, "model-a", &snapshot)
+            .expect_err("an empty prefix must refuse");
+        assert!(err.to_string().contains("zero tokens"), "{err}");
+        // A self-disagreeing snapshot (a layer's rows cut
+        // short) refuses in its own validation, before any
+        // comparison.
+        let mut snapshot = prefix_snapshot(10, None, "model-a");
+        snapshot.layers[1].keys.truncate(4);
+        let err = validate_prefix_snapshot(&cfg, "model-a", &snapshot)
+            .expect_err("an inconsistent snapshot must refuse");
+        assert!(err.to_string().contains("inconsistent"), "{err}");
     }
 
     /// The resident fixture's layer shape: full QKV+gate

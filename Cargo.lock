@@ -405,6 +405,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "itak-kv"
+version = "0.1.0"
+dependencies = [
+ "attention",
+]
+
+[[package]]
 name = "itak-loader"
 version = "0.1.0"
 dependencies = [

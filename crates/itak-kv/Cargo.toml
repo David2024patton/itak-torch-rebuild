@@ -1,0 +1,13 @@
+[package]
+name = "itak-kv"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Versioned KV snapshot format and the persistent tiered prefix-KV store for the Torch token loop (TODO T-2.4): KV snapshots keyed by token prefix, verified on load, LRU-bounded by bytes, built on the attention crate's KvCache"
+
+[dependencies]
+attention = { path = "../attention" }
+
+[lints]
+workspace = true

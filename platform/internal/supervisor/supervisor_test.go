@@ -64,7 +64,7 @@ func runFakeEngine(socketPath string) {
 	}
 	// Like the real engine: the socket is pinned to 0600 after
 	// binding, and the platform refuses to dial anything looser.
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	if err := os.Chmod(socketPath, 0o600); err != nil { //nolint:gosec // test-controlled socket path from the test's own env, same as the Remove above
 		os.Exit(2)
 	}
 	for {

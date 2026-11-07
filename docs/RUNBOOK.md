@@ -71,6 +71,23 @@ torchd flags (the serving-relevant set; `torchd -h` prints them all): `-addr` (1
 
 Expected: an authenticated chat completion streams or returns from the engine; without the key, 401; with no engine configured, engine routes answer 503 `engine_unavailable`. The recorded smoke transcript is bench/serving-smoke-2026-10-30.md.
 
+Diagnostics switches. Every crate ships a diagnostic seam (the build law: debugging in every module from birth). The `*_DEBUG` switches share one shape, the gguf shape: the variable enables the seam when present with any value other than `0` or empty, checked on every call, so any binary linking the crate (the engine included) can be switched on with no rebuild and no code change. All default to off, and the off path is unchanged behavior. Refusals in gguf emit whether or not its switch is on.
+
+| Variable | Owner module | Default | Effect |
+| :--- | :--- | :--- | :--- |
+| `GGUF_DEBUG` | gguf | off | `[gguf][debug]` parse and load lines (errors emit unconditionally) |
+| `ITAK_LOADER_DEBUG` | itak-loader | off | `[itak-loader][debug]` loader bridge lines: config loads, coverage verdicts, coercion refusals |
+| `ATTENTION_DEBUG` | attention | off | `[attention::diag]` KV cache and attention lines |
+| `CPU_COMPUTE_DEBUG` | cpu-compute | off | `[cpu-compute]` backend lines: KV construction, attention positions, resets |
+| `WGPU_COMPUTE_DEBUG` | wgpu-compute | off | `[wgpu-compute]` backend lines: adapter selection, uploads, dispatches |
+| `TORCH_MATH_DEBUG` | torch-math | off | `[torch-math]` reference-math operation and shape lines |
+| `ITAK_KV_DEBUG` | itak-kv | off | `[itak-kv::diag]` prefix-KV store lines |
+| `TOKENIZER_DEBUG` | tokenizer | off | `[tokenizer]` load, fallback, and refusal lines |
+| `WGPU_COMPUTE_DIAG` | wgpu-compute | `off` | Per-dispatch kernel timing (`timing`) or timing plus run capture (`capture`); a separate system from `WGPU_COMPUTE_DEBUG`. `WGPU_COMPUTE_DIAG_OUT` names the capture output file |
+| `ITAK_KV_PREFIX_STORE` | itak-kv | off | Master switch for the prefix-KV store; `ITAK_KV_PREFIX_DIR` sets its root, `ITAK_KV_PREFIX_MAX_BYTES` its byte cap |
+| `TORCH_LOG_LEVEL` | platform (torchd) | `info` | Platform log verbosity: `debug`, `info`, `warn`, or `error` |
+
+One reach limit, stated plainly: a torchd-supervised engine child receives an allowlisted environment (PATH plus `ITAK_ENGINE_*` only, supervisor's `childEnv`), so the switches above reach a hand-run engine today but not a supervised one. Extending that allowlist is tracked follow-up work, not a silent gap.
 ## Deploy
 
 There is no automated deploy for this stack, and production Glimmer serving is down on the owner's explicit order until the engine work is finished; it stays down. Nothing in this repo restarts it. When serving is approved, a deploy is: build both binaries on the target host, start the engine (by hand or supervised by torchd), and run the Verify section against it. Rollback is the previous release binaries, or `git revert` and a rebuild; the pair holds no state that a rollback can strand (the response cache is in-memory, engine state is per-process).

@@ -483,9 +483,13 @@ enum ProjCall {
     /// Constructed only below [`GEMM_MIN_ROWS`], only
     /// when a rung below the matrix forms admits the
     /// batch, and only with a materialization buffer
-    /// supplied; the fused forms serve every other case,
-    /// and at shipped defaults (every rung closed) this
-    /// variant never appears in a plan.
+    /// supplied; the fused forms serve every other case.
+    /// At shipped defaults the MMV rung is open inside
+    /// its measured cells, so this variant appears
+    /// exactly where the band table admits the batch
+    /// (the K18 and chunked rungs stay closed); with
+    /// the MMV ceiling set to 1 every rung is closed
+    /// and this variant never appears in a plan.
     ActProj {
         /// The K7 activation dispatch (gate or SwiGLU,
         /// strided form).
@@ -1221,8 +1225,9 @@ fn small_batch_applies(backend: &WgpuCompute, batch: u32) -> bool {
 /// backend's routing table
 /// ([`WgpuCompute::mmv_routes`]) admits the batch
 /// only under the global ceiling (2 rows up to the
-/// resolved `mmv_max_rows`, default 1, which enables
-/// nothing) AND inside the (family, shape) cell of
+/// resolved `mmv_max_rows`, shipped default 16, the
+/// kernels' full band since the 2026-11-06 flip) AND
+/// inside the (family, shape) cell of
 /// measured wins from the 2026-11-06 sweep
 /// (bench/mmv-band-routing-2026-11-06.md). A batch
 /// the ceiling admits but the cell excludes is the
@@ -1611,7 +1616,8 @@ fn try_mmv_q5k(
 /// threshold, and for Q5_K (the one-row head) at any size,
 /// the GEMV kernels run. Three rungs sit between those:
 /// in the register-streaming band (2 rows up to the
-/// backend's configured `mmv_max_rows`, shipped off),
+/// backend's configured `mmv_max_rows`, shipped open
+/// at 16 and narrowed by the band table),
 /// the MMV register-streaming products serve their
 /// families first in that family's ladder when its band
 /// is open and the (family, shape) cell of the
@@ -1747,9 +1753,13 @@ fn prepare_proj(
 /// plain GEMV product, and the fused form is that same
 /// product with the activation folded in, in one dispatch
 /// instead of two, so the fused form serves it and
-/// nothing changes. At shipped defaults every rung is
-/// closed, so this is false at every batch and the fused
-/// forms serve everything, exactly as before routing.
+/// nothing changes. At shipped defaults the MMV rung is
+/// open inside its measured cells, so this is true
+/// exactly where the band table admits the batch (the
+/// K18 and chunked rungs stay closed); with the MMV
+/// ceiling set to 1 every rung is closed, this is false
+/// at every batch, and the fused forms serve everything,
+/// exactly as before routing.
 fn routed_rung_admits(
     backend: &WgpuCompute,
     family: MmvFamily,

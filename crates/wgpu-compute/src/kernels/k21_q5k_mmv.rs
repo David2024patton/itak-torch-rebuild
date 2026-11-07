@@ -106,12 +106,18 @@
 //! Routing is the session's, and it is config: the
 //! session prefers K21 inside the band only up to the
 //! backend's `mmv_max_rows` threshold (env
-//! `WGPU_COMPUTE_MMV_MAX_ROWS`, default 1, which is
-//! off: no batch qualifies). The wide-MMQ and K18
-//! precedents are the reason for the shipped default:
-//! an unproven kernel never enters the ladder by
-//! default. The server proof sequence that can move
-//! the default is in bench/mmv-q5k-2026-11-05.md.
+//! `WGPU_COMPUTE_MMV_MAX_ROWS`, shipped default 16,
+//! the full band, narrowed per shape by the band
+//! routing table). The default shipped at 1 (off: no
+//! batch qualified) under the wide-MMQ and K18
+//! precedent, that an unproven kernel never enters the
+//! ladder by default; the proof sequence in
+//! bench/mmv-q5k-2026-11-05.md and the baseline
+//! session's card verdict
+//! (bench/baseline-session-2026-11-06.md leg (d))
+//! discharged it, and the default moved on 2026-11-06.
+//! Setting the env to 1 restores the old posture
+//! exactly.
 
 use std::cell::RefCell;
 use std::collections::HashMap;

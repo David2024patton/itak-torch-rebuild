@@ -139,36 +139,57 @@ fn resolve_small_batch_max_rows(raw: Option<&str>) -> u32 {
 /// for Q6_K, K21 for Q5_K) over the K18 and GEMV
 /// forms, inside the band
 /// from 2 rows up. Operational config, not a compiled
-/// constant: set it to 16 to enable the MMV forms
-/// across their band (each kernel itself refuses past
-/// its cap), or leave it at the default to keep them
-/// out of the ladder entirely. The ceiling is only
+/// constant: the shipped default (16) enables the MMV
+/// forms across their band (each kernel itself refuses
+/// past its cap); set it to 1 to keep them out of the
+/// ladder entirely, or to any value in between to clip
+/// the band from above. The ceiling is only
 /// the outer gate: the band routing table below
 /// ([`MmvBands`]) narrows it per family and shape to
 /// the cells the 2026-11-06 sweep measured as wins.
-/// An unparsable value falls back to
-/// [`DEFAULT_MMV_MAX_ROWS`], with the fallback
-/// logged at construction.
+/// An unparsable value falls back to the closed
+/// ceiling ([`MMV_MAX_ROWS_FALLBACK`]), never to the
+/// shipped default, with the resolved value logged at
+/// construction.
 pub const MMV_MAX_ROWS_ENV: &str = "WGPU_COMPUTE_MMV_MAX_ROWS";
 
 /// The MMV row threshold when the environment does not
-/// override it: 1, which is OFF, since the ladder only
-/// routes batches of 2 or more rows to the MMV forms.
-/// The shipped default follows the wide-MMQ and K18
-/// precedent: an unproven kernel does not enter the
-/// ladder by default. The server proofs that can move
-/// this value are sequenced in
+/// override it: 16, the kernels' full band, so the MMV
+/// forms are in the ladder wherever the band table
+/// admits the batch. This default shipped at 1 (OFF:
+/// the ladder only routes batches of 2 or more rows)
+/// under the wide-MMQ and K18 precedent, that an
+/// unproven kernel does not enter the ladder by
+/// default. The server proofs sequenced in
 /// bench/mmv-prototype-2026-11-05.md (Q4_K),
 /// bench/mmv-q6k-2026-11-05.md (Q6_K) and
-/// bench/mmv-q5k-2026-11-05.md (Q5_K).
-pub const DEFAULT_MMV_MAX_ROWS: u32 = 1;
+/// bench/mmv-q5k-2026-11-05.md (Q5_K), then the band
+/// table of bench/mmv-band-routing-2026-11-06.md,
+/// discharged that burden, and the baseline session's
+/// card protocol (bench/baseline-session-2026-11-06.md
+/// leg (d)) passed at this ceiling at both depths with
+/// identity, golden, and byte-identical streams in
+/// every arm; the default moved to 16 on 2026-11-06.
+/// Rollback is one env value:
+/// `WGPU_COMPUTE_MMV_MAX_ROWS=1` restores the pre-flip
+/// ladder exactly.
+pub const DEFAULT_MMV_MAX_ROWS: u32 = 16;
+
+/// The MMV ceiling a present but unparsable env value
+/// resolves to: 1, closed. The fallback is deliberately
+/// NOT the shipped default: a typo in the environment
+/// must never widen routing, so the malformed case
+/// keeps the fail-closed value it resolved to before
+/// the default moved.
+const MMV_MAX_ROWS_FALLBACK: u32 = 1;
 
 /// Resolve the MMV row threshold from the raw
-/// environment value: a plain u32, or the default when
-/// unset or unparsable.
+/// environment value: a plain u32; the shipped default
+/// when unset; the closed fallback when present but
+/// unparsable.
 fn resolve_mmv_max_rows(raw: Option<&str>) -> u32 {
     match raw {
-        Some(s) => s.trim().parse::<u32>().unwrap_or(DEFAULT_MMV_MAX_ROWS),
+        Some(s) => s.trim().parse::<u32>().unwrap_or(MMV_MAX_ROWS_FALLBACK),
         None => DEFAULT_MMV_MAX_ROWS,
     }
 }
@@ -896,9 +917,12 @@ impl WgpuCompute {
         // device class refuses them), and built
         // unconditionally so a shader defect fails at
         // construction like K1's. Only their routing is
-        // config (see MMV_MAX_ROWS_ENV); the default
-        // keeps them out of the ladder until the server
-        // proof moves it.
+        // config (see MMV_MAX_ROWS_ENV); the shipped
+        // default opens the gate to the kernels' full
+        // band, the server proof having moved it on
+        // 2026-11-06 (bench/baseline-session-2026-11-06.md
+        // leg (d)), and the band table narrows the gate
+        // per family and shape from there.
         let k19 = K19Pipeline::new(&ctx.device)?;
         let k20 = K20Pipeline::new(&ctx.device)?;
         let k21 = K21Pipeline::new(&ctx.device)?;
@@ -1273,7 +1297,8 @@ impl WgpuCompute {
     /// the band from 2 rows up: config resolved at
     /// construction from [`MMV_MAX_ROWS_ENV`], never a
     /// constant compiled into the selection seam. The
-    /// shipped default (1) routes nothing. One threshold
+    /// shipped default (16) opens the gate to the
+    /// kernels' full band. One threshold
     /// serves the whole register-streaming family, so an
     /// A/B enables all three arms together; the band
     /// table ([`WgpuCompute::mmv_routes`]) then narrows
@@ -1870,22 +1895,34 @@ mod tests {
 
     #[test]
     fn mmv_max_rows_resolution() {
-        // Unset: the default, which is off (1 routes
-        // nothing, since the ladder's band starts at 2).
+        // Unset: the shipped default, 16, the kernels'
+        // full band. The default moved from 1 (off) to
+        // 16 on the baseline session's card verdict
+        // (bench/baseline-session-2026-11-06.md leg
+        // (d): cap 16 beat the unset control at both
+        // depths, 21.73 vs 17.39 and 16.33 vs 10.14,
+        // with identity and golden green in every arm).
         assert_eq!(resolve_mmv_max_rows(None), DEFAULT_MMV_MAX_ROWS);
-        assert_eq!(DEFAULT_MMV_MAX_ROWS, 1);
+        assert_eq!(DEFAULT_MMV_MAX_ROWS, 16);
         // Plain values pass through, including the
         // proof positions: 15 (the routed band under
         // GEMM_MIN_ROWS) and 16 (the kernels' full
-        // band).
+        // band). The explicit close still closes: a set
+        // "1" wins over the shipped default.
+        assert_eq!(resolve_mmv_max_rows(Some("1")), 1);
         assert_eq!(resolve_mmv_max_rows(Some("15")), 15);
         assert_eq!(resolve_mmv_max_rows(Some("16")), 16);
         assert_eq!(resolve_mmv_max_rows(Some(" 0 ")), 0);
-        // Unparsable values fall back to the default
-        // rather than failing backend construction.
-        assert_eq!(resolve_mmv_max_rows(Some("mmv")), DEFAULT_MMV_MAX_ROWS);
-        assert_eq!(resolve_mmv_max_rows(Some("")), DEFAULT_MMV_MAX_ROWS);
-        assert_eq!(resolve_mmv_max_rows(Some("-2")), DEFAULT_MMV_MAX_ROWS);
+        // Unparsable values fall back to the CLOSED
+        // ceiling, not the shipped default, rather than
+        // failing backend construction: a typo in the
+        // env must never widen routing. This is the
+        // fail-closed behavior the malformed case had
+        // before the default moved, kept deliberately.
+        assert_eq!(MMV_MAX_ROWS_FALLBACK, 1);
+        assert_eq!(resolve_mmv_max_rows(Some("mmv")), MMV_MAX_ROWS_FALLBACK);
+        assert_eq!(resolve_mmv_max_rows(Some("")), MMV_MAX_ROWS_FALLBACK);
+        assert_eq!(resolve_mmv_max_rows(Some("-2")), MMV_MAX_ROWS_FALLBACK);
     }
 
     #[test]
@@ -2088,20 +2125,37 @@ mod tests {
     #[test]
     fn mmv_routes_ceiling_composition() {
         let bands = default_mmv_bands();
-        // The shipped ceiling (1) routes nothing,
+        // The explicit close (ceiling 1) routes nothing,
         // whatever the table says.
         for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
             for shape in [MmvShape::Attn, MmvShape::Ffn, MmvShape::Kv] {
                 for batch in 2..=16 {
                     assert!(
-                        !bands.routes(DEFAULT_MMV_MAX_ROWS, family, shape, batch),
-                        "{} {} batch {batch} routed under the shipped ceiling",
+                        !bands.routes(1, family, shape, batch),
+                        "{} {} batch {batch} routed under the closed ceiling",
                         family.name(),
                         shape.name()
                     );
                 }
             }
         }
+        // The shipped ceiling is the kernels' full band
+        // (16 since the 2026-11-06 flip, on the baseline
+        // session's card verdict,
+        // bench/baseline-session-2026-11-06.md leg (d)),
+        // so at the default the ceiling itself clips
+        // nothing and routing is exactly the band
+        // table's: measured wins route, measured losses
+        // and holes do not.
+        assert_eq!(DEFAULT_MMV_MAX_ROWS, 16);
+        assert!(bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q4K, MmvShape::Attn, 6));
+        assert!(!bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q4K, MmvShape::Attn, 2));
+        assert!(!bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q4K, MmvShape::Ffn, 3));
+        assert!(bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q4K, MmvShape::Kv, 2));
+        assert!(!bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q4K, MmvShape::Kv, 12));
+        assert!(bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q5K, MmvShape::Kv, 16));
+        assert!(bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q6K, MmvShape::Kv, 12));
+        assert!(!bands.routes(DEFAULT_MMV_MAX_ROWS, MmvFamily::Q6K, MmvShape::Attn, 16));
         // A ceiling clips cells from above: at cap 4
         // the Q4_K attention cell (6-12) admits
         // nothing, while Q6_K attention admits its

@@ -54,17 +54,28 @@ run_arm() {
     tail -2 "$OUTDIR/$label.log"
 }
 
+# Since the 2026-11-06 default flip the UNSET MMV
+# ceiling resolves to 16 (the shipped default), so the
+# control arm pins the gate closed explicitly to keep
+# measuring the pre-flip ladder, and the k18 and
+# chunked arms pin it closed too, so each of those
+# arms measures only its own rung. The mmv arm sets
+# the ceiling it measures; it equals the shipped
+# default, and is set anyway so the arm's CSV records
+# the value it ran under.
 run_arm control \
     -u WGPU_COMPUTE_SMALL_BATCH_MAX_ROWS \
-    -u WGPU_COMPUTE_MMV_MAX_ROWS \
+    WGPU_COMPUTE_MMV_MAX_ROWS=1 \
     -u WGPU_COMPUTE_WIDE_MIN_ROWS \
     -u "$CHUNK_ENV"
 run_arm k18 \
-    WGPU_COMPUTE_SMALL_BATCH_MAX_ROWS=16
+    WGPU_COMPUTE_SMALL_BATCH_MAX_ROWS=16 \
+    WGPU_COMPUTE_MMV_MAX_ROWS=1
 run_arm mmv \
     WGPU_COMPUTE_MMV_MAX_ROWS=16
 run_arm chunked \
-    "$CHUNK_ENV=16"
+    "$CHUNK_ENV=16" \
+    WGPU_COMPUTE_MMV_MAX_ROWS=1
 
 echo "done: $OUTDIR"
 ls -la "$OUTDIR"

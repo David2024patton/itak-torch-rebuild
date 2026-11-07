@@ -77,8 +77,11 @@
 //! generation-specialized register accumulators, and
 //! the only workgroup array is the reduction
 //! partials. The session routes to it only under the
-//! shared MMV env threshold, which defaults off; see
-//! the module's own docs for the reasoning.
+//! shared MMV env threshold, which ships open at the
+//! full band (16) since the 2026-11-06 baseline
+//! verdict and is narrowed per shape by the band
+//! routing table; see the module's own docs for the
+//! reasoning.
 //!
 //! K20 is the Q6_K register-streaming small-batch
 //! product: K18's Q6_K band (2..=16 rows, one weight
@@ -90,7 +93,8 @@
 //! measurements behind it are in the module's own
 //! docs). It shares its routing threshold with the
 //! Q4_K register-streaming product (env
-//! `WGPU_COMPUTE_MMV_MAX_ROWS`, default off).
+//! `WGPU_COMPUTE_MMV_MAX_ROWS`, shipped default 16,
+//! the full band; set it to 1 to close the gate).
 //!
 //! K22 is the Q4_K MMQ product reorganized for
 //! occupancy: the prefill profile measured K13 at

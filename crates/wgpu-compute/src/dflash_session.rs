@@ -558,9 +558,14 @@ fn proj_dims(weights: &ProjWeights) -> (MmvFamily, usize, usize) {
 /// path's resolution, not a copy of it. A pure function
 /// of the resolved values so the pin needs no device.
 ///
-/// At shipped defaults every ceiling is 1 and the
-/// list is empty at every batch: the GEMV form serves,
-/// byte-identical to the pre-ladder draft.
+/// At shipped defaults the MMV ceiling is 16 (the
+/// small and chunked ceilings stay 1), so the list
+/// carries the MMV rung exactly where the band table
+/// admits the batch and nothing else. With
+/// `WGPU_COMPUTE_MMV_MAX_ROWS=1` every ceiling is
+/// closed and the list is empty at every batch: the
+/// GEMV form serves, byte-identical to the pre-ladder
+/// draft.
 #[allow(clippy::too_many_arguments)]
 fn proj_candidates(
     bands: &MmvBands,
@@ -2640,11 +2645,81 @@ mod tests {
     const DRAFT_HEAD: (usize, usize) = (6656, 202048);
 
     #[test]
-    fn draft_ladder_ships_closed_at_default_ceilings() {
-        // Every ceiling at its shipped default (1):
-        // no rung applies at any batch, so the GEMV
-        // form serves exactly as the pre-ladder draft
-        // served.
+    fn draft_ladder_ships_open_at_default_ceilings() {
+        // The shipped defaults since the 2026-11-06
+        // flip (bench/baseline-session-2026-11-06.md
+        // leg (d)): the MMV ceiling resolves to 16,
+        // the small and chunked ceilings stay 1. At
+        // those ceilings the ladder carries exactly the
+        // band table's MMV admissions and nothing else.
+        // The ceilings are read from the constants, so
+        // this pins the shipped resolution itself, not
+        // a copy of it.
+        let defaults = (
+            crate::compute::DEFAULT_MMV_MAX_ROWS,
+            crate::compute::DEFAULT_SMALL_BATCH_MAX_ROWS,
+            crate::compute::DEFAULT_CHUNKED_GEMV_MAX_ROWS,
+        );
+        assert_eq!(defaults, (16, 1, 1));
+        // The draft head at the block batch routes to
+        // K21 through the Q5_K FFN cell: the route the
+        // baseline session's leg (e) priced at 10 ms a
+        // round of draft time.
+        assert_eq!(
+            cands(defaults, MmvFamily::Q5K, DRAFT_HEAD.0, DRAFT_HEAD.1, 16),
+            vec![ProjForm::Mmv]
+        );
+        // Measured in-band admissions across families.
+        assert_eq!(
+            cands(defaults, MmvFamily::Q4K, DRAFT_ATTN.0, DRAFT_ATTN.1, 7),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands(defaults, MmvFamily::Q6K, DRAFT_KV.0, DRAFT_KV.1, 12),
+            vec![ProjForm::Mmv]
+        );
+        assert_eq!(
+            cands(defaults, MmvFamily::Q5K, DRAFT_KV.0, DRAFT_KV.1, 16),
+            vec![ProjForm::Mmv]
+        );
+        // The table's exclusions stay exclusions at the
+        // shipped default: Q4_K and Q6_K admit nothing
+        // at the block batch, the Q4_K FFN hole at
+        // row 3 stays a hole, the Q5_K KV cell admits
+        // only row 16, and single rows and past-band
+        // batches stay the GEMV's.
+        for family in [MmvFamily::Q4K, MmvFamily::Q6K] {
+            for (inf, out) in [DRAFT_ATTN, DRAFT_FFN, DRAFT_KV] {
+                assert_eq!(
+                    cands(defaults, family, inf, out, 16),
+                    Vec::<ProjForm>::new(),
+                    "{family:?} in {inf} out {out} batch 16"
+                );
+            }
+        }
+        assert_eq!(
+            cands(defaults, MmvFamily::Q4K, DRAFT_FFN.0, DRAFT_FFN.1, 3),
+            Vec::<ProjForm>::new()
+        );
+        assert_eq!(
+            cands(defaults, MmvFamily::Q5K, DRAFT_KV.0, DRAFT_KV.1, 12),
+            Vec::<ProjForm>::new()
+        );
+        for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
+            for (inf, out) in [DRAFT_ATTN, DRAFT_FFN, DRAFT_KV, DRAFT_HEAD] {
+                for batch in [1, 64] {
+                    assert_eq!(
+                        cands(defaults, family, inf, out, batch),
+                        Vec::<ProjForm>::new(),
+                        "{family:?} in {inf} out {out} batch {batch}"
+                    );
+                }
+            }
+        }
+        // The explicit close still closes everything:
+        // with every ceiling at 1 no rung applies at
+        // any batch, so the GEMV form serves exactly as
+        // the pre-ladder draft served.
         for family in [MmvFamily::Q4K, MmvFamily::Q5K, MmvFamily::Q6K] {
             for (inf, out) in [DRAFT_ATTN, DRAFT_FFN, DRAFT_KV, DRAFT_HEAD] {
                 for batch in [2, 3, 7, 12, 16, 64] {

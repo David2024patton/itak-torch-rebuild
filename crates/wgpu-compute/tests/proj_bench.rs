@@ -81,9 +81,12 @@ fn proj_bench_routes_to_gemv_at_shipped_defaults_and_matches_it() {
         return;
     };
     let ctx = backend.context();
-    // Two super-blocks in, four rows out: small enough
-    // to run anywhere, shaped like the real thing.
-    let (inn, out) = (512usize, 4usize);
+    // Two super-blocks in, as many rows out: an
+    // attention-class shape, small enough to run
+    // anywhere. The class matters: the shipped band
+    // table's Q4_K attention cell starts at row 6, so
+    // the batch below sits outside every open cell.
+    let (inn, out) = (512usize, 512usize);
     let raw = synthetic_q4k(inn, out);
     let bench = ProjBench::upload(&backend, "test q4k", Dtype::Q4K, &raw, inn, out)
         .expect("proj bench upload");
@@ -103,9 +106,17 @@ fn proj_bench_routes_to_gemv_at_shipped_defaults_and_matches_it() {
     let call = bench
         .prepare(&backend, &in_buf, &qs_buf, &ds_buf, &out_buf, rows)
         .expect("proj bench prepare");
-    // At the shipped defaults (small-batch ladder off,
-    // below the matrix threshold) the ladder serves
-    // the GEMV form, and the handle names it.
+    // At the shipped defaults the ladder serves the
+    // GEMV form for this cell, and the handle names
+    // it: the MMV ceiling ships open (16 since the
+    // 2026-11-06 flip, bench/baseline-session-2026-11-06.md
+    // leg (d)) but the band table admits no Q4_K
+    // attention batch below row 6, the small-batch and
+    // chunked rungs stay closed, and the batch is
+    // below the matrix threshold. (The fixture's
+    // earlier KV-class shape, 4 rows out, sits inside
+    // the Q4_K KV cell at this batch and now routes
+    // to K19, so it can no longer pin the GEMV form.)
     assert_eq!(call.kernel_name(), "k1_q4k_gemv");
     assert!(!call.quantized());
     assert_eq!(call.dispatches(), 1);

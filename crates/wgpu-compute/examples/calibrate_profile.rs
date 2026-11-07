@@ -22,17 +22,35 @@
 //!   not the shipped table's opinion of it.
 //!
 //! A row is a win for the MMV form under the shipped
-//! derivation's rule ([`wgpu_compute::profile::mmv_wins`]):
-//! its MMV-arm median is under 0.98x its control
-//! median, and both arms' outputs agree with the
-//! direct GEMV form (a disagreeing cell is no
-//! measurement). Wins adjacent in the sweep group
+//! derivation's rule
+//! ([`wgpu_compute::profile::mmv_row_win`]): its
+//! MMV-arm median is under 0.98x its control median
+//! ([`wgpu_compute::profile::mmv_wins`]), both arms'
+//! outputs agree with the direct GEMV form (a
+//! disagreeing cell is no measurement), and the row
+//! is one the MMV form can dispatch at all. That
+//! third clause matters: the MMV arm pins its bands
+//! to 2-16, so at batch 1 both arms dispatch the
+//! identical GEMV form and a sub-0.98x median there
+//! is inter-arm drift, not a form win (the wave19
+//! session's derived table carried batch 1 in three
+//! cells on exactly that drift; the exclusion lives
+//! in the shared derivation helpers, not in this
+//! tool's printing). Wins adjacent in the sweep group
 //! into the cell's ranges
 //! ([`wgpu_compute::profile::derive_band_ranges`]).
 //! The arms pin every measured knob in the
 //! environment, so a profile already on disk cannot
 //! contaminate the measurement: env wins over
 //! profile per cell by the resolution precedence.
+//!
+//! The run prints its evidence before its conclusion:
+//! one line per measured row (both arms' medians, the
+//! ratio, the agreement, the verdict) ahead of the
+//! derived table, and the same lines are written into
+//! the profile file as comments, so any derived cell
+//! can be checked against the numbers that produced
+//! it without re-running the sweep.
 //!
 //! The profile is keyed to the adapter and driver
 //! that produced it and written to `--out PATH`, or
@@ -57,7 +75,8 @@ use wgpu_compute::kernels::k1_q4k_gemv::{K1Pipeline, K1Weights};
 use wgpu_compute::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use wgpu_compute::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use wgpu_compute::profile::{
-    derive_band_ranges, format_band_cell, mmv_wins, write_profile, AdapterKey, CalibrationProfile,
+    derive_band_ranges, format_band_cell, mmv_row_win, write_profile_with_evidence, AdapterKey,
+    CalibrationProfile, RowEvidence,
 };
 use wgpu_compute::timestamps::DispatchMeta;
 use wgpu_compute::{
@@ -613,23 +632,51 @@ fn run() -> Result<(), ExitCode> {
 
     let mut profile = CalibrationProfile::new(key);
     profile.mmv_max_rows = Some(MMV_MAX_BATCH);
-    println!("derived band table (win = MMV median < 0.98x control, both arms agreeing):");
+    // Derive every cell first, gathering the per-row
+    // evidence as the verdicts are computed, so the
+    // evidence prints before the table it produces.
+    let mut evidence: Vec<RowEvidence> = Vec::new();
+    let mut cells: Vec<(&str, &str, String)> = Vec::new();
     for (fi, (family, _)) in FAMILIES.iter().enumerate() {
         for (si, (shape, _)) in SHAPES.iter().enumerate() {
             let wins: Vec<bool> = ROWS
                 .iter()
                 .enumerate()
-                .map(|(ri, _)| {
-                    control.agrees[fi][si][ri]
-                        && mmv.agrees[fi][si][ri]
-                        && mmv_wins(mmv.medians[fi][si][ri], control.medians[fi][si][ri])
+                .map(|(ri, &rows_n)| {
+                    let row = RowEvidence {
+                        family,
+                        shape,
+                        rows: rows_n,
+                        control_ms: control.medians[fi][si][ri],
+                        mmv_ms: mmv.medians[fi][si][ri],
+                        agrees: control.agrees[fi][si][ri] && mmv.agrees[fi][si][ri],
+                    };
+                    evidence.push(row);
+                    mmv_row_win(row.rows, row.mmv_ms, row.control_ms, row.agrees)
                 })
                 .collect();
-            let cell = format_band_cell(&derive_band_ranges(&ROWS, &wins));
-            println!("  {family} {shape}: {cell}");
-            let placed = profile.set_band_cell_named(family, shape, cell);
-            assert!(placed, "family and shape names are the table's own");
+            cells.push((
+                family,
+                shape,
+                format_band_cell(&derive_band_ranges(&ROWS, &wins)),
+            ));
         }
+    }
+    println!(
+        "calibration evidence (one line per measured row; verdicts by \
+         wgpu_compute::profile::mmv_row_win):"
+    );
+    for row in &evidence {
+        println!("{}", row.line());
+    }
+    println!(
+        "derived band table (win = MMV median < 0.98x control, both arms agreeing, \
+         row inside the kernels' band):"
+    );
+    for (family, shape, cell) in cells {
+        println!("  {family} {shape}: {cell}");
+        let placed = profile.set_band_cell_named(family, shape, cell);
+        assert!(placed, "family and shape names are the table's own");
     }
 
     let out_path = match arg(&args, "--out") {
@@ -646,7 +693,7 @@ fn run() -> Result<(), ExitCode> {
             }
         },
     };
-    if let Err(e) = write_profile(&out_path, &profile) {
+    if let Err(e) = write_profile_with_evidence(&out_path, &profile, &evidence) {
         eprintln!(
             "REFUSED: writing the profile to {} failed: {e}",
             out_path.display()

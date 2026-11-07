@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use crate::compute::{MmvFamily, MmvShape};
 use crate::detect::AdapterFacts;
+use crate::kernels::k19_q4k_mmv::{MMV_MAX_BATCH, MMV_MIN_BATCH};
 
 /// Environment variable naming the calibration
 /// profile file directly. When set (and non-empty) it
@@ -201,6 +202,28 @@ impl CalibrationProfile {
     /// profile are byte-identical.
     #[must_use]
     pub fn render(&self) -> String {
+        self.render_parts(&[])
+    }
+
+    /// Render with calibration evidence lines carried
+    /// as `#` comments between the header and the
+    /// key=value lines: the per-row measurements the
+    /// band cells were derived from, written into the
+    /// file so a profile can be audited where it
+    /// lives, not only in the run that produced it.
+    /// The key=value lines are exactly
+    /// [`render`](Self::render)'s, and the parser
+    /// skips comment lines, so an evidence-bearing
+    /// profile loads identically to the bare render.
+    #[must_use]
+    pub fn render_with_evidence(&self, evidence: &[RowEvidence]) -> String {
+        self.render_parts(evidence)
+    }
+
+    /// The render, with any evidence lines inserted
+    /// as comments after the header (see
+    /// [`render_with_evidence`](Self::render_with_evidence)).
+    fn render_parts(&self, evidence: &[RowEvidence]) -> String {
         let mut out = String::new();
         out.push_str("# wgpu-compute calibration profile\n");
         out.push_str(
@@ -209,6 +232,11 @@ impl CalibrationProfile {
              # and driver. Hand edits are read back through the same\n\
              # parsers the WGPU_COMPUTE_MMV_* env overrides use.\n",
         );
+        for row in evidence {
+            out.push_str("# ");
+            out.push_str(&row.line());
+            out.push('\n');
+        }
         out.push_str(&format!("format_version={}\n", self.format_version));
         out.push_str(&format!(
             "adapter_name={}\n",
@@ -445,12 +473,33 @@ pub fn load_profile(path: &Path, key: &AdapterKey) -> ProfileLoad {
 /// The `io` error when the directories or the file
 /// cannot be created or written.
 pub fn write_profile(path: &Path, profile: &CalibrationProfile) -> std::io::Result<()> {
+    write_profile_text(path, &profile.render())
+}
+
+/// Write a profile with its calibration evidence
+/// carried as comments (see
+/// [`CalibrationProfile::render_with_evidence`]).
+///
+/// # Errors
+///
+/// The `io` error when the directories or the file
+/// cannot be created or written.
+pub fn write_profile_with_evidence(
+    path: &Path,
+    profile: &CalibrationProfile,
+    evidence: &[RowEvidence],
+) -> std::io::Result<()> {
+    write_profile_text(path, &profile.render_with_evidence(evidence))
+}
+
+/// The one file write behind both profile writers.
+fn write_profile_text(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(path, profile.render())
+    std::fs::write(path, text)
 }
 
 /// The path the backend looks for a profile at, from
@@ -505,6 +554,111 @@ pub fn mmv_wins(mmv_median_ms: f64, gemv_median_ms: f64) -> bool {
     gemv_median_ms > 0.0 && mmv_median_ms < MMV_WIN_RATIO * gemv_median_ms
 }
 
+/// Whether the register-streaming MMV form can
+/// dispatch at `rows` at all: the kernels' own band,
+/// [`MMV_MIN_BATCH`]..=[`MMV_MAX_BATCH`]. Outside it
+/// the routing ladder serves the GEMV form no matter
+/// what any band cell says (the band parser clamps
+/// cells to this band and `MmvBands::routes` floors
+/// at its low end), so a timing comparison at such a
+/// row compares the GEMV form against itself and any
+/// sub-0.98x "win" there is inter-arm drift, not a
+/// form win. The wave19 card session measured exactly
+/// that artifact at batch 1: three derived cells
+/// carried batch 1 while the diag census showed zero
+/// MMV dispatches there (bench/wave19-session-2026-11-07.md;
+/// bench/calibrator-evidence-2026-11-07.md).
+#[must_use]
+pub fn mmv_can_dispatch(rows: u32) -> bool {
+    (MMV_MIN_BATCH..=MMV_MAX_BATCH).contains(&rows)
+}
+
+/// Whether one measured row is a win for the MMV
+/// form, the whole derivation rule in one place: the
+/// row must be one the form can dispatch
+/// ([`mmv_can_dispatch`]), both arms must agree with
+/// the direct GEMV form (a disagreeing cell is no
+/// measurement), and the MMV median must win under
+/// [`mmv_wins`]. This is the predicate the
+/// calibration derivation and its printed evidence
+/// verdicts both come from, so the evidence and the
+/// derived table can never disagree about a row.
+#[must_use]
+pub fn mmv_row_win(rows: u32, mmv_median_ms: f64, gemv_median_ms: f64, agrees: bool) -> bool {
+    agrees && mmv_can_dispatch(rows) && mmv_wins(mmv_median_ms, gemv_median_ms)
+}
+
+/// One measured row of calibration evidence: the
+/// numbers one derived cell rests on, carried so a
+/// calibration's table can be audited row by row
+/// instead of trusted. The calibrator prints one
+/// [`line`](RowEvidence::line) per measured row
+/// before its derived table and writes the same
+/// lines into the profile file as comments.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowEvidence {
+    /// Band family short name ("q4k", "q5k", "q6k").
+    pub family: &'static str,
+    /// Shape class short name ("attn", "ffn", "kv").
+    pub shape: &'static str,
+    /// The swept batch row count.
+    pub rows: u32,
+    /// The control (GEMV ladder) arm's median, ms.
+    pub control_ms: f64,
+    /// The MMV arm's median, ms.
+    pub mmv_ms: f64,
+    /// Whether both arms' outputs agreed with the
+    /// direct GEMV form at this row.
+    pub agrees: bool,
+}
+
+impl RowEvidence {
+    /// This row's verdict under the derivation rule:
+    /// "win" when [`mmv_row_win`] holds, "excluded"
+    /// when the MMV form cannot dispatch at this row
+    /// (its timing is same-form drift and is never
+    /// evidence of a win), else "no-win".
+    #[must_use]
+    pub fn verdict(&self) -> &'static str {
+        if !mmv_can_dispatch(self.rows) {
+            "excluded"
+        } else if mmv_row_win(self.rows, self.mmv_ms, self.control_ms, self.agrees) {
+            "win"
+        } else {
+            "no-win"
+        }
+    }
+
+    /// The evidence line for this row, in the stable
+    /// greppable format the calibrator prints and the
+    /// profile file carries as a comment:
+    /// `evidence family=q4k shape=attn rows=6 control_ms=0.1234 mmv_ms=0.1000 ratio=0.813 agree=yes verdict=win`.
+    /// The ratio is the MMV median over the control
+    /// median, or `n/a` when the control median is
+    /// not positive (no measurement, per
+    /// [`mmv_wins`]).
+    #[must_use]
+    pub fn line(&self) -> String {
+        let ratio = if self.control_ms > 0.0 {
+            format!("{:.3}", self.mmv_ms / self.control_ms)
+        } else {
+            "n/a".to_string()
+        };
+        format!(
+            "evidence family={} shape={} rows={} control_ms={:.4} mmv_ms={:.4} \
+             ratio={} agree={} verdict={}",
+            self.family,
+            self.shape,
+            self.rows,
+            self.control_ms,
+            self.mmv_ms,
+            ratio,
+            if self.agrees { "yes" } else { "no" },
+            self.verdict(),
+        )
+    }
+}
+
 /// Group a sweep's winning rows into the band ranges
 /// a cell states. `sweep_rows` is the swept row list
 /// in order and `wins` its per-row verdicts; a run of
@@ -516,12 +670,23 @@ pub fn mmv_wins(mmv_median_ms: f64, gemv_median_ms: f64) -> bool {
 /// measured wins bracket them). Adjacency is in the
 /// sweep list, not numeric: rows 9 and 12 sit next to
 /// each other in the sweep and join one range.
+///
+/// A win at a row the MMV form cannot dispatch
+/// ([`mmv_can_dispatch`]) never joins a range: the
+/// exclusion lives here, in the one helper every
+/// derivation passes through, so a caller handing in
+/// raw timing verdicts still cannot derive a cell
+/// containing batch 1 or any other undispatchable
+/// row. Callers deriving verdicts through
+/// [`mmv_row_win`] already exclude such rows; this
+/// is the same rule enforced again at the grouping
+/// step, not a second rule.
 #[must_use]
 pub fn derive_band_ranges(sweep_rows: &[u32], wins: &[bool]) -> Vec<(u32, u32)> {
     let mut ranges = Vec::new();
     let mut run: Option<(u32, u32)> = None;
     for (i, &row) in sweep_rows.iter().enumerate() {
-        if wins.get(i).copied().unwrap_or(false) {
+        if wins.get(i).copied().unwrap_or(false) && mmv_can_dispatch(row) {
             match &mut run {
                 Some((_, hi)) => *hi = row,
                 None => run = Some((row, row)),
@@ -788,14 +953,172 @@ mod tests {
         assert_eq!(derive_band_ranges(&rows, &[false; 11]), Vec::new());
         assert_eq!(format_band_cell(&[]), "1");
         // A lone win is a single-row cell; a full run
-        // is one span.
+        // of dispatchable rows is one span. (A win at
+        // row 1 itself is the artifact case pinned by
+        // batch_one_timing_win_never_enters_a_derived_cell
+        // below: the full sweep with every verdict true
+        // derives "2-16", never "1-16".)
         let wins = [
             false, false, false, false, false, false, false, false, false, false, true,
         ];
         assert_eq!(format_band_cell(&derive_band_ranges(&rows, &wins)), "16");
         assert_eq!(
             format_band_cell(&derive_band_ranges(&rows, &[true; 11])),
-            "1-16"
+            "2-16"
         );
+    }
+
+    #[test]
+    fn mmv_dispatch_band_edges() {
+        // The kernels' band is the ground truth of
+        // dispatchability: 2..=16 dispatch the MMV
+        // form; batch 1 and anything past the band
+        // are served by the GEMV form in both arms.
+        assert!(!mmv_can_dispatch(0));
+        assert!(!mmv_can_dispatch(1));
+        assert!(mmv_can_dispatch(2));
+        assert!(mmv_can_dispatch(16));
+        assert!(!mmv_can_dispatch(17));
+    }
+
+    #[test]
+    fn batch_one_timing_win_never_enters_a_derived_cell() {
+        // The wave19 artifact as a synthetic cell set:
+        // batch 1 "wins" on timing (the MMV arm
+        // dispatches the same GEMV form there, so a
+        // sub-0.98x median is inter-arm drift) and the
+        // derivation must not record it, whether the
+        // caller hands in raw timing verdicts (this
+        // test) or verdicts already gated by
+        // mmv_row_win (the calibrator's path).
+        let rows = [1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 16];
+        // Batch 1 and rows 2..=4 marked as wins: the
+        // cell starts at the first dispatchable win,
+        // not at batch 1.
+        let wins = [
+            true, true, true, true, false, false, false, false, false, false, false,
+        ];
+        let ranges = derive_band_ranges(&rows, &wins);
+        assert_eq!(ranges, vec![(2, 4)]);
+        assert_eq!(format_band_cell(&ranges), "2-4");
+        // A batch-1 win alone derives the closed cell:
+        // no dispatchable row won, so the cell states
+        // no opinion the ladder can route.
+        let wins = [
+            true, false, false, false, false, false, false, false, false, false, false,
+        ];
+        assert_eq!(derive_band_ranges(&rows, &wins), Vec::new());
+        assert_eq!(format_band_cell(&derive_band_ranges(&rows, &wins)), "1");
+        // An excluded row does not bridge two runs:
+        // wins at 1 and 3 with a loss at 2 derive the
+        // row-3 cell alone.
+        let wins = [
+            true, false, true, false, false, false, false, false, false, false, false,
+        ];
+        assert_eq!(format_band_cell(&derive_band_ranges(&rows, &wins)), "3");
+        // The composed predicate refuses the same row
+        // the grouping step excludes: a fast, agreeing
+        // batch-1 measurement is not a win, while the
+        // identical numbers at a dispatchable row are.
+        assert!(!mmv_row_win(1, 0.5, 1.0, true));
+        assert!(mmv_row_win(2, 0.5, 1.0, true));
+        assert!(!mmv_row_win(2, 0.5, 1.0, false));
+        assert!(!mmv_row_win(2, 0.99, 1.0, true));
+    }
+
+    #[test]
+    fn evidence_lines_carry_the_row_numbers_and_verdict() {
+        // The artifact row itself: fast on paper at
+        // batch 1, and the line says excluded, with
+        // the drift ratio printed beside it so the
+        // exclusion is auditable, not silent.
+        let drift = RowEvidence {
+            family: "q4k",
+            shape: "attn",
+            rows: 1,
+            control_ms: 1.0,
+            mmv_ms: 0.9,
+            agrees: true,
+        };
+        assert_eq!(drift.verdict(), "excluded");
+        assert_eq!(
+            drift.line(),
+            "evidence family=q4k shape=attn rows=1 control_ms=1.0000 \
+             mmv_ms=0.9000 ratio=0.900 agree=yes verdict=excluded"
+        );
+        // A real win and a measured loss at
+        // dispatchable rows.
+        let win = RowEvidence { rows: 6, ..drift };
+        assert_eq!(win.verdict(), "win");
+        let loss = RowEvidence { mmv_ms: 1.5, ..win };
+        assert_eq!(loss.verdict(), "no-win");
+        assert!(loss.line().contains("ratio=1.500"));
+        // A disagreement is no measurement and never
+        // a win, whatever the timing says.
+        let disagree = RowEvidence {
+            mmv_ms: 0.5,
+            agrees: false,
+            ..win
+        };
+        assert_eq!(disagree.verdict(), "no-win");
+        assert!(disagree.line().contains("agree=no"));
+        // A non-positive control median prints no
+        // ratio: there is no measurement to divide by.
+        let unmeasured = RowEvidence {
+            control_ms: 0.0,
+            mmv_ms: 0.0,
+            ..win
+        };
+        assert!(unmeasured.line().contains("ratio=n/a"));
+        assert_eq!(unmeasured.verdict(), "no-win");
+    }
+
+    #[test]
+    fn profile_with_evidence_comments_loads_identically() {
+        // A profile carrying its evidence as comments
+        // loads back Loaded with the same cells,
+        // ceiling, and key as the bare profile: the
+        // comments are provenance, never parsed as
+        // values, and never dropped silently (the file
+        // on disk still carries them).
+        let profile = full_profile();
+        let evidence = [
+            RowEvidence {
+                family: "q4k",
+                shape: "attn",
+                rows: 1,
+                control_ms: 1.0,
+                mmv_ms: 0.9,
+                agrees: true,
+            },
+            RowEvidence {
+                family: "q4k",
+                shape: "attn",
+                rows: 6,
+                control_ms: 1.0,
+                mmv_ms: 0.8,
+                agrees: true,
+            },
+        ];
+        let text = profile.render_with_evidence(&evidence);
+        assert!(text.contains("# evidence family=q4k shape=attn rows=1"));
+        assert!(text.contains("verdict=excluded"));
+        assert!(text.contains("verdict=win"));
+        let parsed = CalibrationProfile::parse(&text).expect("evidence render parses");
+        assert_eq!(parsed, profile);
+        // The bare render of a profile with no
+        // evidence is unchanged by the evidence path.
+        assert_eq!(profile.render_with_evidence(&[]), profile.render());
+
+        let dir = scratch_dir("evidence-round-trip");
+        let path = dir.join("profile.txt");
+        write_profile_with_evidence(&path, &profile, &evidence).expect("write with evidence");
+        match load_profile(&path, &test_key()) {
+            ProfileLoad::Loaded(loaded) => assert_eq!(*loaded, profile),
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+        let on_disk = std::fs::read_to_string(&path).expect("read back");
+        assert!(on_disk.contains("# evidence family=q4k shape=attn rows=6"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

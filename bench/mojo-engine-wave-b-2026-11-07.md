@@ -124,12 +124,31 @@ window (phase lock, tenants stopped and restored by trap,
 VRAM measured via sysfs at both ends, staging = git archive
 of abbd8cf with STAGED_COMMIT stamp and the staged
 model.mojo sha256 verified equal to the worktree's
-98bb15dc...). At this writing the window was IN FLIGHT; its
-log is ~/gpu-wave-b/proof.log on the server. The rung-2
-independent comparison target is an in-proof Float64
-sum/max/first-8 print per layer for spot-checking against a
-Python recomputation; that Python cross-check has NOT been
-run yet and rung 2 is not counted until it has.
+98bb15dc...). The window's log is ~/gpu-wave-b/proof3.log on
+the server (two earlier attempts, proof.log and proof2.log,
+died at launch on a wrong pixi path -- the server's pixi is
+~/mojo-probe/pixi/bin/pixi, NOT ~/mojo-probe/bin/pixi -- and
+a wrong VRAM node; both failed windows restored their
+tenants cleanly with exact bookends and ran no model code).
+The corrected window measured VRAM_DRAINED exactly
+33,271,808 B, then: model load 21,150 ms with embd_type=12
+(Q4_K, confirming the quantized embedding path is the live
+one) and output_type=13 (Q5_K). RUNG 2 EXECUTED: layer 0
+(sliding) step 4,055 ms, output sum 65.22733633872122, max
+22.1184024810791, first8 [0.08513339, 0.026624471,
+-0.42816293, 3.276528, -1.1669861, 2.0494282, -0.08531731,
+0.34014347]; layer 3 (global) step 4,115 ms, sum
+157.77914571017027, max 19.754636764526367, first8
+[1.254974, -0.3695352, -0.49299628, 1.3146128, -0.27929068,
+1.1605207, 0.099737644, 0.68446195]. The independent Python
+Float64 spot check of those two rows has NOT been run yet,
+so rung 2 is EXECUTED BUT NOT COUNTED. RUNG 3 was still
+executing when this update was written (the process was
+alive at ~98% CPU in the teacher-forced forward; a full
+52-layer step at the rung-2 rate is minutes, and rung 3
+needs 13 of them); its per-position lines land in the same
+log, followed by the window's restore lines (VRAM_RESTORED3,
+TENANT_EMBED3, WAVE_B_WINDOW3_DONE).
 
 ## Integration record
 
@@ -143,25 +162,25 @@ integration).
 
 ## THE GOLDEN VERDICT
 
-PENDING at this writing: the end-to-end run (integrated
-tree, real file, B4 generate over the B3 adapter) has NOT
-been run as a separate rung beyond the proof harness's
-teacher-forced rung 3, and rung 3 itself was still executing
-in its server window. The wave is therefore NOT declared
-complete. What remains, in order: (1) read the rung 2/3
-results from ~/gpu-wave-b/proof.log and run the rung-2
-Python spot check; (2) wire the end-to-end runner (a main
-that opens the real model, wraps it in GlimmerForwardAdapter,
+PENDING: rung 3's verdict (in flight, see above) and the
+end-to-end run (integrated tree, real file, B4 generate over
+the B3 adapter), which has NOT been run as a separate rung
+beyond the proof harness's teacher-forced rung 3. The wave
+is therefore NOT declared complete. What remains, in order:
+(1) read the rung-3 results from ~/gpu-wave-b/proof3.log,
+verify the window's restore lines, and run the rung-2 Python
+spot check; (2) wire the end-to-end runner (a main that
+opens the real model, wraps it in GlimmerForwardAdapter,
 tokenizes "The capital of France is" with the Wave A
 tokenizer + BOS, runs B4 generate for 16 tokens at eos
 200001, prints the ids) and run it in a cleared window: PASS
 is exactly first-8 == [13796, 26, 1573, 373, 290, 2167,
 26899, 1212]; (3) record decode tok/s and prefill time from
 that run (first-light numbers, no verdict); (4) bump the
-engine to 1.3, update DESIGN.md build-order steps 3-6, and
-close the wave. If rung 3 or the end-to-end run diverges,
-the parity ladder's next step is per-layer capture diffing
-at position 0 (captures are built into B3 for exactly this).
+engine to 1.3, finish the DESIGN.md step statuses, and close
+the wave. If rung 3 or the end-to-end run diverges, the
+parity ladder's next step is per-layer capture diffing at
+position 0 (captures are built into B3 for exactly this).
 
 ## Server closeout
 

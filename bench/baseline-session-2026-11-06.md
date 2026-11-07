@@ -393,9 +393,9 @@ numbers and are not compared against the recorded
   5,923 ms (off).
 - Step 3 session wall (glimmer_generate --gpu, same
   prompt, timing off, 3 runs each): off 5,717 / 5,723 /
-  5,741 (median 5,723); on 9,949 / 9,956 / third run in
-  the leg log (median about 9.95 s). K23 costs roughly
-  74 percent on the prefill wall at this shape.
+  5,741 (median 5,723); on 9,949 / 9,956 / 9,956
+  (median 9,956). K23 costs roughly 74 percent on the
+  prefill wall at this shape.
 - Step 0 autopsy and step 4 no-leak: the autopsy reads
   are in the filtered single-kernel dump section below
   (the full-suite dump interleaves under parallel test

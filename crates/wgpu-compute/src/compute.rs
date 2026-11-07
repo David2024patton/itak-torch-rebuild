@@ -686,16 +686,23 @@ fn resolve_coopmat(raw: Option<&str>) -> bool {
 }
 
 /// Environment variable naming the K21F finish-carrying
-/// head routing switch: the exact value `1` allows the
-/// resident session's block head to route its Q5_K
-/// product to the finish-carrying MMV form (K21F, see
+/// head routing switch: it allows the resident session's
+/// block head to route its Q5_K product to the
+/// finish-carrying MMV form (K21F, see
 /// `crate::kernels::k21_q5k_mmv_finish`) when the shared
 /// MMV band also admits the block batch. Operational
-/// config, not a compiled constant, and deliberately
-/// fail-closed on the K22 pattern: an unset variable,
-/// or any other value, keeps the block head on the K3
-/// fused call entirely. The switch is the head route's
-/// own gate, separate from the shared MMV ceiling
+/// config, not a compiled constant. The route is the
+/// DEFAULT: an unset variable resolves to on (see
+/// [`DEFAULT_K21F_HEAD`]), and the exact value `1`
+/// (after trimming) also resolves to on, so a value
+/// that meant on under the guard still means on. The
+/// exact value `0` is the explicit off and the
+/// one-variable rollback to the K3 fused head. Any
+/// other value fails closed to off
+/// ([`K21F_HEAD_FALLBACK`]), with the refusal logged by
+/// name at construction: a typo must never silently
+/// select a route. The switch is the head route's own
+/// gate, separate from the shared MMV ceiling
 /// ([`MMV_MAX_ROWS_ENV`]): the route used to ride that
 /// ceiling alone, so when the ceiling's default opened
 /// to 16 the head route went live by default, and the
@@ -703,17 +710,89 @@ fn resolve_coopmat(raw: Option<&str>) -> bool {
 /// (bench/defaults-confirmation-2026-11-07.md) proved
 /// speculative identity FAILS on the real file with
 /// the route live (deterministic divergence at stream
-/// index 23, depths 1 and 6). The default is therefore
-/// OFF until the K21F numerics are fixed and the route
-/// re-earns it; the guard is recorded in
-/// bench/k21f-default-guard-2026-11-07.md.
+/// index 23, depths 1 and 6). The guard that closed it
+/// by default is recorded in
+/// bench/k21f-default-guard-2026-11-07.md; the
+/// root-cause fix (a truncated dequant mask in the
+/// K21F shader, bench/k21f-mask-fix-2026-11-07.md) and
+/// the wave18 card retest that met the guard's reopen
+/// criterion (bench/k21f-retest-2026-11-07.md) are what
+/// moved the default back to on; the flip itself is
+/// recorded in bench/k21f-default-flip-2026-11-07.md.
 pub const K21F_HEAD_ENV: &str = "WGPU_COMPUTE_K21F_HEAD";
 
+/// Whether the K21F head route is live when the
+/// environment does not override it: on. The route
+/// originally shipped live by riding the shared MMV
+/// ceiling; the 2026-11-07 defaults-confirmation
+/// identity failure closed it behind this switch with
+/// the default off (bench/k21f-default-guard-2026-11-07.md)
+/// until the numerics were fixed and the route
+/// re-earned the default under the guard's written
+/// reopen criterion. The mask fix
+/// (bench/k21f-mask-fix-2026-11-07.md) plus the wave18
+/// card retest (bench/k21f-retest-2026-11-07.md:
+/// identity and golden PASS at depths 1 and 6 with the
+/// switch on, K21F's finished output bit-identical to
+/// K3's at the real head geometry) discharged that
+/// criterion, and the default moved back to on.
+/// Rollback is one env value:
+/// `WGPU_COMPUTE_K21F_HEAD=0` restores the guarded
+/// (K3 fused head) composition exactly.
+pub const DEFAULT_K21F_HEAD: bool = true;
+
+/// The K21F head switch position a present but
+/// unrecognized env value resolves to: off, closed.
+/// The fallback is deliberately NOT the shipped
+/// default: a typo in the environment must never
+/// widen routing, so the malformed case keeps the
+/// fail-closed value it resolved to while the guard's
+/// default was off.
+const K21F_HEAD_FALLBACK: bool = false;
+
 /// Resolve the K21F head routing switch from the raw
-/// environment value: only the exact value `1` (after
-/// trimming) enables it; everything else is off.
+/// environment value: unset is ON (the shipped
+/// default, [`DEFAULT_K21F_HEAD`]), the exact value
+/// `1` (after trimming) is ON, the exact value `0` is
+/// the explicit OFF, and any other value fails closed
+/// to OFF ([`K21F_HEAD_FALLBACK`]). The caller logs
+/// the refusal for an unrecognized value at
+/// construction ([`log_k21f_head_fallback`]), so the
+/// fail-closed position is visible in the run log,
+/// never silent.
 fn resolve_k21f_head(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
+    match raw.map(str::trim) {
+        None => DEFAULT_K21F_HEAD,
+        Some("1") => true,
+        Some("0") => false,
+        Some(_) => K21F_HEAD_FALLBACK,
+    }
+}
+
+/// Whether a raw K21F head env value is one the
+/// resolver recognizes (`1` or `0` after trimming, or
+/// unset). An unrecognized value resolves off; the
+/// construction log names it, following the MMV band
+/// and flash-staged fallback pattern: a silent
+/// fallback in a routing switch is how a typo becomes
+/// a mystery regression.
+fn k21f_head_value_recognized(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("1") | Some("0"))
+}
+
+/// Log, at construction, when the K21F head env value
+/// is present but unrecognized and the switch
+/// therefore fails closed to off.
+fn log_k21f_head_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !k21f_head_value_recognized(raw) {
+            dbg_log!(
+                "k21f head env {K21F_HEAD_ENV}={value:?} is not a recognized \
+                 value (\"1\" or unset enables, \"0\" disables); failing closed, \
+                 the K21F head route is OFF"
+            );
+        }
+    }
 }
 
 /// Build a [`GlimmerError::StepFailed`] for `step` with `detail`.
@@ -845,9 +924,13 @@ pub struct WgpuCompute {
     /// route to the finish-carrying K21 form at all:
     /// resolved once at construction from
     /// [`K21F_HEAD_ENV`], never a constant compiled
-    /// into the routing. `false` (the default) keeps
-    /// the block head on the K3 fused call no matter
-    /// where the shared MMV ceiling sits; the route
+    /// into the routing. `true` (the shipped default,
+    /// [`DEFAULT_K21F_HEAD`]) lets the route prepare
+    /// wherever the shared band admits the block
+    /// batch; `false` (the explicit `0`, or a
+    /// fail-closed unrecognized value) keeps the
+    /// block head on the K3 fused call no matter
+    /// where the shared MMV ceiling sits. The route
     /// additionally requires the shared band to admit
     /// the block batch (see
     /// `session::try_mmv_q5k_finish`).
@@ -1068,13 +1151,23 @@ impl WgpuCompute {
         // sibling. Only its block-head routing is
         // config, read here (see K21F_HEAD_ENV): the
         // route requires BOTH this switch on AND the
-        // shared MMV band admitting the block batch,
-        // and the switch defaults off since the
-        // 2026-11-07 defaults-confirmation identity
-        // failure (bench/k21f-default-guard-2026-11-07.md).
+        // shared MMV band admitting the block batch.
+        // The switch defaulted off after the 2026-11-07
+        // defaults-confirmation identity failure
+        // (bench/k21f-default-guard-2026-11-07.md) and
+        // returned to on when the wave18 retest met
+        // the guard's reopen criterion
+        // (bench/k21f-retest-2026-11-07.md); an
+        // unrecognized value fails closed and is
+        // logged by name.
         let k21_finish = K21FinishPipeline::new(&ctx.device)?;
-        let k21f_head = resolve_k21f_head(std::env::var(K21F_HEAD_ENV).ok().as_deref());
-        dbg_log!("k21f head config: enabled={k21f_head} (env {K21F_HEAD_ENV}, only \"1\" enables)");
+        let k21f_head_raw = std::env::var(K21F_HEAD_ENV).ok();
+        let k21f_head = resolve_k21f_head(k21f_head_raw.as_deref());
+        log_k21f_head_fallback(k21f_head_raw.as_deref());
+        dbg_log!(
+            "k21f head config: enabled={k21f_head} (env {K21F_HEAD_ENV}, \
+             \"1\" or unset enables, \"0\" disables)"
+        );
         let mmv_max_rows = resolve_mmv_max_rows(std::env::var(MMV_MAX_ROWS_ENV).ok().as_deref());
         log_mmv_band_fallbacks();
         let mmv_bands = resolve_mmv_bands(|name| std::env::var(name).ok());
@@ -1479,12 +1572,14 @@ impl WgpuCompute {
     /// route its Q5_K product to the finish-carrying
     /// K21 form: config resolved at construction from
     /// [`K21F_HEAD_ENV`], never a constant compiled
-    /// into the selection seam. `false` (the default)
-    /// leaves the block head on the K3 fused call at
-    /// every shared-MMV-ceiling position; `true` is
-    /// necessary but not sufficient, the shared band
-    /// must also admit the block batch (see
-    /// `session::try_mmv_q5k_finish`).
+    /// into the selection seam. `true` (the shipped
+    /// default, [`DEFAULT_K21F_HEAD`]) is necessary
+    /// but not sufficient, the shared band must also
+    /// admit the block batch (see
+    /// `session::try_mmv_q5k_finish`); `false` (the
+    /// explicit `0`, or a fail-closed unrecognized
+    /// value) leaves the block head on the K3 fused
+    /// call at every shared-MMV-ceiling position.
     pub(crate) fn k21f_head(&self) -> bool {
         self.k21f_head
     }
@@ -2463,25 +2558,57 @@ mod tests {
 
     #[test]
     fn k21f_head_switch_resolution() {
-        // Unset: off. The block head is the K3 fused
-        // call, exactly as shipped before the route
-        // existed, at every shared-ceiling position:
-        // the defaults-confirmation identity failure
-        // (bench/defaults-confirmation-2026-11-07.md)
-        // is why this switch exists and why its
-        // default is closed.
-        assert!(!resolve_k21f_head(None));
-        // The exact value "1" (trimmed) is the only
-        // enabling position: the switch is fail-closed
-        // by design, so a typo keeps the proven head,
-        // not the identity-breaking route.
+        // Unset: ON (the shipped default). The route
+        // earned the default back under the guard's
+        // written reopen criterion: the wave18 card
+        // retest (bench/k21f-retest-2026-11-07.md) ran
+        // the mask-fixed kernel on the real file with
+        // the switch on and recorded IDENTITY and
+        // GOLDEN PASS at depths 1 and 6, with the
+        // finish output bit-identical to K3's at the
+        // real head geometry. Before that proof the
+        // default was off (the guard, bench/k21f-
+        // default-guard-2026-11-07.md, after the
+        // defaults-confirmation identity failure).
+        // (This assertion also pins DEFAULT_K21F_HEAD
+        // itself: the unset arm returns the constant.)
+        assert!(resolve_k21f_head(None));
+        // The exact value "1" (trimmed) is on: the
+        // value that meant on under the guard still
+        // means on after the flip.
         assert!(resolve_k21f_head(Some("1")));
         assert!(resolve_k21f_head(Some(" 1 ")));
+        // The exact value "0" (trimmed) is the
+        // explicit off: the one-variable rollback to
+        // the K3 fused head.
         assert!(!resolve_k21f_head(Some("0")));
+        assert!(!resolve_k21f_head(Some(" 0 ")));
+        // Anything else fails closed to the fallback,
+        // never to the shipped default: a typo must
+        // not silently widen routing (the MMV
+        // ceiling's fallback discipline).
         assert!(!resolve_k21f_head(Some("true")));
         assert!(!resolve_k21f_head(Some("")));
         assert!(!resolve_k21f_head(Some("11")));
+        // (These arms pin K21F_HEAD_FALLBACK the same
+        // way: the unrecognized arm returns it.)
+        assert!(!resolve_k21f_head(Some("on")));
         assert_eq!(K21F_HEAD_ENV, "WGPU_COMPUTE_K21F_HEAD");
+    }
+
+    #[test]
+    fn k21f_head_value_recognition() {
+        // The recognized positions are exactly the
+        // ones the resolver gives a non-fallback
+        // meaning: unset, "1", "0" (each trimmed).
+        // The construction log names the rest.
+        assert!(k21f_head_value_recognized(None));
+        assert!(k21f_head_value_recognized(Some("1")));
+        assert!(k21f_head_value_recognized(Some(" 0 ")));
+        assert!(!k21f_head_value_recognized(Some("true")));
+        assert!(!k21f_head_value_recognized(Some("")));
+        assert!(!k21f_head_value_recognized(Some("11")));
+        assert!(!k21f_head_value_recognized(Some("on")));
     }
 
     #[test]

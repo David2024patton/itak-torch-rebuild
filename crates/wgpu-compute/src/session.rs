@@ -1331,15 +1331,20 @@ fn mmv_band_admits(max_rows: u32, batch: u32) -> bool {
 /// head at `batch`: BOTH halves of its gate must
 /// admit. The first half is the route's own switch
 /// ([`WgpuCompute::k21f_head`], resolved at
-/// construction from `WGPU_COMPUTE_K21F_HEAD`,
-/// default off since the 2026-11-07
+/// construction from `WGPU_COMPUTE_K21F_HEAD`: on by
+/// default since the wave18 retest met the guard's
+/// reopen criterion, off only on the explicit `0` or
+/// a fail-closed unrecognized value; the switch was
+/// added, default off, after the 2026-11-07
 /// defaults-confirmation identity failure; see
-/// bench/k21f-default-guard-2026-11-07.md). The
+/// bench/k21f-default-guard-2026-11-07.md and
+/// bench/k21f-retest-2026-11-07.md). The
 /// second half is the shared MMV band's admission
 /// ([`mmv_band_admits`] over the resolved
 /// `mmv_max_rows`): opening the shared ceiling for
-/// the plain MMV products must never again open the
-/// head route as a side effect. Factored as a pure
+/// the plain MMV products must never by itself open
+/// the head route; the route's own switch position
+/// is always consulted too. Factored as a pure
 /// function over the two resolved values so the
 /// combined gate is unit-pinnable without a device.
 fn k21f_head_admits(head_switch: bool, max_rows: u32, batch: u32) -> bool {
@@ -1699,9 +1704,11 @@ fn try_mmv_q5k(
 /// (`mode`, `scale`, `cap`) forwarded to the prepare
 /// verbatim, exactly as the head site hands it to
 /// K3's `prepare_with_finish`. `None` when the
-/// route's own head switch is off (the shipped
-/// default; [`k21f_head_admits`]), when the batch is
-/// outside the shared band, or when the prepare
+/// route's own head switch is off (the explicit `0`
+/// position, or a fail-closed unrecognized value;
+/// the shipped default is on; [`k21f_head_admits`]),
+/// when the batch is outside the shared band, or
+/// when the prepare
 /// refuses the shape or the finish (logged by name):
 /// the head site then prepares the K3 fused call it
 /// builds today, so a refusal changes the product
@@ -3833,7 +3840,9 @@ impl ChunkPlan {
         // [batch, out]): the finish-carrying MMV form (K21F)
         // prepares it when its own head switch is on AND
         // the shared MMV band admits the block batch (the
-        // switch defaults off; see k21f_head_admits), with
+        // switch defaults on since the wave18 retest met
+        // the guard's reopen criterion; the explicit `0`
+        // closes it; see k21f_head_admits), with
         // the K3 fused call behind any refusal, so the
         // finish is the same map on both paths and only the
         // product engine changes; the
@@ -5480,27 +5489,34 @@ mod tests {
 
     #[test]
     fn k21f_head_gate_requires_both_halves() {
-        // The guard this lane adds (bench/k21f-default-
-        // guard-2026-11-07.md): the head route prepares
-        // K21F only when the route's own switch is on
-        // AND the shared band admits the batch.
+        // The guard (bench/k21f-default-guard-2026-11-07.md):
+        // the head route prepares K21F only when the
+        // route's own switch is on AND the shared band
+        // admits the batch. The switch's DEFAULT moved
+        // back to on with the default flip
+        // (bench/k21f-default-flip-2026-11-07.md) after
+        // the wave18 retest met the guard's reopen
+        // criterion (bench/k21f-retest-2026-11-07.md);
+        // the combined gate itself is unchanged.
         //
-        // Default construction: the switch resolves off
-        // (WGPU_COMPUTE_K21F_HEAD unset), so even at the
+        // Switch off (the explicit
+        // WGPU_COMPUTE_K21F_HEAD=0 rollback, or a
+        // fail-closed unrecognized value): even at the
         // shipped ceiling of 16 the block batch is NOT
         // admitted and the block head stays on the K3
-        // fused call. This is the position the
-        // defaults-confirmation failure demands: the
-        // shared ceiling being open must not open the
-        // head route as a side effect.
+        // fused call. The shared ceiling being open
+        // never opens the head route on its own; the
+        // switch position is always consulted.
         assert!(!k21f_head_admits(false, 16, 16));
         assert!(!k21f_head_admits(false, 16, 2));
         assert!(!k21f_head_admits(false, u32::MAX, 16));
-        // Explicit switch on: the band half governs, so
-        // the fix lane's re-enable recipe (switch on,
-        // ceiling open) admits the block batch and the
-        // band floor, and a closed ceiling still
-        // refuses every batch.
+        // Switch on (the shipped default position:
+        // unset or "1"; the resolver half is pinned in
+        // compute::k21f_head_switch_resolution): the
+        // band half governs, so the block batch and the
+        // band floor are admitted at the shipped
+        // ceiling, and a closed ceiling still refuses
+        // every batch.
         assert!(k21f_head_admits(true, 16, 16));
         assert!(k21f_head_admits(true, 16, 2));
         assert!(!k21f_head_admits(true, 1, 16));

@@ -110,10 +110,16 @@
 //! falling back to K3 on any refusal. The route is
 //! governed by TWO gates, not the family threshold
 //! alone: the backend's dedicated head switch
-//! (`WGPU_COMPUTE_K21F_HEAD`, exact `1`, resolved in
-//! compute.rs; default off since the 2026-11-07
-//! defaults-confirmation identity failure, see
-//! bench/k21f-default-guard-2026-11-07.md) AND the
+//! (`WGPU_COMPUTE_K21F_HEAD`, resolved in compute.rs;
+//! on when unset or `1`, off on `0` or any
+//! unrecognized value; default off under the guard
+//! written after the 2026-11-07 defaults-confirmation
+//! identity failure, see
+//! bench/k21f-default-guard-2026-11-07.md, and back
+//! to on by default since the wave18 retest met the
+//! guard's reopen criterion, see
+//! bench/k21f-retest-2026-11-07.md and
+//! bench/k21f-default-flip-2026-11-07.md) AND the
 //! family's shared `WGPU_COMPUTE_MMV_MAX_ROWS` band
 //! admitting the block batch. Consistent with the
 //! family, this module adds no env var of its own;

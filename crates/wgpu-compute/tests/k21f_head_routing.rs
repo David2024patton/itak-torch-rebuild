@@ -1,9 +1,11 @@
 //! The K21F head-routing pins (bench/k21-finish-2026-11-06.md,
-//! guard in bench/k21f-default-guard-2026-11-07.md): the
+//! guard in bench/k21f-default-guard-2026-11-07.md, default
+//! flip in bench/k21f-default-flip-2026-11-07.md): the
 //! resident block head's Q5_K product routes to the
 //! finish-carrying MMV form (`k21_q5k_mmv_finish`) only
 //! when BOTH gates admit: the route's own switch
-//! (`WGPU_COMPUTE_K21F_HEAD`, exact `1`, default off) and
+//! (`WGPU_COMPUTE_K21F_HEAD`: on when unset or `1`, off
+//! when `0`, fail-closed off on any other value) and
 //! the shared `WGPU_COMPUTE_MMV_MAX_ROWS` band at the
 //! block batch. Otherwise the head stays on the K3 fused
 //! call, with the finish (the fixture config's logit
@@ -15,21 +17,32 @@
 //! each test self-skips with a printed reason when its
 //! arm's conditions are not met):
 //!
-//! - Head switch off (the shipped default): launch with
-//!   `WGPU_COMPUTE_DIAG=timing`, `WGPU_COMPUTE_K21F_HEAD`
-//!   unset, and `WGPU_COMPUTE_MMV_MAX_ROWS` unset (the
-//!   backend's shipped ceiling, 16, admits the block
-//!   batch) or explicitly 16. The block head must stamp
+//! - Head switch off (explicit): launch with
+//!   `WGPU_COMPUTE_DIAG=timing`,
+//!   `WGPU_COMPUTE_K21F_HEAD=0`, and
+//!   `WGPU_COMPUTE_MMV_MAX_ROWS` unset (the backend's
+//!   shipped ceiling, 16, admits the block batch) or
+//!   explicitly 16. The block head must stamp
 //!   `k3_q5k_gemv` and never `k21_q5k_mmv_finish`: the
 //!   open shared ceiling alone must not open the head
-//!   route. A malformed switch value (anything but the
-//!   exact `1`, e.g. `true` or `0`) lands in this arm by
-//!   construction, which is the fail-closed pin.
+//!   route. An unrecognized switch value (anything but
+//!   `1` or `0`, e.g. `true`) also lands in this arm by
+//!   construction, which is the fail-closed pin. An
+//!   unset switch does NOT land here: unset resolves
+//!   on since the default flip, and the next arm pins
+//!   that position.
+//! - Default construction: launch with
+//!   `WGPU_COMPUTE_DIAG=timing` and both
+//!   `WGPU_COMPUTE_K21F_HEAD` and
+//!   `WGPU_COMPUTE_MMV_MAX_ROWS` unset. The block head
+//!   must stamp `k21_q5k_mmv_finish` at the block
+//!   batch: the shipped defaults route the head, which
+//!   is the flip's central pin.
 //! - Band closed: launch with
 //!   `WGPU_COMPUTE_MMV_MAX_ROWS=1` (either switch
 //!   position). The block head must stamp `k3_q5k_gemv`
 //!   and never `k21_q5k_mmv_finish`.
-//! - Both gates open: launch with
+//! - Both gates open (explicit): launch with
 //!   `WGPU_COMPUTE_DIAG=timing`,
 //!   `WGPU_COMPUTE_MMV_MAX_ROWS=16`, and
 //!   `WGPU_COMPUTE_K21F_HEAD=1`. The block head must
@@ -43,7 +56,7 @@
 //! agreement, max-abs under 0.5): the CPU head applies the
 //! true finish, so a finish the routing dropped, swapped,
 //! or re-ordered on its way into the K21F call cannot pass
-//! the open arm. All arms need a discrete Vulkan GPU and
+//! the open arms. All arms need a discrete Vulkan GPU and
 //! skip where none qualifies.
 
 use std::collections::HashMap;
@@ -295,9 +308,11 @@ fn backend_or_skip(test: &str) -> Option<WgpuCompute> {
 
 /// The resolved MMV gate this process was launched with:
 /// the block batch (16) is admitted exactly when the
-/// parsed threshold reaches it. Unparsable values resolve
-/// to the shipped default in the backend, which admits
-/// nothing, so they read as closed here too.
+/// parsed threshold reaches it. Unset and unparsable
+/// values read as not-admitting here; the arms that
+/// need those positions select on the raw env state
+/// instead (see `mmv_ceiling_unset`,
+/// `gate_explicitly_closed`).
 fn gate_admits_block_batch() -> bool {
     std::env::var(MMV_MAX_ROWS_ENV)
         .ok()
@@ -305,13 +320,60 @@ fn gate_admits_block_batch() -> bool {
         .is_some_and(|max_rows| max_rows >= 16)
 }
 
+/// Whether the shared ceiling env is set to a position
+/// that closes the band at the block batch: set, and
+/// either unparsable (the backend resolves those to
+/// its fail-closed fallback, 1) or parsed below 16.
+/// Unset is NOT closed: the shipped default is 16,
+/// which admits the block batch. The closed-gate arm
+/// selects on this so it can never proceed at the
+/// shipped defaults and mistake the default-open
+/// ceiling for a closed one.
+fn gate_explicitly_closed() -> bool {
+    match std::env::var(MMV_MAX_ROWS_ENV) {
+        Err(_) => false,
+        Ok(v) => v
+            .trim()
+            .parse::<u32>()
+            .map_or(true, |max_rows| max_rows < 16),
+    }
+}
+
 /// The resolved head switch this process was launched
-/// with, mirroring the backend's resolver exactly: only
-/// the exact value `1` (after trimming) is on. Unset and
-/// every malformed value read as off, which is what
-/// places them in the switch-off arm.
+/// with, mirroring the backend's resolver exactly:
+/// unset and the exact value `1` (after trimming) are
+/// on; the exact value `0` and every unrecognized
+/// value read as off (the explicit off and the
+/// fail-closed position, which is what places them in
+/// the switch-off arm).
 fn head_switch_on() -> bool {
+    match std::env::var(K21F_HEAD_ENV) {
+        Err(_) => true,
+        Ok(v) => v.trim() == "1",
+    }
+}
+
+/// Whether the head switch env is entirely unset: the
+/// default-construction arm's selection condition.
+fn head_switch_unset() -> bool {
+    std::env::var_os(K21F_HEAD_ENV).is_none()
+}
+
+/// Whether the head switch was set to the exact `1`
+/// explicitly: the both-gates-open arm's selection
+/// condition (unset resolves on too since the default
+/// flip, but that position belongs to the
+/// default-construction arm).
+fn head_switch_explicitly_on() -> bool {
     std::env::var(K21F_HEAD_ENV).is_ok_and(|v| v.trim() == "1")
+}
+
+/// Whether the shared ceiling env is entirely unset:
+/// at the shipped default (16) the backend admits the
+/// block batch, which is half of the default-
+/// construction arm's selection condition.
+fn mmv_ceiling_unset() -> bool {
+    std::env::var_os(MMV_MAX_ROWS_ENV).is_none()
 }
 
 /// The diag conditions both arms read their exposure from:
@@ -389,20 +451,31 @@ fn assert_block_matches_cpu(res_block: &[f32], cpu_block: &[f32], vocab: usize) 
     }
 }
 
-/// Head switch off (the shipped default, and every
-/// malformed switch value): even with the shared
+/// Head switch off, exercised explicitly
+/// (`WGPU_COMPUTE_K21F_HEAD=0`, the one-variable
+/// rollback; every unrecognized switch value lands
+/// here too, fail-closed): even with the shared
 /// ceiling at its shipped open position, the block head
 /// is the K3 fused call and no `k21_q5k_mmv_finish`
-/// stamp appears anywhere. This is the guard's central
-/// pin: default construction must not prepare K21F.
+/// stamp appears anywhere. The off position must be
+/// reachable and exact at every point after the
+/// default flip.
 #[test]
 fn block_head_stays_k3_when_the_head_switch_is_off() {
     let test = "k21f switch-off routing pin";
     if head_switch_on() {
-        eprintln!(
-            "skipping {test}: {K21F_HEAD_ENV}=1 resolves the head switch on; \
-             this is the switch-off arm"
-        );
+        if head_switch_unset() {
+            eprintln!(
+                "skipping {test}: {K21F_HEAD_ENV} is unset, which resolves \
+                 the head switch ON at the shipped default; this arm needs \
+                 {K21F_HEAD_ENV}=0 (or an unrecognized value)"
+            );
+        } else {
+            eprintln!(
+                "skipping {test}: {K21F_HEAD_ENV}=1 resolves the head switch \
+                 on; this arm needs {K21F_HEAD_ENV}=0 (or an unrecognized value)"
+            );
+        }
         return;
     }
     let Some(backend) = backend_or_skip(test) else {
@@ -424,6 +497,48 @@ fn block_head_stays_k3_when_the_head_switch_is_off() {
     );
 }
 
+/// Default construction (both envs unset: the head
+/// switch at its shipped default ON, the shared
+/// ceiling at its shipped default 16): the block head
+/// routes to the finish form. This is the default
+/// flip's central pin (bench/k21f-default-flip-2026-11-07.md):
+/// it proves the position a run lands in when nobody
+/// sets anything, the position the wave18 retest
+/// proved on the real file
+/// (bench/k21f-retest-2026-11-07.md).
+#[test]
+fn block_head_routes_to_k21f_at_default_construction() {
+    let test = "k21f default-construction routing pin";
+    if !head_switch_unset() {
+        eprintln!(
+            "skipping {test}: {K21F_HEAD_ENV} is set; this arm needs it \
+             unset (the shipped default position)"
+        );
+        return;
+    }
+    if !mmv_ceiling_unset() {
+        eprintln!(
+            "skipping {test}: {MMV_MAX_ROWS_ENV} is set; this arm needs it \
+             unset (the shipped ceiling, 16)"
+        );
+        return;
+    }
+    let Some(backend) = backend_or_skip(test) else {
+        return;
+    };
+    if !diag_ready(test, &backend) {
+        return;
+    }
+    let (session, res_block, cpu_block) = run_block(&backend);
+    assert_block_matches_cpu(&res_block, &cpu_block, 1024);
+    let names = session.diag_kernel_names();
+    assert!(
+        names.contains(&"k21_q5k_mmv_finish"),
+        "default construction must stamp the finish form at the block \
+         batch, saw {names:?}"
+    );
+}
+
 /// Band closed: whatever the head switch says, a shared
 /// ceiling that does not admit the block batch keeps the
 /// block head on the K3 fused call, and no
@@ -431,10 +546,11 @@ fn block_head_stays_k3_when_the_head_switch_is_off() {
 #[test]
 fn block_head_stays_k3_fused_with_the_gate_closed() {
     let test = "k21f closed-gate routing pin";
-    if gate_admits_block_batch() {
+    if !gate_explicitly_closed() {
         eprintln!(
-            "skipping {test}: {MMV_MAX_ROWS_ENV} admits the block batch; \
-             this is the closed arm"
+            "skipping {test}: {MMV_MAX_ROWS_ENV} is not set to a closing \
+             value (unset resolves to the shipped ceiling 16, which admits \
+             the block batch); this arm needs {MMV_MAX_ROWS_ENV}=1"
         );
         return;
     }
@@ -472,10 +588,11 @@ fn block_head_routes_to_k21f_with_the_gate_open() {
         );
         return;
     }
-    if !head_switch_on() {
+    if !head_switch_explicitly_on() {
         eprintln!(
-            "skipping {test}: {K21F_HEAD_ENV} does not resolve on (unset or \
-             not the exact \"1\"); the head route needs its own switch too"
+            "skipping {test}: {K21F_HEAD_ENV} is not the exact \"1\"; this \
+             arm needs the switch set explicitly (unset resolves on too, \
+             but that position is the default-construction arm's)"
         );
         return;
     }

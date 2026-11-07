@@ -94,11 +94,14 @@
 //! prepare a finish this variant now carries. It is
 //! registered at backend construction and routed at
 //! the resident block head only under two gates: its
-//! own switch (`WGPU_COMPUTE_K21F_HEAD`, default off
-//! since the 2026-11-07 defaults-confirmation
-//! identity failure) and the shared MMV band; see
-//! bench/k21-finish-2026-11-06.md and
-//! bench/k21f-default-guard-2026-11-07.md.
+//! own switch (`WGPU_COMPUTE_K21F_HEAD`, default on
+//! since the wave18 retest met the reopen criterion
+//! the guard wrote after the 2026-11-07
+//! defaults-confirmation identity failure; `0`
+//! closes it) and the shared MMV band; see
+//! bench/k21-finish-2026-11-06.md,
+//! bench/k21f-default-guard-2026-11-07.md, and
+//! bench/k21f-default-flip-2026-11-07.md.
 //!
 //! K20 is the Q6_K register-streaming small-batch
 //! product: K18's Q6_K band (2..=16 rows, one weight

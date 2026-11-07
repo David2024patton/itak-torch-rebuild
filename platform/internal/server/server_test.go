@@ -348,6 +348,43 @@ func TestChatWithoutTemplateFallsBackToFlattening(t *testing.T) {
 	}
 }
 
+// The tool wire flow, end to end over HTTP: a request carrying
+// tool definitions and a tool-calling conversation renders through
+// the model's template shape with the real tool names — the tool
+// definitions block (through the tojson filter), the assistant
+// call in ATEM form, and the tool result under the name resolved
+// from its tool_call_id.
+func TestChatWithToolsRendersToolNames(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, fake, func(c *server.Config) {
+		c.ChatTemplate = `{% if tools %}DEFS[{% for tool in tools %}{{ tool.function.name }}:{{ tool.function.parameters | tojson }};{% endfor %}]{% endif %}{% for message in messages %}{% if message['role'] == 'assistant' and message.get('tool_calls') %}{% for tc in message['tool_calls'] %}CALL[{{ tc.function.name }}|{{ tc.function.arguments | tojson }}]{% endfor %}{% elif message['role'] == 'tool' %}OUT[{{ message.get('name') }}:{{ message['content'] }}]{% else %}{{ message['role'] }}:{{ message['content'] }};{% endif %}{% endfor %}`
+	})
+	body := `{"model":"glimmer","tools":[{"type":"function","function":{"name":"get_weather","description":"d","parameters":{"type":"object"}}}],"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":{"city":"Paris"}}}]},{"role":"tool","tool_call_id":"c1","content":"sunny"}]}`
+	code, _, respBody := do(t, ts, http.MethodPost, "/v1/chat/completions", body, testKey)
+	if code != http.StatusOK {
+		t.Fatalf("chat status = %d (%s)", code, respBody)
+	}
+	want := `DEFS[get_weather:{"type":"object"};]user:hi;CALL[get_weather|{"city":"Paris"}]OUT[get_weather:sunny]`
+	if got := lastPrompt(t, fake); got != want {
+		t.Fatalf("engine prompt = %q, want the tool-carrying %q", got, want)
+	}
+}
+
+// A tool message whose name cannot be resolved is a named
+// chat_template_error over HTTP, not a silent empty-name render:
+// the handler's existing template-failure path carries it.
+func TestChatUnresolvableToolMessageIsNamed(t *testing.T) {
+	fake := &fakeEngine{}
+	ts := newServerWithConfig(t, fake, func(c *server.Config) {
+		c.ChatTemplate = chatMLTemplate
+	})
+	body := `{"model":"glimmer","messages":[{"role":"tool","content":"orphan result"}]}`
+	code, _, respBody := do(t, ts, http.MethodPost, "/v1/chat/completions", body, testKey)
+	if code != http.StatusBadGateway || errorCode(t, respBody) != "chat_template_error" {
+		t.Fatalf("status = %d, body = %s; want 502 chat_template_error", code, respBody)
+	}
+}
+
 func TestChatTemplateRenderFailureIsNamed(t *testing.T) {
 	fake := &fakeEngine{}
 	ts := newServerWithConfig(t, fake, func(c *server.Config) {

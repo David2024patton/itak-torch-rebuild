@@ -69,7 +69,10 @@ func TestRoleConditionalsWithElifAndElse(t *testing.T) {
 		{Role: "system", Content: "s"},
 		{Role: "user", Content: "u"},
 		{Role: "assistant", Content: "a"},
-		{Role: "tool", Content: "t"},
+		// A tool message carries its name, as the API requires
+		// for the name to render anywhere; the branch taken here
+		// does not read it.
+		{Role: "tool", Name: "f", Content: "t"},
 	}, chattemplate.Params{})
 	if want := "SYS[s]USR[u]AST[a]AST[t]"; got != want {
 		t.Fatalf("got %q, want %q", got, want)
@@ -110,7 +113,6 @@ func TestUnsupportedConstructsRefuseByName(t *testing.T) {
 	msgs := []chattemplate.Message{{Role: "user", Content: "x"}}
 	cases := map[string]string{
 		"length filter":  `{{ messages | length }}`,
-		"tojson filter":  `{{ messages | tojson }}`,
 		"unknown name":   `{{ model_name }}`,
 		"raise call":     `{{ raise_exception('nope') }}`,
 		"bad for":        `{% for m in model_name %}x{% endfor %}`,
@@ -136,8 +138,11 @@ func TestUntakenBranchIsNotEvaluated(t *testing.T) {
 		t.Fatalf("got %q, want %q", got, "fine")
 	}
 	// The same template refuses by name when the branch IS taken.
+	// The tool message carries a name so the render reaches the
+	// branch: a nameless one refuses earlier, with
+	// ErrUnresolvableTool, before any branch runs.
 	_, err := chattemplate.Render(tmpl,
-		[]chattemplate.Message{{Role: "tool", Content: "x"}}, chattemplate.Params{})
+		[]chattemplate.Message{{Role: "tool", Name: "f", Content: "x"}}, chattemplate.Params{})
 	if !errors.Is(err, chattemplate.ErrUnsupported) {
 		t.Fatalf("tool branch err = %v, want ErrUnsupported", err)
 	}
@@ -148,7 +153,8 @@ func TestUntakenBranchIsNotEvaluated(t *testing.T) {
 // The Glimmer file's own ATEM template uses macros, namespace
 // state, set, defined tests and the join/replace/lower filters.
 // These tests pin the constructs that template's taken paths need;
-// the golden test below renders the file's real template whole.
+// the golden tests below render the file's real template over the
+// paths the conversations they carry actually reach.
 
 func TestSetAndInlineConditional(t *testing.T) {
 	tmpl := `{% set x = 'yes' if add_generation_prompt else 'no' %}{{ x }}`
@@ -219,11 +225,13 @@ var glimmerParams = chattemplate.Params{
 	Now: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC),
 }
 
-// The file's real template, one user message: the default system
-// block renders (no system message given), with the cutoff, the
-// current-date line the template synthesizes from strftime_now,
-// and the reasoning line, plus the valid recipients list joined
-// from namespace state.
+// The file's real template, one user message: this conversation
+// exercises the default system block (no system message given, no
+// tools bound), with the cutoff, the current-date line the
+// template synthesizes from strftime_now, and the reasoning line,
+// plus the valid recipients list joined from namespace state. The
+// tool-definition and tool-call paths are covered separately by
+// TestGlimmerATEMTemplateWithTools below.
 func TestGlimmerATEMTemplateUserOnly(t *testing.T) {
 	got := render(t, glimmerTemplate(t), []chattemplate.Message{
 		{Role: "user", Content: "Capital of France? One word."},
@@ -413,6 +421,184 @@ func TestNestedMacrosWithinBudgetRender(t *testing.T) {
 	got := render(t, tmpl, []chattemplate.Message{{Role: "user", Content: "hi"}},
 		chattemplate.Params{})
 	if want := "[hi][hi]"; got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// ---- tool conversations (critic panel Category E) ----------------
+//
+// The panel's probes, pinned as tests: a tool-role message used to
+// render with an empty tool name (no error anywhere), a tool-
+// calling assistant turn lost its calls, and the template's tool
+// paths were unreachable because Render bound no tools value and
+// the renderer refused the tojson filter the template calls.
+
+func toJSON(t *testing.T, tmpl string) string {
+	t.Helper()
+	return render(t, tmpl, nil, chattemplate.Params{})
+}
+
+// The tojson filter: Jinja's encoding for the shapes the ATEM
+// template passes through it — strings, numbers (integral floats
+// without a trailing .0), booleans, none, lists, and mappings with
+// sorted keys and no spaces after the separators.
+func TestToJSONFilter(t *testing.T) {
+	cases := map[string]string{
+		`{{ 'plain' | tojson }}`:                                  `"plain"`,
+		`{{ 'a"b<c>&d' | tojson }}`:                               `"a\"b\u003cc\u003e\u0026d"`,
+		`{{ 42 | tojson }}`:                                       `42`,
+		`{{ true | tojson }}`:                                     `true`,
+		`{{ none | tojson }}`:                                     `null`,
+		`{{ ['a', 1, true, none] | tojson }}`:                     `["a",1,true,null]`,
+		`{{ {'b': 1, 'a': 'x'} | tojson }}`:                       `{"a":"x","b":1}`,
+		`{{ {'name': 'f', 'parameters': {'a': 1} } | tojson }}`:   `{"name":"f","parameters":{"a":1}}`,
+		`{{ {'xs': [{'k': 'v'}]} | tojson }}`:                     `{"xs":[{"k":"v"}]}`,
+		`{{ {'name': 'f'} | tojson(indent=2) }}`:                  "{\n  \"name\": \"f\"\n}",
+		`{{ {'b': 1, 'a': 'x'} | tojson(indent=2) }}`:             "{\n  \"a\": \"x\",\n  \"b\": 1\n}",
+		`{{ {'name': 'f'} | tojson(indent=2, sort_keys=false) }}`: "{\n  \"name\": \"f\"\n}",
+	}
+	for tmpl, want := range cases {
+		if got := toJSON(t, tmpl); got != want {
+			t.Fatalf("%s: got %q, want %q", tmpl, got, want)
+		}
+	}
+}
+
+// The tojson keyword contract: the fixture never uses kwargs, but
+// the shapes Python's json.dumps accepts beyond them refuse by
+// name instead of being silently ignored.
+func TestToJSONFilterRefusals(t *testing.T) {
+	cases := map[string]string{
+		"positional indent": `{{ {'a': 1} | tojson(2) }}`,
+		"boolean indent":    `{{ {'a': 1} | tojson(indent=true) }}`,
+		"unknown kwarg":     `{{ {'a': 1} | tojson(ensure_ascii=false) }}`,
+		"over a builtin":    `{{ strftime_now | tojson }}`,
+		"over an undefined": `{{ missing | tojson }}`,
+	}
+	for name, tmpl := range cases {
+		_, err := chattemplate.Render(tmpl, nil, chattemplate.Params{})
+		if !errors.Is(err, chattemplate.ErrUnsupported) {
+			t.Fatalf("%s: err = %v, want ErrUnsupported", name, err)
+		}
+	}
+}
+
+// A tool message with an explicit name renders that name.
+func TestGlimmerToolMessageWithName(t *testing.T) {
+	got := render(t, glimmerTemplate(t), []chattemplate.Message{
+		{Role: "tool", Name: "weather.get_forecast", Content: "sunny"},
+	}, glimmerParams)
+	if !strings.Contains(got, `<|start|>tool weather.get_forecast<|message|><tool_output name="weather.get_forecast">`) {
+		t.Fatalf("tool message lost its name: %q", got)
+	}
+	if !strings.Contains(got, "sunny\n</tool_output><|eot|>") {
+		t.Fatalf("tool message lost its content: %q", got)
+	}
+}
+
+// A tool message without a name resolves it from the matching
+// tool_call_id in an earlier assistant turn's calls.
+func TestGlimmerToolMessageResolvedByCallID(t *testing.T) {
+	got := render(t, glimmerTemplate(t), []chattemplate.Message{
+		{Role: "assistant", ToolCalls: []chattemplate.ToolCall{{
+			ID:   "call-7",
+			Type: "function",
+			Function: chattemplate.FunctionCall{
+				Name:      "weather.get_forecast",
+				Arguments: map[string]any{"city": "Paris"},
+			},
+		}}},
+		{Role: "tool", ToolCallID: "call-7", Content: "sunny"},
+	}, glimmerParams)
+	if !strings.Contains(got, `<atem:parameter name="city">Paris</atem:parameter>`) {
+		t.Fatalf("tool call did not render its arguments: %q", got)
+	}
+	if !strings.Contains(got, `<|start|>assistant to=weather.get_forecast<|message|>`) {
+		t.Fatalf("tool call did not render its recipient: %q", got)
+	}
+	if !strings.Contains(got, `<|start|>tool weather.get_forecast<|message|><tool_output name="weather.get_forecast">`) {
+		t.Fatalf("tool message did not resolve its name by call id: %q", got)
+	}
+}
+
+// A tool message whose name cannot be resolved at all refuses by
+// name: the template would otherwise print an empty name, which is
+// exactly the silent flattening the package contract forbids.
+func TestGlimmerToolMessageUnresolvableRefuses(t *testing.T) {
+	_, err := chattemplate.Render(glimmerTemplate(t), []chattemplate.Message{
+		{Role: "tool", Content: "result-42"},
+	}, glimmerParams)
+	if !errors.Is(err, chattemplate.ErrUnresolvableTool) {
+		t.Fatalf("err = %v, want ErrUnresolvableTool", err)
+	}
+}
+
+// The end-to-end golden: tool definitions bound through Params and
+// a conversation carrying a tool call, a resolved tool result, and
+// a plain assistant reply. The rendered prompt carries the real
+// tool names and calls: the definitions block (through tojson),
+// the namespace line in the recipients list, the call in ATEM
+// form, and the tool output under its resolved name.
+func TestGlimmerATEMTemplateWithTools(t *testing.T) {
+	p := glimmerParams
+	p.Tools = []chattemplate.Tool{{
+		Type: "function",
+		Function: chattemplate.ToolFunction{
+			Name:        "weather.get_forecast",
+			Description: "Get the weather forecast for a city.",
+			Parameters: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"city": map[string]any{"type": "string"},
+				},
+			},
+		},
+	}}
+	got := render(t, glimmerTemplate(t), []chattemplate.Message{
+		{Role: "user", Content: "Weather in Paris?"},
+		{Role: "assistant", ToolCalls: []chattemplate.ToolCall{{
+			ID:   "call-1",
+			Type: "function",
+			Function: chattemplate.FunctionCall{
+				Name:      "weather.get_forecast",
+				Arguments: map[string]any{"city": "Paris", "days": float64(3)},
+			},
+		}}},
+		{Role: "tool", ToolCallID: "call-1", Content: "sunny"},
+		{Role: "assistant", Content: "It is sunny in Paris."},
+	}, p)
+	want := "<|begin_of_text|>" +
+		"<|start|>system<|message|>You are a helpful AI assistant.\n" +
+		"Knowledge cutoff: 2026-01-04.\n" +
+		"Current date: 2026-10-31.\n\n" +
+		"Reasoning strength: high.\n\n" +
+		"In this environment you have access to a set of tools you can use to answer the user's question.\n\n" +
+		"You can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n" +
+		"<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\n" +
+		"String and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\n" +
+		"Here are the functions available in JSONSchema format:\n" +
+		"// Tool metadata\n" +
+		"{\"name\": \"weather\", \"description\": \"\"}\n" +
+		"// Function schemas\n" +
+		"{\"name\": \"weather.get_forecast\", \"description\": \"Get the weather forecast for a city.\", \"parameters\": {\"properties\":{\"city\":{\"type\":\"string\"}},\"type\":\"object\"}}\n\n" +
+		"Here's an example of how to call a function in the tool set:\n" +
+		"(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\n" +
+		"to=example_tool_name.example_function_name\n\n" +
+		"<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n" +
+		"<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n" +
+		"<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n" +
+		"</atem:invoke>\n</atem:function_calls>" +
+		"\n\n# Valid recipients: \"self\", \"weather.*\", \"user\".<|eot|>" +
+		"<|start|>user<|message|>Weather in Paris?<|eot|>" +
+		"<|start|>assistant to=weather.get_forecast<|message|>" +
+		"<atem:function_calls>\n<atem:invoke name=\"weather.get_forecast\">\n" +
+		"<atem:parameter name=\"city\">Paris</atem:parameter>\n" +
+		"<atem:parameter name=\"days\">3</atem:parameter>\n" +
+		"</atem:invoke>\n</atem:function_calls><|eot|>" +
+		"<|start|>tool weather.get_forecast<|message|><tool_output name=\"weather.get_forecast\">\nsunny\n</tool_output><|eot|>" +
+		"<|start|>assistant to=user<|message|>It is sunny in Paris.<|eot|>" +
+		"<|start|>assistant"
+	if got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }

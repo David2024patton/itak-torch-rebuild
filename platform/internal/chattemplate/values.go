@@ -25,6 +25,15 @@ const (
 // to vUndef carrying the name: it is falsy and answers the defined
 // test, but printing one refuses by name instead of rendering
 // empty text the caller never asked for.
+//
+// A dict value also carries its keys' insertion order in keys:
+// mappings built from caller data (tool definitions, tool-call
+// arguments, content parts) keep the order that data arrived in,
+// the order Jinja's environment iterates. The dict literal and
+// the namespace() builtin have no caller order worth preserving —
+// a literal's keys are authored in the template, not the data —
+// so they leave keys nil and iterate in sorted-key order, the
+// deterministic order they have always used.
 type value struct {
 	kind vKind
 	name string // vUndef: the unresolved name
@@ -33,6 +42,7 @@ type value struct {
 	s    string
 	list []value
 	dict map[string]value
+	keys []string // vDict: insertion order of dict's keys, nil = sorted
 }
 
 func strValue(s string) value            { return value{kind: vStr, s: s} }
@@ -42,6 +52,37 @@ func listValue(l []value) value          { return value{kind: vList, list: l} }
 func dictValue(d map[string]value) value { return value{kind: vDict, dict: d} }
 func undefValue(name string) value       { return value{kind: vUndef, name: name} }
 func builtinValue(name string) value     { return value{kind: vBuiltin, s: name} }
+
+// orderedDict builds a mapping from key/value pairs in the given
+// order, recording that order for iteration and tojson. A later
+// pair with an already-seen key replaces the value and keeps the
+// key's first position, as Python dict assignment does.
+func orderedDict(pairs ...value) value {
+	d := make(map[string]value, len(pairs)/2)
+	keys := make([]string, 0, len(pairs)/2)
+	for i := 0; i+1 < len(pairs); i += 2 {
+		k := pairs[i].s
+		if _, seen := d[k]; !seen {
+			keys = append(keys, k)
+		}
+		d[k] = pairs[i+1]
+	}
+	return value{kind: vDict, dict: d, keys: keys}
+}
+
+// orderedKeys returns the keys a mapping iterates in: the recorded
+// insertion order when the mapping carries one, else sorted order.
+func (v value) orderedKeys() []string {
+	if v.keys != nil {
+		return v.keys
+	}
+	keys := make([]string, 0, len(v.dict))
+	for k := range v.dict {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	return keys
+}
 
 func (v value) truthy() bool {
 	switch v.kind {

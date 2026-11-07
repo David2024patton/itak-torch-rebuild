@@ -381,14 +381,54 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
+// toolFunction is the wire shape of one function inside a tool
+// definition or a tool call. Parameters and Arguments are
+// decoded JSON objects, kept as maps: templates serialize them
+// with tojson, whose sorted-key default makes the rendered form
+// independent of map order.
+type toolFunction struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+	Arguments   map[string]any `json:"arguments"`
+}
+
+// chatTool is the wire shape of one entry of a request's tools
+// array: {"type": "function", "function": {...}}.
+type chatTool struct {
+	Type     string       `json:"type"`
+	Function toolFunction `json:"function"`
+}
+
+// chatToolCall is the wire shape of one entry of an assistant
+// message's tool_calls array.
+type chatToolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function toolFunction `json:"function"`
+}
+
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// Tool fields (OpenAI-shaped): a tool message's name and
+	// tool_call_id, and an assistant message's tool calls,
+	// reasoning content, recipient, and end-of-turn flag. They
+	// ride to the chat template, whose tool branches read them;
+	// before they existed here, a tool message rendered with an
+	// empty name and a tool call rendered as plain text.
+	Name             string         `json:"name"`
+	ToolCallID       string         `json:"tool_call_id"`
+	ToolCalls        []chatToolCall `json:"tool_calls"`
+	ReasoningContent string         `json:"reasoning_content"`
+	Recipient        string         `json:"recipient"`
+	EndTurn          *bool          `json:"end_turn"`
 }
 
 type chatRequest struct {
 	Model       string        `json:"model"`
 	Messages    []chatMessage `json:"messages"`
+	Tools       []chatTool    `json:"tools"`
 	Stream      bool          `json:"stream"`
 	MaxTokens   int           `json:"max_tokens"`
 	Temperature *float64      `json:"temperature"`
@@ -424,7 +464,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.GenerationTimeout)
 	defer cancel()
 	r = r.WithContext(ctx)
-	prompt, err := s.buildPrompt(r.Context(), req.Messages)
+	prompt, err := s.buildPrompt(r.Context(), &req)
 	if err != nil {
 		// The model's own template could not be rendered. That is
 		// a named platform failure, never a silent fallback to
@@ -648,7 +688,9 @@ func validateChat(req *chatRequest) *fieldError {
 		if m.Role == "" {
 			return &fieldError{fmt.Sprintf("messages[%d].role is required", i), "messages"}
 		}
-		if m.Content == "" {
+		// An assistant turn that only calls tools carries no
+		// content text; every other message must carry some.
+		if m.Content == "" && len(m.ToolCalls) == 0 {
 			return &fieldError{fmt.Sprintf("messages[%d].content is required", i), "messages"}
 		}
 	}
@@ -741,20 +783,57 @@ func (s *Server) templateSource() string {
 // model's own chat template rendered over the messages when the
 // model carries one (TODO T-9.16), role flattening when it carries
 // none. A render failure is an error, not a fallback.
-func (s *Server) buildPrompt(ctx context.Context, msgs []chatMessage) (string, error) {
+func (s *Server) buildPrompt(ctx context.Context, req *chatRequest) (string, error) {
 	tpl := s.resolveTemplate(ctx)
 	if tpl == nil {
-		return flattenMessages(msgs), nil
+		return flattenMessages(req.Messages), nil
 	}
-	converted := make([]chattemplate.Message, len(msgs))
-	for i, m := range msgs {
-		converted[i] = chattemplate.Message{Role: m.Role, Content: m.Content}
+	converted := make([]chattemplate.Message, len(req.Messages))
+	for i, m := range req.Messages {
+		converted[i] = convertMessage(m)
+	}
+	tools := make([]chattemplate.Tool, len(req.Tools))
+	for i, t := range req.Tools {
+		tools[i] = chattemplate.Tool{
+			Type: t.Type,
+			Function: chattemplate.ToolFunction{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  t.Function.Parameters,
+			},
+		}
 	}
 	return chattemplate.Render(tpl.Template, converted, chattemplate.Params{
 		BOSToken:            tpl.BOSToken,
 		EOSToken:            tpl.EOSToken,
 		AddGenerationPrompt: true,
+		Tools:               tools,
 	})
+}
+
+// convertMessage maps one wire message to the template's message
+// shape, carrying the tool fields the template reads.
+func convertMessage(m chatMessage) chattemplate.Message {
+	out := chattemplate.Message{
+		Role:             m.Role,
+		Content:          m.Content,
+		Name:             m.Name,
+		ToolCallID:       m.ToolCallID,
+		ReasoningContent: m.ReasoningContent,
+		Recipient:        m.Recipient,
+		EndTurn:          m.EndTurn,
+	}
+	for _, tc := range m.ToolCalls {
+		out.ToolCalls = append(out.ToolCalls, chattemplate.ToolCall{
+			ID:   tc.ID,
+			Type: tc.Type,
+			Function: chattemplate.FunctionCall{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		})
+	}
+	return out
 }
 
 func flattenMessages(msgs []chatMessage) string {

@@ -241,18 +241,23 @@ func (p *exprParser) parsePostfix() (*vExpr, error) {
 				return nil, err
 			}
 			var args []*vExpr
+			var kw map[string]*vExpr
 			p.skipSpace()
 			if p.pos < len(p.s) && p.s[p.pos] == '(' {
-				var kw map[string]*vExpr
 				args, kw, err = p.parseArgs()
 				if err != nil {
 					return nil, err
 				}
-				if len(kw) > 0 {
+				// Keyword arguments ride along only for the one
+				// filter that defines them (tojson, matching
+				// Jinja); evalFilter refuses them by name for
+				// every other filter, as it refused all of them
+				// before.
+				if len(kw) > 0 && name != "tojson" {
 					return nil, fmt.Errorf("%w: filter %q with keyword arguments", ErrUnsupported, name)
 				}
 			}
-			e = &vExpr{kind: "filter", s: name, lhs: e, args: args}
+			e = &vExpr{kind: "filter", s: name, lhs: e, args: args, kw: kw}
 		default:
 			return e, nil
 		}

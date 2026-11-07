@@ -2,6 +2,7 @@ package chattemplate
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -180,8 +181,29 @@ func assign(e *env, target []string, v value) error {
 	if !ok || base.kind != vDict {
 		return fmt.Errorf("%w: set %s.%s on a non-mapping", ErrUnsupported, target[0], target[1])
 	}
+	// A key the mapping does not carry yet joins its iteration
+	// order at the end, as Python dict assignment does; the
+	// scope's stored copy of the mapping header has to see the
+	// new order slice, so write it back.
+	if _, seen := base.dict[target[1]]; !seen && base.keys != nil {
+		base.keys = append(base.keys, target[1])
+		if scopeVars, found := findScopeVars(e.cur, target[0]); found {
+			scopeVars[target[0]] = base
+		}
+	}
 	base.dict[target[1]] = v
 	return nil
+}
+
+// findScopeVars returns the vars map that binds name, walking the
+// scope chain the way lookup does.
+func findScopeVars(s *scope, name string) (map[string]value, bool) {
+	for cur := s; cur != nil; cur = cur.parent {
+		if _, ok := cur.vars[name]; ok {
+			return cur.vars, true
+		}
+	}
+	return nil, false
 }
 
 func eval(x *vExpr, e *env) (value, error) {
@@ -250,6 +272,24 @@ func eval(x *vExpr, e *env) (value, error) {
 		r, err := eval(x.rhs, e)
 		if err != nil {
 			return value{}, err
+		}
+		// The ATEM template concatenates a string with a filtered
+		// value ('...' + rns.recipients | join(', ')): Jinja binds
+		// the filter tighter than +, so the right operand parses
+		// as one filtered primary. This parser reads a whole
+		// conditional expression there instead, leaving the
+		// filter node as the top of its tree; evaluate that node
+		// here, which composes because filters are pure. The
+		// parse-level binding stays the subtree case this
+		// codebase has always had: a filter whose base is itself
+		// the concatenation is outside it and refuses by name.
+		if r.kind == vUndef {
+			if fr, ok := trailingFilter(x.rhs); ok {
+				r, err = evalFilter(fr, e)
+				if err != nil {
+					return value{}, err
+				}
+			}
 		}
 		out, err := addValues(l, r)
 		if err != nil {
@@ -337,6 +377,22 @@ func eval(x *vExpr, e *env) (value, error) {
 		return evalCall(x, e)
 	}
 	return value{}, fmt.Errorf("%w: expression kind %q", ErrUnsupported, x.kind)
+}
+
+// trailingFilter reports whether an expression tree's root is a
+// bare filter application over a name or attribute chain — the
+// shape the add case completes. Grouped operands (parentheses in
+// Jinja) parse as the same root shape here, which is harmless:
+// those are exactly the operands Jinja binds the filter to.
+func trailingFilter(x *vExpr) (*vExpr, bool) {
+	if x == nil || x.kind != "filter" {
+		return nil, false
+	}
+	switch x.lhs.kind {
+	case "name", "attr", "index":
+		return x, true
+	}
+	return nil, false
 }
 
 func getAttr(base value, name string) value {
@@ -516,8 +572,237 @@ func evalFilter(x *vExpr, e *env) (value, error) {
 			return value{}, err
 		}
 		return strValue(out), nil
+	case "tojson":
+		return evalToJSON(x, e, base)
 	}
 	return value{}, fmt.Errorf("%w: filter %q", ErrUnsupported, x.s)
+}
+
+// evalToJSON implements the tojson filter with Jinja's semantics:
+// the value is serialized as Python's json.dumps serializes it,
+// then marked safe, which in this print-only renderer means the
+// JSON text passes through unchanged (without the HTML entity
+// escaping Jinja applies on top, which belongs to autoescaping
+// web contexts, not prompt building). The default dump uses the
+// compact separators and sorts mapping keys — the ATEM template
+// relies on exactly this when it serializes tool schemas, whose
+// key order in the prompt is therefore sorted, as under Jinja.
+// The indent keyword (a non-negative integer) switches to the
+// pretty form with ", " after colons and one entry per line, and
+// sort_keys (default true) may be set false to keep recorded
+// insertion order. The encoded text charges the output budget
+// like any other produced text: a filter can be applied to a
+// whole tool schema at every message.
+func evalToJSON(x *vExpr, e *env, base value) (value, error) {
+	if len(x.args) > 0 {
+		return value{}, fmt.Errorf("%w: filter \"tojson\" takes keyword arguments only", ErrUnsupported)
+	}
+	indent := -1
+	sortKeys := true
+	for name, argExpr := range x.kw {
+		v, err := eval(argExpr, e)
+		if err != nil {
+			return value{}, err
+		}
+		switch name {
+		case "indent":
+			if v.kind != vNum || v.n < 0 || v.n != float64(int(v.n)) {
+				return value{}, fmt.Errorf("%w: filter \"tojson\" indent is not a non-negative integer", ErrUnsupported)
+			}
+			indent = int(v.n)
+		case "sort_keys":
+			if v.kind != vBool {
+				return value{}, fmt.Errorf("%w: filter \"tojson\" sort_keys is not a boolean", ErrUnsupported)
+			}
+			sortKeys = v.b
+		default:
+			return value{}, fmt.Errorf("%w: filter \"tojson\" argument %q", ErrUnsupported, name)
+		}
+	}
+	var sb strings.Builder
+	if err := writeJSONValue(&sb, base, indent, sortKeys, 0); err != nil {
+		return value{}, err
+	}
+	out := sb.String()
+	if err := e.budget.write(len(out)); err != nil {
+		return value{}, err
+	}
+	return strValue(out), nil
+}
+
+// writeJSONValue serializes a value the way Python's json.dumps
+// does, which is what Jinja's tojson wraps: strings escape the
+// backslash and control characters as \u00XX (with the short
+// escapes for newline, tab, and carriage return), the quote
+// itself as \" (or \u0022 in Jinja's HTML-safe pass, which also
+// escapes <, >, & and ' the same unicode way; the fixture's
+// schema dumps come through llama.cpp's minja runtime, whose
+// tojson is a plain nlohmann::json dump, and this encoder
+// follows that plain form for the quote — tool schemas pinned
+// against the reference environment are byte-compared in the
+// golden tests), plus <, >, and & as \u003c, \u003e, \u0026
+// (shared by the HTML-safe form), and non-ASCII characters as
+// \uXXXX because ensure_ascii defaults to true. Numbers print
+// as Python prints them: integral floats without a fraction,
+// other floats in the shortest round-trip decimal; NaN and the
+// infinities print as Python's bare NaN/Infinity/-Infinity
+// tokens, as json.dumps emits them by default. Mappings print
+// their keys sorted unless sortKeys is false and the mapping
+// carries an insertion order. Container nesting is bounded
+// explicitly (Python bounds it with its recursion limit): a
+// pathological value refuses by name instead of overflowing the
+// stack.
+func writeJSONValue(sb *strings.Builder, v value, indent int, sortKeys bool, depth int) error {
+	const maxJSONDepth = 512
+	if depth > maxJSONDepth {
+		return fmt.Errorf("%w: filter \"tojson\" over a value nested deeper than %d", ErrUnsupported, maxJSONDepth)
+	}
+	switch v.kind {
+	case vStr:
+		writeJSONString(sb, v.s)
+	case vNum:
+		sb.WriteString(jsonNumber(v.n))
+	case vBool:
+		if v.b {
+			sb.WriteString("true")
+		} else {
+			sb.WriteString("false")
+		}
+	case vNone:
+		sb.WriteString("null")
+	case vList:
+		if len(v.list) == 0 {
+			sb.WriteString("[]")
+			return nil
+		}
+		sb.WriteByte('[')
+		for i, el := range v.list {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			writeJSONIndent(sb, indent, depth+1, i > 0)
+			if err := writeJSONValue(sb, el, indent, sortKeys, depth+1); err != nil {
+				return err
+			}
+		}
+		writeJSONIndent(sb, indent, depth, len(v.list) > 0)
+		sb.WriteByte(']')
+	case vDict:
+		if len(v.dict) == 0 {
+			sb.WriteString("{}")
+			return nil
+		}
+		keys := v.orderedKeys()
+		if !sortKeys {
+			// Insertion order already; nothing to arrange.
+		} else {
+			sorted := make([]string, len(keys))
+			copy(sorted, keys)
+			sortStrings(sorted)
+			keys = sorted
+		}
+		sb.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			writeJSONIndent(sb, indent, depth+1, i > 0)
+			writeJSONString(sb, k)
+			sb.WriteByte(':')
+			if indent >= 0 {
+				sb.WriteByte(' ')
+			}
+			if err := writeJSONValue(sb, v.dict[k], indent, sortKeys, depth+1); err != nil {
+				return err
+			}
+		}
+		writeJSONIndent(sb, indent, depth, len(v.dict) > 0)
+		sb.WriteByte('}')
+	default:
+		return fmt.Errorf("%w: filter \"tojson\" over a value with no JSON form", ErrUnsupported)
+	}
+	return nil
+}
+
+// writeJSONIndent emits the pretty-print line break and padding
+// for one entry when indent is on, and nothing in compact form.
+// The first entry of a container opens on the container's own
+// line; every entry, first included, ends up indented by its
+// level once the comma or opening bracket before it is written.
+func writeJSONIndent(sb *strings.Builder, indent, level int, afterComma bool) {
+	if indent < 0 {
+		return
+	}
+	_ = afterComma
+	sb.WriteByte('\n')
+	for i := 0; i < indent*level; i++ {
+		sb.WriteByte(' ')
+	}
+}
+
+// writeJSONString writes one string with Python json escaping.
+func writeJSONString(sb *strings.Builder, s string) {
+	sb.WriteByte('"')
+	for _, r := range s {
+		switch {
+		case r == '"':
+			sb.WriteString(`\"`)
+		case r == '\\':
+			sb.WriteString(`\\`)
+		case r == '\n':
+			sb.WriteString(`\n`)
+		case r == '\r':
+			sb.WriteString(`\r`)
+		case r == '\t':
+			sb.WriteString(`\t`)
+		case r == '\b':
+			sb.WriteString(`\b`)
+		case r == '\f':
+			sb.WriteString(`\f`)
+		case r == '<':
+			sb.WriteString(`\u003c`)
+		case r == '>':
+			sb.WriteString(`\u003e`)
+		case r == '&':
+			sb.WriteString(`\u0026`)
+		case r < 0x20:
+			fmt.Fprintf(sb, `\u%04x`, r)
+		case r < 0x80:
+			sb.WriteRune(r)
+		case r <= 0xFFFF:
+			fmt.Fprintf(sb, `\u%04x`, r)
+		default:
+			// Above the basic multilingual plane, Python emits
+			// a UTF-16 surrogate pair.
+			r -= 0x10000
+			fmt.Fprintf(sb, `\u%04x\u%04x`, 0xD800+(r>>10), 0xDC00+(r&0x3FF))
+		}
+	}
+	sb.WriteByte('"')
+}
+
+// jsonNumber formats a float the way Python's repr does for the
+// magnitudes chat data carries: integral values print without a
+// fraction, others in the shortest decimal that round-trips.
+// strconv's shortest form differs from repr only in exponent
+// formatting (Go writes 1e+21 where Python writes 1e+21 as well
+// for floats this size; both agree on the plain range), which is
+// acceptable here: the values tojson serializes from templates
+// are tool schemas, names, and arguments, not float extremes.
+func jsonNumber(n float64) string {
+	if n != n {
+		return "NaN"
+	}
+	if n > 1.7976931348623157e308 {
+		return "Infinity"
+	}
+	if n < -1.7976931348623157e308 {
+		return "-Infinity"
+	}
+	if n == float64(int64(n)) && n < 9.0e15 && n > -9.0e15 {
+		return strconv.FormatInt(int64(n), 10)
+	}
+	return strconv.FormatFloat(n, 'g', -1, 64)
 }
 
 func evalMethod(x *vExpr, e *env) (value, error) {
@@ -571,14 +856,12 @@ func evalMethod(x *vExpr, e *env) (value, error) {
 		if base.kind != vDict {
 			return value{}, fmt.Errorf("%w: method items on a non-mapping", ErrUnsupported)
 		}
-		// Pair items in sorted-key order: Go maps do not carry
-		// Jinja's insertion order, and no shipped shape iterates
-		// a mapping whose order affects the prompt.
-		keys := make([]string, 0, len(base.dict))
-		for k := range base.dict {
-			keys = append(keys, k)
-		}
-		sortStrings(keys)
+		// Pair items in the mapping's iteration order: the
+		// insertion order caller data arrived in, or sorted
+		// order for mappings without one (see values.go). The
+		// ATEM template prints one parameter block per pair,
+		// so this order is prompt text, not an internal detail.
+		keys := base.orderedKeys()
 		out := make([]value, 0, len(keys))
 		for _, k := range keys {
 			out = append(out, listValue([]value{strValue(k), base.dict[k]}))

@@ -10,7 +10,12 @@
 //     fabricates a success: unconfigured engine = 503 engine_unavailable,
 //     unimplemented engine op = 501 not_implemented.
 //   - Requests flow through the scheduler's priority lanes and
-//     non-streaming completions through the exact-match response cache.
+//     non-streaming completions through the exact-match response
+//     cache — except unseeded sampled requests (temperature > 0
+//     with no seed): those bypass the cache on both sides, because
+//     replaying the first caller's sample would freeze the
+//     variation the caller asked the temperature for. Seeded and
+//     temperature-0 requests are deterministic and do cache.
 //   - Every operational limit (generation cap and deadline, body
 //     size, header and idle timeouts, lane queue caps, cache size)
 //     is operator config with a default, threaded from torchd's
@@ -128,7 +133,9 @@ type Server struct {
 	// Chat template resolution (TODO T-9.16): resolved lazily and
 	// cached once the outcome is definitive (a template, or the
 	// engine's named no-template answer). Transient fetch errors
-	// are retried on the next request rather than cached.
+	// surface to the request that hit them and are retried on the
+	// next request rather than cached. tplMu guards the cached
+	// outcome only; it is never held across the fetch.
 	tplMu     sync.Mutex
 	tpl       *engine.ChatTemplate
 	tplSource string // "", "config", "engine", "none"
@@ -495,13 +502,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cacheKey := chatCacheKey(&req)
-	if body, hit := s.cache.Get(cacheKey); hit {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Torch-Cache", "hit")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
-		return
+	cacheable := chatCacheable(&req)
+	var cacheKey string
+	if cacheable {
+		cacheKey = chatCacheKey(&req)
+		if body, hit := s.cache.Get(cacheKey); hit {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Torch-Cache", "hit")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		}
 	}
 
 	release, ok := s.acquire(w, r)
@@ -571,9 +582,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		s.engineError(w, fmt.Errorf("marshal completion: %w", err))
 		return
 	}
-	s.cache.Set(cacheKey, body)
+	if cacheable {
+		s.cache.Set(cacheKey, body)
+		w.Header().Set("X-Torch-Cache", "miss")
+	} else {
+		w.Header().Set("X-Torch-Cache", "skip")
+	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("X-Torch-Cache", "miss")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
@@ -722,47 +737,63 @@ type chatTemplater interface {
 	ChatTemplate(context.Context) (engine.ChatTemplate, error)
 }
 
-// resolveTemplate returns the chat template to render with, or nil
-// when the model has none (the flattening fallback). The outcome is
-// cached once definitive: a configured template wins outright; the
-// engine's own template is fetched once; the engine's named
-// ErrNoChatTemplate settles it as none. Any other fetch error is
-// logged and NOT cached, so a later request retries.
-func (s *Server) resolveTemplate(ctx context.Context) *engine.ChatTemplate {
+// resolveTemplate returns the chat template to render with, or
+// (nil, nil) when the model definitively has none (the flattening
+// fallback). A transient fetch failure is neither: it returns an
+// error, because flattening on a hiccup would silently build the
+// wrong prompt — the two nil outcomes used to be indistinguishable
+// and a fetch error took the flattening path with no signal.
+//
+// The outcome is cached once definitive: a configured template
+// wins outright; the engine's own template is fetched once; the
+// engine's named ErrNoChatTemplate settles it as none. Fetch
+// errors are logged and NOT cached, so a later request retries.
+// tplMu guards the cached outcome only and is never held across
+// the fetch: one slow fetch must not serialize every chat request
+// behind it. Concurrent requests may fetch twice; both cache the
+// same outcome (first writer wins in cacheTemplateOutcome).
+func (s *Server) resolveTemplate(ctx context.Context) (*engine.ChatTemplate, error) {
 	s.tplMu.Lock()
-	defer s.tplMu.Unlock()
-	if s.tplDone {
-		return s.tpl
+	done, tpl := s.tplDone, s.tpl
+	s.tplMu.Unlock()
+	if done {
+		return tpl, nil
 	}
 	if s.cfg.ChatTemplate != "" {
-		s.tpl = &engine.ChatTemplate{
+		return s.cacheTemplateOutcome(&engine.ChatTemplate{
 			Template: s.cfg.ChatTemplate,
 			BOSToken: s.cfg.ChatBOSToken,
 			EOSToken: s.cfg.ChatEOSToken,
-		}
-		s.tplSource, s.tplDone = "config", true
-		return s.tpl
+		}, "config"), nil
 	}
 	ct, ok := s.eng.(chatTemplater)
 	if !ok {
-		s.tplSource, s.tplDone = "none", true
-		return nil
+		return s.cacheTemplateOutcome(nil, "none"), nil
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	tpl, err := ct.ChatTemplate(fetchCtx)
+	fetched, err := ct.ChatTemplate(fetchCtx)
 	switch {
 	case err == nil:
-		s.tpl = &tpl
-		s.tplSource, s.tplDone = "engine", true
-		return s.tpl
+		return s.cacheTemplateOutcome(&fetched, "engine"), nil
 	case errors.Is(err, engine.ErrNoChatTemplate):
-		s.tplSource, s.tplDone = "none", true
-		return nil
+		return s.cacheTemplateOutcome(nil, "none"), nil
 	default:
 		s.log.Warn("chat template fetch failed; will retry on the next request", "err", err)
-		return nil
+		return nil, fmt.Errorf("chat template fetch failed: %w", err)
 	}
+}
+
+// cacheTemplateOutcome records a definitive template outcome
+// (first writer wins, so concurrent fetches agree) and returns
+// the recorded template.
+func (s *Server) cacheTemplateOutcome(tpl *engine.ChatTemplate, source string) *engine.ChatTemplate {
+	s.tplMu.Lock()
+	defer s.tplMu.Unlock()
+	if !s.tplDone {
+		s.tpl, s.tplSource, s.tplDone = tpl, source, true
+	}
+	return s.tpl
 }
 
 // templateSource reports how the prompt is being built, for /debug:
@@ -782,9 +813,13 @@ func (s *Server) templateSource() string {
 // buildPrompt produces the engine prompt for one chat request: the
 // model's own chat template rendered over the messages when the
 // model carries one (TODO T-9.16), role flattening when it carries
-// none. A render failure is an error, not a fallback.
+// none. A render failure — and a template fetch failure — is an
+// error, not a fallback.
 func (s *Server) buildPrompt(ctx context.Context, req *chatRequest) (string, error) {
-	tpl := s.resolveTemplate(ctx)
+	tpl, err := s.resolveTemplate(ctx)
+	if err != nil {
+		return "", err
+	}
 	if tpl == nil {
 		return flattenMessages(req.Messages), nil
 	}
@@ -848,9 +883,26 @@ func flattenMessages(msgs []chatMessage) string {
 	return sb.String()
 }
 
+// chatCacheable reports whether a chat request may use the
+// response cache at all. An unseeded temperature > 0 request asks
+// the sampler for variation; caching it would replay the first
+// caller's sample byte-identical to every later identical caller
+// for the TTL, freezing the variation the temperature was set to
+// obtain. Seeded requests are deterministic (same seed, same
+// sample) and temperature 0 is greedy, so both keep the cache.
+// Uncacheable requests skip the read AND the write and answer
+// X-Torch-Cache: skip.
+func chatCacheable(req *chatRequest) bool {
+	return req.Seed != nil || req.Temperature == nil || *req.Temperature <= 0
+}
+
 func chatCacheKey(req *chatRequest) string {
 	// Pointer fields marshal distinctly from absent ones, so temperature
-	// 0 and no temperature do not collide.
+	// 0 and no temperature do not collide. Every field of the request
+	// is in the hash; that distinctness is pinned field by field in
+	// cachekey_internal_test.go and over HTTP in server_cache_test.go,
+	// because a key that silently stops covering a field serves one
+	// caller's completion to every other caller of the model.
 	b, _ := json.Marshal(req)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])

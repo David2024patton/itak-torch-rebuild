@@ -289,12 +289,12 @@ def main() raises:
         )
     var row_bytes = (cols // SB_ELEMS) * SB_BYTES
     var weights_bytes = rows * row_bytes
-    log_debug("k1_gemv.load", "fixture dir " + fixture_dir)
+    _ = log_debug("k1_gemv.load", "fixture dir " + fixture_dir)
     var w_host = read_file_exact(
         fixture_dir + "/weights_q4k.bin", weights_bytes
     )
     var x_host = read_file_exact(fixture_dir + "/input_f32.bin", cols * 4)
-    log_debug(
+    _ = log_debug(
         "k1_gemv.load",
         "weights "
         + String(weights_bytes)
@@ -304,7 +304,7 @@ def main() raises:
     )
 
     var ctx = DeviceContext()
-    log_debug("k1_gemv.device", "DeviceContext created")
+    _ = log_debug("k1_gemv.device", "DeviceContext created")
     var w_dev = ctx.enqueue_create_buffer[DType.uint8](weights_bytes)
     var x_dev = ctx.enqueue_create_buffer[DType.float32](cols)
     var o_dev = ctx.enqueue_create_buffer[DType.float32](rows)
@@ -317,13 +317,13 @@ def main() raises:
         x_src[i] = p[unsafe_offset=i]
     ctx.enqueue_copy(src_buf=w_src, dst_buf=w_dev)
     ctx.enqueue_copy(src_buf=x_src, dst_buf=x_dev)
-    log_debug("k1_gemv.device", "fixture uploaded")
+    _ = log_debug("k1_gemv.device", "fixture uploaded")
 
     ctx.enqueue_function[k1_gemv_kernel](
         w_dev, x_dev, o_dev, Int32(cols), grid_dim=rows, block_dim=THREADS
     )
     ctx.synchronize()
-    log_debug("k1_gemv.run", "correctness launch done")
+    _ = log_debug("k1_gemv.run", "correctness launch done")
 
     var o_host = ctx.enqueue_create_host_buffer[DType.float32](rows)
     ctx.enqueue_copy(src_buf=o_dev, dst_buf=o_host)
@@ -373,4 +373,4 @@ def main() raises:
             gbs,
             "GB/s",
         )
-        log_debug("k1_gemv.timing", "loop done")
+        _ = log_debug("k1_gemv.timing", "loop done")

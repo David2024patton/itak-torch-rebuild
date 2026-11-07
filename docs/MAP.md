@@ -46,8 +46,9 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Unmarked nodes
 | arch-llama | module | Generic dense architecture for the llama and qwen2 families (pre-norm, RoPE, GQA with KV cache, SwiGLU), config and weights from the file's own GGUF metadata. Depends on gguf, attention, torch-math. |
 | itak-loader | module | The loader bridge: implements the muse-glimmer module's Metadata and TensorSource traits over the gguf crate, and verifies a file's tensor inventory against the architecture's expected names (the coverage gate). |
 | cpu-compute | module | The CPU reference Compute backend: real f32 arithmetic via torch-math, dequantization via gguf, KV storage via attention. This is the backend the serving engine runs today. |
-| wgpu-compute | module | The wgpu (Vulkan) Compute backend: kernels K1 through K14 and the device-resident forward session. Proven against the golden as a bench (bench/gpu-resident-2026-10-30.md); not yet wired into the itak-engine binary. |
+| wgpu-compute | module | The wgpu (Vulkan) Compute backend: kernels K1 through K24 plus the split-K reducer and the cooperative-matrix variants, and the device-resident forward session. Proven against the golden as a bench (bench/gpu-resident-2026-10-30.md); not yet wired into the itak-engine binary. |
 | dflash | module | The DFlash draft architecture: config from the draft file's own metadata, conditioning fused from named target layer inputs, non-causal block forward producing per-position draft logits. |
+| itak-kv | module | The persistent tiered prefix-KV store: versioned KV snapshots keyed by token prefix, verified token for token on load, written atomically, LRU-bounded by bytes. Built on the attention crate's KvCache; the resident session's capture and restore seam consumes it. |
 | itak-spec | module | The speculative decoding loop: DFlash block drafting against the target, exact-output verification, KV checkpoint and rewind, rejection sampling. Proven token-identical on CPU (bench/spec-loop-2026-10-30.md); not yet in the serving path. |
 | itak-core (planned) | module | The shared Go contracts: types, health, event, debug, registry. Published and versioned. |
 | itak-ssm (planned) | module | The state space scan: three-term recurrence, rotation on B and C, MIMO rank. |
@@ -86,6 +87,8 @@ Nodes marked (planned) are designed in PLAN.md and not yet built. Unmarked nodes
 | wgpu-compute | muse-glimmer | reads (implements its Compute trait) | muse-glimmer can run on wgpu-compute (bench path today) |
 | wgpu-compute | gguf | calls (dequantization and upload) | gguf supplies weights to wgpu-compute |
 | wgpu-compute | attention | reads (KV shapes and masks) | attention defines the cache layout wgpu-compute mirrors on device |
+| wgpu-compute | itak-kv | reads and writes (prefix snapshots through the store seam) | itak-kv serves snapshot capture and restore to wgpu-compute's resident session |
+| itak-kv | attention | reads and writes (snapshots captured from and restored into KvCache) | attention holds the cache state itak-kv persists |
 | wgpu-compute | RX 7900 XTX server | runs on (Vulkan via wgpu) | RX 7900 XTX server hosts wgpu-compute |
 | arch-llama | gguf | reads (metadata and tensors) | gguf supplies arch-llama |
 | arch-llama | attention | reads and writes (KV cache) | attention holds cache state for arch-llama |
@@ -130,6 +133,8 @@ flowchart TD
   WGPU[wgpu-compute] --> GLIM
   WGPU --> GG
   WGPU --> ATT
+  WGPU --> KV[itak-kv]
+  KV --> ATT
   WGPU --> GPU[RX 7900 XTX server]
   ARCH[arch-llama] --> GG
   ARCH --> ATT

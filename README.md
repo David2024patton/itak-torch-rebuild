@@ -39,7 +39,7 @@ iTaK Torch began as a pure-Go inference engine with an unusually wide reach: an 
 
 The rebuild splits the system by what each language is best at:
 
-- **Rust owns the token loop.** Twelve crates: the GGUF loader, both tokenizer families, the reference math core, attention and KV caches, two architecture modules (dense llama-family and Muse Glimmer), a CPU reference backend, a wgpu/Vulkan backend, the DFlash draft module, the speculative loop, and the engine binary itself.
+- **Rust owns the token loop.** Thirteen crates: the GGUF loader, both tokenizer families, the reference math core, attention and KV caches, the persistent prefix-KV store, two architecture modules (dense llama-family and Muse Glimmer), a CPU reference backend, a wgpu/Vulkan backend, the DFlash draft module, the speculative loop, and the engine binary itself.
 - **Go owns the platform.** The OpenAI-compatible API surface, API-key auth, scheduling, response cache, engine supervision, and observability, in [platform/](platform/). The platform serves authenticated chat completions by driving the Rust engine over a Unix socket.
 - **Mojo stays the research lab.** New kernel ideas are prototyped there; winners graduate into the Rust crates.
 
@@ -54,7 +54,7 @@ Measured on the target hardware, an AMD Radeon RX 7900 XTX (24 GB, gfx1100), aga
 - The device-resident GPU forward reproduces the golden continuation exactly, 8 of 8 tokens (bench/gpu-resident-2026-10-30.md).
 - The speculative verify loop (DFlash draft plus rejection sampling) produces a stream token-identical to plain greedy over 16 tokens on the real files (bench/spec-loop-2026-10-30.md).
 - The serving pair passed its live proof run on the real file: sampling parity, two concurrent slots with independent outputs, embeddings geometry, and chat-template prompt ids matching llama.cpp 63 for 63 (bench/t917-proof-2026-10-30.md).
-- The reference-stack record the design stands on: llama.cpp decodes Glimmer Q4_K_M at 44.31 tok/s (Vulkan) on this card, and the DFlash depth sweep found its operating point at depth 6, 107.39 tok/s (bench/gpu-proof-2026-10-30.md; full record in docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md).
+- The reference-stack record the design stands on: llama.cpp decodes Glimmer Q4_K_M at 44.31 tok/s (Vulkan, llama-bench tg128 after pp512) on this card, and the DFlash depth sweep on the llama-server /completion harness found its operating point at depth 6, 107.39 tok/s (bench/gpu-proof-2026-10-30.md; full record in docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md). The two numbers come from different harnesses and are not compared against each other; DECISIONS.md (2026-10-30) designates the sweep harness as the comparison shape.
 
 ## Quickstart
 
@@ -86,8 +86,9 @@ Operating the pair, flags and all, is in [SERVING.md](SERVING.md); the operation
 | arch-llama | Rust crate | Generic dense architecture for the llama and qwen2 families, config and weights from the file's own metadata. |
 | itak-loader | Rust crate | The bridge: implements the architecture modules' Metadata and TensorSource traits over the gguf crate, with the tensor coverage gate. |
 | cpu-compute | Rust crate | CPU reference Compute backend: real f32 arithmetic via torch-math, KV storage via the attention crate. |
-| wgpu-compute | Rust crate | wgpu (Vulkan) Compute backend: kernels K1 through K14, including the device-resident forward session. |
+| wgpu-compute | Rust crate | wgpu (Vulkan) Compute backend: kernels K1 through K24 plus the split-K reducer and the cooperative-matrix variants, including the device-resident forward session. |
 | dflash | Rust crate | The DFlash draft architecture: conditioning fused from named target layer inputs, non-causal block forward. |
+| itak-kv | Rust crate | The persistent tiered prefix-KV store: versioned KV snapshots keyed by token prefix, verified on load, LRU-bounded by bytes, on the attention crate's KV cache. |
 | itak-spec | Rust crate | The speculative decoding loop: block drafting, exact-output verification, KV checkpoint and rewind, rejection sampling. |
 | itak-engine | Rust binary | Owns one loaded model and serves the NDJSON-over-unix-socket protocol (hello, ping, debug, generate, embed, chat_template) with streamed token events and named errors. |
 | Go platform | Go service | API handlers (OpenAI-compatible), API-key auth, scheduler, response cache, engine client and supervision, chat-template rendering, the torchd daemon. |
@@ -96,7 +97,7 @@ Full map with links traced both ways: [docs/MAP.md](docs/MAP.md). Still designed
 
 ## Status
 
-The engine and platform exist and serve. The serving path today is the CPU reference backend behind the platform; the GPU-resident forward is proven as a bench, not yet wired into the serving engine, and the speculative loop is proven on CPU, not in the serving path. A double critic panel graded this tree DO NOT SHIP; fix wave Waves 1 and 2 have landed (socket and bounds hardening, the corrected record, toolchain pins, the dependency policy), and Wave 3 plus a cold panel re-run are still ahead. No claim in this repo outruns its proof note. Detail: [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
+The engine and platform exist and serve. The serving path today is the CPU reference backend behind the platform; the GPU-resident forward, the GPU speculative loop, and the prefix-KV store are proven on the card, not yet wired into the serving engine. The first double critic panel graded this tree DO NOT SHIP and its three fix waves landed in full; a second cold panel on 2026-11-07 graded the grown tree DO NOT SHIP again (83 findings, no criticals, the numeric core verified clean), and its safety, socket, platform-answer, proof-tool, and diagnostics fixes have landed, with the remaining categories and the card confirmation at the new shipped defaults (cooperative-matrix MMQ and split-K on) still ahead. No claim in this repo outruns its proof note. Detail: [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
 
 ## License
 

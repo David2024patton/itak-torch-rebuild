@@ -28,7 +28,7 @@ RULES:
 Toolchains are pinned: `rust-toolchain.toml` at the repo root (rust 1.99.1) and the platform's `go.mod` toolchain line (go1.26.10). Build both halves from the repo root:
 
 ```bash
-# Rust workspace: the engine binary plus the eleven library crates
+# Rust workspace: the engine binary plus the twelve library crates
 cargo build --release -p itak-engine
 
 # Go platform: the torchd daemon

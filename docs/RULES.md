@@ -53,11 +53,18 @@ Patton and apply to every module, every language, every time.
 
 ## Security
 - No secrets in the repo, ever: keys, tokens, and passwords live in
-  secure storage only. Secret scanning (gitleaks or betterleaks) runs
-  in the gates.
+  secure storage only. Secret scanning (gitleaks or betterleaks) in
+  the commit gates is the target state, not yet landed: the gate
+  script is TODO T-1.5, still open, and no gate script or CI exists
+  in the tree today. Until it lands, the rule is the first sentence,
+  enforced by review.
 - Every refusal, overage, and verdict emits through the project's
   diagnostic channel. Nothing fails silently.
-- Untrusted input gets a bounded parser and a fuzz target, not trust.
+- Untrusted input gets a bounded parser, not trust; the bounded
+  parsers exist and are tested. A fuzz target for each one is the
+  target state, not yet landed: no fuzz target exists in the tree
+  today, and the gate work that would run them is TODO T-1.7,
+  still open.
 
 ## Verification
 - Done means proven: a test with asserted values, a log line, a bench

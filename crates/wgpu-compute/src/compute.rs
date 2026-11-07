@@ -3,19 +3,33 @@
 //! What runs on the device: `proj` (and through it `lm_head`)
 //! for Q4_K, Q6_K, and Q5_K tensors, through kernels K1, K2,
 //! and K3 respectively, selected by the tensor's dtype; the
-//! norms and the residual add through K4; `swiglu_ffn` end to
-//! end (K1 gate and up, K7 activation, K2 down) with
-//! `attn_gate` through K7; and the embedding gather through
-//! K8. The one step that still refuses, by name, is
-//! `attention`: the K5 (RoPE plus KV append) and K6 (scores
-//! plus reduce) pipelines are built, but their composition
-//! over this backend (device KV residency mirroring
-//! `cpu-compute`'s backend-owned storage, behind the `Cache`
-//! trait's position contract) is not wired yet. Nothing is
-//! silently substituted: BACKEND.md Section 6 puts per-op CPU
-//! fallback at load time as the caller's disclosed composition
-//! decision, so this backend never detours a step to the CPU
-//! behind the caller's back.
+//! norms and the residual add through K4; `attention` end to
+//! end, with K5 rotating Q and K on the sliding layers and
+//! appending the rotated keys and the values into this
+//! backend's own resident KV buffers, and K6 running the
+//! scores and the online-softmax reduce over them (the host
+//! mirror in the backend's KV state holds the same rows, so
+//! the device buffers and the `Cache` trait's position
+//! contract cannot drift apart); `swiglu_ffn` end to end
+//! (K1 gate and up, K7 activation, K2 down) with `attn_gate`
+//! through K7; and the embedding gather through K8. Nothing
+//! is silently substituted: BACKEND.md Section 6 puts per-op
+//! CPU fallback at load time as the caller's disclosed
+//! composition decision, so this backend never detours a
+//! step to the CPU behind the caller's back.
+//!
+//! The device-resident forward (the session in
+//! `crate::session`, with the DFlash draft session beside
+//! it) is the crate's other half: it keeps the whole forward
+//! on the device and routes its projections through the
+//! wider kernel ladder (the K9 to K24 products, the split-K
+//! reducer, and the cooperative-matrix variants) under the
+//! routing switches resolved in this module. The shipped
+//! defaults at this writing: the MMV ceiling is 16, staged
+//! flash is on, the K21F head route is on, the cooperative
+//! matrix rung is on with K24 selected, split-K is fixed
+//! factor 4, and F16 KV storage is off; each switch keeps
+//! its named env override and its fail-closed fallback.
 //!
 //! Data path, stated plainly: weight tensors upload once and are
 //! cached by name (per-tensor device buffers, BACKEND.md
@@ -397,10 +411,8 @@ fn parse_mmv_band(raw: &str) -> Option<Vec<(u32, u32)>> {
 /// narrows the global [`MMV_MAX_ROWS_ENV`] ceiling:
 /// a family's product serves a projection when the
 /// batch is under the ceiling AND inside the cell,
-/// so the shipped ceiling default (1) keeps every
-/// product out of the ladder whatever the table
-/// says, and opening the ceiling admits exactly the
-/// measured-win cells instead of the whole band
+/// so the shipped ceiling default (16) admits exactly
+/// the measured-win cells instead of the whole band
 /// whose middle the dose-response sweep convicted
 /// (bench/mmv-verdict-2026-11-05.md, step 4).
 #[derive(Clone, Debug, PartialEq, Eq)]

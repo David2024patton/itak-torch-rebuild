@@ -12,12 +12,17 @@ are parked; Vulkan is the GPU path.
 
 ## 1. Ground truth (measured 2026-10-28, bench/ and TODO T-0.2, T-P.2)
 
+Speed anchors are harness-relative (DECISIONS.md, 2026-10-30); the
+harness is named per number below, and the Section 9 sweep harness is
+the designated comparison shape for operating-point claims.
+
 | Fact | Value |
 | :--- | :--- |
 | Card | AMD Radeon RX 7900 XTX (Navi 31, RDNA3), 24 GiB |
 | Memory bandwidth, hardware | 960 GB/s |
-| llama.cpp Vulkan decode, Glimmer Q4_K_M | 44.31 tok/s = 708 GB/s achieved (73.8 percent of peak) |
-| llama.cpp Vulkan decode with DFlash | 88.6 effective tok/s |
+| llama.cpp Vulkan decode, Glimmer Q4_K_M (llama-bench, tg128 after pp512) | 44.31 tok/s = 708 GB/s achieved (73.8 percent of peak) |
+| llama.cpp Vulkan decode with DFlash (2026-10-28 model-suite run, depth 4) | 88.6 effective tok/s |
+| llama.cpp Vulkan decode, Glimmer Q4_K_M (Section 9 sweep harness: llama-server /completion, short raw prompts, fixed 256-token generations, temperature 0; measured 2026-10-30, bench/gpu-proof-2026-10-30.md) | 41.64 tok/s plain; DFlash depth 4 = 103.01, depth 6 = 107.39 effective tok/s (depth 6 is the operating point by the SPEC 9.4 rule) |
 | HIP decode, same build | 41.13 tok/s (Vulkan keeps generation; HIP won prefill only) |
 | Ceiling at this quant | 60.0 tok/s (14.89 GiB streamed per token) |
 | Specialized target (ARCHITECTURE Section 6) | about 51 tok/s (85 percent of peak) |

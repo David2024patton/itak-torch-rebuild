@@ -1604,6 +1604,7 @@ impl<'a> DflashSession<'a> {
                 pair("k22_mmq", backend.k22_mmq().to_string()),
                 pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
                 pair("k21f_head", backend.k21f_head().to_string()),
+                pair("mmq_splitk", backend.mmq_splitk().describe()),
             ],
             model: None,
             session: Self::capture_session_pairs(

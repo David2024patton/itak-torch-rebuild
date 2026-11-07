@@ -105,8 +105,8 @@ use crate::error::WgpuError;
 use crate::kernels::k10_q4k_gemm::K10Call;
 use crate::kernels::k11_q6k_gemm::K11Call;
 use crate::kernels::k12_q8_quant::K12QuantCall;
-use crate::kernels::k13_q4k_mmq::K13Call;
-use crate::kernels::k14_q6k_mmq::K14Call;
+use crate::kernels::k13_q4k_mmq::{K13Call, K13SplitCall};
+use crate::kernels::k14_q6k_mmq::{K14Call, K14SplitCall};
 use crate::kernels::k15_q4k_mmq_wide::K15Call;
 use crate::kernels::k16_q6k_mmq_wide::K16Call;
 use crate::kernels::k18_small_batch::K18Call;
@@ -382,6 +382,31 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K14Call,
     },
+    /// K12 quantize + K13 split-K (Q4_K MMQ) dispatches:
+    /// the split product and its reduction are two
+    /// dispatches inside the one call. Constructed only
+    /// when the backend's split-K config selects a factor
+    /// of 2 or more for the projection's shape; at shipped
+    /// defaults (split-K off) this variant never appears
+    /// in a plan.
+    MmqSplitQ4K {
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
+        /// The split product + reduction dispatch pair.
+        mmq: K13SplitCall,
+    },
+    /// K12 quantize + K14 split-K (Q6_K MMQ) dispatches.
+    /// See [`ProjCall::MmqSplitQ4K`].
+    MmqSplitQ6K {
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
+        /// The split product + reduction dispatch pair.
+        mmq: K14SplitCall,
+    },
     /// K12 quantize + K15 (Q4_K wide-tile double-buffered
     /// MMQ) dispatches.
     MmqWideQ4K {
@@ -543,6 +568,18 @@ impl ProjCall {
                 }
                 mmq.encode_into(pass);
             }
+            ProjCall::MmqSplitQ4K { quant, mmq } => {
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
+                mmq.encode_into(pass);
+            }
+            ProjCall::MmqSplitQ6K { quant, mmq } => {
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
+                mmq.encode_into(pass);
+            }
             ProjCall::MmqWideQ4K { quant, mmq } => {
                 if let Some(q) = quant {
                     q.encode_into(pass);
@@ -629,6 +666,12 @@ impl ProjCall {
             | ProjCall::MmqK22Q4K { quant, .. }
             | ProjCall::MmqK23Q4K { quant, .. }
             | ProjCall::MmqCoopmatQ4K { quant, .. } => 1 + u64::from(quant.is_some()),
+            // A split form records two dispatches of its
+            // own (the split product and its reduction),
+            // plus its quantize when it carries one.
+            ProjCall::MmqSplitQ4K { quant, .. } | ProjCall::MmqSplitQ6K { quant, .. } => {
+                2 + u64::from(quant.is_some())
+            }
             ProjCall::SmallQ4K { .. } | ProjCall::SmallQ6K { .. } | ProjCall::SmallQ5K { .. } => 2,
             ProjCall::ChunkedQ4K(calls) => calls.len() as u64,
             ProjCall::ChunkedQ6K(calls) => calls.len() as u64,
@@ -654,6 +697,8 @@ impl ProjCall {
             ProjCall::GemmQ6K(_) => "k11_q6k_gemm",
             ProjCall::MmqQ4K { .. } => "k13_q4k_mmq",
             ProjCall::MmqQ6K { .. } => "k14_q6k_mmq",
+            ProjCall::MmqSplitQ4K { .. } => "k13_q4k_mmq_split",
+            ProjCall::MmqSplitQ6K { .. } => "k14_q6k_mmq_split",
             ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
             ProjCall::MmqK23Q4K { .. } => "k23_q4k_mmq",
             ProjCall::MmqCoopmatQ4K { .. } => "k23_q4k_coopmat",
@@ -911,10 +956,16 @@ impl ProjBenchCall {
 /// register-organization prototype when the backend's
 /// K22 switch is on, then the K23 staging-repack
 /// prototype when the backend's K23 switch is on, the
-/// standard product (K13) behind all of them. With every
-/// switch off (the shipped defaults) the ladder is the
-/// shipped ladder exactly: the opt-in rungs are skipped
-/// without being consulted. `None` when no pipeline
+/// standard product (K13) behind all of them. The
+/// standard rung itself serves in split-K form when the
+/// backend's split-K config selects a factor of 2 or
+/// more for the projection's shape (see
+/// [`crate::compute::MMQ_SPLITK_ENV`]); the split is a
+/// property of the standard product, not a rung above
+/// the prototypes, so it never stacks on an unproven
+/// form. With every switch off (the shipped defaults)
+/// the ladder is the shipped ladder exactly: the opt-in
+/// rungs are skipped without being consulted. `None` when no pipeline
 /// exists or every prepare refuses: the caller then
 /// takes the GEMM form. Every refusal is logged by name;
 /// the choice is made here, at plan-build time, and
@@ -993,6 +1044,19 @@ fn mmq_product_q4k(
         }
     }
     let mmq = backend.k13()?;
+    let tiles = (weights.out_rows as u64).div_ceil(u64::from(mmq.shape().tile_n)) as u32;
+    let splits = backend.mmq_splitk_factor_for(tiles, (weights.in_features / 256) as u32);
+    if splits >= 2 {
+        match mmq.prepare_split(ctx, weights, q8_qs, q8_ds, output, batch, splits) {
+            Ok(mmq) => return Some(ProjCall::MmqSplitQ4K { quant, mmq }),
+            Err(e) => {
+                dbg_log!(
+                    "mmq split q4k refused at the product prepare: {e}; \
+                     the unsplit product serves it"
+                );
+            }
+        }
+    }
     match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
         Ok(mmq) => Some(ProjCall::MmqQ4K { quant, mmq }),
         Err(e) => {
@@ -1030,6 +1094,19 @@ fn mmq_product_q6k(
         }
     }
     let mmq = backend.k14()?;
+    let tiles = (weights.out_rows as u64).div_ceil(u64::from(mmq.shape().tile_n)) as u32;
+    let splits = backend.mmq_splitk_factor_for(tiles, (weights.in_features / 256) as u32);
+    if splits >= 2 {
+        match mmq.prepare_split(ctx, weights, q8_qs, q8_ds, output, batch, splits) {
+            Ok(mmq) => return Some(ProjCall::MmqSplitQ6K { quant, mmq }),
+            Err(e) => {
+                dbg_log!(
+                    "mmq split q6k refused at the product prepare: {e}; \
+                     the unsplit product serves it"
+                );
+            }
+        }
+    }
     match mmq.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
         Ok(mmq) => Some(ProjCall::MmqQ6K { quant, mmq }),
         Err(e) => {
@@ -5010,6 +5087,7 @@ impl<'a> ResidentSession<'a> {
                 pair("k22_mmq", backend.k22_mmq().to_string()),
                 pair("mmq_wide_min_rows", backend.wide_min_rows().to_string()),
                 pair("k21f_head", backend.k21f_head().to_string()),
+                pair("mmq_splitk", backend.mmq_splitk().describe()),
             ],
             model: None,
             session: vec![

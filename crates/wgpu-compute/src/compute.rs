@@ -807,6 +807,121 @@ fn resolve_coopmat(raw: Option<&str>) -> bool {
     matches!(raw.map(str::trim), Some("1"))
 }
 
+/// Environment variable naming the MMQ split-K routing
+/// config for the standard products (K13 Q4_K, K14 Q6_K):
+/// the split partitions a product's reduction dimension
+/// across S workgroups per output tile writing f32
+/// partial sums, folded by a reduction dispatch, so a
+/// narrow output whose plain grid cannot fill the card
+/// (the 256-wide Q6_K KV projections: 4 tiles walking 26
+/// super-blocks each) still parallelizes. Values:
+/// `off` (and unset) keeps the shipped unsplit products;
+/// `1`..=`8` fixes the split factor; `auto` picks the
+/// factor per projection from its tile count (see
+/// [`mmq_splitk_factor`]). Operational config, not a
+/// compiled constant, and deliberately fail-closed on
+/// the K22 pattern: any other value resolves to
+/// [`MmqSplitK::Off`] and is named in the construction
+/// log. The default is OFF: the dispatch shape is
+/// unproven on the card, and the verdict that can move
+/// it is sequenced in bench/splitk-mmq-2026-11-07.md.
+pub const MMQ_SPLITK_ENV: &str = "WGPU_COMPUTE_MMQ_SPLITK";
+
+/// The resolved MMQ split-K mode (see [`MMQ_SPLITK_ENV`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MmqSplitK {
+    /// Split-K off: the standard products serve as shipped.
+    Off,
+    /// A fixed split factor in 1..=[`crate::kernels::splitk_reduce::SPLITK_MAX`]
+    /// (1 resolves to no split at the factor rule).
+    Fixed(u32),
+    /// The per-projection auto rule (see
+    /// [`mmq_splitk_factor`]).
+    Auto,
+}
+
+impl MmqSplitK {
+    /// The diag manifest's spelling of this mode.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            MmqSplitK::Off => "off".to_string(),
+            MmqSplitK::Fixed(n) => format!("fixed:{n}"),
+            MmqSplitK::Auto => "auto".to_string(),
+        }
+    }
+}
+
+/// Resolve the MMQ split-K config from the raw
+/// environment value: unset or `off` is off, `auto` is
+/// the auto rule, an integer in 1..=8 is a fixed factor,
+/// and anything else fails closed to off.
+fn resolve_mmq_splitk(raw: Option<&str>) -> MmqSplitK {
+    match raw.map(str::trim) {
+        None | Some("off") => MmqSplitK::Off,
+        Some("auto") => MmqSplitK::Auto,
+        Some(value) => match value.parse::<u32>() {
+            Ok(n) if (1..=crate::kernels::splitk_reduce::SPLITK_MAX).contains(&n) => {
+                MmqSplitK::Fixed(n)
+            }
+            _ => MmqSplitK::Off,
+        },
+    }
+}
+
+/// Whether a raw MMQ split-K env value is one the
+/// resolver recognizes (unset, `off`, `auto`, or an
+/// integer in 1..=8 after trimming). An unrecognized
+/// value resolves off; the construction log names it
+/// (the flash fallback pattern).
+fn mmq_splitk_value_recognized(raw: Option<&str>) -> bool {
+    match raw.map(str::trim) {
+        None | Some("off") | Some("auto") => true,
+        Some(value) => matches!(
+            value.parse::<u32>(),
+            Ok(n) if (1..=crate::kernels::splitk_reduce::SPLITK_MAX).contains(&n)
+        ),
+    }
+}
+
+/// Log, at construction, when the MMQ split-K env value
+/// is present but unrecognized and the config therefore
+/// fails closed to off.
+fn log_mmq_splitk_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !mmq_splitk_value_recognized(raw) {
+            dbg_log!(
+                "mmq splitk env {MMQ_SPLITK_ENV}={value:?} is not a recognized value \
+                 (\"off\", \"auto\", or 1..=8); failing closed, split-K is OFF"
+            );
+        }
+    }
+}
+
+/// The split factor for one projection under `mode`,
+/// from the shape math (bench/splitk-mmq-2026-11-07.md):
+/// `tiles` is the unsplit grid's workgroup count
+/// (output rows over the kernel's tile) and
+/// `blocks_per_row` the super-block columns each
+/// workgroup would walk. The factor never exceeds the
+/// block count (a slice past the last block is empty
+/// work) and never exceeds [`crate::kernels::splitk_reduce::SPLITK_MAX`].
+/// The auto rule targets roughly 64 workgroups: the KV
+/// shape's 4 tiles get the full factor of 8 (32
+/// workgroups, about 4 blocks per slice), a 32-tile
+/// projection doubles to 64, and any projection already
+/// filling the card (64+ tiles) stays unsplit. The rule
+/// is a heuristic pending the card A/B; the fixed mode
+/// exists so the verdict can sweep the factor directly.
+pub(crate) fn mmq_splitk_factor(mode: MmqSplitK, tiles: u32, blocks_per_row: u32) -> u32 {
+    let blocks = blocks_per_row.max(1);
+    let cap = blocks.min(crate::kernels::splitk_reduce::SPLITK_MAX);
+    match mode {
+        MmqSplitK::Off => 1,
+        MmqSplitK::Fixed(n) => n.clamp(1, cap),
+        MmqSplitK::Auto => 64u32.div_ceil(tiles.max(1)).clamp(1, cap),
+    }
+}
+
 /// Environment variable naming the K21F finish-carrying
 /// head routing switch: it allows the resident session's
 /// block head to route its Q5_K product to the
@@ -1027,6 +1142,14 @@ pub struct WgpuCompute {
     k23_mmq: bool,
     k23_coopmat: Option<K23CoopmatPipeline>,
     coopmat: bool,
+    /// The MMQ split-K routing config for the standard
+    /// products, resolved once at construction from
+    /// [`MMQ_SPLITK_ENV`], never a constant compiled into
+    /// the routing. The split pipelines live inside the
+    /// K13/K14 pipelines and are built regardless of this
+    /// config; the session reads the mode and the factor
+    /// rule at plan build.
+    mmq_splitk: MmqSplitK,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -1217,6 +1340,22 @@ impl WgpuCompute {
              k23_coopmat={}",
             k23_coopmat.is_some()
         );
+        // The MMQ split-K routing config (see
+        // MMQ_SPLITK_ENV): resolved here like every
+        // routing switch; the split pipelines themselves
+        // were built inside K13/K14 above regardless of
+        // the mode, so a defect in either form fails at
+        // construction. Default off (unproven dispatch
+        // shape; the card verdict is sequenced in
+        // bench/splitk-mmq-2026-11-07.md).
+        let mmq_splitk_raw = std::env::var(MMQ_SPLITK_ENV).ok();
+        log_mmq_splitk_fallback(mmq_splitk_raw.as_deref());
+        let mmq_splitk = resolve_mmq_splitk(mmq_splitk_raw.as_deref());
+        dbg_log!(
+            "mmq splitk config: mode={} (env {MMQ_SPLITK_ENV}: \"off\"/unset is off, \
+             \"auto\" is the tile-count rule, 1..=8 a fixed factor)",
+            mmq_splitk.describe()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -1373,6 +1512,7 @@ impl WgpuCompute {
             k23_mmq,
             k23_coopmat,
             coopmat,
+            mmq_splitk,
             k15,
             k16,
             wide_min_rows,
@@ -1608,6 +1748,24 @@ impl WgpuCompute {
     /// the shipped ladder untouched.
     pub(crate) fn coopmat(&self) -> bool {
         self.coopmat
+    }
+
+    /// The MMQ split-K routing config: config resolved
+    /// at construction from [`MMQ_SPLITK_ENV`], never a
+    /// constant compiled into the selection seam.
+    /// [`MmqSplitK::Off`] (the default) leaves the
+    /// shipped ladder untouched.
+    pub(crate) fn mmq_splitk(&self) -> MmqSplitK {
+        self.mmq_splitk
+    }
+
+    /// The split factor this backend's config selects
+    /// for a projection with the given unsplit tile count
+    /// and super-block columns (see [`mmq_splitk_factor`]
+    /// for the rule). A factor of 1 means the unsplit
+    /// product serves.
+    pub(crate) fn mmq_splitk_factor_for(&self, tiles: u32, blocks_per_row: u32) -> u32 {
+        mmq_splitk_factor(self.mmq_splitk, tiles, blocks_per_row)
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -2850,6 +3008,74 @@ mod tests {
         assert!(!resolve_coopmat(Some("true")));
         assert!(!resolve_coopmat(Some("")));
         assert!(!resolve_coopmat(Some("11")));
+    }
+
+    #[test]
+    fn mmq_splitk_resolution() {
+        // Unset: off. The default keeps the shipped
+        // unsplit products (unproven dispatch shape).
+        assert_eq!(resolve_mmq_splitk(None), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("off")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some(" off ")), MmqSplitK::Off);
+        // The auto rule.
+        assert_eq!(resolve_mmq_splitk(Some("auto")), MmqSplitK::Auto);
+        assert_eq!(resolve_mmq_splitk(Some(" auto ")), MmqSplitK::Auto);
+        // Fixed factors across the admitted range.
+        assert_eq!(resolve_mmq_splitk(Some("1")), MmqSplitK::Fixed(1));
+        assert_eq!(resolve_mmq_splitk(Some("4")), MmqSplitK::Fixed(4));
+        assert_eq!(resolve_mmq_splitk(Some(" 8 ")), MmqSplitK::Fixed(8));
+        // Everything else fails closed to off: zero, past
+        // the ceiling, booleans, words, empty.
+        assert_eq!(resolve_mmq_splitk(Some("0")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("9")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("true")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("on")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("")), MmqSplitK::Off);
+        assert_eq!(resolve_mmq_splitk(Some("-2")), MmqSplitK::Off);
+        assert_eq!(MMQ_SPLITK_ENV, "WGPU_COMPUTE_MMQ_SPLITK");
+    }
+
+    #[test]
+    fn mmq_splitk_value_recognition() {
+        // The recognized positions are exactly the ones
+        // the resolver gives a non-fallback meaning.
+        assert!(mmq_splitk_value_recognized(None));
+        assert!(mmq_splitk_value_recognized(Some("off")));
+        assert!(mmq_splitk_value_recognized(Some("auto")));
+        assert!(mmq_splitk_value_recognized(Some("1")));
+        assert!(mmq_splitk_value_recognized(Some(" 8 ")));
+        // The unrecognized rest resolve off and are
+        // named in the construction log.
+        assert!(!mmq_splitk_value_recognized(Some("0")));
+        assert!(!mmq_splitk_value_recognized(Some("9")));
+        assert!(!mmq_splitk_value_recognized(Some("true")));
+        assert!(!mmq_splitk_value_recognized(Some("")));
+    }
+
+    #[test]
+    fn mmq_splitk_factor_rule() {
+        // Off never splits.
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Off, 4, 26), 1);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Off, 512, 26), 1);
+        // Fixed: the factor itself, capped at the block
+        // count (past it the extra slices are empty) and
+        // floored at 1. Fixed(1) is an explicit no-split.
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Fixed(4), 4, 26), 4);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Fixed(8), 4, 3), 3);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Fixed(1), 4, 26), 1);
+        // Auto: target roughly 64 workgroups. The KV
+        // shape (4 tiles, 26 blocks) takes the full 8;
+        // a 32-tile projection doubles; anything at or
+        // past 64 tiles stays unsplit.
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 4, 26), 8);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 32, 26), 2);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 64, 26), 1);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 312, 26), 1);
+        // Auto never exceeds the block count either: a
+        // 4-tile projection over a single super-block
+        // cannot split.
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 4, 1), 1);
+        assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 8, 2), 2);
     }
 
     #[test]

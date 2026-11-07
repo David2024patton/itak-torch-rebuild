@@ -39,6 +39,17 @@
 //! its thread's four batch rows, and each staged activation
 //! word its four output rows.
 //!
+//! The split-K form ([`K13Pipeline::prepare_split`]) runs
+//! this same generated body with the reduction partitioned
+//! across slices: on narrow outputs the plain grid is a
+//! handful of workgroups (a 256-row output is 4 tiles of
+//! 64) and the card idles while each workgroup walks the
+//! whole K range serially. The split multiplies the grid
+//! by the factor and folds f32 partials through
+//! [`crate::kernels::splitk_reduce`]; routing and the
+//! factor rule live in the backend's `WGPU_COMPUTE_MMQ_SPLITK`
+//! resolution (default off; bench/splitk-mmq-2026-11-07.md).
+//!
 //! The activation transform (the gated output projection,
 //! the SwiGLU-fused down projection) is NOT here: it is
 //! finished in K12's quantizer, upstream of the product, so
@@ -55,6 +66,7 @@ use crate::device::GpuContext;
 use crate::error::{Result, WgpuError};
 use crate::kernels::k12_q8_quant::{ds_vec4s, qs_words};
 use crate::kernels::k1_q4k_gemv::K1Weights;
+use crate::kernels::splitk_reduce::{SplitkReduceCall, SplitkReducer, SPLITK_MAX};
 
 use crate::diag::dbg_log;
 
@@ -144,6 +156,27 @@ pub fn shipped_shape(limits: &wgpu::Limits) -> Option<MmqShape> {
 /// geometry as literals so the compiler unrolls the sub-tile
 /// loops and sizes the staging arrays exactly.
 fn mmq_shader(shape: &MmqShape) -> String {
+    mmq_shader_split(shape, false)
+}
+
+/// The split-K form of the Q4_K MMQ shader: the same
+/// generated body with the reduction partitioned across
+/// `wid.y` slices. Slice `s` walks a contiguous range of
+/// super-block columns and writes its partial sums to slice
+/// `s` of the output binding (a `[splits][batch][out_rows]`
+/// partials buffer), which [`crate::kernels::splitk_reduce`]
+/// folds into the real output. The split factor is a
+/// runtime parameter, not a generated literal, so one
+/// compiled pipeline serves every factor 2..=[`SPLITK_MAX`].
+/// The drift contract is the reducer's module docs: same
+/// exact integer dots, same per-sub-block fold order inside
+/// each slice, reassociation-class drift against the
+/// unsplit product from the regrouped f32 accumulation.
+fn mmq_split_shader(shape: &MmqShape) -> String {
+    mmq_shader_split(shape, true)
+}
+
+fn mmq_shader_split(shape: &MmqShape, split: bool) -> String {
     let tile_n = shape.tile_n;
     let wg = shape.workgroup;
     let w_words = tile_n * 64;
@@ -207,22 +240,42 @@ fn mmq_shader(shape: &MmqShape) -> String {
         inner.push_str("        }\n");
     }
     // The output store, guarded per element (K10's form).
+    // The split form indexes its partials buffer by slice
+    // (wid.y) first: [splits][batch][out_rows].
     let mut stores = String::new();
     for i in 0..4 {
         for j in 0..4 {
+            let index = if split {
+                format!("(wid.y * params.batch + m{j}) * params.out_rows + n{i}")
+            } else {
+                format!("m{j} * params.out_rows + n{i}")
+            };
             stores.push_str(&format!(
-                "    if (n{i} < params.out_rows && m{j} < params.batch) {{\n        output[m{j} * params.out_rows + n{i}] = acc[{}];\n    }}\n",
+                "    if (n{i} < params.out_rows && m{j} < params.batch) {{\n        output[{index}] = acc[{}];\n    }}\n",
                 i * 4 + j
             ));
         }
     }
+    let params_extra = if split { "\n    splits: u32," } else { "" };
+    // The split form walks only its slice's contiguous
+    // super-block range: slice s covers
+    // [s * per_split, min((s + 1) * per_split, blocks)).
+    // A slice past the end (more splits than super-blocks)
+    // walks an empty range and stores its zero
+    // accumulators, which the reduction folds in as exact
+    // zeros: any factor in range is correct for any width.
+    let loop_open = if split {
+        "    let per_split = (params.blocks_per_row + params.splits - 1u) / params.splits;\n    let blk_first = wid.y * per_split;\n    let blk_last = min(blk_first + per_split, params.blocks_per_row);\n    for (var blk = blk_first; blk < blk_last; blk++) {"
+    } else {
+        "    for (var blk = 0u; blk < params.blocks_per_row; blk++) {"
+    };
 
     format!(
         r#"struct Params {{
     blocks_per_row: u32,
     out_rows: u32,
     batch: u32,
-    blocks32: u32,
+    blocks32: u32,{params_extra}
 }}
 
 @group(0) @binding(0) var<storage, read> weights: array<u32>;
@@ -291,7 +344,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>,
     let n2 = n0 + 2u;
     let n3 = n0 + 3u;
     var acc = array<f32, 16>();
-    for (var blk = 0u; blk < params.blocks_per_row; blk++) {{
+{loop_open}
         // Stage the tile's packed weight words and scale
         // pairs for this super-block column. Task (n, g)
         // owns output row n's four word-groups: group g's
@@ -389,12 +442,70 @@ impl K13Call {
     }
 }
 
+/// One prepared split-K K13 dispatch pair: the split
+/// product (writing f32 partial sums to a scratch buffer
+/// the prepare allocated) followed by the split-K
+/// reduction into the caller's output. Encoded as one unit
+/// so the session's plan sees a single projection call; the
+/// two dispatches carry separate diag stamps
+/// (`k13_q4k_mmq_split` and `splitk_reduce`) so a profile
+/// run shows the split engaged.
+#[derive(Debug)]
+pub struct K13SplitCall {
+    pipeline: wgpu::ComputePipeline,
+    bind_group: wgpu::BindGroup,
+    grid: (u32, u32),
+    reduce: SplitkReduceCall,
+    /// Diag timestamp stamp for the product dispatch (the
+    /// reduction carries its own, inside `reduce`).
+    diag: Option<crate::timestamps::DiagStamp>,
+}
+
+impl K13SplitCall {
+    /// Record this call's dispatches into `encoder`.
+    pub fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("k13 q4_k mmq split"),
+            timestamp_writes: None,
+        });
+        self.encode_into(&mut pass);
+    }
+
+    /// Record the product and its reduction into an
+    /// already-open compute `pass`, in that order (the
+    /// reduction reads the product's partials; dispatches
+    /// within one pass are ordered, the same composition
+    /// the K12 quantize + product chain relies on).
+    pub fn encode_into(&self, pass: &mut wgpu::ComputePass<'_>) {
+        let slot = self.diag.as_ref().and_then(|d| d.begin(pass));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.dispatch_workgroups(self.grid.0, self.grid.1, 1);
+        if let (Some(d), Some(s)) = (&self.diag, slot) {
+            d.end(pass, s);
+        }
+        self.reduce.encode_into(pass);
+    }
+
+    /// The split factor this call runs (its grid's slice
+    /// count).
+    #[must_use]
+    pub fn splits(&self) -> u32 {
+        self.grid.1
+    }
+}
+
 /// The compiled K13 pipeline, in one [`MmqShape`].
 /// Compilation happens at backend construction, like every
-/// kernel in this crate.
+/// kernel in this crate. The split-K form's pipeline and
+/// the shared reducer compile alongside the plain pipeline
+/// regardless of the split switch, so a shader defect in
+/// either form fails at construction, never at first use.
 #[derive(Debug)]
 pub struct K13Pipeline {
     pipeline: wgpu::ComputePipeline,
+    split_pipeline: wgpu::ComputePipeline,
+    reducer: SplitkReducer,
     shape: MmqShape,
 }
 
@@ -458,8 +569,29 @@ impl K13Pipeline {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        dbg_log!("k13 mmq pipeline built: shape {}", shape.name());
-        Ok(K13Pipeline { pipeline, shape })
+        let split_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("k13 q4_k mmq split shader"),
+            source: wgpu::ShaderSource::Wgsl(mmq_split_shader(&shape).into()),
+        });
+        let split_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("k13 q4_k mmq split pipeline"),
+            layout: None,
+            module: &split_module,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let reducer = SplitkReducer::new(device)?;
+        dbg_log!(
+            "k13 mmq pipelines built: shape {} (plain and split-K forms)",
+            shape.name()
+        );
+        Ok(K13Pipeline {
+            pipeline,
+            split_pipeline,
+            reducer,
+            shape,
+        })
     }
 
     /// The shape this pipeline runs.
@@ -592,6 +724,153 @@ impl K13Pipeline {
         })
     }
 
+    /// Prepare a split-K MMQ dispatch: [`Self::prepare`]'s
+    /// geometry and buffers, with the reduction partitioned
+    /// across `splits` workgroups per output tile. The
+    /// partial sums land in a scratch buffer this prepare
+    /// allocates (`splits * batch * out_rows` f32, owned by
+    /// the returned call's bind groups) and the paired
+    /// reduction writes the caller's `output`. Any factor
+    /// in 2..=[`SPLITK_MAX`] is correct for any width: a
+    /// factor past the super-block count leaves trailing
+    /// slices empty (they store zeros), so callers may cap
+    /// the factor by width for efficiency but never need to
+    /// for correctness.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on the same geometry
+    /// refusals as [`Self::prepare`], or a split factor
+    /// outside 2..=[`SPLITK_MAX`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_split(
+        &self,
+        ctx: &GpuContext,
+        weights: &K1Weights,
+        qs: &wgpu::Buffer,
+        ds: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        batch: u32,
+        splits: u32,
+    ) -> Result<K13SplitCall> {
+        if !(2..=SPLITK_MAX).contains(&splits) {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split call".to_string(),
+                detail: format!(
+                    "splits {splits} is outside 2..={SPLITK_MAX} (a split of 1 is the unsplit product)"
+                ),
+            });
+        }
+        if batch == 0 || batch > MMQ_MAX_BATCH {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split call".to_string(),
+                detail: format!(
+                    "batch {batch} is outside 1..={MMQ_MAX_BATCH} (the batch tile's row count)"
+                ),
+            });
+        }
+        if weights.in_features == 0 || weights.in_features % BLOCK_ELEMS != 0 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split call".to_string(),
+                detail: format!(
+                    "input width {} is not a whole number of {BLOCK_ELEMS}-element super-blocks",
+                    weights.in_features
+                ),
+            });
+        }
+        let tiles = (weights.out_rows as u64).div_ceil(u64::from(self.shape.tile_n));
+        if tiles > 65_535 {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split call".to_string(),
+                detail: format!(
+                    "{} output rows need {tiles} tile workgroups, past one dispatch dimension",
+                    weights.out_rows
+                ),
+            });
+        }
+        let need_qs = (qs_words(batch as usize, weights.in_features) * 4) as u64;
+        let need_ds = (ds_vec4s(batch as usize, weights.in_features) * 16) as u64;
+        let need_out = batch as u64 * weights.out_rows as u64 * 4;
+        if qs.size() < need_qs || ds.size() < need_ds || output.size() < need_out {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split call".to_string(),
+                detail: format!(
+                    "buffer sizes (qs {}, ds {}, out {}) are below the geometry's needs \
+                     ({need_qs}, {need_ds}, {need_out})",
+                    qs.size(),
+                    ds.size(),
+                    output.size()
+                ),
+            });
+        }
+        let partials = ctx.scratch_buffer("k13 split partials", u64::from(splits) * need_out);
+        let grid = (tiles as u32, splits);
+        let params: [u32; 5] = [
+            (weights.in_features / BLOCK_ELEMS) as u32,
+            weights.out_rows as u32,
+            batch,
+            (weights.in_features / 32) as u32,
+            splits,
+        ];
+        let param_bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let params_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k13 split params"),
+            size: param_bytes.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&params_buffer, 0, &param_bytes);
+        let entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: weights.buffer().as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: qs.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ds.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: partials.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ];
+        let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("k13 split bind group"),
+            layout: &self.split_pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let reduce = self.reducer.prepare(
+            ctx,
+            &partials,
+            output,
+            batch as u64 * weights.out_rows as u64,
+            splits,
+            "Q4_K",
+        )?;
+        Ok(K13SplitCall {
+            pipeline: self.split_pipeline.clone(),
+            bind_group,
+            grid,
+            reduce,
+            diag: ctx.diag_stamp(crate::timestamps::DispatchMeta {
+                kernel: "k13_q4k_mmq_split",
+                rows: weights.out_rows as u64,
+                cols: weights.in_features as u64,
+                quant: "Q4_K",
+                weight_bytes: weights.byte_len,
+                shape: format!("batch={batch} grid={}x{} splits={splits}", grid.0, grid.1),
+            }),
+        })
+    }
+
     /// Convenience one-shot: run the MMQ over host-side
     /// quantized rows (`qs` packed words and flat `ds`
     /// quads, K12's layout for `batch` rows of the tensor's
@@ -668,6 +947,89 @@ impl K13Pipeline {
         );
         Ok(out)
     }
+
+    /// Convenience one-shot for the split-K form: like
+    /// [`Self::run`], with the reduction partitioned across
+    /// `splits` workgroups per output tile. The check/bench
+    /// data path for the split form.
+    ///
+    /// # Errors
+    ///
+    /// [`WgpuError::InvalidTensor`] on the same conditions
+    /// as [`Self::prepare_split`]; [`WgpuError::Readback`]
+    /// when the result cannot be mapped back.
+    pub fn run_split(
+        &self,
+        ctx: &GpuContext,
+        weights: &K1Weights,
+        qs: &[u32],
+        ds: &[f32],
+        batch: u32,
+        splits: u32,
+    ) -> Result<Vec<f32>> {
+        if qs.len() != qs_words(batch as usize, weights.in_features)
+            || ds.len() != ds_vec4s(batch as usize, weights.in_features) * 4
+        {
+            return Err(WgpuError::InvalidTensor {
+                name: "k13 split input".to_string(),
+                detail: format!(
+                    "quantized inputs hold {} words and {} scale values, not the \
+                     {} words and {} values {batch} rows of width {} need",
+                    qs.len(),
+                    ds.len(),
+                    qs_words(batch as usize, weights.in_features),
+                    ds_vec4s(batch as usize, weights.in_features) * 4,
+                    weights.in_features
+                ),
+            });
+        }
+        let qs_bytes: Vec<u8> = qs.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let qs_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k13 split qs"),
+            size: qs_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&qs_buffer, 0, &qs_bytes);
+        let ds_bytes: Vec<u8> = ds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let ds_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k13 split ds"),
+            size: ds_bytes.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        ctx.queue.write_buffer(&ds_buffer, 0, &ds_bytes);
+        let out_elems = batch as usize * weights.out_rows;
+        let output_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("k13 split output"),
+            size: (out_elems * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let call = self.prepare_split(
+            ctx,
+            weights,
+            &qs_buffer,
+            &ds_buffer,
+            &output_buffer,
+            batch,
+            splits,
+        )?;
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("k13 split run"),
+            });
+        call.encode(&mut encoder);
+        ctx.queue.submit([encoder.finish()]);
+        let out = ctx.read_f32(&output_buffer, out_elems)?;
+        dbg_log!(
+            "k13 split run: batch={batch} splits={splits} out_rows={} bytes_streamed={}",
+            weights.out_rows,
+            weights.byte_len
+        );
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -703,5 +1065,69 @@ mod tests {
         let s64 = mmq_shader(&MmqShape::new(64));
         assert!(s64.contains("@workgroup_size(256)"));
         assert!(s64.contains("array<u32, 4096>"));
+    }
+
+    #[test]
+    fn split_shader_partitions_the_reduction() {
+        let s = mmq_split_shader(&MmqShape::new(64));
+        // The split factor arrives as a runtime parameter.
+        assert!(s.contains("splits: u32,"));
+        // Each slice walks its contiguous super-block range.
+        assert!(s.contains(
+            "let per_split = (params.blocks_per_row + params.splits - 1u) / params.splits;"
+        ));
+        assert!(s.contains("let blk_first = wid.y * per_split;"));
+        assert!(s.contains("for (var blk = blk_first; blk < blk_last; blk++)"));
+        // Partials are indexed [slice][batch][out_row].
+        assert!(s.contains("output[(wid.y * params.batch + m0) * params.out_rows + n0]"));
+        // The staging and inner product are the plain
+        // kernel's, unchanged.
+        assert!(s.contains("dot4I8Packed"));
+        assert!(s.contains("@workgroup_size(256)"));
+        // The plain shader carries none of the split
+        // machinery: the unsplit product is untouched.
+        let plain = mmq_shader(&MmqShape::new(64));
+        assert!(!plain.contains("per_split"));
+        assert!(!plain.contains("splits"));
+        assert!(plain.contains("for (var blk = 0u; blk < params.blocks_per_row; blk++)"));
+    }
+
+    #[test]
+    fn plain_and_split_shaders_validate_under_naga() {
+        // The strongest shader gate a machine with no GPU
+        // adapter at all can run (K19's reasoning): every
+        // generated variant must parse and validate under
+        // Naga, the same front end wgpu feeds the driver
+        // with. Driver acceptance and register behavior
+        // are the card session's checks, listed in
+        // bench/splitk-mmq-2026-11-07.md.
+        for shape in [MmqShape::new(32), MmqShape::new(64)] {
+            for src in [mmq_shader(&shape), mmq_split_shader(&shape)] {
+                // A format-escape leak (a doubled brace from
+                // a substituted value) is a syntax error the
+                // parser reports at end of file; name it here
+                // instead.
+                assert!(
+                    !src.contains("{{") && !src.contains("}}"),
+                    "shape {}: format escape leaked into the generated shader",
+                    shape.name()
+                );
+                let module = naga::front::wgsl::parse_str(&src).unwrap_or_else(|e| {
+                    panic!(
+                        "shape {}: WGSL parse failed: {}",
+                        shape.name(),
+                        e.emit_to_string(&src)
+                    )
+                });
+                naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                )
+                .validate(&module)
+                .unwrap_or_else(|e| {
+                    panic!("shape {}: Naga validation failed: {e:?}", shape.name())
+                });
+            }
+        }
     }
 }

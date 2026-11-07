@@ -164,3 +164,4 @@ pub mod k6_attention;
 pub mod k7_swiglu;
 pub mod k8_head;
 pub mod k9_attn_prep;
+pub mod splitk_reduce;

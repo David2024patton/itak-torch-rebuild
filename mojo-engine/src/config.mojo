@@ -11,8 +11,10 @@ from std.os import getenv
 
 # The new engine line starts at 1.1 under the repo's versioning
 # scheme (1.<release number>, counting up, never resets).
+# 1.2: Wave A landed (GGUF loader, tuned K1, the GEMV shape
+# family, the elementwise ops, the tokenizer).
 comptime ENGINE_NAME = "mojo-engine"
-comptime ENGINE_VERSION = "1.1"
+comptime ENGINE_VERSION = "1.2"
 
 # Defaults. These are configuration defaults, stated once here;
 # env vars of the same name override them per launch.

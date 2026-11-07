@@ -1,6 +1,8 @@
 # Mojo/MAX engine: design
 
-Status: foundation lane, 2026-11-07, branch `mojo-max-engine`.
+Status: Wave A landed, 2026-11-07, branch `mojo-max-engine`,
+engine version 1.2. The full record is
+`bench/mojo-engine-wave-a-2026-11-07.md`.
 This branch starts the engine over on Mojo and MAX, on David's
 order ("pause rust and golang.. create a new branch and let's
 start over with Max and Mojo"). The Rust and Go trees are paused,
@@ -33,13 +35,21 @@ engine must match, piece by piece, under the parity law below.
 Each step lands as its own lane on this branch, proves parity
 (step's law below), and only then counts.
 
-1. **GGUF loader.** Parse the real Glimmer file: header,
-   metadata, tensor directory, mmap or staged load. Interface
-   already fixed in `src/gguf/loader.mojo`.
-2. **Dequant + GEMV kernels, TUNED from the start.** K1's tuned
-   structure (the r2sg shape's lessons: packed loads, subgroup
-   reduction, no per-element recompute) is the starting point,
-   not a later fix. Then K2/K3 shapes (Q6_K, Q5_K).
+1. **GGUF loader. DONE (Wave A, Lane A1).** Parses the real
+   Glimmer file: header, metadata, tensor directory, staged
+   load (Mojo 1.2's stdlib has no mmap binding; staged reads
+   serve the same bytes). Proven: 731 tensors, metadata spot
+   values exact, fixture tensor bytes hash-matched.
+2. **Dequant + GEMV kernels, TUNED from the start. DONE
+   (Wave A, Lanes A2/A3).** K1 tuned to the r2sg shape:
+   624.1 GB/s median, 74.4% of the recorded wgpu median, under
+   the within-10% line; the correctness gate (rel 1.267e-07)
+   is the binding constraint, gap analysis in the wave note.
+   Q6_K, Q5_K, F32/F16 kernels built and GPU-proven at the
+   recorded bars (straight ports; tuning them is later work).
+   The elementwise ops (norms, RoPE, SwiGLU, residual, softmax,
+   final-logit transform, embedding gather) also landed
+   (Lane A4), and the tokenizer (Lane A5, 16/16 prompt parity).
 3. **Attention.** Scores, masking, the sliding-window and global
    layer split Glimmer needs, flash-style staging.
 4. **One full layer, then all layers.** Norms, projections,

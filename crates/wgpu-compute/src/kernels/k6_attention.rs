@@ -40,8 +40,11 @@
 //!   32 keys staged in workgroup memory, 8 query rows per
 //!   workgroup. Env-gated at the backend
 //!   (`WGPU_COMPUTE_FLASH_STAGED` in `crate::compute`) and
-//!   routed only for multi-row calls; the shipped flash
-//!   remains the default and the single-row form.
+//!   routed only for multi-row calls; it is the backend
+//!   default for those calls (the variable's explicit
+//!   `0` restores the shipped flash), and the shipped
+//!   flash remains the single-row form in every switch
+//!   position.
 //!
 //! KV state: like `cpu-compute`, this backend owns its KV
 //! storage, because the `Cache` trait the forward hands over is

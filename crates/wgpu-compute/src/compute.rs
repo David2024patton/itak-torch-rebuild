@@ -573,30 +573,70 @@ fn resolve_k22_mmq(raw: Option<&str>) -> bool {
 }
 
 /// Environment variable naming the staged-flash routing
-/// switch: the exact value `1` makes the resident session
-/// run multi-row attention calls through K6's staged flash
+/// switch: it decides whether the resident session runs
+/// multi-row attention calls through K6's staged flash
 /// form (K/V blocks of 32 keys staged in workgroup memory,
 /// 8 query rows per workgroup; see
 /// `crate::kernels::k6_attention::FLASH_STAGED_SHADER`)
 /// instead of the shipped flash form. Operational config,
-/// not a compiled constant, and deliberately fail-closed:
-/// an unset variable, or any other value, keeps the staged
-/// form out of the session entirely, so the shipped form
-/// is byte-for-byte the form every existing proof ran on.
-/// Single-row calls keep the shipped form even with the
-/// switch on (a one-row workgroup would stage a KV block
-/// for one active row of eight). The shipped default
-/// follows the K22 precedent: an unproven kernel does not
-/// enter the ladder by default. The server proof that can
-/// move this switch's default is sequenced in
-/// bench/flash-rework-2026-11-06.md.
+/// not a compiled constant. The staged form is the
+/// DEFAULT: an unset variable resolves to on, and the
+/// exact value `1` (after trimming) also resolves to on,
+/// so a value that meant on before the default flip still
+/// means on. The exact value `0` is the explicit off and
+/// the one-variable rollback to the shipped form. Any
+/// other value fails closed to off, with the refusal
+/// logged by name at construction: a typo must never
+/// silently select a form. Single-row calls keep the
+/// shipped form in every switch position (a one-row
+/// workgroup would stage a KV block for one active row
+/// of eight); that exclusion is routing, not part of the
+/// switch. The default flipped on the interleaved card
+/// evidence in bench/flash-host-cost-2026-11-06.md,
+/// which discharged the decision rule written in
+/// bench/flash-rework-2026-11-06.md; the flip itself is
+/// recorded in bench/flash-default-flip-2026-11-07.md.
 pub const FLASH_STAGED_ENV: &str = "WGPU_COMPUTE_FLASH_STAGED";
 
 /// Resolve the staged-flash routing switch from the raw
-/// environment value: only the exact value `1` (after
-/// trimming) enables it; everything else is off.
+/// environment value: unset is ON (the shipped default),
+/// the exact value `1` (after trimming) is ON, the exact
+/// value `0` is the explicit OFF, and any other value
+/// fails closed to OFF. The caller logs the refusal for
+/// an unrecognized value at construction
+/// ([`log_flash_staged_fallback`]), so the fail-closed
+/// position is visible in the run log, never silent.
 fn resolve_flash_staged(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1"))
+    match raw.map(str::trim) {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(_) => false,
+    }
+}
+
+/// Whether a raw staged-flash env value is one the
+/// resolver recognizes (`1` or `0` after trimming, or
+/// unset). An unrecognized value resolves off; the
+/// construction log names it, following the MMV band
+/// fallback pattern: a silent fallback in a routing
+/// switch is how a typo becomes a mystery regression.
+fn flash_staged_value_recognized(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("1") | Some("0"))
+}
+
+/// Log, at construction, when the staged-flash env
+/// value is present but unrecognized and the switch
+/// therefore fails closed to off.
+fn log_flash_staged_fallback(raw: Option<&str>) {
+    if let Some(value) = raw {
+        if !flash_staged_value_recognized(raw) {
+            dbg_log!(
+                "flash staged env {FLASH_STAGED_ENV}={value:?} is not a recognized \
+                 value (\"1\" or unset enables, \"0\" disables); failing closed, \
+                 the staged form is OFF"
+            );
+        }
+    }
 }
 
 /// Environment variable naming the K23 (Q4_K MMQ,
@@ -853,10 +893,12 @@ impl WgpuCompute {
         // a switch that cannot engage (enabled with no
         // pipeline) instead of silently timing the shipped
         // form under the staged name.
-        let flash_staged = resolve_flash_staged(std::env::var(FLASH_STAGED_ENV).ok().as_deref());
+        let flash_staged_raw = std::env::var(FLASH_STAGED_ENV).ok();
+        let flash_staged = resolve_flash_staged(flash_staged_raw.as_deref());
+        log_flash_staged_fallback(flash_staged_raw.as_deref());
         dbg_log!(
             "flash staged config: enabled={flash_staged} (env {FLASH_STAGED_ENV}, \
-             only \"1\" enables); staged pipeline={}",
+             \"1\" or unset enables, \"0\" disables); staged pipeline={}",
             k6.flash_staged_available()
         );
         // The K23 Q4_K MMQ prototype (K13's organization
@@ -1188,8 +1230,9 @@ impl WgpuCompute {
     /// attention calls through K6's staged flash form:
     /// config resolved at construction from
     /// [`FLASH_STAGED_ENV`], never a constant compiled into
-    /// the routing. `false` (the default) leaves every call
-    /// on the shipped flash form. The session also requires
+    /// the routing. `true` is the default (the variable
+    /// unset); the explicit off is the value `0` on the
+    /// same variable. The session also requires
     /// the staged pipeline to exist on this device
     /// (`K6Pipeline::flash_staged_available`) and the call
     /// to carry more than one row.
@@ -2224,20 +2267,55 @@ mod tests {
 
     #[test]
     fn flash_staged_switch_resolution() {
-        // Unset: off. The shipped flash form is the only
-        // form the session can dispatch.
-        assert!(!resolve_flash_staged(None));
-        // The exact value "1" (trimmed) is the only
-        // enabling position, fail-closed like the K22
-        // switch: a typo routes the proven kernel, not
-        // the rework.
+        // Unset: ON. The default flipped on the
+        // interleaved card evidence in
+        // bench/flash-host-cost-2026-11-06.md: cache-
+        // controlled arms show the staged form winning
+        // the prefill wall at 1,022 tokens (about 6,150
+        // ms on against 6,490 ms off) and at every
+        // longer shape measured, with the wall delta
+        // matching the kernel delta and identical
+        // session stats, discharging the decision rule
+        // in bench/flash-rework-2026-11-06.md. The flip
+        // is recorded in
+        // bench/flash-default-flip-2026-11-07.md.
+        assert!(resolve_flash_staged(None));
+        // The exact value "1" (trimmed) still means on:
+        // a value that enabled the staged form before
+        // the flip enables it after.
         assert!(resolve_flash_staged(Some("1")));
         assert!(resolve_flash_staged(Some(" 1 ")));
+        // The exact value "0" (trimmed) is the explicit
+        // off, the one-variable rollback to the shipped
+        // flash form.
         assert!(!resolve_flash_staged(Some("0")));
+        assert!(!resolve_flash_staged(Some(" 0 ")));
+        // Any other value fails closed to off: a typo
+        // never silently selects a form, and the refusal
+        // is logged by name at construction.
         assert!(!resolve_flash_staged(Some("true")));
         assert!(!resolve_flash_staged(Some("")));
         assert!(!resolve_flash_staged(Some("11")));
+        assert!(!resolve_flash_staged(Some("on")));
         assert_eq!(FLASH_STAGED_ENV, "WGPU_COMPUTE_FLASH_STAGED");
+    }
+
+    #[test]
+    fn flash_staged_value_recognition() {
+        // The recognized set is exactly the positions
+        // the resolver gives meaning to: unset, "1",
+        // "0" (either after trimming). Everything else
+        // is the unrecognized set the construction log
+        // names when it fails closed.
+        assert!(flash_staged_value_recognized(None));
+        assert!(flash_staged_value_recognized(Some("1")));
+        assert!(flash_staged_value_recognized(Some(" 1 ")));
+        assert!(flash_staged_value_recognized(Some("0")));
+        assert!(flash_staged_value_recognized(Some(" 0 ")));
+        assert!(!flash_staged_value_recognized(Some("true")));
+        assert!(!flash_staged_value_recognized(Some("")));
+        assert!(!flash_staged_value_recognized(Some("11")));
+        assert!(!flash_staged_value_recognized(Some("on")));
     }
 
     #[test]

@@ -1,0 +1,100 @@
+# Mojo/MAX engine: design
+
+Status: foundation lane, 2026-11-07, branch `mojo-max-engine`.
+This branch starts the engine over on Mojo and MAX, on David's
+order ("pause rust and golang.. create a new branch and let's
+start over with Max and Mojo"). The Rust and Go trees are paused,
+not deleted: they stay on `main` as the proven reference this
+engine must match, piece by piece, under the parity law below.
+
+## The stack, top to bottom
+
+1. **Front end (later, optional):** the existing Go platform, or
+   MAX Serve. The serving seam is a later decision; the engine
+   does not care which one calls it.
+2. **Host engine: Mojo.** Model loading, KV cache management,
+   scheduling, sampling, the generation loop. One language for
+   host and kernels is the point of the restart.
+3. **Kernels: Mojo.** MAX's own kernel library where it fits
+   (its tuned matmul, attention, and MoE kernels are Apache 2.0);
+   hand-written, hand-TUNED custom kernels where it does not
+   (our quantized formats, Q4_K first). Custom does not mean
+   naive: see the speed law.
+4. **Plumbing: MAX.** The MAX runtime compiles Mojo to the
+   target chip and feeds it work. No wgpu, no Vulkan layer, no
+   ash in this stack.
+5. **Vendor drivers.** AMD's HIP stack on the RX 7900 XTX
+   (gfx1100, a listed MAX target, proven in-house 2026-11-07),
+   NVIDIA's driver on NVIDIA cards. Every stack ends here; this
+   layer is never ours to write.
+
+## Build order, piece by piece
+
+Each step lands as its own lane on this branch, proves parity
+(step's law below), and only then counts.
+
+1. **GGUF loader.** Parse the real Glimmer file: header,
+   metadata, tensor directory, mmap or staged load. Interface
+   already fixed in `src/gguf/loader.mojo`.
+2. **Dequant + GEMV kernels, TUNED from the start.** K1's tuned
+   structure (the r2sg shape's lessons: packed loads, subgroup
+   reduction, no per-element recompute) is the starting point,
+   not a later fix. Then K2/K3 shapes (Q6_K, Q5_K).
+3. **Attention.** Scores, masking, the sliding-window and global
+   layer split Glimmer needs, flash-style staging.
+4. **One full layer, then all layers.** Norms, projections,
+   MLP, residuals, proven per layer against the reference.
+5. **Generation loop.** Prefill and decode over the KV cache,
+   token-identical to the recorded golden.
+6. **Sampler.** Greedy first (the parity surface), then the
+   temperature/top-k/top-p family.
+7. **Serving seam.** Socket protocol parity with the paused
+   platform, or MAX Serve; decided when step 6 lands.
+
+## The parity law
+
+Every piece proves its answers against the Rust engine's
+recorded references before it counts: same fixture, same bars
+(cosine and max relative error as recorded per kernel; identity
+and golden token checks at the loop level). A piece that cannot
+show its numbers is not done, however clean it compiles. The
+kernel test set the pattern: the straight Mojo K1 port recorded
+cosine 1.000000000, rel 8.941e-08 against the CPU reference on
+the real fixture tensor, tighter than the shipped wgpu kernel's
+own 1.267e-07.
+
+## The speed law
+
+A straight port is a correctness proof, not a speed result. The
+kernel test measured it: in one interleaved cleared-card window,
+the tuned wgpu K1 ran a median 838.4 GB/s; the straight Mojo
+port of the same math ran 39.8 GB/s, 21x slower, because it
+recomputes dequant per element, loads a byte at a time, and has
+no subgroup reduction. Tuning is therefore budgeted work in
+every kernel lane's plan, never an afterthought and never a
+surprise. No kernel is called fast on a port's numbers.
+
+## Licensing constraints (facts, as of MAX 26.7)
+
+- Mojo the language: Apache 2.0 with LLVM Exceptions.
+- MAX: the MAX License. Free and royalty-free, including
+  commercial use, on any hardware. Conditions that bind a
+  public engine: MAX ships inside a product in object code
+  form with the MAX License included; modified MAX source may
+  not be published except by forking to contribute back to
+  Modular's project; MAX may not be used as AI input to
+  reimplement MAX; selling MAX as a hosted inference service
+  carries the Modular Accelerated branding condition and
+  written approval through Modular's brand portal.
+- Each MAX release keeps the license terms it shipped with;
+  later term changes do not reach back into 26.7.
+- Our own code stays ours, under our own terms.
+
+## Modularity
+
+Grid-and-tiles, as everywhere in David's projects: one module
+per job under `src/` (config, diag, gguf/, kernels/, and the
+modules the build order adds), each independently testable,
+each with the diag seam wired and named refusals for bad
+inputs from birth. Operational limits are config with defaults
+(`src/config.mojo`), never compiled-in constants.

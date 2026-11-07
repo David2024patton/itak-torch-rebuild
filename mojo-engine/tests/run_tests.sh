@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# run_tests.sh - the mojo-engine test gate.
+#
+# Runs the toolchain's own runner (std.testing.TestSuite
+# via each test file's main under `mojo run`) over tests/ in a
+# clean environment, then again with the debug seam ON (the diag
+# suite asserts both modes against the same code), then drives
+# the config probe at process level for the env-override and
+# bad-value cases. Any failure exits nonzero.
+# shellcheck: NOT RUN on the authoring VM (shellcheck absent
+# there, same standing note as bench/gate.sh); bash -n clean.
+set -u
+cd "$(dirname "$0")/.."
+
+fail() { echo "run_tests: FAIL: $*" >&2; exit 1; }
+
+# Mojo 1.2 has no `mojo test` subcommand; the toolchain's own
+# runner is std.testing.TestSuite, discovered and run by each
+# test file's main() under `mojo run`.
+echo "== TestSuite files (clean env, seam off) =="
+for t in tests/test_diag.mojo tests/test_config.mojo tests/test_k1_cpu.mojo tests/test_loader.mojo; do
+    env -u MOJO_ENGINE_DEBUG -u MOJO_ENGINE_MODEL_PATH \
+        -u MOJO_ENGINE_CONTEXT_LEN \
+        mojo run -I src "$t" || fail "TestSuite $t (seam off)"
+done
+
+echo "== TestSuite diag (MOJO_ENGINE_DEBUG=1, seam on) =="
+env MOJO_ENGINE_DEBUG=1 \
+    mojo run -I src tests/test_diag.mojo || fail "TestSuite diag (seam on)"
+
+echo "== config probe: defaults =="
+out=$(env -u MOJO_ENGINE_MODEL_PATH -u MOJO_ENGINE_CONTEXT_LEN \
+    mojo run -I src tests/config_probe.mojo) || fail "probe defaults"
+echo "$out"
+echo "$out" | grep -q "context_len 131072" || fail "probe default ctx"
+
+echo "== config probe: env override =="
+out=$(env MOJO_ENGINE_CONTEXT_LEN=4096 MOJO_ENGINE_MODEL_PATH=/tmp/m.gguf \
+    mojo run -I src tests/config_probe.mojo) || fail "probe override"
+echo "$out"
+echo "$out" | grep -q "context_len 4096" || fail "probe override ctx"
+echo "$out" | grep -q "model_path /tmp/m.gguf" || fail "probe override path"
+
+echo "== config probe: bad value refused by name =="
+if out=$(env MOJO_ENGINE_CONTEXT_LEN=abc \
+    mojo run -I src tests/config_probe.mojo 2>&1); then
+    fail "probe bad value exited 0"
+fi
+echo "$out"
+echo "$out" | grep -q "REFUSAL mojo_engine_config" \
+    || fail "probe bad value refusal unnamed"
+
+echo "== engine hello =="
+out=$(env -u MOJO_ENGINE_MODEL_PATH -u MOJO_ENGINE_CONTEXT_LEN \
+    mojo run -I src src/main.mojo) || fail "engine hello"
+echo "$out"
+echo "$out" | grep -q "mojo-engine 1.1" || fail "hello missing name/version"
+
+echo "run_tests: PASS"

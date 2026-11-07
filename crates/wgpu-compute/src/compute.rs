@@ -52,6 +52,7 @@ use crate::kernels::k21_q5k_mmv_finish::K21FinishPipeline;
 use crate::kernels::k22_q4k_mmq::K22Pipeline;
 use crate::kernels::k23_q4k_coopmat::K23Pipeline as K23CoopmatPipeline;
 use crate::kernels::k23_q4k_mmq::K23Pipeline;
+use crate::kernels::k24_q4k_coopmat::K24Pipeline as K24CoopmatPipeline;
 use crate::kernels::k2_q6k_gemv::{K2Pipeline, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Pipeline, K3Weights};
 use crate::kernels::k4_rmsnorm::K4Pipeline;
@@ -922,6 +923,35 @@ pub(crate) fn mmq_splitk_factor(mode: MmqSplitK, tiles: u32, blocks_per_row: u32
     }
 }
 
+/// Environment variable naming the K24 (Q4_K coopmat
+/// MMQ v2) selector: when the coopmat routing switch
+/// ([`COOPMAT_ENV`]) is on, the exact value `1` makes
+/// the resident session prefer the v2 register-resident
+/// product (K24) over the v1 product (K23); any other
+/// value, or an unset variable, keeps K23 as the
+/// coopmat form, so the v1 kernel stays intact as the
+/// A/B reference behind the same routing flag.
+/// Operational config, not a compiled constant, and
+/// deliberately fail-closed on the K22 pattern: the
+/// selector alone never routes anything (the coopmat
+/// switch must also be on), and the K24 pipeline itself
+/// exists only on a device opened through the coopmat
+/// bridge; with the selector on but no pipeline
+/// present, the session logs the refusal by name at
+/// plan build and the standard ladder serves. The
+/// resolved pair is named in the sessions' diag
+/// manifests (`coopmat`, `coopmat_v2`). The server
+/// proof that can move this selector's default is
+/// sequenced in bench/coopmat-v2-2026-11-07.md.
+pub const COOPMAT_V2_ENV: &str = "WGPU_COMPUTE_COOPMAT_V2";
+
+/// Resolve the K24 coopmat v2 selector from the raw
+/// environment value: only the exact value `1` (after
+/// trimming) enables it; everything else is off.
+fn resolve_coopmat_v2(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), Some("1"))
+}
+
 /// Environment variable naming the K21F finish-carrying
 /// head routing switch: it allows the resident session's
 /// block head to route its Q5_K product to the
@@ -1210,6 +1240,8 @@ pub struct WgpuCompute {
     /// config; the session reads the mode and the factor
     /// rule at plan build.
     mmq_splitk: MmqSplitK,
+    k24_coopmat: Option<K24CoopmatPipeline>,
+    coopmat_v2: bool,
     k15: Option<K15Pipeline>,
     k16: Option<K16Pipeline>,
     wide_min_rows: u32,
@@ -1430,6 +1462,23 @@ impl WgpuCompute {
              \"auto\" is the tile-count rule, 1..=8 a fixed factor)",
             mmq_splitk.describe()
         );
+        // The K24 Q4_K coopmat MMQ v2: built beside K23
+        // from the same bridge record, under the same
+        // gates; its selector is read here (see
+        // COOPMAT_V2_ENV), default off, so with shipped
+        // defaults the coopmat rung keeps serving K23
+        // exactly and this pipeline is never consulted.
+        let k24_coopmat = match &ctx.coopmat {
+            Some(info) => K24CoopmatPipeline::for_device(&ctx.device, info)?,
+            None => None,
+        };
+        let coopmat_v2 = resolve_coopmat_v2(std::env::var(COOPMAT_V2_ENV).ok().as_deref());
+        dbg_log!(
+            "mmq coopmat v2 config: selected={coopmat_v2} (env {COOPMAT_V2_ENV}, \
+             only \"1\" selects; consulted only when the coopmat switch is on); \
+             k24_coopmat={}",
+            k24_coopmat.is_some()
+        );
         let k17 = K17Pipeline::new(&ctx.device)?;
         // The wide-tile double-buffered MMQ set (K15/K16):
         // optional on the same terms as the standard MMQ
@@ -1603,6 +1652,8 @@ impl WgpuCompute {
             k23_coopmat,
             coopmat,
             mmq_splitk,
+            k24_coopmat,
+            coopmat_v2,
             k15,
             k16,
             wide_min_rows,
@@ -1857,6 +1908,25 @@ impl WgpuCompute {
     /// product serves.
     pub(crate) fn mmq_splitk_factor_for(&self, tiles: u32, blocks_per_row: u32) -> u32 {
         mmq_splitk_factor(self.mmq_splitk, tiles, blocks_per_row)
+    }
+
+    /// The K24 (Q4_K coopmat MMQ v2, register-resident)
+    /// pipeline, present only on a device opened through
+    /// the coopmat bridge whose probes passed. See
+    /// [`WgpuCompute::k13`] for the fallback contract.
+    pub(crate) fn k24_coopmat(&self) -> Option<&K24CoopmatPipeline> {
+        self.k24_coopmat.as_ref()
+    }
+
+    /// Whether the resident session prefers the K24
+    /// coopmat v2 product over the K23 coopmat product
+    /// when the coopmat routing switch is on: config
+    /// resolved at construction from [`COOPMAT_V2_ENV`],
+    /// never a constant compiled into the selection
+    /// seam. `false` (the default) leaves the coopmat
+    /// rung serving K23 exactly.
+    pub(crate) fn coopmat_v2(&self) -> bool {
+        self.coopmat_v2
     }
 
     /// The K17 (DFlash NEOX rotate + draft attention)
@@ -3222,6 +3292,23 @@ mod tests {
         // cannot split.
         assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 4, 1), 1);
         assert_eq!(mmq_splitk_factor(MmqSplitK::Auto, 8, 2), 2);
+    }
+
+    #[test]
+    fn coopmat_v2_selector_resolution() {
+        // Unset: off. The coopmat rung serves K23
+        // exactly, the v1 kernel intact as the A/B
+        // reference.
+        assert!(!resolve_coopmat_v2(None));
+        // The exact value "1" (trimmed) is the only
+        // selecting position: fail-closed, like the
+        // routing switch it refines.
+        assert!(resolve_coopmat_v2(Some("1")));
+        assert!(resolve_coopmat_v2(Some(" 1 ")));
+        assert!(!resolve_coopmat_v2(Some("0")));
+        assert!(!resolve_coopmat_v2(Some("true")));
+        assert!(!resolve_coopmat_v2(Some("")));
+        assert!(!resolve_coopmat_v2(Some("11")));
     }
 
     #[test]

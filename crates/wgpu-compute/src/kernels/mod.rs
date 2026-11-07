@@ -156,6 +156,7 @@ pub mod k21_q5k_mmv_finish;
 pub mod k22_q4k_mmq;
 pub mod k23_q4k_coopmat;
 pub mod k23_q4k_mmq;
+pub mod k24_q4k_coopmat;
 pub mod k2_q6k_gemv;
 pub mod k3_q5k_gemv;
 pub mod k4_rmsnorm;

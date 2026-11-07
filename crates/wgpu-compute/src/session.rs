@@ -118,6 +118,7 @@ use crate::kernels::k21_q5k_mmv_finish::K21FinishCall;
 use crate::kernels::k22_q4k_mmq::K22Call;
 use crate::kernels::k23_q4k_coopmat::K23Call as K23CoopmatCall;
 use crate::kernels::k23_q4k_mmq::K23Call;
+use crate::kernels::k24_q4k_coopmat::K24Call as K24CoopmatCall;
 use crate::kernels::k2_q6k_gemv::{K2Call, K2Weights};
 use crate::kernels::k3_q5k_gemv::{K3Call, K3Weights};
 use crate::kernels::k4_rmsnorm::{K4Call, CHAIN_MAX_WIDTH};
@@ -466,6 +467,20 @@ enum ProjCall {
         /// The integer product dispatch.
         mmq: K23CoopmatCall,
     },
+    /// K12 quantize + K24 (Q4_K coopmat MMQ v2, the
+    /// register-resident form of K23) dispatches.
+    /// Constructed only when the backend's coopmat switch
+    /// is on, its v2 selector is on, and a bridged device
+    /// supplied the pipeline; at shipped defaults this
+    /// variant never appears in a plan.
+    MmqCoopmatV2Q4K {
+        /// The activation quantize dispatch, or `None` when
+        /// this projection reads its layer's shared `h`
+        /// quantize instead (see the enum's docs).
+        quant: Option<K12QuantCall>,
+        /// The integer product dispatch.
+        mmq: K24CoopmatCall,
+    },
     /// K12 quantize + K18 (Q4_K small-batch) dispatches.
     SmallQ4K {
         /// The activation quantize dispatch.
@@ -610,6 +625,12 @@ impl ProjCall {
                 }
                 mmq.encode_into(pass);
             }
+            ProjCall::MmqCoopmatV2Q4K { quant, mmq } => {
+                if let Some(q) = quant {
+                    q.encode_into(pass);
+                }
+                mmq.encode_into(pass);
+            }
             ProjCall::SmallQ4K { quant, mmq } => {
                 quant.encode_into(pass);
                 mmq.encode_into(pass);
@@ -665,7 +686,8 @@ impl ProjCall {
             | ProjCall::MmqWideQ6K { quant, .. }
             | ProjCall::MmqK22Q4K { quant, .. }
             | ProjCall::MmqK23Q4K { quant, .. }
-            | ProjCall::MmqCoopmatQ4K { quant, .. } => 1 + u64::from(quant.is_some()),
+            | ProjCall::MmqCoopmatQ4K { quant, .. }
+            | ProjCall::MmqCoopmatV2Q4K { quant, .. } => 1 + u64::from(quant.is_some()),
             // A split form records two dispatches of its
             // own (the split product and its reduction),
             // plus its quantize when it carries one.
@@ -702,6 +724,7 @@ impl ProjCall {
             ProjCall::MmqK22Q4K { .. } => "k22_q4k_mmq",
             ProjCall::MmqK23Q4K { .. } => "k23_q4k_mmq",
             ProjCall::MmqCoopmatQ4K { .. } => "k23_q4k_coopmat",
+            ProjCall::MmqCoopmatV2Q4K { .. } => "k24_q4k_coopmat",
             ProjCall::MmqWideQ4K { .. } => "k15_q4k_mmq_wide",
             ProjCall::MmqWideQ6K { .. } => "k16_q6k_mmq_wide",
             ProjCall::SmallQ4K { .. } => "k18_q4k_small",
@@ -949,8 +972,10 @@ impl ProjBenchCall {
 }
 
 /// Choose the Q4_K MMQ product for an already-prepared
-/// K12 quantize call: the K23 coopmat product first when
-/// the backend's coopmat switch is on, then the wide
+/// K12 quantize call: the coopmat product first when
+/// the backend's coopmat switch is on (the K24 v2 form
+/// when the backend's v2 selector is also on, the K23
+/// v1 form behind it), then the wide
 /// product (K15) when the batch is at or past the
 /// backend's wide row threshold, then the K22
 /// register-organization prototype when the backend's
@@ -985,6 +1010,26 @@ fn mmq_product_q4k(
 ) -> Option<ProjCall> {
     let ctx = backend.context();
     if backend.coopmat() {
+        if backend.coopmat_v2() {
+            match backend.k24_coopmat() {
+                Some(k24) => match k24.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
+                    Ok(mmq) => return Some(ProjCall::MmqCoopmatV2Q4K { quant, mmq }),
+                    Err(e) => {
+                        dbg_log!(
+                            "mmq coopmat v2 q4k refused at the product prepare: {e}; \
+                             the v1 coopmat form serves it"
+                        );
+                    }
+                },
+                None => {
+                    dbg_log!(
+                        "mmq coopmat v2 q4k selected by env but no coopmat v2 pipeline \
+                         exists on this device (stock device, or a bridged device \
+                         failing the kernel's gates); the v1 coopmat form serves it"
+                    );
+                }
+            }
+        }
         match backend.k23_coopmat() {
             Some(k23) => match k23.prepare(ctx, weights, q8_qs, q8_ds, output, batch) {
                 Ok(mmq) => return Some(ProjCall::MmqCoopmatQ4K { quant, mmq }),
@@ -5115,6 +5160,8 @@ impl<'a> ResidentSession<'a> {
                 pair("k21f_head", backend.k21f_head().to_string()),
                 pair("mmq_splitk", backend.mmq_splitk().describe()),
                 pair("kv_f16", backend.kv_f16().to_string()),
+                pair("coopmat", backend.coopmat().to_string()),
+                pair("coopmat_v2", backend.coopmat_v2().to_string()),
             ],
             model: None,
             session: vec![

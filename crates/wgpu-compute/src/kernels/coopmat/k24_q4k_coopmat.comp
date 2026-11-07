@@ -1,0 +1,378 @@
+// K24: Q4_K x Q8_1 integer cooperative-matrix MMQ, v2.
+//
+// The register-resident form of K23 (the v1 coopmat
+// kernel in k23_q4k_coopmat.comp, same directory). The
+// staging, the tile geometry, the buffer contract, and
+// the accumulate identity are K23's, unchanged; the
+// product loop is rebuilt on llama.cpp's mul_mmq_cm1
+// Q4_K branch structure (ggml-org/llama.cpp, MIT;
+// bench/llama-parity-specs-2026-11-06.md pins the
+// reference, bench/coopmat-v2-2026-11-07.md records
+// the autopsy that motivated this form and the card
+// protocol that judges it).
+//
+// What changed against K23, and why:
+//
+// - Fragments are preloaded once per 32-element
+//   sub-block into register arrays (llama's cache_a /
+//   cache_b "preload up front" structure). K23 reloaded
+//   the A fragment once per column tile and the B
+//   fragment once per row tile, 32 cooperative loads
+//   per sub-block on the critical path between the
+//   muladds; this form loads 12 and reuses them from
+//   registers.
+// - The accumulator fold is in-register. K23 stored
+//   every 16x16 int32 tile into a shared fold tile and
+//   folded it back with scalar reads: 32 coopMatStores
+//   and 64 subgroup barriers per staged chunk, with
+//   half of each subgroup idle in every fold. This
+//   form reads the accumulator's elements directly
+//   (acc[e]) and folds them into the per-thread f32
+//   sums with llama's cm1_accumulate identity in its
+//   plain (non-magic-bias) shape:
+//     sums += dot_i32 * (d_b * sc) * d_a
+//           + (-(dmin_b * mn)) * (d_a * sum_q)
+//   No shared fold tile, no coopMatStore, no subgroup
+//   barrier anywhere in the shader.
+//
+// The element mapping the register fold stands on:
+// element e of this thread's 16x16 int32 accumulator
+// sits at row cm_elem_row(e), column
+// gl_SubgroupInvocationID % TN of the tile. This is
+// NOT llama's mapping: llama runs its cm1 on AMD at
+// wave32 (ggml-vulkan.cpp's cm1_use_wave32, which
+// forces a 32-wide subgroup through pipeline creation,
+// a control the wgpu passthrough path does not have),
+// where the row is (inv / 16) + 2e. This shader is
+// compiled for the 64-wide subgroup the crate's bridge
+// probes and the Rust constructor requires, and at
+// wave64 on GFX11 (RDNA3) Mesa's cooperative matrix
+// lowering (radv_nir_lower_cooperative_matrix) places
+// accumulator element e at row (inv / 16) + 4e, column
+// inv % 16: its load, store, and element-coordinate
+// lowerings all compute base_row = inv / 16,
+// row_iter = e * wave_size / 16 = 4e, inner_idx =
+// inv & 15, and the accumulator length is
+// 16 * 16 / 64 = 4 elements per thread (CM_ELEMS).
+// The mapping is a GFX11 hardware-layout fact the
+// driver lowering transcribes, not a tuning choice.
+// GFX11.5/12 (RDNA3.5/RDNA4) take a different branch
+// of that lowering and are out of scope here, exactly
+// as they are for K23; the on-card numeric gate in
+// the lane protocol is the proof on the target card.
+//
+// What deliberately did not change:
+//
+// - Staging is K23's transcription of llama's split
+//   layout, byte for byte: raw nibble codes at QPITCH
+//   36 with the +4 bank skew, (d * scale, -(dmin *
+//   min)) vec2 pairs on the weight side, K12's Q8_1
+//   words with (d, d * sum) split float arrays on the
+//   activation side.
+// - The tile is K23's: 128 output rows x 64 batch
+//   rows per workgroup, 256 threads, four subgroups
+//   of 64 owning 64 x 32 each, BK 32 staged in
+//   BK_STEP 4 chunks of 128 K elements. llama's cm1
+//   runs a 128 x 128 tile at wave32 with 512 threads;
+//   the batch cap of this backend's MMQ band (64,
+//   K13's MMQ_MAX_BATCH contract) fixes the batch
+//   side here, and the subgroup width is the
+//   passthrough's, not a free choice.
+// - No magic bias: llama's accumulator bias trick is
+//   its wave32-off path (USE_MAGIC_BIAS = WARP != 32
+//   selects it, and llama's AMD configuration runs
+//   WARP 32, so the shipped fast path does not use it
+//   either). The sub-block integer dot is bounded by
+//   32 * 15 * 127 = 60960 in magnitude, far inside
+//   f32's exact-integer range, so the plain
+//   float(acc[e]) conversion is exact.
+// - No staging prefetch split: llama overlaps the
+//   next chunk's loads with this chunk's compute
+//   (its PREFETCH_BLOCK / STORE_BLOCK_TO_LDS split).
+//   That is a staging-side change, a different design
+//   story from this kernel's register-resident
+//   product loop; the bench note names it as the
+//   recorded next step if the card convicts staging.
+//
+// Device assumptions, all gated before this module
+// can exist (the Rust constructor enforces them): the
+// s8 x s8 to s32 16x16x16 subgroup property row
+// (bridge probe), subgroup size 64, RADV on RDNA3
+// (GFX11; the only stack the lane protocol measures).
+//
+// Shape contract (the Rust prepare enforces it):
+// in_features % 256 == 0, batch in 1..=64. Rows past
+// out_rows or batch stage zeros and store nothing.
+//
+// Rebuild: see rebuild.sh in this directory. The .spv
+// is a checked-in build artifact; Naga cannot validate
+// it (wgpu 27 has no coopmat IR), so correctness rests
+// on the on-card numeric gate, as the feasibility note
+// disclosed for K23.
+
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint data_w[]; };
+layout(set = 0, binding = 1) readonly buffer QsIn { uint data_qs[]; };
+layout(set = 0, binding = 2) readonly buffer DsIn { vec4 data_ds[]; };
+layout(set = 0, binding = 3) buffer OutBuf { float data_out[]; };
+layout(set = 0, binding = 4) uniform Params {
+    uint blocks_per_row; // Q4_K super-blocks per weight row
+    uint out_rows;
+    uint batch;
+    uint blocks32;       // 32-element blocks per row
+} p;
+
+const uint BK = 32;
+const uint BK_STEP = 4;
+const uint QPITCH = BK_STEP * (BK / 4) + 4; // 36
+const uint W_ROWS = 128;  // output rows per workgroup
+const uint X_ROWS = 64;   // batch rows per workgroup
+const uint WM = 64;       // output rows per subgroup
+const uint WN = 32;       // batch rows per subgroup
+const uint TM = 16;
+const uint TN = 16;
+const uint TK = 16;
+const uint CMS_PER_ROW = WM / TM; // 4 coopmat tiles down the subgroup tile
+const uint CMS_PER_COL = WN / TN; // 2 coopmat tiles across it
+const uint K_SUB = BK / TK;       // 2 K steps per 32-element sub-block
+// Accumulator elements per thread at the compiled
+// subgroup size 64: (TM * TN) / 64. Mesa's GFX11
+// lowering computes the same length for a 32-bit
+// accumulator (radv_nir_cmat_length).
+const uint CM_ELEMS = (TM * TN) / 64u; // 4
+
+shared uint buf_w_qs[W_ROWS * QPITCH];
+shared vec2 buf_w_dm[W_ROWS * BK_STEP];
+shared uint buf_x_qs[X_ROWS * QPITCH];
+shared float buf_x_d[X_ROWS * BK_STEP];
+shared float buf_x_s[X_ROWS * BK_STEP];
+
+// One of the 12 packed scale bytes of a Q4_K
+// super-block (K13's scale_byte, transcribed).
+uint scale_byte(uint sw0, uint sw1, uint sw2, uint i) {
+    uint w = (i < 4u) ? sw0 : ((i < 8u) ? sw1 : sw2);
+    return (w >> (8u * (i % 4u))) & 0xffu;
+}
+
+// ggml get_scale_min_k4: sub-block j's (scale, min)
+// 6-bit pair (K13's scale_min_k4, transcribed).
+uvec2 scale_min_k4(uint j, uint sw0, uint sw1, uint sw2) {
+    if (j < 4u) {
+        return uvec2(scale_byte(sw0, sw1, sw2, j) & 63u,
+                     scale_byte(sw0, sw1, sw2, j + 4u) & 63u);
+    }
+    return uvec2((scale_byte(sw0, sw1, sw2, j + 4u) & 0xfu)
+                     | ((scale_byte(sw0, sw1, sw2, j - 4u) >> 6u) << 4u),
+                 (scale_byte(sw0, sw1, sw2, j + 4u) >> 4u)
+                     | ((scale_byte(sw0, sw1, sw2, j) >> 6u) << 4u));
+}
+
+// The tile row of accumulator element e for this
+// thread, at subgroup size 64 on GFX11: Mesa's
+// lowering places it at base_row + e * (wave_size /
+// 16) with base_row = inv / 16 (see the header). The
+// element's column is inv % TN, fixed per thread.
+uint cm_elem_row(uint e) {
+    return (gl_SubgroupInvocationID / TN) + 4u * e;
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationIndex;
+    const uint sg = gl_SubgroupID;
+    const uint inv = gl_SubgroupInvocationID;
+
+    const uint wg_out0 = gl_WorkGroupID.x * W_ROWS;
+    const uint wg_batch0 = gl_WorkGroupID.y * X_ROWS;
+
+    // Subgroup tile assignment (llama's warp_r / warp_c
+    // over the weight side and the activation side).
+    const uint warp_r = sg % (W_ROWS / WM);
+    const uint warp_c = sg / (W_ROWS / WM);
+    const uint a_row0 = warp_r * WM;
+    const uint b_col0 = warp_c * WN;
+
+    // This thread's fixed accumulator column in every
+    // 16-wide tile (llama's elem_col0). sums is indexed
+    // [tile (r, c)][element e], llama's layout: element
+    // e of tile (r, c) is this thread's partial for
+    // output (a_row0 + r * TM + cm_elem_row(e),
+    // b_col0 + c * TN + elem_col0) of the subgroup tile.
+    const uint elem_col0 = inv % TN;
+    float sums[CMS_PER_ROW * CMS_PER_COL * CM_ELEMS];
+    for (uint i = 0; i < CMS_PER_ROW * CMS_PER_COL * CM_ELEMS; i++) {
+        sums[i] = 0.0;
+    }
+
+    // Weight staging assignment (llama's loadr_a /
+    // loadc_a): each thread owns one row quarter; two
+    // row passes cover the 128-row tile.
+    const uint loadr = tid % (BK / 8u);
+    const uint loadc = tid / (BK / 8u);
+    const uint loadstride = 256u * 8u / BK; // 64 rows per pass
+
+    for (uint kb0 = 0; kb0 < p.blocks32; kb0 += BK_STEP) {
+        // ---- Stage the weight tile for this chunk.
+        [[unroll]] for (uint li = 0; li < W_ROWS / loadstride; li++) {
+            const uint row = loadc + li * loadstride;
+            const uint grow = wg_out0 + row;
+            const bool valid = grow < p.out_rows;
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {
+                const uint sb = kb0 + ks;
+                const uint base = row * QPITCH + ks * (BK / 4u);
+                if (valid) {
+                    const uint super_blk = sb >> 3;
+                    const uint sub = sb & 7u;
+                    const uint g = sub >> 1;
+                    const uint bw = (grow * p.blocks_per_row + super_blk) * 36u;
+                    const uint raw0 = data_w[bw + 4u + g * 8u + loadr * 2u];
+                    const uint raw1 = data_w[bw + 4u + g * 8u + loadr * 2u + 1u];
+                    if ((sub & 1u) == 0u) {
+                        buf_w_qs[base + loadr * 2u] = raw0 & 0x0F0F0F0Fu;
+                        buf_w_qs[base + loadr * 2u + 1u] = raw1 & 0x0F0F0F0Fu;
+                    } else {
+                        buf_w_qs[base + loadr * 2u] = (raw0 >> 4) & 0x0F0F0F0Fu;
+                        buf_w_qs[base + loadr * 2u + 1u] = (raw1 >> 4) & 0x0F0F0F0Fu;
+                    }
+                    if (loadr == 0u) {
+                        const vec2 dm = unpackHalf2x16(data_w[bw]);
+                        const uvec2 sm = scale_min_k4(sub, data_w[bw + 1u],
+                                                      data_w[bw + 2u], data_w[bw + 3u]);
+                        buf_w_dm[ks * W_ROWS + row] =
+                            vec2(dm.x * float(sm.x), -(dm.y * float(sm.y)));
+                    }
+                } else {
+                    buf_w_qs[base + loadr * 2u] = 0u;
+                    buf_w_qs[base + loadr * 2u + 1u] = 0u;
+                    if (loadr == 0u) {
+                        buf_w_dm[ks * W_ROWS + row] = vec2(0.0);
+                    }
+                }
+            }
+        }
+        // ---- Stage the activation tile for this chunk:
+        // each thread owns one batch row's word pairs.
+        {
+            const uint row = tid / 4u;
+            const uint part = tid % 4u;
+            const uint grow = wg_batch0 + row;
+            const bool valid = grow < p.batch;
+            [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {
+                const uint kb = kb0 + ks;
+                const uint base = row * QPITCH + ks * (BK / 4u) + part * 2u;
+                if (valid) {
+                    const uint src = (grow * p.blocks32 + kb) * 8u;
+                    buf_x_qs[base] = data_qs[src + part * 2u];
+                    buf_x_qs[base + 1u] = data_qs[src + part * 2u + 1u];
+                    if (part == 0u) {
+                        const vec4 ds = data_ds[grow * p.blocks32 + kb];
+                        buf_x_d[ks * X_ROWS + row] = ds.x;
+                        buf_x_s[ks * X_ROWS + row] = ds.y;
+                    }
+                } else {
+                    buf_x_qs[base] = 0u;
+                    buf_x_qs[base + 1u] = 0u;
+                    if (part == 0u) {
+                        buf_x_d[ks * X_ROWS + row] = 0.0;
+                        buf_x_s[ks * X_ROWS + row] = 0.0;
+                    }
+                }
+            }
+        }
+        barrier();
+
+        // ---- The integer coopmat product, one staged
+        // chunk: BK_STEP sub-blocks. Per sub-block the
+        // fragments are preloaded into register arrays
+        // once, then every (r, c) tile's product folds
+        // in-register (llama's Q4_K cm1 branch shape).
+        [[unroll]] for (uint ks = 0; ks < BK_STEP; ks++) {
+            // Preload all A/B fragments up front (ILP).
+            coopmat<int8_t, gl_ScopeSubgroup, TM, TK, gl_MatrixUseA>
+                cache_a[CMS_PER_ROW * K_SUB];
+            coopmat<int8_t, gl_ScopeSubgroup, TK, TN, gl_MatrixUseB>
+                cache_b[CMS_PER_COL * K_SUB];
+
+            [[unroll]] for (uint r = 0; r < CMS_PER_ROW; r++) {
+                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                    coopMatLoad(cache_a[r * K_SUB + h], buf_w_qs,
+                                (a_row0 + r * TM) * QPITCH + ks * (BK / 4u) + h * (TK / 4u),
+                                QPITCH, gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            [[unroll]] for (uint c = 0; c < CMS_PER_COL; c++) {
+                [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                    coopMatLoad(cache_b[c * K_SUB + h], buf_x_qs,
+                                (b_col0 + c * TN) * QPITCH + ks * (BK / 4u) + h * (TK / 4u),
+                                QPITCH, gl_CooperativeMatrixLayoutColumnMajor);
+                }
+            }
+
+            // This thread's activation scale pair per
+            // column tile: (d, d * sum) for its own
+            // element column.
+            float scale_b[CMS_PER_COL];
+            float bs[CMS_PER_COL];
+            [[unroll]] for (uint c = 0; c < CMS_PER_COL; c++) {
+                scale_b[c] = buf_x_d[ks * X_ROWS + b_col0 + c * TN + elem_col0];
+                bs[c] = buf_x_s[ks * X_ROWS + b_col0 + c * TN + elem_col0];
+            }
+
+            [[unroll]] for (uint r = 0; r < CMS_PER_ROW; r++) {
+                // This thread's weight scale pairs for
+                // its element rows in this row tile:
+                // (d * sc, -(dmin * mn)) per element.
+                float scale_a[CM_ELEMS];
+                float ma[CM_ELEMS];
+                [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                    const vec2 dm = buf_w_dm[ks * W_ROWS + a_row0 + r * TM + cm_elem_row(e)];
+                    scale_a[e] = dm.x;
+                    ma[e] = dm.y;
+                }
+
+                [[unroll]] for (uint c = 0; c < CMS_PER_COL; c++) {
+                    coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator> acc =
+                        coopmat<int32_t, gl_ScopeSubgroup, TM, TN, gl_MatrixUseAccumulator>(0);
+                    [[unroll]] for (uint h = 0; h < K_SUB; h++) {
+                        acc = coopMatMulAdd(cache_a[r * K_SUB + h],
+                                            cache_b[c * K_SUB + h], acc);
+                    }
+                    // The in-register fold: llama's
+                    // cm1_accumulate, plain path.
+                    const uint tile_idx = r * CMS_PER_COL + c;
+                    [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                        sums[tile_idx * CM_ELEMS + e] =
+                            sums[tile_idx * CM_ELEMS + e]
+                            + fma(float(acc[e]) * scale_a[e], scale_b[c],
+                                  ma[e] * bs[c]);
+                    }
+                }
+            }
+        }
+        barrier();
+    }
+
+    // ---- Store: each thread stores its own elements,
+    // guarded per element (llama's cm1 store form).
+    [[unroll]] for (uint r = 0; r < CMS_PER_ROW; r++) {
+        [[unroll]] for (uint c = 0; c < CMS_PER_COL; c++) {
+            const uint tile_idx = r * CMS_PER_COL + c;
+            [[unroll]] for (uint e = 0; e < CM_ELEMS; e++) {
+                const uint grow_out = wg_out0 + a_row0 + r * TM + cm_elem_row(e);
+                const uint grow_batch = wg_batch0 + b_col0 + c * TN + elem_col0;
+                if (grow_out < p.out_rows && grow_batch < p.batch) {
+                    data_out[grow_batch * p.out_rows + grow_out] =
+                        sums[tile_idx * CM_ELEMS + e];
+                }
+            }
+        }
+    }
+}

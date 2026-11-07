@@ -37,11 +37,15 @@ use crate::session::{SpecSession, SpecStats};
 
 /// The default candidate depths, ascending: exactly the set the
 /// 2026-10-30 llama.cpp sweep measured (`bench/gpu-proof-2026-10-30.
-/// md`), from the floor to the real draft's block size (16) and
-/// including 6, the standing default that sweep picked. Keeping the
-/// set identical makes the two tables comparable cell for cell. A
-/// default, not a constant: any caller can replace the set wholesale
-/// through [`SweepConfig`].
+/// md`), from the floor to the real draft's block size (16).
+/// Keeping the set identical makes the two tables comparable cell
+/// for cell. The set is a sweep menu, not a default: this stack's
+/// own sweep (T-9.7, `bench/spec-sweep-gpu-fixed-2026-11-04.md`)
+/// picked depth 1, which is [`SpecConfig`]'s standing default;
+/// the 6 in the set is the llama.cpp operating point that sweep
+/// measured, not a default of this stack. A default, not a
+/// constant: any caller can replace the set wholesale through
+/// [`SweepConfig`].
 pub const DEFAULT_CANDIDATE_DEPTHS: &[usize] = &[1, 2, 3, 4, 6, 8, 12, 16];
 
 /// The default winner band: the recorded operating-point rule (SPEC
@@ -508,7 +512,11 @@ mod tests {
         config
             .validate()
             .expect("the default sweep config validates");
-        assert!(config.depths.contains(&6), "the standing default is swept");
+        assert!(config.depths.contains(&1), "the standing default is swept");
+        assert!(
+            config.depths.contains(&6),
+            "the llama.cpp operating point is swept"
+        );
         assert!(config.depths.contains(&16), "the draft block max is swept");
         assert_eq!(config.tokens_per_depth, DEFAULT_TOKENS_PER_DEPTH);
     }

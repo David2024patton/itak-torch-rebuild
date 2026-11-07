@@ -52,6 +52,14 @@ use tokenizer::{TokenType, Tokenizer, TokenizerData};
 /// (bench/gpu-proof-2026-10-30.md): " Paris. It is the most populous".
 const GOLDEN_FIRST8: [u32; 8] = [13796, 26, 1573, 373, 290, 2167, 26899, 1212];
 
+/// The draft depth when the caller does not pass one: 1, this
+/// stack's own measured winner (the T-9.7 sweep,
+/// bench/spec-sweep-gpu-fixed-2026-11-04.md), and the default
+/// [`SpecConfig`] itself carries. The depth 6 this runner once
+/// defaulted to is the llama.cpp operating point, never this
+/// stack's pick.
+const DEFAULT_DEPTH: usize = 1;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let (Some(target_path), Some(draft_path)) = (args.get(1), args.get(2)) else {
@@ -59,7 +67,9 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let n_tokens: usize = args.get(3).map_or(16, |a| a.parse().unwrap_or(16));
-    let depth: usize = args.get(4).map_or(6, |a| a.parse().unwrap_or(6));
+    let depth: usize = args
+        .get(4)
+        .map_or(DEFAULT_DEPTH, |a| a.parse().unwrap_or(DEFAULT_DEPTH));
     let prompt = args
         .get(5)
         .map_or("The capital of France is", String::as_str);

@@ -33,6 +33,8 @@ An inference engine and serving platform rebuilt the way it should have been bui
 
 **Plan:** [PLAN.md](PLAN.md) · **Tasks:** [TODO.md](TODO.md) · **Ideas:** [IDEA.md](IDEA.md) · **Build rules:** [docs/RULES.md](docs/RULES.md)
 
+About the HTML comment at the top of this file: it is this project's own editing process, the structure and accuracy rules the owner set for whoever maintains the repo, kept verbatim by the owner's standing instruction. It is project process for this repo's editors; it makes no claim about the software and binds nobody outside this repo.
+
 ## What it is
 
 iTaK Torch began as a pure-Go inference engine with an unusually wide reach: an OpenAI-compatible server, speculative decoding, a full training stack (SFT, DPO, GRPO, ORPO, LoRA), continuous batching, clustering, model operations, and a native engine experimenting with hybrid state space models. It also had a fatal flaw: it depended on a shared support module that lived in a relative folder, was never published, and is lost. The original engine cannot be built today. The audit of exactly what it contained, feature by feature, is in [PLAN.md](PLAN.md) and drives this rebuild.

@@ -256,7 +256,11 @@ def _dashboard_js() -> String:
     js += "var nm=new TextDecoder().decode(buf.subarray(k+46,k+46+nl));var lnl=view.getUint16(lh+26,true);var lel=view.getUint16(lh+28,true);var ds2=lh+30+lnl+lel;var raw2=buf.subarray(ds2,ds2+cs);var tx=null;"
     js += "if(m2===0){tx=new TextDecoder().decode(raw2);}else if(m2===8){try{tx=new TextDecoder().decode(await inflateRaw(raw2));}catch(e){tx=null;}}"
     js += "if(tx!==null&&nm.length){files.push({name:nm,text:tx});}k+=46+nl+el+cl;}}"
-    js += "return files;}\n"
+    # The return closes BOTH the outer if(!files.length) block
+    # and readZip itself; an earlier build shipped one brace
+    # short here and the whole page script failed to parse
+    # (caught by node --check on the served page, window 4).
+    js += "return files;}}\n"
     js += "function refuseInPage(msg){attached={kind:null,name:\"\",names:[],text:\"\",image:null};$(\"attachInfo\").textContent=\"\";$(\"attachWarn\").textContent=msg;}\n"
     js += "$(\"attachBtn\").addEventListener(\"click\",function(){$(\"fileInput\").click();});\n"
     js += "$(\"fileInput\").addEventListener(\"change\",async function(){var file=this.files[0];this.value=\"\";if(!file){return;}var name=file.name;var lower=name.toLowerCase();"

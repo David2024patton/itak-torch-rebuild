@@ -428,8 +428,22 @@ def test_dashboard_wiring() raises:
         "vision",
         "data-dl",
         "temperature:0.0",
+        # readZip must close its function body; window 4
+        # caught a one-brace-short ending via node --check.
+        "return files;}}",
     ]:
         assert_true(page.find(marker) != -1)
+    # Delimiter balance over the whole page: style and
+    # script braces must net to zero or the browser drops
+    # the script block silently.
+    var opens = 0
+    var closes = 0
+    for b in page.as_bytes():
+        if b == UInt8(123):
+            opens += 1
+        elif b == UInt8(125):
+            closes += 1
+    assert_equal(opens, closes)
 
 
 def test_mcp_tools_list() raises:

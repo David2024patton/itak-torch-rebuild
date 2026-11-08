@@ -187,6 +187,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             cpu_model^,
             context_len,
             budget_bytes,
+            DEFAULT_ATTN_TILE_POSITIONS,
+            DEFAULT_ATTN_MAX_SPLITS,
+            DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
             prefill_gemm_min_batch,
             gemm_tiled_min_batch,
         )

@@ -6,8 +6,9 @@
 # bundle envelope, history filtering, the leaderboard shape
 # (measured rows per model + hardware, reference rows marked
 # and separate), and the fact sheet over the tiny fixture.
-# All pure: no sockets, no model, no files except the tiny
-# fixture GGUF under tests/fixtures/.
+# All pure: no sockets, no model; the only files are the tiny
+# fixture GGUF under tests/fixtures/ and two throwaway hash
+# inputs the SHA file test writes under /tmp.
 
 from std.testing import TestSuite, assert_true, assert_false, assert_equal
 
@@ -22,6 +23,7 @@ from serve.factsheet import (
 from serve.history import (
     RunRecord,
     bundle_json,
+    file_sha256_hex,
     history_json,
     leaderboard_json,
     load_records,
@@ -454,6 +456,40 @@ def test_sha256_fips_vector() raises:
         sha256_hex_of_bytes(bytes),
         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
     )
+
+
+def test_file_sha256_matches_bytes() raises:
+    # The file path is what serve_main fingerprints the model
+    # with; it must agree with the in-memory path exactly,
+    # including across the 4 MiB read-chunk boundary with a
+    # non-block-aligned remainder (the streaming carry path).
+    var small = "/tmp/test_serve_sha_abc.bin"
+    with open(small, "w") as f:
+        f.write("abc")
+    assert_equal(
+        file_sha256_hex(small),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )
+    var block = String("")
+    for i in range(90):
+        block += String(chr(33 + i))
+    var reps = 46604  # 46604 * 90 = 4,194,360 bytes
+    var bytes = List[UInt8]()
+    for _ in range(reps):
+        for c in block.as_bytes():
+            bytes.append(c)
+    for i in range(9):
+        bytes.append(UInt8(33 + i))
+    var big = "/tmp/test_serve_sha_big.bin"
+    with open(big, "w") as f:
+        for _ in range(reps):
+            f.write(block)
+        var tail = String("")
+        for i in range(9):
+            tail += String(chr(33 + i))
+        f.write(tail)
+    assert_equal(len(bytes), 4194369)
+    assert_equal(file_sha256_hex(big), sha256_hex_of_bytes(bytes))
 
 
 def main() raises:

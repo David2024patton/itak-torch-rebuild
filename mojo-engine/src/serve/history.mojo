@@ -585,8 +585,14 @@ def leaderboard_json(records: List[RunRecord]) -> String:
     return out
 
 
-def _sha256_k(t: Int) -> UInt32:
-    var words = List[UInt32]()
+def _sha256_table() -> List[UInt32]:
+    """The 64 round constants (FIPS 180-4), built ONCE per
+    hash. The first version of this code rebuilt the whole
+    table inside a per-round accessor: 64 rebuilds per
+    64-byte block, which made hashing a 17 GB model file a
+    multi-hour job and stalled serve startup on the card
+    (2026-11-08). Never index constants through a builder."""
+    var words = List[UInt32](capacity=64)
     words.extend([0x428A2F98, 0x71374491, 0xB5C0FBCF, 0xE9B5DBA5, 0x3956C25B, 0x59F111F1, 0x923F82A4, 0xAB1C5ED5])
     words.extend([0xD807AA98, 0x12835B01, 0x243185BE, 0x550C7DC3, 0x72BE5D74, 0x80DEB1FE, 0x9BDC06A7, 0xC19BF174])
     words.extend([0xE49B69C1, 0xEFBE4786, 0x0FC19DC6, 0x240CA1CC, 0x2DE92C6F, 0x4A7484AA, 0x5CB0A9DC, 0x76F988DA])
@@ -595,14 +601,16 @@ def _sha256_k(t: Int) -> UInt32:
     words.extend([0xA2BFE8A1, 0xA81A664B, 0xC24B8B70, 0xC76C51A3, 0xD192E819, 0xD6990624, 0xF40E3585, 0x106AA070])
     words.extend([0x19A4C116, 0x1E376C08, 0x2748774C, 0x34B0BCB5, 0x391C0CB3, 0x4ED8AA4A, 0x5B9CCA4F, 0x682E6FF3])
     words.extend([0x748F82EE, 0x78A5636F, 0x84C87814, 0x8CC70208, 0x90BEFFFA, 0xA4506CEB, 0xBEF9A3F7, 0xC67178F2])
-    return words[t]
+    return words^
 
 
 def _rotr32(x: UInt32, n: Int) -> UInt32:
     return (x >> UInt32(n)) | (x << UInt32(32 - n))
 
 
-def _sha256_block(h: List[UInt32], data: List[UInt8], base: Int) -> List[UInt32]:
+def _sha256_block(
+    h: List[UInt32], data: List[UInt8], base: Int, k: List[UInt32]
+) -> List[UInt32]:
     var w = List[UInt32](capacity=64)
     for t in range(16):
         var o = base + t * 4
@@ -629,7 +637,7 @@ def _sha256_block(h: List[UInt32], data: List[UInt8], base: Int) -> List[UInt32]
     for t in range(64):
         var s1 = _rotr32(e, 6) ^ _rotr32(e, 11) ^ _rotr32(e, 25)
         var ch = (e & f) ^ ((~e) & g)
-        var t1 = hh + s1 + ch + _sha256_k(t) + w[t]
+        var t1 = hh + s1 + ch + k[t] + w[t]
         var s0 = _rotr32(a, 2) ^ _rotr32(a, 13) ^ _rotr32(a, 22)
         var maj = (a & b) ^ (a & c) ^ (b & c)
         var t2 = s0 + maj
@@ -668,9 +676,10 @@ def sha256_hex_of_bytes(data: List[UInt8]) -> String:
     var bit_len = UInt64(total) * 8
     for shift in [56, 48, 40, 32, 24, 16, 8, 0]:
         buf.append(UInt8((bit_len >> UInt64(shift)) & 0xFF))
+    var k = _sha256_table()
     var base = 0
     while base < len(buf):
-        h = _sha256_block(h, buf, base)
+        h = _sha256_block(h, buf, base, k)
         base += 64
     var hexd = "0123456789abcdef"
     var hd = hexd.as_bytes()
@@ -686,13 +695,20 @@ def sha256_hex_of_bytes(data: List[UInt8]) -> String:
 
 def file_sha256_hex(path: String) raises -> String:
     """SHA-256 of a file's bytes (pure Mojo, chunked reads).
-    Used for the served model's fingerprint at serve start;
-    a 17 GB file hashes in a few seconds."""
+    Used for the served model's fingerprint at serve start.
+    Streaming shape: full 64-byte blocks are compressed
+    straight out of each read chunk; only the sub-block
+    remainder (< 64 bytes) is ever copied, into `carry`.
+    The first version appended every byte of every chunk
+    into a tail list AND rebuilt the round-constant table
+    per round; on a 17 GB file that never finished inside
+    a proof window (2026-11-08)."""
     var h: List[UInt32] = [
         0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
         0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
     ]
-    var tail = List[UInt8]()
+    var k = _sha256_table()
+    var carry = List[UInt8]()
     var total: Int = 0
     try:
         with open(path, "r") as f:
@@ -701,31 +717,36 @@ def file_sha256_hex(path: String) raises -> String:
                 if len(chunk) == 0:
                     break
                 total += len(chunk)
-                for i in range(len(chunk)):
-                    tail.append(chunk[i])
-                var full = (len(tail) // 64) * 64
-                if full > 0:
-                    var base = 0
-                    var hh = h.copy()
-                    while base < full:
-                        hh = _sha256_block(hh, tail, base)
-                        base += 64
-                    h = hh^
-                    var rest = List[UInt8]()
-                    for i in range(full, len(tail)):
-                        rest.append(tail[i])
-                    tail = rest^
+                var off = 0
+                if len(carry) > 0:
+                    var need = 64 - len(carry)
+                    var take = need
+                    if take > len(chunk):
+                        take = len(chunk)
+                    for i in range(take):
+                        carry.append(chunk[i])
+                    off = take
+                    if len(carry) == 64:
+                        h = _sha256_block(h, carry, 0, k)
+                        carry = List[UInt8]()
+                var full_end = off + ((len(chunk) - off) // 64) * 64
+                var base = off
+                while base < full_end:
+                    h = _sha256_block(h, chunk, base, k)
+                    base += 64
+                for i in range(full_end, len(chunk)):
+                    carry.append(chunk[i])
     except e:
         raise Error("serve_fingerprint: cannot read " + path + ": " + String(e))
-    tail.append(UInt8(0x80))
-    while len(tail) % 64 != 56:
-        tail.append(UInt8(0))
+    carry.append(UInt8(0x80))
+    while len(carry) % 64 != 56:
+        carry.append(UInt8(0))
     var bit_len = UInt64(total) * 8
     for shift in [56, 48, 40, 32, 24, 16, 8, 0]:
-        tail.append(UInt8((bit_len >> UInt64(shift)) & 0xFF))
+        carry.append(UInt8((bit_len >> UInt64(shift)) & 0xFF))
     var base2 = 0
-    while base2 < len(tail):
-        h = _sha256_block(h, tail, base2)
+    while base2 < len(carry):
+        h = _sha256_block(h, carry, base2, k)
         base2 += 64
     var hexd = "0123456789abcdef"
     var hd = hexd.as_bytes()

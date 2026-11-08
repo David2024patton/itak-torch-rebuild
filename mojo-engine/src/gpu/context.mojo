@@ -13,6 +13,17 @@
 # one buffer; the largest single activation is the 808,192 B
 # logits row).
 #
+# Release law (Wave E, Lane E3; owed since Wave C): a
+# reservation is returned with unreserve_*() when the
+# structure it guarded is torn down - DeviceWeights and
+# DeviceKvCache expose release_reservation() for exactly
+# that, and GpuGlimmerModel.release_reservations() releases
+# both. Before this API existed the ledger only ever grew in
+# a long-lived runtime, so a second build in the same process
+# double-counted and refused gpu_budget_exceeded on a card
+# that had the room (the Wave C layer proof reset the ledger
+# field directly to work around it; that hack is gone).
+#
 # Named refusals: gpu_no_device (DeviceContext creation finds
 # no usable device), gpu_budget_exceeded (a reservation would
 # push the resident total over the cap, or a size overflows),
@@ -76,6 +87,38 @@ def check_gpu_budget(weights: Int, kv: Int, scratch: Int, cap: Int) raises:
         )
 
 
+def budget_release(current: Int, amount: Int, what: String) raises -> Int:
+    """current - amount for one ledger bucket, refused by name.
+
+    Pure, so the release arithmetic is VM-testable without a
+    device; GpuRuntime.unreserve_* delegates here. A negative
+    amount, or releasing more than the bucket currently holds
+    (a double release, or releasing a reservation that was
+    never made), refuses gpu_budget_exceeded instead of
+    silently driving the ledger negative - a negative bucket
+    would let a later reserve pass against room that does not
+    exist.
+    """
+    if amount < 0:
+        raise Error(
+            "gpu_budget_exceeded: unreserve amount for "
+            + what
+            + " must not be negative, got "
+            + String(amount)
+        )
+    if amount > current:
+        raise Error(
+            "gpu_budget_exceeded: unreserve of "
+            + String(amount)
+            + " B for "
+            + what
+            + " exceeds its reserved "
+            + String(current)
+            + " B"
+        )
+    return current - amount
+
+
 # ---------------------------------------------------------------------------
 # Zero-fill kernels (one exact grid, one element per thread)
 # ---------------------------------------------------------------------------
@@ -103,10 +146,12 @@ struct GpuRuntime(Movable):
 
     weights_bytes / kv_bytes are RESERVED figures accumulated
     through reserve_weights / reserve_kv (each checks the new
-    total against the cap before applying it); scratch_bytes
-    starts at the full envelope. Callers reserve the exact
-    computed size of a structure BEFORE allocating any of its
-    buffers, so an over-cap build fails before the card fills.
+    total against the cap before applying it) and returned
+    through unreserve_weights / unreserve_kv on teardown;
+    scratch_bytes starts at the full envelope. Callers reserve
+    the exact computed size of a structure BEFORE allocating
+    any of its buffers, so an over-cap build fails before the
+    card fills.
     """
 
     var ctx: DeviceContext
@@ -196,6 +241,37 @@ struct GpuRuntime(Movable):
             "gpu",
             "reserve kv +"
             + String(additional)
+            + " total_kv="
+            + String(self.kv_bytes),
+        )
+
+    def unreserve_weights(mut self, amount: Int) raises:
+        """Return a weights reservation (teardown path).
+
+        The mirror of reserve_weights: callers release the
+        exact figure they reserved when the structure it
+        guarded is destroyed, so a later build in the same
+        runtime reserves against the true free room.
+        """
+        self.weights_bytes = budget_release(
+            self.weights_bytes, amount, "weights"
+        )
+        _ = log_debug(
+            "gpu",
+            "unreserve weights -"
+            + String(amount)
+            + " total_weights="
+            + String(self.weights_bytes),
+        )
+
+    def unreserve_kv(mut self, amount: Int) raises:
+        """Return a KV reservation (teardown path); see
+        unreserve_weights."""
+        self.kv_bytes = budget_release(self.kv_bytes, amount, "kv")
+        _ = log_debug(
+            "gpu",
+            "unreserve kv -"
+            + String(amount)
             + " total_kv="
             + String(self.kv_bytes),
         )

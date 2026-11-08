@@ -133,7 +133,6 @@ def main() raises:
         # Warmup round (untimed), then interleaved timed rounds.
         for round in range(ROUNDS + 1):
             var timed = round > 0
-            rt.kv_bytes = 0
             var kv_h = DeviceKvCache.build(
                 rt,
                 cpu_model.cfg.kinds.copy(),
@@ -147,7 +146,7 @@ def main() raises:
             )
             var host_ns = Int(perf_counter_ns() - t0)
             var host_ms = host_ns // 1_000_000
-            rt.kv_bytes = 0
+            kv_h.release_reservation(rt)
             var kv_r = DeviceKvCache.build(
                 rt,
                 cpu_model.cfg.kinds.copy(),
@@ -161,6 +160,7 @@ def main() raises:
             )
             var res_ns = Int(perf_counter_ns() - t1)
             var res_ms = res_ns // 1_000_000
+            kv_r.release_reservation(rt)
             if timed:
                 host_times.append(host_ns)
                 res_times.append(res_ns)

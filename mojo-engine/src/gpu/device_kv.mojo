@@ -350,6 +350,7 @@ struct DeviceKvCache(Movable):
     var head_dim: Int
     var context_len: Int
     var total_bytes: Int
+    var reservation_released: Bool
 
     def __init__(
         out self,
@@ -364,6 +365,7 @@ struct DeviceKvCache(Movable):
         self.head_dim = head_dim
         self.context_len = context_len
         self.total_bytes = total_bytes
+        self.reservation_released = False
 
     @staticmethod
     def build(
@@ -415,6 +417,28 @@ struct DeviceKvCache(Movable):
 
     def resident_bytes(self) -> Int:
         return self.total_bytes
+
+    def release_reservation(mut self, mut rt: GpuRuntime) raises:
+        """Return build()'s KV reservation to the runtime
+        ledger (Wave E): call when this cache is being torn
+        down, so a later cache build in the same runtime can
+        reserve the same room instead of double-counting
+        against the cap. Releasing twice refuses
+        gpu_budget_exceeded by name (see DeviceWeights.
+        release_reservation for the shape)."""
+        if self.reservation_released:
+            raise Error(
+                "gpu_budget_exceeded: kv reservation of "
+                + String(self.total_bytes)
+                + " B was already released"
+            )
+        rt.unreserve_kv(self.total_bytes)
+        self.reservation_released = True
+        _ = log_debug(
+            "gpu",
+            "device kv reservation released bytes="
+            + String(self.total_bytes),
+        )
 
     def _check_layer(self, layer: Int) raises:
         if layer < 0 or layer >= len(self.layers):

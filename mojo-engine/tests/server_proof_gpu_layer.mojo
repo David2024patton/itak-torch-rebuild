@@ -184,16 +184,12 @@ def main() raises:
     for target in [0, 3]:
         var x = cpu_model.embed_token(13796)
         x = rms_norm_plain_cpu(x, cpu_model.cfg.rms_eps)
-        # Ledger hygiene (proof-local): the previous
-        # iteration's DeviceKvCache is destroyed when its
-        # loop scope exits, but C1's runtime ledger has no
-        # unreserve call, so without this reset the second
-        # build would double-count KV bytes against the cap
-        # and refuse gpu_budget_exceeded on a card that has
-        # the room. The reset matches the device reality
-        # (only one proof cache is alive at a time); the
-        # missing unreserve API is noted in the lane report.
-        rt.kv_bytes = 0
+        # Ledger hygiene: the previous iteration's cache was
+        # released at the end of that iteration through
+        # DeviceKvCache.release_reservation (Wave E; before
+        # that API existed this proof reset rt.kv_bytes
+        # directly, because the destroyed cache's reservation
+        # otherwise double-counted against the cap).
         var kv = DeviceKvCache.build(
             rt,
             cpu_model.cfg.kinds.copy(),
@@ -271,6 +267,7 @@ def main() raises:
             + " ok="
             + String(1 if lok else 0)
         )
+        kv.release_reservation(rt)
 
     # ---- 3. logits on the layer-0 output row ----
     var t_l = perf_counter_ns()

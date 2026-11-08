@@ -37,6 +37,9 @@ from max.gpu.host import DeviceBuffer
 
 from diag import log_debug
 from gpu.context import GpuRuntime, upload_f32, upload_u8
+
+# (Release: build() reserves the exact total on the runtime's
+# budget ledger; release_reservation() below returns it.)
 from model.model import DT_F32, LAYER_SUFFIX_COUNT, GlimmerModel, TensorSlot
 
 
@@ -172,6 +175,7 @@ struct DeviceWeights(Movable):
     var output_norm_meta: DeviceSlotMeta
     var total_resident_bytes: Int
     var layers: Int
+    var reservation_released: Bool
 
     def __init__(
         out self,
@@ -187,6 +191,7 @@ struct DeviceWeights(Movable):
         self.output_norm_meta = output_norm_meta^
         self.total_resident_bytes = total_resident_bytes
         self.layers = layers
+        self.reservation_released = False
 
     @staticmethod
     def build(mut rt: GpuRuntime, model: GlimmerModel) raises -> DeviceWeights:
@@ -261,6 +266,29 @@ struct DeviceWeights(Movable):
 
     def resident_bytes(self) -> Int:
         return self.total_resident_bytes
+
+    def release_reservation(mut self, mut rt: GpuRuntime) raises:
+        """Return build()'s weights reservation to the runtime
+        ledger (Wave E): call when this structure is being torn
+        down, before or as its buffers go away, so a later build
+        in the same runtime can reserve the same room. Releasing
+        twice refuses gpu_budget_exceeded by name (through the
+        ledger's own check, and this flag keeps the refusal
+        exact even if another weights build reserved in between).
+        """
+        if self.reservation_released:
+            raise Error(
+                "gpu_budget_exceeded: weights reservation of "
+                + String(self.total_resident_bytes)
+                + " B was already released"
+            )
+        rt.unreserve_weights(self.total_resident_bytes)
+        self.reservation_released = True
+        _ = log_debug(
+            "gpu",
+            "device weights reservation released bytes="
+            + String(self.total_resident_bytes),
+        )
 
     # -- meta accessors ----------------------------------------------
 

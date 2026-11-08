@@ -216,6 +216,27 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             attn_split_span_positions,
         )
 
+    def release_reservations(mut self) raises:
+        """Teardown path for the budget ledger (Wave E, owed
+        since Wave C): return this model's weights and KV
+        reservations to its runtime, so a model built later in
+        the same process/runtime reserves against the true free
+        room instead of double-counting a destroyed model. Call
+        when the model is being torn down; using the model
+        after this call is a caller error (its buffers' room is
+        no longer accounted). Releasing twice refuses
+        gpu_budget_exceeded by name, through the structures'
+        own release checks."""
+        self.kv.release_reservation(self.rt)
+        self.weights.release_reservation(self.rt)
+        _ = log_debug(
+            "model",
+            "gpu model reservations released weights="
+            + String(self.weights.total_resident_bytes)
+            + " kv="
+            + String(self.kv.total_bytes),
+        )
+
     def _plain_rms_norm(
         mut self, x: List[Float32], eps: Float32
     ) raises -> List[Float32]:

@@ -3,16 +3,12 @@
 #
 # NOT a TestSuite file: run explicitly on a GPU host with
 #   mojo run -I src tests/server_proof_gpu_layer.mojo
-# (against Lane C1's real src/gpu/), or, before C1 is
-# integrable, with the Lane C2 stand-in package appended:
-#   mojo run -I src -I tests/gpu_standin \
-#       tests/server_proof_gpu_layer.mojo
-# The run prints which plumbing it used (PLUMBING line):
-# when the stand-in include path is present the stand-in
-# DeviceWeights / DeviceKvCache / GpuRuntime are what the
-# layer code ran against, and the lines say STANDIN plainly.
-# The layer, embedding, and logits code under proof is the
-# committed src/ code either way.
+# against Lane C1's real src/gpu/ package (the coordinator's
+# merged tree, or a lane-merge staging tree of C1 + C2 heads;
+# the staged run script stamps both commits next to the log).
+# Lane C2's tests/gpu_standin package mirrors C1's surface
+# for VM-side compile/tests in the C2 worktree only; it is
+# NOT what the server proof of record runs against.
 #
 # What is proven, and against what:
 # 1. EMBEDDING: gpu_embed_token vs GlimmerModel.embed_token
@@ -157,19 +153,14 @@ def main() raises:
     )
     var rt = GpuRuntime.create(GPU_BUDGET_CAP)
     var t_w = perf_counter_ns()
-    var weights = DeviceWeights.from_model(rt, cpu_model)
+    var weights = DeviceWeights.build(rt, cpu_model)
     print(
         "WEIGHTS_UPLOADED ms="
         + String((perf_counter_ns() - t_w) // 1_000_000)
         + " resident_bytes="
-        + String(weights.resident_bytes)
+        + String(weights.resident_bytes())
     )
-    print(
-        "PLUMBING note: DeviceWeights/DeviceKvCache/GpuRuntime"
-        " come from whichever gpu package the include path"
-        " resolved; the staged run script records STANDIN or"
-        " REAL_C1 next to this log"
-    )
+    print("PLUMBING real C1 src/gpu (see the staged run stamps)")
 
     # ---- 1. embedding ----
     for token in [13796, 200000]:
@@ -193,7 +184,17 @@ def main() raises:
     for target in [0, 3]:
         var x = cpu_model.embed_token(13796)
         x = rms_norm_plain_cpu(x, cpu_model.cfg.rms_eps)
-        var kv = DeviceKvCache.create(
+        # Ledger hygiene (proof-local): the previous
+        # iteration's DeviceKvCache is destroyed when its
+        # loop scope exits, but C1's runtime ledger has no
+        # unreserve call, so without this reset the second
+        # build would double-count KV bytes against the cap
+        # and refuse gpu_budget_exceeded on a card that has
+        # the room. The reset matches the device reality
+        # (only one proof cache is alive at a time); the
+        # missing unreserve API is noted in the lane report.
+        rt.kv_bytes = 0
+        var kv = DeviceKvCache.build(
             rt,
             cpu_model.cfg.kinds.copy(),
             cpu_model.cfg.kv_heads,

@@ -104,9 +104,9 @@ struct DeviceWeights(Movable):
         rt.account(total, "device weights")
         self.total_bytes = total
 
+        self.final_norm = upload_f32(rt, model.final_norm.copy())
         self._upload_slot(rt, model.embd.copy())
         self._upload_slot(rt, model.output.copy())
-        self.final_norm = upload_f32(rt, model.final_norm.copy())
         for layer in range(model.cfg.layers):
             for s in range(LAYER_SUFFIX_COUNT):
                 self._upload_slot(rt, model.slot(layer, s))

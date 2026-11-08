@@ -97,13 +97,13 @@ struct DeviceKvCache(Movable):
         var row = kv_heads * head_dim
         var total = 0
         for i in range(len(self.kinds)):
-            var cap = self._capacity_of(self.kinds[i].copy())
+            var cap = Self._capacity_of(self.kinds[i].copy(), context_len)
             total += 2 * cap * row * 4
         rt.account(total, "device kv cache")
         self.total_bytes = total
 
         for i in range(len(self.kinds)):
-            var cap = self._capacity_of(self.kinds[i].copy())
+            var cap = Self._capacity_of(self.kinds[i].copy(), context_len)
             self.capacities.append(cap)
             self.appended.append(0)
             self.key_buffers.append(create_zero_f32(rt, cap * row))
@@ -116,9 +116,10 @@ struct DeviceKvCache(Movable):
             + String(self.total_bytes),
         )
 
-    def _capacity_of(self, kind: LayerKind) -> Int:
+    @staticmethod
+    def _capacity_of(kind: LayerKind, context_len: Int) -> Int:
         if kind.is_global:
-            return self.context_len
+            return context_len
         return kind.window
 
     def row_len(self) -> Int:

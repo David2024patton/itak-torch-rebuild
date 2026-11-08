@@ -43,9 +43,10 @@ engine must match, piece by piece, under the parity law below.
 
 ## The stack, top to bottom
 
-1. **Front end (later, optional):** the existing Go platform, or
-   MAX Serve. The serving seam is a later decision; the engine
-   does not care which one calls it.
+1. **Front end:** the engine's own Mojo API endpoint and
+   testing dashboard (step 7, decided Mojo-only by David on
+   2026-11-08). The Go platform and MAX Serve were both
+   considered and rejected on that ruling.
 2. **Host engine: Mojo.** Model loading, KV cache management,
    scheduling, sampling, the generation loop. One language for
    host and kernels is the point of the restart.
@@ -143,13 +144,28 @@ Each step lands as its own lane on this branch, proves parity
    the batched tiled split-KV attention; prefill routes
    per-row below 16 tokens and batched at/above, by the
    MOJO_ENGINE_PREFILL_BATCH_MIN_TOKENS knob). The
-   temperature/top-k/top-p sampler family and the serving
-   seam (step 7) remain owed.
+   temperature/top-k/top-p sampler family remains owed;
+   the serving seam (step 7) is decided and built.
 6. **Sampler. GREEDY LANDED (Wave B, Lane B4).** First-max
    tie-break, EOS excluded per engine.rs. The
    temperature/top-k/top-p family is still to come.
-7. **Serving seam.** Socket protocol parity with the paused
-   platform, or MAX Serve; decided when step 6 lands.
+7. **Serving seam. DECIDED (David, 2026-11-08): Mojo-only.**
+   The endpoint lives inside the engine process, written in
+   Mojo (`src/serve/` + `src/runner/serve_main.mojo`): an
+   OpenAI-shaped POST /v1/chat/completions over the generation
+   loop (greedy only in v1, locked by name), /health,
+   /v1/models with per-file fact sheets read from each GGUF's
+   own metadata and tensor signatures, /stats, /debug/log,
+   /openapi.json, a JSON-fed testing dashboard at /, on-disk
+   run history at /history with export/import bundles, a
+   measured-only /leaderboard (llama.cpp and the paused Rust
+   engine appear as marked reference rows), and an MCP-style
+   bridge (/mcp/tools, /mcp/call, JSON-RPC subset at /mcp).
+   Transport is pure Mojo over POSIX sockets via libc FFI.
+   MAX Serve is rejected (Python-based, not Mojo) and socket
+   parity with the paused Go platform is rejected (Go) on the
+   same Mojo-only ruling. Proof record:
+   bench/mojo-engine-api-endpoint-2026-11-08.md.
 
 ## The parity law
 

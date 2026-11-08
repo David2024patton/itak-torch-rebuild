@@ -16,20 +16,26 @@
 # (crates/wgpu-compute/src/kernels/k3_q5k_gemv.rs, its
 # shipped_shape r2sg - K1's own tuned shape, confirmed best
 # for the head's 26-blocks-per-row geometry by K3's bench
-# matrix): 2 rows per 128-thread workgroup as 8 groups of
+# matrix), with the tile widened on this engine's own
+# evidence: 4 rows per 128-thread workgroup as 8 groups of
 # 16, one 16-thread group per Q5_K super-block, packed scale
 # extraction from the header words loaded as one vec4,
 # activation quads loaded once per super-block and shared by
-# both rows, per-sub-block dots in the
-# d*sc*dot(q,x) - dmin*m*sum(x) form, and a segmented
-# shuffle_xor butterfly plus a short shared-memory finish.
-# The one addition over K1 is the fifth-bit assembly: one qh
-# word per thread (its four bytes are the high bits of its
-# four positions in every sub-block) and, per sub-block, the
-# bit plane (qh >> s) & 0x01010101 unpacked to the vec4 of
-# bits the quant quads need. A Q5_K block is 176 bytes, a
-# whole number of words, so unlike Q6_K every load is a
-# direct aligned u32 load, exactly as in K1.
+# every row of the tile, per-sub-block dots in the
+# d*sc*dot(q,x) - dmin*m*sum(x) form (factored as
+# q5k_block_dot), and a segmented shuffle_xor butterfly plus
+# a short shared-memory finish. The ladder: the 2-row form
+# measured 337.38 GB/s median in window 1; the 4-row form
+# beat it in every window-2 rep (median 361.92 against the
+# 2-row's 341.30 in the same window) and was promoted; the
+# port it replaced measured 35.40. The one addition over K1
+# is the fifth-bit assembly: one qh word per thread (its
+# four bytes are the high bits of its four positions in
+# every sub-block) and, per sub-block, the bit plane
+# (qh >> s) & 0x01010101 unpacked to the vec4 of bits the
+# quant quads need. A Q5_K block is 176 bytes, a whole
+# number of words, so unlike Q6_K every load is a direct
+# aligned u32 load, exactly as in K1.
 #
 # Every bad input shape gets a named REFUSAL line and exit 2.
 # Standalone usage mirrors k1_gemv:
@@ -50,7 +56,7 @@ from diag import log_debug
 from kernels.dequant import q5k_element_list, note_loaded
 
 comptime THREADS = 128
-comptime ROWS_PER_WG = 2
+comptime ROWS_PER_WG = 4
 comptime GROUP_THREADS = 16
 comptime GROUPS = THREADS // GROUP_THREADS
 comptime SB_ELEMS = 256
@@ -135,21 +141,57 @@ def q5k_qh_bit_quads(
     return (bits_a, bits_b, bits_c, bits_d)
 
 
+def q5k_block_dot(
+    w32: Pointer[UInt32, MutAnyOrigin],
+    bw: Int,
+    half: Int,
+    qh_off: Int,
+    w0_off: Int,
+    xa: SIMD[DType.float32, 4],
+    xbq: SIMD[DType.float32, 4],
+    xc: SIMD[DType.float32, 4],
+    xd: SIMD[DType.float32, 4],
+    sa: Float32,
+    sb: Float32,
+    sc_: Float32,
+    sd: Float32,
+) -> Float32:
+    # One row's contribution from one super-block (the tuned
+    # kernel's per-row body, factored for the rows=4 tile).
+    var hdr = w32.unsafe_load[width=4](bw)
+    var d = f16_to_f32_gpu(hdr[0] & 0xFFFF)
+    var dmin = f16_to_f32_gpu(hdr[0] >> 16)
+    var scales = q5k_packed_scales(hdr[1], hdr[2], hdr[3], half)
+    var bits = q5k_qh_bit_quads(w32.unsafe_load[width=1](bw + qh_off), half)
+    var w0 = w32.unsafe_load[width=1](bw + w0_off)
+    var w1 = w32.unsafe_load[width=1](bw + w0_off + 16)
+    var qa = unpack4_f32(w0 & 0x0F0F0F0F) + Float32(16.0) * bits[0]
+    var qb = unpack4_f32((w0 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits[1]
+    var qc = unpack4_f32(w1 & 0x0F0F0F0F) + Float32(16.0) * bits[2]
+    var qd = unpack4_f32((w1 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits[3]
+    return d * (
+        scales[0][0] * (qa * xa).reduce_add()
+        + scales[0][1] * (qb * xbq).reduce_add()
+        + scales[1][0] * (qc * xc).reduce_add()
+        + scales[1][1] * (qd * xd).reduce_add()
+    ) - dmin * (
+        scales[0][2] * sa
+        + scales[0][3] * sb
+        + scales[1][2] * sc_
+        + scales[1][3] * sd
+    )
+
+
 def q5k_gemv_kernel(
     w: Pointer[UInt8, MutAnyOrigin],
     x: Pointer[Float32, MutAnyOrigin],
     y: Pointer[Float32, MutAnyOrigin],
     cols: Int32,
 ):
-    # The r2sg shape (see the file header): one workgroup
-    # covers ROWS_PER_WG rows; inside it, GROUPS groups of
-    # GROUP_THREADS threads each own one super-block at a
-    # time. Thread t of a group owns 16 elements of that
-    # block: 4-element quads from sub-blocks 2h, 2h+1, 2h+4,
-    # 2h+5, where h = t // 8 is the block half and the quad's
-    # ql word sits at word 12 + 8h + (t % 8) of the block,
-    # exactly the wgpu K3 assignment (and K1's, offset by the
-    # wider Q5_K header).
+    # The r4sg shape (see the file header): ROWS_PER_WG rows
+    # per workgroup, activation quads loaded once per
+    # super-block and shared by every row of the tile, each
+    # row's block contribution computed by q5k_block_dot.
     var lane = Int(thread_idx.x)
     var group = lane // GROUP_THREADS
     var t = lane % GROUP_THREADS
@@ -166,10 +208,9 @@ def q5k_gemv_kernel(
     ]()
     var acc0 = Float32(0.0)
     var acc1 = Float32(0.0)
+    var acc2 = Float32(0.0)
+    var acc3 = Float32(0.0)
     for blk in range(group, blocks_per_row, GROUPS):
-        # Activation quads and their sums are per super-block
-        # and shared by both rows of the tile: loaded once,
-        # used twice.
         var xb = blk * SB_ELEMS + yv * 4
         var xa = x.unsafe_load[width=4](xb)
         var xbq = x.unsafe_load[width=4](xb + 32)
@@ -179,64 +220,66 @@ def q5k_gemv_kernel(
         var sb = xbq.reduce_add()
         var sc_ = xc.reduce_add()
         var sd = xd.reduce_add()
-        # Row 0 of the tile.
-        var bw0 = (row0 * blocks_per_row + blk) * SB_WORDS
-        var hdr0 = w32.unsafe_load[width=4](bw0)
-        var d0 = f16_to_f32_gpu(hdr0[0] & 0xFFFF)
-        var dmin0 = f16_to_f32_gpu(hdr0[0] >> 16)
-        var scales0 = q5k_packed_scales(hdr0[1], hdr0[2], hdr0[3], half)
-        var bits0 = q5k_qh_bit_quads(
-            w32.unsafe_load[width=1](bw0 + qh_off), half
+        acc0 += q5k_block_dot(
+            w32,
+            (row0 * blocks_per_row + blk) * SB_WORDS,
+            half,
+            qh_off,
+            w0_off,
+            xa,
+            xbq,
+            xc,
+            xd,
+            sa,
+            sb,
+            sc_,
+            sd,
         )
-        var w0 = w32.unsafe_load[width=1](bw0 + w0_off)
-        var w1 = w32.unsafe_load[width=1](bw0 + w0_off + 16)
-        var qa0 = unpack4_f32(w0 & 0x0F0F0F0F) + Float32(16.0) * bits0[0]
-        var qb0 = unpack4_f32((w0 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits0[1]
-        var qc0 = unpack4_f32(w1 & 0x0F0F0F0F) + Float32(16.0) * bits0[2]
-        var qd0 = unpack4_f32((w1 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits0[3]
-        acc0 += d0 * (
-            scales0[0][0] * (qa0 * xa).reduce_add()
-            + scales0[0][1] * (qb0 * xbq).reduce_add()
-            + scales0[1][0] * (qc0 * xc).reduce_add()
-            + scales0[1][1] * (qd0 * xd).reduce_add()
-        ) - dmin0 * (
-            scales0[0][2] * sa
-            + scales0[0][3] * sb
-            + scales0[1][2] * sc_
-            + scales0[1][3] * sd
+        acc1 += q5k_block_dot(
+            w32,
+            ((row0 + 1) * blocks_per_row + blk) * SB_WORDS,
+            half,
+            qh_off,
+            w0_off,
+            xa,
+            xbq,
+            xc,
+            xd,
+            sa,
+            sb,
+            sc_,
+            sd,
         )
-        # Row 1 of the tile: the next row of the same tensor,
-        # reusing the activation quads above. The host refuses
-        # an odd row count by name (see main), so row0 + 1 is
-        # always a real row here.
-        var bw1 = ((row0 + 1) * blocks_per_row + blk) * SB_WORDS
-        var hdr1 = w32.unsafe_load[width=4](bw1)
-        var d1 = f16_to_f32_gpu(hdr1[0] & 0xFFFF)
-        var dmin1 = f16_to_f32_gpu(hdr1[0] >> 16)
-        var scales1 = q5k_packed_scales(hdr1[1], hdr1[2], hdr1[3], half)
-        var bits1 = q5k_qh_bit_quads(
-            w32.unsafe_load[width=1](bw1 + qh_off), half
+        acc2 += q5k_block_dot(
+            w32,
+            ((row0 + 2) * blocks_per_row + blk) * SB_WORDS,
+            half,
+            qh_off,
+            w0_off,
+            xa,
+            xbq,
+            xc,
+            xd,
+            sa,
+            sb,
+            sc_,
+            sd,
         )
-        var w2 = w32.unsafe_load[width=1](bw1 + w0_off)
-        var w3 = w32.unsafe_load[width=1](bw1 + w0_off + 16)
-        var qa1 = unpack4_f32(w2 & 0x0F0F0F0F) + Float32(16.0) * bits1[0]
-        var qb1 = unpack4_f32((w2 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits1[1]
-        var qc1 = unpack4_f32(w3 & 0x0F0F0F0F) + Float32(16.0) * bits1[2]
-        var qd1 = unpack4_f32((w3 >> 4) & 0x0F0F0F0F) + Float32(16.0) * bits1[3]
-        acc1 += d1 * (
-            scales1[0][0] * (qa1 * xa).reduce_add()
-            + scales1[0][1] * (qb1 * xbq).reduce_add()
-            + scales1[1][0] * (qc1 * xc).reduce_add()
-            + scales1[1][1] * (qd1 * xd).reduce_add()
-        ) - dmin1 * (
-            scales1[0][2] * sa
-            + scales1[0][3] * sb
-            + scales1[1][2] * sc_
-            + scales1[1][3] * sd
+        acc3 += q5k_block_dot(
+            w32,
+            ((row0 + 3) * blocks_per_row + blk) * SB_WORDS,
+            half,
+            qh_off,
+            w0_off,
+            xa,
+            xbq,
+            xc,
+            xd,
+            sa,
+            sb,
+            sc_,
+            sd,
         )
-    # Segmented butterfly inside each 16-thread group, then
-    # one shared-memory finish across groups: K1's hybrid
-    # reduction, the wgpu K3 shipped shape's own finish.
     acc0 += shuffle_xor(acc0, UInt32(1))
     acc0 += shuffle_xor(acc0, UInt32(2))
     acc0 += shuffle_xor(acc0, UInt32(4))
@@ -245,18 +288,34 @@ def q5k_gemv_kernel(
     acc1 += shuffle_xor(acc1, UInt32(2))
     acc1 += shuffle_xor(acc1, UInt32(4))
     acc1 += shuffle_xor(acc1, UInt32(8))
+    acc2 += shuffle_xor(acc2, UInt32(1))
+    acc2 += shuffle_xor(acc2, UInt32(2))
+    acc2 += shuffle_xor(acc2, UInt32(4))
+    acc2 += shuffle_xor(acc2, UInt32(8))
+    acc3 += shuffle_xor(acc3, UInt32(1))
+    acc3 += shuffle_xor(acc3, UInt32(2))
+    acc3 += shuffle_xor(acc3, UInt32(4))
+    acc3 += shuffle_xor(acc3, UInt32(8))
     if t == 0:
         shared[unsafe_offset=group] = acc0
         shared[unsafe_offset=GROUPS + group] = acc1
+        shared[unsafe_offset=2 * GROUPS + group] = acc2
+        shared[unsafe_offset=3 * GROUPS + group] = acc3
     barrier()
     if lane == 0:
         var s0 = Float32(0.0)
         var s1 = Float32(0.0)
+        var s2 = Float32(0.0)
+        var s3 = Float32(0.0)
         for g in range(GROUPS):
             s0 += shared[unsafe_offset=g]
             s1 += shared[unsafe_offset=GROUPS + g]
+            s2 += shared[unsafe_offset=2 * GROUPS + g]
+            s3 += shared[unsafe_offset=3 * GROUPS + g]
         y[unsafe_offset=row0] = s0
         y[unsafe_offset=row0 + 1] = s1
+        y[unsafe_offset=row0 + 2] = s2
+        y[unsafe_offset=row0 + 3] = s3
 
 
 def q5k_gemv_cpu(
@@ -352,7 +411,7 @@ def main() raises:
     if rows % ROWS_PER_WG != 0:
         refuse(
             "bad shape",
-            "rows must be a multiple of the 2-row workgroup tile, got "
+            "rows must be a multiple of the 4-row workgroup tile, got "
             + String(rows),
         )
     var row_bytes = (cols // SB_ELEMS) * SB_BYTES

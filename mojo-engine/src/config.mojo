@@ -126,6 +126,23 @@ comptime DEFAULT_VOCAB = 202048
 # bench/mojo-engine-wave-e1-batch-2026-11-08.md.
 comptime DEFAULT_PREFILL_BATCH_MIN_TOKENS = 16
 
+# Serving seam knobs (DESIGN.md step 7, decided 2026-11-08:
+# the endpoint is Mojo-only, an HTTP server inside the engine
+# process; see src/serve/). The default port is deliberately
+# NOT 8080: production Glimmer stays down and port 8080 stays
+# clear. The host default is loopback only; serving beyond the
+# host is an operator's explicit env choice. Body and token
+# limits are config for the same reason every other limit is:
+# a request past them refuses BY NAME (serve_body_too_large /
+# serve_max_tokens_exceeded), never silently truncates.
+comptime DEFAULT_SERVE_HOST = "127.0.0.1"
+comptime DEFAULT_SERVE_PORT = 18767
+comptime DEFAULT_SERVE_MAX_BODY_BYTES = 65536
+comptime DEFAULT_SERVE_DEFAULT_MAX_TOKENS = 64
+comptime DEFAULT_SERVE_MAX_TOKENS = 512
+comptime DEFAULT_SERVE_DEBUG_RING_LINES = 200
+comptime DEFAULT_SERVE_MAX_CONTEXT_BYTES = 32768
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -261,6 +278,96 @@ def parse_gemm_tiled_min_batch(raw: String) raises -> Int:
     return _parse_positive(raw, "MOJO_ENGINE_GEMM_TILED_MIN_BATCH")
 
 
+def parse_serve_port(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_PORT: TCP port, 1..65535."""
+    var v = _parse_positive(raw, "MOJO_ENGINE_SERVE_PORT")
+    if v > 65535:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_SERVE_PORT must be <= 65535, got "
+            + String(v)
+        )
+    return v
+
+
+def parse_serve_max_body_bytes(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_MAX_BODY_BYTES: request body cap."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_MAX_BODY_BYTES")
+
+
+def parse_serve_default_max_tokens(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS: chat completions
+    without an explicit max_tokens generate this many."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS")
+
+
+def parse_serve_max_tokens(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_MAX_TOKENS: hard cap on a chat
+    request's max_tokens; past it the request refuses."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_MAX_TOKENS")
+
+
+def parse_ipv4(host: String) raises -> List[Int]:
+    """Parse a dotted-quad IPv4 host into its 4 octets.
+
+    The serve socket binds an IPv4 address; hostnames are
+    refused BY NAME as mojo_engine_config instead of being
+    resolved by a hidden DNS call. Pure and testable: digits
+    accumulate numerically, so no substring surgery is needed.
+    """
+    var bytes = host.as_bytes()
+    var parts = List[Int]()
+    var value = 0
+    var digits = 0
+    for i in range(len(bytes) + 1):
+        if i == len(bytes) or bytes[i] == 46:  # '.'
+            if digits == 0 or digits > 3 or value > 255:
+                raise Error(
+                    "mojo_engine_config: MOJO_ENGINE_SERVE_HOST is not"
+                    " a dotted-quad IPv4 address: '"
+                    + host
+                    + "'"
+                )
+            parts.append(value)
+            value = 0
+            digits = 0
+        else:
+            var b = Int(bytes[i])
+            if b < 48 or b > 57:
+                raise Error(
+                    "mojo_engine_config: MOJO_ENGINE_SERVE_HOST is not"
+                    " a dotted-quad IPv4 address: '"
+                    + host
+                    + "'"
+                )
+            value = value * 10 + (b - 48)
+            digits += 1
+    if len(parts) != 4:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_SERVE_HOST is not"
+            " a dotted-quad IPv4 address: '"
+            + host
+            + "'"
+        )
+    return parts^
+
+
+def parse_serve_debug_ring_lines(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_DEBUG_RING_LINES: /debug/log ring size."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_DEBUG_RING_LINES")
+
+
+def parse_serve_max_context_bytes(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_MAX_CONTEXT_BYTES: cap on attachment
+    context text accepted with a chat request."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_MAX_CONTEXT_BYTES")
+
+
+def parse_serve_host(raw: String) raises -> String:
+    """MOJO_ENGINE_SERVE_HOST: dotted-quad IPv4 only (v1)."""
+    _ = parse_ipv4(raw)
+    return raw
+
+
 # =====================================================================
 # BEGIN Wave E Lane E3 block: parsers for the Glimmer op
 # defaults above. Same discipline as the other values here:
@@ -383,6 +490,14 @@ struct EngineConfig(Copyable, Movable):
     var vocab: Int
     # -- END Wave E Lane E3 fields --
     var prefill_batch_min_tokens: Int
+    # -- Serving seam fields (step 7) --
+    var serve_host: String
+    var serve_port: Int
+    var serve_max_body_bytes: Int
+    var serve_default_max_tokens: Int
+    var serve_max_tokens: Int
+    var serve_debug_ring_lines: Int
+    var serve_max_context_bytes: Int
 
     def __init__(
         out self,
@@ -404,6 +519,13 @@ struct EngineConfig(Copyable, Movable):
         vocab: Int = DEFAULT_VOCAB,
         # -- END Wave E Lane E3 init params --
         prefill_batch_min_tokens: Int = DEFAULT_PREFILL_BATCH_MIN_TOKENS,
+        serve_host: String = DEFAULT_SERVE_HOST,
+        serve_port: Int = DEFAULT_SERVE_PORT,
+        serve_max_body_bytes: Int = DEFAULT_SERVE_MAX_BODY_BYTES,
+        serve_default_max_tokens: Int = DEFAULT_SERVE_DEFAULT_MAX_TOKENS,
+        serve_max_tokens: Int = DEFAULT_SERVE_MAX_TOKENS,
+        serve_debug_ring_lines: Int = DEFAULT_SERVE_DEBUG_RING_LINES,
+        serve_max_context_bytes: Int = DEFAULT_SERVE_MAX_CONTEXT_BYTES,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -423,6 +545,13 @@ struct EngineConfig(Copyable, Movable):
         self.vocab = vocab
         # -- END Wave E Lane E3 init assignments --
         self.prefill_batch_min_tokens = prefill_batch_min_tokens
+        self.serve_host = serve_host
+        self.serve_port = serve_port
+        self.serve_max_body_bytes = serve_max_body_bytes
+        self.serve_default_max_tokens = serve_default_max_tokens
+        self.serve_max_tokens = serve_max_tokens
+        self.serve_debug_ring_lines = serve_debug_ring_lines
+        self.serve_max_context_bytes = serve_max_context_bytes
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -512,6 +641,48 @@ struct EngineConfig(Copyable, Movable):
         if raw_route != "":
             prefill_batch_min_tokens = parse_prefill_batch_min_tokens(raw_route)
 
+        var serve_host = DEFAULT_SERVE_HOST
+        var raw_host = getenv("MOJO_ENGINE_SERVE_HOST")
+        if raw_host != "":
+            serve_host = parse_serve_host(raw_host)
+
+        var serve_port = DEFAULT_SERVE_PORT
+        var raw_port = getenv("MOJO_ENGINE_SERVE_PORT")
+        if raw_port != "":
+            serve_port = parse_serve_port(raw_port)
+
+        var serve_max_body = DEFAULT_SERVE_MAX_BODY_BYTES
+        var raw_body = getenv("MOJO_ENGINE_SERVE_MAX_BODY_BYTES")
+        if raw_body != "":
+            serve_max_body = parse_serve_max_body_bytes(raw_body)
+
+        var serve_default_max_tokens = DEFAULT_SERVE_DEFAULT_MAX_TOKENS
+        var raw_dmt = getenv("MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS")
+        if raw_dmt != "":
+            serve_default_max_tokens = parse_serve_default_max_tokens(raw_dmt)
+
+        var serve_max_tokens = DEFAULT_SERVE_MAX_TOKENS
+        var raw_mt = getenv("MOJO_ENGINE_SERVE_MAX_TOKENS")
+        if raw_mt != "":
+            serve_max_tokens = parse_serve_max_tokens(raw_mt)
+        var serve_debug_ring_lines = DEFAULT_SERVE_DEBUG_RING_LINES
+        var raw_ring = getenv("MOJO_ENGINE_SERVE_DEBUG_RING_LINES")
+        if raw_ring != "":
+            serve_debug_ring_lines = parse_serve_debug_ring_lines(raw_ring)
+
+        var serve_max_context_bytes = DEFAULT_SERVE_MAX_CONTEXT_BYTES
+        var raw_ctx_bytes = getenv("MOJO_ENGINE_SERVE_MAX_CONTEXT_BYTES")
+        if raw_ctx_bytes != "":
+            serve_max_context_bytes = parse_serve_max_context_bytes(
+                raw_ctx_bytes
+            )
+
+        if serve_default_max_tokens > serve_max_tokens:
+            raise Error(
+                "mojo_engine_config: MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS"
+                " exceeds MOJO_ENGINE_SERVE_MAX_TOKENS"
+            )
+
         return EngineConfig(
             model_path,
             context_len,
@@ -531,4 +702,11 @@ struct EngineConfig(Copyable, Movable):
             vocab,
             # -- END Wave E Lane E3 load return values --
             prefill_batch_min_tokens,
+            serve_host,
+            serve_port,
+            serve_max_body,
+            serve_default_max_tokens,
+            serve_max_tokens,
+            serve_debug_ring_lines,
+            serve_max_context_bytes,
         )

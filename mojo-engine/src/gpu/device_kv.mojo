@@ -29,17 +29,29 @@
 # gpu_kv_shape_mismatch / gpu_kv_out_of_order_position /
 # gpu_kv_position_evicted / gpu_kv_position_not_written.
 #
-# WAVE C LIMIT (the contract's stated deviation from B1, and
-# the one place this cache does NOT mirror the CPU twin):
-# B1's windowed append wraps the ring and evicts the oldest
-# position. Here a windowed append whose position would wrap
-# past the window refuses gpu_kv_window_wrapped, because the
-# Wave C attention kernel consumes visible rows in slot order
-# from offset 0, which equals position order only before a
-# wrap. The CPU path remains the fallback beyond 2,048
-# positions on windowed layers. A global append past the
-# configured context capacity refuses gpu_kv_capacity_exceeded
-# (B1's global store grows; a device buffer cannot).
+# WAVE D (Lane D4): the Wave C wrap limit is RETIRED. B1's
+# windowed append wraps the ring and evicts the oldest
+# position; the device cache now does exactly the same
+# (slot = position % window, slot_position tracks the holder,
+# stored/first_visible carry B1's meanings past the wrap).
+# The Wave C problem was the READER, not the writer: the
+# attention kernel consumes visible rows in absolute-position
+# order, which equals raw slot order only while
+# first_visible % window == 0. Past a wrap, readers go
+# through kv_visible_gather_kernel (below), which materializes
+# the visible rows in absolute-position order into a scratch
+# buffer the attention kernel consumes unchanged; see
+# DeviceKvCache.gather_visible. The retirement is proven by
+# tests/server_proof_gpu_kv_wrap.mojo (B1 wraparound sequences
+# replayed element-exact on device, synthetic window + the
+# real 2,048 window past 2,048) - the refusal name
+# gpu_kv_window_wrapped is gone from this cache because that
+# proof passes; it survives only in the legacy host-chained
+# layer path (gpu_layer_step_hostchain), which still launches
+# attention directly on the raw buffers. A global append past
+# the configured context capacity refuses
+# gpu_kv_capacity_exceeded (B1's global store grows; a device
+# buffer cannot).
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceBuffer
@@ -158,8 +170,7 @@ def kv_total_bytes(
     for i in range(len(pattern)):
         if not pattern[i].is_global and pattern[i].window <= 0:
             raise Error(
-                "gpu_kv_invalid_window: sliding window must be positive,"
-                " got "
+                "gpu_kv_invalid_window: sliding window must be positive, got "
                 + String(pattern[i].window)
             )
     try:
@@ -169,8 +180,7 @@ def kv_total_bytes(
         var msg = String(e)
         if msg.find("kv_size_overflow") != -1:
             raise Error(
-                "gpu_kv_size_overflow: KV size overflows (from B1"
-                " accounting: "
+                "gpu_kv_size_overflow: KV size overflows (from B1 accounting: "
                 + msg
                 + ")"
             )
@@ -188,18 +198,42 @@ def kv_append_refusal(
 ) -> String:
     """The refusal NAME an append with these facts earns, or
     "" when the append is legal. Pure, so the refusal surface
-    (including the Wave C wrap limit) is VM-testable without a
-    device. Check order mirrors B1: shape, then order, then
-    this wave's wrap / capacity limits."""
+    is VM-testable without a device. Check order mirrors B1:
+    shape, then order, then the global capacity limit.
+    Windowed appends NEVER refuse for wrapping (Wave D): the
+    ring evicts exactly as B1's cache does."""
     if k_len != row_len or v_len != row_len:
         return "gpu_kv_shape_mismatch"
     if position != appended:
         return "gpu_kv_out_of_order_position"
-    if not kind.is_global and position >= kind.window:
-        return "gpu_kv_window_wrapped"
     if kind.is_global and position >= capacity:
         return "gpu_kv_capacity_exceeded"
     return ""
+
+
+def kv_visible_slot(
+    kind: LayerKind, first_visible: Int, visible_index: Int
+) -> Int:
+    """Storage slot of the visible row at `visible_index`
+    (0 = the oldest visible row, absolute position
+    first_visible + visible_index). B1's presentation rule:
+    global rows sit at their absolute position; windowed rows
+    sit at (first_visible + visible_index) % window."""
+    if kind.is_global:
+        return first_visible + visible_index
+    return (first_visible + visible_index) % kind.window
+
+
+def kv_gather_needed(kind: LayerKind, first_visible: Int) -> Bool:
+    """True when the raw buffer's slot order is NOT the
+    visible (absolute-position) order, so a reader must go
+    through the visible-order gather. Global layers never
+    wrap (first_visible is always 0); a windowed layer's raw
+    order matches visible order exactly when the first
+    visible position lands on slot 0."""
+    if kind.is_global:
+        return False
+    return first_visible % kind.window != 0
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +265,35 @@ def kv_gather_kernel(
     var i = Int(thread_idx.x)
     while i < Int(row_len):
         dst[unsafe_offset=i] = src[unsafe_offset=Int(src_offset) + i]
+        i += _KV_BLOCK
+
+
+def kv_visible_gather_kernel(
+    src: Pointer[Float32, MutAnyOrigin],
+    dst: Pointer[Float32, MutAnyOrigin],
+    row_len: Int32,
+    first_slot: Int32,
+    window: Int32,
+):
+    """Visible-order gather: one block per visible row.
+    Block i copies storage row kv_visible_slot(first_visible,
+    i) into output row i, so dst is the layer's visible rows
+    in absolute-position order ([stored][row] flat), the exact
+    layout attention_kernel consumes. window is the layer's
+    ring size, or 0 for a global layer (slots are then the
+    absolute positions themselves, first_slot = first_visible).
+    Threads stride the row, as in the scatter/gather pair."""
+    var vis = Int(block_idx.x)
+    var slot: Int
+    if Int(window) == 0:
+        slot = Int(first_slot) + vis
+    else:
+        slot = (Int(first_slot) + vis) % Int(window)
+    var src_off = slot * Int(row_len)
+    var dst_off = vis * Int(row_len)
+    var i = Int(thread_idx.x)
+    while i < Int(row_len):
+        dst[unsafe_offset=dst_off + i] = src[unsafe_offset=src_off + i]
         i += _KV_BLOCK
 
 
@@ -280,7 +343,7 @@ struct DeviceKvLayer(Movable):
 struct DeviceKvCache(Movable):
     """A device KV cache for one sequence: one K and one V
     device buffer per layer, B1 layout and (except the stated
-    wrap limit) B1 semantics."""
+    the retired Wave C wrap limit) B1 semantics."""
 
     var layers: List[DeviceKvLayer]
     var num_kv_heads: Int
@@ -314,9 +377,7 @@ struct DeviceKvCache(Movable):
         layer's two zero-filled buffers. Raises
         gpu_budget_exceeded (via the runtime) before the first
         buffer exists when the total is over cap."""
-        var total = kv_total_bytes(
-            pattern, num_kv_heads, head_dim, context_len
-        )
+        var total = kv_total_bytes(pattern, num_kv_heads, head_dim, context_len)
         rt.reserve_kv(total)
         var row = num_kv_heads * head_dim
         var layers = List[DeviceKvLayer](capacity=len(pattern))
@@ -339,7 +400,9 @@ struct DeviceKvCache(Movable):
             + " kv_bytes="
             + String(total),
         )
-        return DeviceKvCache(layers^, num_kv_heads, head_dim, context_len, total)
+        return DeviceKvCache(
+            layers^, num_kv_heads, head_dim, context_len, total
+        )
 
     # -- inventory ---------------------------------------------------
 
@@ -387,44 +450,35 @@ struct DeviceKvCache(Movable):
         self._check_layer(layer)
         return self.layers[layer].first_visible_position()
 
-    def key_buffer(
-        self, layer: Int
-    ) raises -> DeviceBuffer[DType.float32]:
+    def key_buffer(self, layer: Int) raises -> DeviceBuffer[DType.float32]:
         """The layer's raw K device buffer, for attention."""
         self._check_layer(layer)
         return self.layers[layer].k_buf.copy()
 
-    def value_buffer(
-        self, layer: Int
-    ) raises -> DeviceBuffer[DType.float32]:
+    def value_buffer(self, layer: Int) raises -> DeviceBuffer[DType.float32]:
         """The layer's raw V device buffer, for attention."""
         self._check_layer(layer)
         return self.layers[layer].v_buf.copy()
 
     # -- append --------------------------------------------------------
 
-    def append(
-        mut self,
-        mut rt: GpuRuntime,
-        layer: Int,
-        k_row: List[Float32],
-        v_row: List[Float32],
-        position: Int,
-    ) raises:
-        """Append one position's K and V rows to a layer via
-        one-row staging + scatter. Refuses by name on a wrong
+    def _append_slot(
+        self, layer: Int, position: Int, k_len: Int, v_len: Int
+    ) raises -> Int:
+        """Validate one append (host or device-resident rows)
+        and return its storage slot. Refuses by name on a wrong
         row length (gpu_kv_shape_mismatch), an out-of-range
         layer (gpu_kv_invalid_layer), an out-of-order position
-        (gpu_kv_out_of_order_position), a windowed wrap
-        (gpu_kv_window_wrapped, the Wave C limit), and a global
-        append past capacity (gpu_kv_capacity_exceeded)."""
+        (gpu_kv_out_of_order_position), and a global append
+        past capacity (gpu_kv_capacity_exceeded). Windowed
+        appends wrap the ring, B1-exact (Wave D)."""
         var row = self.row_len()
-        if len(k_row) != row or len(v_row) != row:
+        if k_len != row or v_len != row:
             raise Error(
                 "gpu_kv_shape_mismatch: k/v rows have "
-                + String(len(k_row))
+                + String(k_len)
                 + "/"
-                + String(len(v_row))
+                + String(v_len)
                 + " elements, expected "
                 + String(row)
                 + " (num_kv_heads * head_dim)"
@@ -435,8 +489,8 @@ struct DeviceKvCache(Movable):
             self.layers[layer].capacity,
             self.layers[layer].appended,
             position,
-            len(k_row),
-            len(v_row),
+            k_len,
+            v_len,
             row,
         )
         if refusal == "gpu_kv_out_of_order_position":
@@ -447,17 +501,6 @@ struct DeviceKvCache(Movable):
                 + String(self.layers[layer].appended)
                 + ", got "
                 + String(position)
-            )
-        if refusal == "gpu_kv_window_wrapped":
-            raise Error(
-                "gpu_kv_window_wrapped: layer "
-                + String(layer)
-                + " position "
-                + String(position)
-                + " would wrap the window "
-                + String(self.layers[layer].kind.window)
-                + "; the Wave C device path refuses wraps (the CPU"
-                + " cache remains the fallback beyond the window)"
             )
         if refusal == "gpu_kv_capacity_exceeded":
             raise Error(
@@ -470,7 +513,35 @@ struct DeviceKvCache(Movable):
             )
         if refusal != "":
             raise Error(refusal + ": layer " + String(layer))
-        var slot = kv_slot_of(self.layers[layer].kind, position)
+        return kv_slot_of(self.layers[layer].kind, position)
+
+    def _append_commit(mut self, layer: Int, slot: Int, position: Int):
+        if not self.layers[layer].kind.is_global:
+            self.layers[layer].slot_position[slot] = position
+        self.layers[layer].appended += 1
+        _ = log_debug(
+            "gpu",
+            "kv append layer="
+            + String(layer)
+            + " position="
+            + String(position)
+            + " slot="
+            + String(slot),
+        )
+
+    def append(
+        mut self,
+        mut rt: GpuRuntime,
+        layer: Int,
+        k_row: List[Float32],
+        v_row: List[Float32],
+        position: Int,
+    ) raises:
+        """Append one position's K and V rows to a layer via
+        one-row staging + scatter. Refusals per _append_slot;
+        windowed appends wrap and evict, exactly as B1."""
+        var row = self.row_len()
+        var slot = self._append_slot(layer, position, len(k_row), len(v_row))
         var offset = slot * row
         var k_stage = upload_f32(rt, k_row)
         rt.ctx.enqueue_function[kv_scatter_kernel](
@@ -491,18 +562,94 @@ struct DeviceKvCache(Movable):
             block_dim=_KV_BLOCK,
         )
         rt.ctx.synchronize()
-        if not self.layers[layer].kind.is_global:
-            self.layers[layer].slot_position[slot] = position
-        self.layers[layer].appended += 1
+        self._append_commit(layer, slot, position)
+
+    def append_device(
+        mut self,
+        mut rt: GpuRuntime,
+        layer: Int,
+        k_buf: DeviceBuffer[DType.float32],
+        v_buf: DeviceBuffer[DType.float32],
+        position: Int,
+    ) raises:
+        """Append one position's rows from RESIDENT device
+        buffers (the residency path: the layer's K/V rows never
+        cross to the host). The buffers' first row_len()
+        elements are the row; the scatter is device-to-device.
+        Same validation and refusals as append()."""
+        var row = self.row_len()
+        var slot = self._append_slot(layer, position, row, row)
+        var offset = slot * row
+        rt.ctx.enqueue_function[kv_scatter_kernel](
+            self.layers[layer].k_buf,
+            k_buf,
+            Int32(row),
+            Int32(offset),
+            grid_dim=1,
+            block_dim=_KV_BLOCK,
+        )
+        rt.ctx.enqueue_function[kv_scatter_kernel](
+            self.layers[layer].v_buf,
+            v_buf,
+            Int32(row),
+            Int32(offset),
+            grid_dim=1,
+            block_dim=_KV_BLOCK,
+        )
+        rt.ctx.synchronize()
+        self._append_commit(layer, slot, position)
+
+    # -- visible-order read for attention (Wave D) ----------------
+
+    def gather_visible(
+        mut self, mut rt: GpuRuntime, layer: Int, want_value: Bool
+    ) raises -> DeviceBuffer[DType.float32]:
+        """The layer's visible K (or V) rows in
+        absolute-position order, as one device buffer of
+        stored_len x row_len floats - the layout
+        attention_kernel consumes. When the raw buffer is
+        already in visible order (kv_gather_needed is False:
+        global layers, and windowed layers whose first visible
+        position lands on slot 0) the raw buffer itself is
+        returned, no copy; otherwise kv_visible_gather_kernel
+        materializes the order into a fresh scratch buffer
+        (at most window x row floats, inside the runtime's
+        scratch envelope)."""
+        self._check_layer(layer)
+        var kind = self.layers[layer].kind.copy()
+        var first = self.layers[layer].first_visible_position()
+        var src = (
+            self.layers[layer]
+            .v_buf.copy() if want_value else self.layers[layer]
+            .k_buf.copy()
+        )
+        if not kv_gather_needed(kind, first):
+            return src^
+        var stored = self.layers[layer].stored()
+        var row = self.row_len()
+        var out = create_zero_f32(rt, stored * row)
+        var window = 0 if kind.is_global else kind.window
+        var first_slot = kv_visible_slot(kind, first, 0)
+        rt.ctx.enqueue_function[kv_visible_gather_kernel](
+            src,
+            out,
+            Int32(row),
+            Int32(first_slot),
+            Int32(window),
+            grid_dim=stored,
+            block_dim=_KV_BLOCK,
+        )
+        rt.ctx.synchronize()
         _ = log_debug(
             "gpu",
-            "kv append layer="
+            "kv gather_visible layer="
             + String(layer)
-            + " position="
-            + String(position)
-            + " slot="
-            + String(slot),
+            + " stored="
+            + String(stored)
+            + " first_visible="
+            + String(first),
         )
+        return out^
 
     # -- read-back (proof / debug path; attention consumes the
     #    raw buffers through key_buffer / value_buffer) --------------

@@ -1,10 +1,21 @@
-# gpu_layer.mojo - the GPU layer assembly, Lane C2 (Wave C).
+# gpu_layer.mojo - the GPU layer assembly, Lane C2 (Wave C),
+# activation residency added by Lane D4 (Wave D).
 #
 # Host-side launch wrappers and the device layer step, per
 # WAVE_C_INTERFACES.md. Public surface:
 #   gpu_logits(rt, weights, cpu_model, hidden) -> List[Float32]
 #   gpu_layer_step(rt, weights, kv, cpu_model, x, layer,
 #                  position) -> List[Float32]
+#   gpu_layer_step_resident(...) - same signature, the
+#     device-resident chain gpu_layer_step now runs.
+#   gpu_layer_step_hostchain(...) - the original Wave C
+#     per-op host-chained step, kept as the A/B baseline the
+#     residency proof measures against (and the only path
+#     that still refuses past the KV window, because it
+#     launches attention on the raw KV buffers).
+#   attention_device_resident(rt, kv, q_buf, layer, q_heads,
+#     kv_heads, head_dim) -> DeviceBuffer - the resident
+#     attention launch over the visible-order KV gather.
 # (The contract's gpu_logits shorthand omits cpu_model; the
 # CPU model is a parameter here because the task fixes the
 # final-logit scale/softcap as "from the CPU model's config
@@ -12,13 +23,33 @@
 # those values and the cross-check for every slot's shape.
 # Lane C3 holds the CPU model for config/fallback anyway.)
 #
-# Port shape (contract): weights and KV are resident on
-# device; activations are host List[Float32] rows at the
-# layer boundary - each op below uploads its input row(s),
-# launches its device kernel against the resident buffers,
-# and downloads its output row. Statement for statement the
-# CPU GlimmerModel.layer_step / .logits (model.mojo), with
-# every projection and op launched on device:
+# Port shape (Wave C contract): weights and KV are resident
+# on device; activations are host List[Float32] rows at the
+# layer boundary. Wave C's step then crossed per op: each op
+# uploaded its input row(s), launched, and downloaded its
+# output row, and the residual adds were HOST adds on the
+# downloaded rows.
+#
+# RESIDENCY (Wave D, Lane D4): gpu_layer_step now keeps the
+# layer's activations ON DEVICE across the whole layer - the
+# residual stream, norm outputs, projection outputs, the
+# attention output, and the MLP intermediates are device
+# buffers passed op to op, the KV append is device-to-device
+# (DeviceKvCache.append_device), and the residual adds are
+# device adds (residual_add_kernel). The host sees exactly
+# two crossings per layer: the input row upload and the
+# output row download. gpu_logits chains the same way
+# (upload the hidden row once, download the logits once).
+# Remaining host crossings in the resident path, stated
+# plainly: (1) the layer boundary itself, one upload + one
+# download of the hidden row per layer - the contract's
+# boundary shape, and the seam the model-level chain crosses
+# 52 times per step; (2) inside attention past a KV wrap,
+# the visible-order gather is a device-to-device copy, not a
+# host crossing. No other activation leaves the card inside
+# a layer. Statement for statement the CPU
+# GlimmerModel.layer_step / .logits (model.mojo), with every
+# projection and op launched on device:
 #   rms_norm_kernel (grid = row count, width = row length;
 #     per-head Q/K norms launch grid = head count,
 #     width = head_dim, exactly as gpu_proof_ops proved the
@@ -38,11 +69,14 @@
 # the CPU model's rope_base_swa config value (500,000 on
 # Glimmer, where the file carries no separate SWA key).
 #
-# Residual adds are HOST adds (residual_add_cpu) on the
-# downloaded rows: the rows are already host lists at this
-# wave's layer boundary, so a host add costs no extra device
-# traffic, and it keeps the add in the CPU twin's exact f32
-# arithmetic. Stated per the contract's "say which, and why".
+# Residual adds: Wave C did them as HOST adds
+# (residual_add_cpu) on the downloaded rows. Wave D's
+# resident step does them ON DEVICE with
+# residual_add_kernel - the same plain f32 per-element add,
+# so the arithmetic is identical; the hostchain baseline
+# below keeps the host adds, which is exactly the A/B the
+# residency proof measures. Stated per the contract's
+# "say which, and why".
 #
 # Norm weights are RESIDENT: C1's DeviceWeights serves them
 # as float32 buffers (slot_f32 for the per-layer norms,
@@ -104,11 +138,15 @@ from kernels.k1_gemv import (
 )
 from kernels.q6k_gemv import q6k_gemv_kernel, THREADS as Q6_THREADS
 from kernels.q5k_gemv import q5k_gemv_kernel, THREADS as Q5_THREADS
-from kernels.f32_gemv import f32_gemv_kernel, f16_gemv_kernel, THREADS as F_THREADS
+from kernels.f32_gemv import (
+    f32_gemv_kernel,
+    f16_gemv_kernel,
+    THREADS as F_THREADS,
+)
 from ops.rms_norm import rms_norm_kernel, RMS_THREADS
 from ops.rope import rope_kernel
 from ops.swiglu import swiglu_kernel
-from ops.residual import residual_add_cpu
+from ops.residual import residual_add_cpu, residual_add_kernel
 from ops.final_logit import final_logit_kernel
 from attention.attention import attention_kernel, ATTN_THREADS
 
@@ -240,9 +278,7 @@ def attn_gate_kernel(
         y[unsafe_offset=i] = a[unsafe_offset=i] * _sigmoid(g[unsafe_offset=i])
 
 
-def attn_gate_cpu(
-    a: List[Float32], g: List[Float32]
-) raises -> List[Float32]:
+def attn_gate_cpu(a: List[Float32], g: List[Float32]) raises -> List[Float32]:
     """Host twin of attn_gate_kernel (VM tests + parity)."""
     if len(a) != len(g):
         raise Error(
@@ -288,8 +324,13 @@ def _rms_norm_device(
 
 
 def _check_view(
-    name: String, type_id: Int, rows: Int, cols: Int,
-    cpu_type: Int, cpu_rows: Int, cpu_cols: Int,
+    name: String,
+    type_id: Int,
+    rows: Int,
+    cols: Int,
+    cpu_type: Int,
+    cpu_rows: Int,
+    cpu_cols: Int,
 ) raises:
     if type_id != cpu_type or rows != cpu_rows or cols != cpu_cols:
         raise Error(
@@ -330,17 +371,29 @@ def _gemv_u8_device(
         )
     elif view.type_id == DT_Q6_K:
         rt.ctx.enqueue_function[q6k_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
             block_dim=Q6_THREADS,
         )
     elif view.type_id == DT_Q5_K:
         rt.ctx.enqueue_function[q5k_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
             block_dim=Q5_THREADS,
         )
     elif view.type_id == DT_F16:
         rt.ctx.enqueue_function[f16_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
             block_dim=F_THREADS,
         )
     else:
@@ -351,7 +404,9 @@ def _gemv_u8_device(
             + String(view.type_id)
         )
     rt.ctx.synchronize()
-    _ = log_debug("gpu.layer", "gemv " + view.name + " rows=" + String(view.rows))
+    _ = log_debug(
+        "gpu.layer", "gemv " + view.name + " rows=" + String(view.rows)
+    )
     return download_f32(rt, y_dev, view.rows)
 
 
@@ -363,7 +418,11 @@ def _gemv_f32_device(
     var x_dev = upload_f32(rt, x)
     var y_dev = create_zero_f32(rt, view.rows)
     rt.ctx.enqueue_function[f32_gemv_kernel](
-        view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+        view.buffer,
+        x_dev,
+        y_dev,
+        Int32(view.cols),
+        grid_dim=view.rows,
         block_dim=F_THREADS,
     )
     rt.ctx.synchronize()
@@ -397,7 +456,12 @@ def _proj_layer(
     if cpu_type == DT_F32:
         var fview = weights.slot_f32(layer, suffix_index)
         _check_view(
-            name, fview.type_id, fview.rows, fview.cols, cpu_type, cpu_rows,
+            name,
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
             cpu_cols,
         )
         return _gemv_f32_device(rt, fview, x)
@@ -421,14 +485,24 @@ def _proj_output(
     if cpu_type == DT_F32:
         var fview = weights.output_f32()
         _check_view(
-            "output.weight", fview.type_id, fview.rows, fview.cols, cpu_type,
-            cpu_rows, cpu_cols,
+            "output.weight",
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
+            cpu_cols,
         )
         return _gemv_f32_device(rt, fview, x)
     var view = weights.output_u8()
     _check_view(
-        "output.weight", view.type_id, view.rows, view.cols, cpu_type,
-        cpu_rows, cpu_cols,
+        "output.weight",
+        view.type_id,
+        view.rows,
+        view.cols,
+        cpu_type,
+        cpu_rows,
+        cpu_cols,
     )
     return _gemv_u8_device(rt, view, x)
 
@@ -591,7 +665,11 @@ def _attn_gate_device(
     var y_dev = create_zero_f32(rt, len(attn))
     var grid = (len(attn) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[attn_gate_kernel](
-        a_dev, g_dev, y_dev, Int32(len(attn)), grid_dim=grid,
+        a_dev,
+        g_dev,
+        y_dev,
+        Int32(len(attn)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
@@ -614,11 +692,339 @@ def _swiglu_device(
     var y_dev = create_zero_f32(rt, len(gate))
     var grid = (len(gate) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[swiglu_kernel](
-        g_dev, u_dev, y_dev, Int32(len(gate)), grid_dim=grid,
+        g_dev,
+        u_dev,
+        y_dev,
+        Int32(len(gate)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
     return download_f32(rt, y_dev, len(gate))
+
+
+# ---- device-resident launch helpers (Wave D) -----------------
+#
+# The same kernels as the host helpers above, chained on
+# DeviceBuffers: no upload, no download, no per-op sync (the
+# context's single queue orders the launches; the one sync
+# happens in download_f32 at the layer boundary). Buffer
+# lengths are carried host-side by the caller (n arguments),
+# exactly as the host helpers carry List lengths.
+
+
+def _rms_norm_buf(
+    mut rt: GpuRuntime,
+    x_buf: DeviceBuffer[DType.float32],
+    n: Int,
+    w_buf: DeviceBuffer[DType.float32],
+    row_len: Int,
+    eps: Float32,
+) raises -> DeviceBuffer[DType.float32]:
+    gpu_layer_check_norm(n, row_len, row_len)
+    var rows = n // row_len
+    var y_dev = create_zero_f32(rt, n)
+    rt.ctx.enqueue_function[rms_norm_kernel](
+        x_buf,
+        w_buf,
+        y_dev,
+        Int32(row_len),
+        eps,
+        grid_dim=rows,
+        block_dim=RMS_THREADS,
+    )
+    return y_dev^
+
+
+def _gemv_u8_buf(
+    mut rt: GpuRuntime,
+    view: DeviceSlotU8,
+    x_buf: DeviceBuffer[DType.float32],
+    x_len: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, x_len)
+    var y_dev = create_zero_f32(rt, view.rows)
+    if view.type_id == DT_Q4_K:
+        rt.ctx.enqueue_function[k1_gemv_kernel](
+            view.buffer,
+            x_buf,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows // K1_ROWS_PER_WG,
+            block_dim=K1_THREADS,
+        )
+    elif view.type_id == DT_Q6_K:
+        rt.ctx.enqueue_function[q6k_gemv_kernel](
+            view.buffer,
+            x_buf,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
+            block_dim=Q6_THREADS,
+        )
+    elif view.type_id == DT_Q5_K:
+        rt.ctx.enqueue_function[q5k_gemv_kernel](
+            view.buffer,
+            x_buf,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
+            block_dim=Q5_THREADS,
+        )
+    elif view.type_id == DT_F16:
+        rt.ctx.enqueue_function[f16_gemv_kernel](
+            view.buffer,
+            x_buf,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
+            block_dim=F_THREADS,
+        )
+    else:
+        raise Error(
+            "gpu_layer_unsupported_dtype: "
+            + view.name
+            + " reached the byte GEMV path with ggml type id "
+            + String(view.type_id)
+        )
+    _ = log_debug("gpu.layer", "gemv resident " + view.name)
+    return y_dev^
+
+
+def _gemv_f32_buf(
+    mut rt: GpuRuntime,
+    view: DeviceSlotF32,
+    x_buf: DeviceBuffer[DType.float32],
+    x_len: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, x_len)
+    var y_dev = create_zero_f32(rt, view.rows)
+    rt.ctx.enqueue_function[f32_gemv_kernel](
+        view.buffer,
+        x_buf,
+        y_dev,
+        Int32(view.cols),
+        grid_dim=view.rows,
+        block_dim=F_THREADS,
+    )
+    return y_dev^
+
+
+def _proj_layer_buf(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    cpu_model: GlimmerModel,
+    layer: Int,
+    suffix_index: Int,
+    x_buf: DeviceBuffer[DType.float32],
+    x_len: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    var idx = layer * LAYER_SUFFIX_COUNT + suffix_index
+    if layer < 0 or idx < 0 or idx >= len(cpu_model.layer_weights):
+        raise Error(
+            "gpu_layer_bad_shape: layer "
+            + String(layer)
+            + " suffix "
+            + String(suffix_index)
+            + " outside the CPU model's slots"
+        )
+    var cpu_type = cpu_model.layer_weights[idx].type_id
+    var cpu_rows = cpu_model.layer_weights[idx].rows
+    var cpu_cols = cpu_model.layer_weights[idx].cols
+    var name = cpu_model.layer_weights[idx].name.copy()
+    if cpu_type == DT_F32:
+        var fview = weights.slot_f32(layer, suffix_index)
+        _check_view(
+            name,
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
+            cpu_cols,
+        )
+        return _gemv_f32_buf(rt, fview, x_buf, x_len)
+    var view = weights.slot_u8(layer, suffix_index)
+    _check_view(
+        name, view.type_id, view.rows, view.cols, cpu_type, cpu_rows, cpu_cols
+    )
+    return _gemv_u8_buf(rt, view, x_buf, x_len)
+
+
+def _proj_output_buf(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    cpu_model: GlimmerModel,
+    x_buf: DeviceBuffer[DType.float32],
+    x_len: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    var cpu_type = cpu_model.output.type_id
+    var cpu_rows = cpu_model.output.rows
+    var cpu_cols = cpu_model.output.cols
+    if cpu_type == DT_F32:
+        var fview = weights.output_f32()
+        _check_view(
+            "output.weight",
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
+            cpu_cols,
+        )
+        return _gemv_f32_buf(rt, fview, x_buf, x_len)
+    var view = weights.output_u8()
+    _check_view(
+        "output.weight",
+        view.type_id,
+        view.rows,
+        view.cols,
+        cpu_type,
+        cpu_rows,
+        cpu_cols,
+    )
+    return _gemv_u8_buf(rt, view, x_buf, x_len)
+
+
+def _rope_buf(
+    mut rt: GpuRuntime,
+    x_buf: DeviceBuffer[DType.float32],
+    n: Int,
+    vectors: Int,
+    head_dim: Int,
+    position: Int,
+    base: Float32,
+) raises -> DeviceBuffer[DType.float32]:
+    if n != vectors * head_dim:
+        raise Error(
+            "gpu_layer_bad_shape: rope input has "
+            + String(n)
+            + " elements, expected "
+            + String(vectors * head_dim)
+        )
+    var shape = rope_launch_shape(vectors * (head_dim // 2))
+    var y_dev = create_zero_f32(rt, n)
+    var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
+    for i in range(vectors):
+        pos_host[i] = Int32(position)
+    var pos_dev = rt.ctx.enqueue_create_buffer[DType.int32](vectors)
+    rt.ctx.enqueue_copy(src_buf=pos_host, dst_buf=pos_dev)
+    rt.ctx.enqueue_function[rope_kernel](
+        x_buf,
+        y_dev,
+        pos_dev,
+        Int32(head_dim),
+        base,
+        grid_dim=shape[0],
+        block_dim=shape[1],
+    )
+    return y_dev^
+
+
+def attention_device_resident(
+    mut rt: GpuRuntime,
+    mut kv: DeviceKvCache,
+    q_buf: DeviceBuffer[DType.float32],
+    layer: Int,
+    q_heads: Int,
+    kv_heads: Int,
+    head_dim: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """attention_kernel over the layer's VISIBLE rows in
+    absolute-position order, Q resident. The K/V sources are
+    DeviceKvCache.gather_visible buffers: the raw buffers
+    themselves when their slot order already is the visible
+    order, a device-side visible-order gather past a wrap
+    (Wave D; the hostchain path below still refuses there).
+    """
+    var stored = kv.stored_len(layer)
+    if stored <= 0:
+        raise Error(
+            "gpu_layer_bad_shape: attention on layer "
+            + String(layer)
+            + " with no stored positions"
+        )
+    if q_heads * head_dim <= 0:
+        raise Error("gpu_layer_bad_shape: attention Q row shape is empty")
+    var y_dev = create_zero_f32(rt, q_heads * head_dim)
+    var k_vis = kv.gather_visible(rt, layer, False)
+    var v_vis = kv.gather_visible(rt, layer, True)
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    rt.ctx.enqueue_function[attention_kernel](
+        q_buf,
+        k_vis,
+        v_vis,
+        y_dev,
+        Int32(stored),
+        Int32(kv_heads),
+        Int32(head_dim),
+        Int32(q_heads // kv_heads),
+        scale,
+        grid_dim=q_heads,
+        block_dim=ATTN_THREADS,
+    )
+    return y_dev^
+
+
+def _attn_gate_buf(
+    mut rt: GpuRuntime,
+    a_buf: DeviceBuffer[DType.float32],
+    g_buf: DeviceBuffer[DType.float32],
+    n: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    var y_dev = create_zero_f32(rt, n)
+    var grid = (n + GATE_THREADS - 1) // GATE_THREADS
+    rt.ctx.enqueue_function[attn_gate_kernel](
+        a_buf,
+        g_buf,
+        y_dev,
+        Int32(n),
+        grid_dim=grid,
+        block_dim=GATE_THREADS,
+    )
+    return y_dev^
+
+
+def _swiglu_buf(
+    mut rt: GpuRuntime,
+    g_buf: DeviceBuffer[DType.float32],
+    u_buf: DeviceBuffer[DType.float32],
+    n: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    var y_dev = create_zero_f32(rt, n)
+    var grid = (n + GATE_THREADS - 1) // GATE_THREADS
+    rt.ctx.enqueue_function[swiglu_kernel](
+        g_buf,
+        u_buf,
+        y_dev,
+        Int32(n),
+        grid_dim=grid,
+        block_dim=GATE_THREADS,
+    )
+    return y_dev^
+
+
+def _residual_add_buf(
+    mut rt: GpuRuntime,
+    a_buf: DeviceBuffer[DType.float32],
+    b_buf: DeviceBuffer[DType.float32],
+    n: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """residual_add_kernel on resident buffers: the same
+    plain f32 per-element add residual_add_cpu does on host
+    rows, so the resident chain's arithmetic matches the
+    hostchain's exactly."""
+    var y_dev = create_zero_f32(rt, n)
+    var grid = (n + GATE_THREADS - 1) // GATE_THREADS
+    rt.ctx.enqueue_function[residual_add_kernel](
+        a_buf,
+        b_buf,
+        y_dev,
+        Int32(n),
+        grid_dim=grid,
+        block_dim=GATE_THREADS,
+    )
+    return y_dev^
 
 
 # ---- public surface ------------------------------------------
@@ -650,28 +1056,31 @@ def gpu_logits(
             + " is not hidden "
             + String(cfg.hidden)
         )
-    var normed = _rms_norm_device(
-        rt, hidden, norm_view.buffer, cfg.hidden, cfg.rms_eps
+    # Resident chain (Wave D): upload the hidden row once,
+    # norm -> head GEMV -> final-logit transform on buffers,
+    # download the logits row once.
+    var hidden_dev = upload_f32(rt, hidden)
+    var normed = _rms_norm_buf(
+        rt, hidden_dev, cfg.hidden, norm_view.buffer, cfg.hidden, cfg.rms_eps
     )
-    var raw = _proj_output(rt, weights, cpu_model, normed)
-    var x_dev = upload_f32(rt, raw)
-    var y_dev = create_zero_f32(rt, len(raw))
-    var grid = (len(raw) + GATE_THREADS - 1) // GATE_THREADS
+    var raw = _proj_output_buf(rt, weights, cpu_model, normed, cfg.hidden)
+    var raw_len = cpu_model.output.rows
+    var y_dev = create_zero_f32(rt, raw_len)
+    var grid = (raw_len + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[final_logit_kernel](
-        x_dev,
+        raw,
         y_dev,
-        Int32(len(raw)),
+        Int32(raw_len),
         cfg.logit_scale,
         cfg.logit_softcap,
         grid_dim=grid,
         block_dim=GATE_THREADS,
     )
-    rt.ctx.synchronize()
-    _ = log_debug("gpu.layer", "logits rows=" + String(len(raw)))
-    return download_f32(rt, y_dev, len(raw))
+    _ = log_debug("gpu.layer", "logits rows=" + String(raw_len))
+    return download_f32(rt, y_dev, raw_len)
 
 
-def gpu_layer_step(
+def gpu_layer_step_hostchain(
     mut rt: GpuRuntime,
     weights: DeviceWeights,
     mut kv: DeviceKvCache,
@@ -680,8 +1089,12 @@ def gpu_layer_step(
     layer: Int,
     position: Int,
 ) raises -> List[Float32]:
-    """One token's hidden row through one layer on device,
-    statement for statement the CPU layer_step."""
+    """The Wave C step, kept as the residency A/B baseline:
+    one token's hidden row through one layer, every op
+    uploading its input row and downloading its output row,
+    residual adds on the host. Still refuses past the KV
+    window (its attention launches on the raw KV buffers).
+    Statement for statement the CPU layer_step."""
     var cfg = cpu_model.cfg.copy()
     if layer < 0 or layer >= cfg.layers:
         raise Error(
@@ -712,8 +1125,7 @@ def gpu_layer_step(
             + String(position)
             + " would wrap its window "
             + String(kind.window)
-            + "; the CPU path is the fallback beyond the window"
-            " (Wave C limit)"
+            + "; the CPU path is the fallback beyond the window (Wave C limit)"
         )
     _ = log_debug(
         "gpu.layer",
@@ -726,26 +1138,37 @@ def gpu_layer_step(
     )
     var residual = x.copy()
     var h = _rms_norm_device(
-        rt, residual, _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        rt,
+        residual,
+        _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
     )
     var q = _proj_layer(rt, weights, cpu_model, layer, 1, h)
     var k = _proj_layer(rt, weights, cpu_model, layer, 2, h)
     var v = _proj_layer(rt, weights, cpu_model, layer, 3, h)
     q = _rms_norm_device(
-        rt, q, _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        rt,
+        q,
+        _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     k = _rms_norm_device(
-        rt, k, _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        rt,
+        k,
+        _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     var q_for_attn = q.copy()
     if sliding:
         # K rotates HERE (write time; the cache holds rotated
         # K, Rust-exact); Q rotates before the attention
         # launch because the kernel takes pre-rotated Q.
-        k = _rope_device(rt, k, cfg.kv_heads, cfg.head_dim, position, cfg.rope_base_swa)
+        k = _rope_device(
+            rt, k, cfg.kv_heads, cfg.head_dim, position, cfg.rope_base_swa
+        )
         q_for_attn = _rope_device(
             rt, q, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
         )
@@ -757,21 +1180,198 @@ def gpu_layer_step(
     var gated = _attn_gate_device(rt, attn, gate)
     var out = _proj_layer(rt, weights, cpu_model, layer, 6, gated)
     out = _rms_norm_device(
-        rt, out, _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        rt,
+        out,
+        _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     var after_attn = residual_add_cpu(residual, out)
     var residual2 = after_attn.copy()
     var h2 = _rms_norm_device(
-        rt, residual2, _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        rt,
+        residual2,
+        _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
     )
     var gate_ffn = _proj_layer(rt, weights, cpu_model, layer, 10, h2)
     var up_ffn = _proj_layer(rt, weights, cpu_model, layer, 11, h2)
     var act = _swiglu_device(rt, gate_ffn, up_ffn)
     var ffn = _proj_layer(rt, weights, cpu_model, layer, 12, act)
     ffn = _rms_norm_device(
-        rt, ffn, _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        rt,
+        ffn,
+        _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     return residual_add_cpu(residual2, ffn)
+
+
+def gpu_layer_step_resident(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    mut kv: DeviceKvCache,
+    cpu_model: GlimmerModel,
+    x: List[Float32],
+    layer: Int,
+    position: Int,
+) raises -> List[Float32]:
+    """One token's hidden row through one layer, activations
+    RESIDENT on device across the whole layer (Wave D): the
+    input row uploads once, every intermediate (residual
+    stream, norm outputs, Q/K/V, gated attention, MLP rows)
+    stays a device buffer, the KV append is device-to-device,
+    and the output row downloads once. Statement for
+    statement the CPU layer_step, same kernels in the same
+    order as the hostchain step. Windowed layers run PAST
+    the window here: the KV ring wraps (B1 semantics) and
+    attention reads through the visible-order gather."""
+    var cfg = cpu_model.cfg.copy()
+    if layer < 0 or layer >= cfg.layers:
+        raise Error(
+            "gpu_layer_bad_shape: layer "
+            + String(layer)
+            + " outside 0.."
+            + String(cfg.layers)
+        )
+    if len(x) != cfg.hidden:
+        raise Error(
+            "gpu_layer_bad_shape: layer input has "
+            + String(len(x))
+            + " elements, hidden is "
+            + String(cfg.hidden)
+        )
+    if position < 0:
+        raise Error(
+            "gpu_layer_bad_shape: position must be >= 0, got "
+            + String(position)
+        )
+    var kind = cfg.kinds[layer].copy()
+    var sliding = not kind.is_global
+    _ = log_debug(
+        "gpu.layer",
+        "step resident layer="
+        + String(layer)
+        + " position="
+        + String(position)
+        + " sliding="
+        + String(sliding),
+    )
+    var qkv_w = cfg.kv_heads * cfg.head_dim
+    var q_w = cfg.q_heads * cfg.head_dim
+    var residual = upload_f32(rt, x)
+    var h = _rms_norm_buf(
+        rt,
+        residual,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
+    )
+    var q = _proj_layer_buf(rt, weights, cpu_model, layer, 1, h, cfg.hidden)
+    var k = _proj_layer_buf(rt, weights, cpu_model, layer, 2, h, cfg.hidden)
+    var v = _proj_layer_buf(rt, weights, cpu_model, layer, 3, h, cfg.hidden)
+    q = _rms_norm_buf(
+        rt,
+        q,
+        q_w,
+        _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
+    )
+    k = _rms_norm_buf(
+        rt,
+        k,
+        qkv_w,
+        _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
+    )
+    if sliding:
+        # K rotates at write time (the cache holds rotated K);
+        # Q rotates before the attention launch (pre-rotated
+        # contract), exactly as the hostchain step.
+        k = _rope_buf(
+            rt,
+            k,
+            qkv_w,
+            cfg.kv_heads,
+            cfg.head_dim,
+            position,
+            cfg.rope_base_swa,
+        )
+        q = _rope_buf(
+            rt, q, q_w, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
+        )
+    kv.append_device(rt, layer, k, v, position)
+    var attn = attention_device_resident(
+        rt, kv, q, layer, cfg.q_heads, cfg.kv_heads, cfg.head_dim
+    )
+    var gate = _proj_layer_buf(rt, weights, cpu_model, layer, 7, h, cfg.hidden)
+    var gated = _attn_gate_buf(rt, attn, gate, q_w)
+    var out = _proj_layer_buf(rt, weights, cpu_model, layer, 6, gated, q_w)
+    out = _rms_norm_buf(
+        rt,
+        out,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
+    )
+    var residual2 = _residual_add_buf(rt, residual, out, cfg.hidden)
+    var h2 = _rms_norm_buf(
+        rt,
+        residual2,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
+    )
+    var gate_ffn = _proj_layer_buf(
+        rt, weights, cpu_model, layer, 10, h2, cfg.hidden
+    )
+    var up_ffn = _proj_layer_buf(
+        rt, weights, cpu_model, layer, 11, h2, cfg.hidden
+    )
+    var act = _swiglu_buf(rt, gate_ffn, up_ffn, _ffn_width(cpu_model, layer))
+    var ffn = _proj_layer_buf(
+        rt, weights, cpu_model, layer, 12, act, _ffn_width(cpu_model, layer)
+    )
+    ffn = _rms_norm_buf(
+        rt,
+        ffn,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
+    )
+    var result = _residual_add_buf(rt, residual2, ffn, cfg.hidden)
+    return download_f32(rt, result, cfg.hidden)
+
+
+def _ffn_width(cpu_model: GlimmerModel, layer: Int) -> Int:
+    """The FFN intermediate width: the ffn_gate slot's rows
+    (suffix 10), the width gate/up produce and down consumes.
+    """
+    var idx = layer * LAYER_SUFFIX_COUNT + 10
+    return cpu_model.layer_weights[idx].rows
+
+
+def gpu_layer_step(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    mut kv: DeviceKvCache,
+    cpu_model: GlimmerModel,
+    x: List[Float32],
+    layer: Int,
+    position: Int,
+) raises -> List[Float32]:
+    """One token's hidden row through one layer on device.
+    Wave D: the resident chain (gpu_layer_step_resident);
+    the Wave C hostchain survives above as the A/B baseline.
+    """
+    return gpu_layer_step_resident(
+        rt, weights, kv, cpu_model, x, layer, position
+    )

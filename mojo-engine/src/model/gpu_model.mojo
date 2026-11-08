@@ -19,6 +19,12 @@
 # MOJO_ENGINE_GPU_BUDGET_BYTES config value; the runner hands
 # EngineConfig.gpu_budget_bytes in (config field: Lane C1).
 #
+# Wave D (Lane D4): gpu_layer_step is now the resident chain
+# (activations stay on device inside each layer) and windowed
+# layers run past the 2,048 wrap on device (ring appends +
+# visible-order gather in DeviceKvCache); the CPU fallback is
+# no longer the only path past the window.
+#
 # step() mirrors GlimmerModel.step statement for statement:
 #   1. embedding row on device (gpu_embed_token, C2);
 #   2. the weightless embedding norm as a PLAIN rms_norm via
@@ -46,7 +52,7 @@
 # model_bad_token), gpu_model_bad_shape (hidden row width at
 # logits time, mirroring model_bad_shape), plus whatever the
 # C1/C2 surfaces refuse by name underneath (gpu_no_device,
-# gpu_budget_exceeded, gpu_kv_window_wrapped, ...), propagated
+# gpu_budget_exceeded, gpu_kv_capacity_exceeded, ...), propagated
 # untouched. Diag seam: phase `model`, model.mojo's phase.
 
 from config import DEFAULT_GPU_BUDGET_BYTES
@@ -126,9 +132,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         """
         var n = len(x)
         if n == 0:
-            raise Error(
-                "gpu_model_bad_shape: embedding norm got an empty row"
-            )
+            raise Error("gpu_model_bad_shape: embedding norm got an empty row")
         var ones = List[Float32](capacity=n)
         ones.resize(n, Float32(1.0))
         var x_dev = upload_f32(self.rt, x)
@@ -146,9 +150,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.rt.ctx.synchronize()
         return download_f32(self.rt, y_dev, n)
 
-    def step(
-        mut self, token_id: Int, position: Int
-    ) raises -> List[Float32]:
+    def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
         """One token at one absolute position through the whole
         stack on device; appends to the device KV cache (inside
         gpu_layer_step); returns the final hidden row. Mirrors
@@ -163,8 +165,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             )
         if position < 0:
             raise Error(
-                "gpu_model_bad_shape: negative position "
-                + String(position)
+                "gpu_model_bad_shape: negative position " + String(position)
             )
         var x = gpu_embed_token(self.rt, self.weights, token_id)
         x = self._plain_rms_norm(x, cfg.rms_eps)
@@ -189,9 +190,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         )
         return x^
 
-    def logits(
-        mut self, hidden: List[Float32]
-    ) raises -> List[Float32]:
+    def logits(mut self, hidden: List[Float32]) raises -> List[Float32]:
         """Finished logits for one hidden row: C2's gpu_logits
         (final norm, head GEMV, scale-then-softcap on device).
         """

@@ -140,6 +140,8 @@ def _gpu_generate_phase(
     attn_max_splits: Int,
     attn_span: Int,
     prompt: List[Int],
+    prefill_gemm_min_batch: Int,
+    gemm_tiled_min_batch: Int,
 ) raises -> Tuple[List[Int], Int, Int]:
     """Build the GPU model, time its load, generate, and
     DESTROY the model on return. Wave C integration fix: the
@@ -150,8 +152,15 @@ def _gpu_generate_phase(
     prefill model is built only after this one is gone. The
     printed lines and their order are unchanged."""
     var t0 = perf_counter_ns()
-    var model = GpuGlimmerModel.open_attn(
-        path, context_len, budget_bytes, attn_tile, attn_max_splits, attn_span
+    var model = GpuGlimmerModel(
+        GlimmerModel.open(path)^,
+        context_len,
+        budget_bytes,
+        attn_tile,
+        attn_max_splits,
+        attn_span,
+        prefill_gemm_min_batch,
+        gemm_tiled_min_batch,
     )
     var t_load = perf_counter_ns()
     var load_ms = Int((t_load - t0) // 1_000_000)
@@ -170,13 +179,22 @@ def _gpu_prefill_phase(
     attn_max_splits: Int,
     attn_span: Int,
     prompt: List[Int],
+    prefill_gemm_min_batch: Int,
+    gemm_tiled_min_batch: Int,
 ) raises -> Int:
     """Build a fresh GPU model (the generate model is already
     destroyed), time forward_rows over the prompt ids, and
     destroy it on return. The Wave B prefill construction,
     phased for device memory."""
-    var fresh = GpuGlimmerModel.open_attn(
-        path, context_len, budget_bytes, attn_tile, attn_max_splits, attn_span
+    var fresh = GpuGlimmerModel(
+        GlimmerModel.open(path)^,
+        context_len,
+        budget_bytes,
+        attn_tile,
+        attn_max_splits,
+        attn_span,
+        prefill_gemm_min_batch,
+        gemm_tiled_min_batch,
     )
     var t_pf0 = perf_counter_ns()
     _ = fresh.forward_rows(prompt.copy())
@@ -193,6 +211,8 @@ def _run_gpu(
     attn_span: Int,
     tok: Tokenizer,
     prompt: List[Int],
+    prefill_gemm_min_batch: Int,
+    gemm_tiled_min_batch: Int,
 ) raises:
     """The Wave C GPU path: same run, same prints, driven by
     GpuGlimmerModel. Prefill is measured on a second fresh GPU
@@ -208,6 +228,8 @@ def _run_gpu(
         attn_max_splits,
         attn_span,
         prompt,
+        prefill_gemm_min_batch,
+        gemm_tiled_min_batch,
     )
     var out = phase[0].copy()
     print("LOAD_MS", String(phase[1]))
@@ -221,6 +243,8 @@ def _run_gpu(
         attn_max_splits,
         attn_span,
         prompt,
+        prefill_gemm_min_batch,
+        gemm_tiled_min_batch,
     )
     _report_prefill(prefill_ms, phase[2])
 
@@ -264,6 +288,8 @@ def run() raises:
             config.attn_split_span_positions,
             tok,
             prompt,
+            config.prefill_gemm_min_batch,
+            config.gemm_tiled_min_batch,
         )
         return
 

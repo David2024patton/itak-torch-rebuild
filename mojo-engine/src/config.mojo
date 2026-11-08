@@ -55,6 +55,20 @@ comptime DEFAULT_ATTN_MAX_SPLITS = 8
 # 512 stored the launch stays single-split.
 comptime DEFAULT_ATTN_SPLIT_SPAN_POSITIONS = 512
 
+# Prefill GEMM knobs (Wave D, Lane D1): a prompt batch at or
+# above PREFILL_GEMM_MIN_BATCH rows takes the batched GEMM
+# projection path on device (below it the per-row GEMV path is
+# kept - at one or two rows the GEMV launches are already the
+# cheap shape, and decode always uses GEMV); at or above
+# GEMM_TILED_MIN_BATCH rows the register-tiled GEMM structure
+# is used instead of the straightforward batched one. Setting
+# PREFILL_GEMM_MIN_BATCH above any real prompt length disables
+# the GEMM path entirely (the A/B control the Wave D timing
+# harness uses). Both are positive whole numbers, refused by
+# name like every other value here.
+comptime DEFAULT_PREFILL_GEMM_MIN_BATCH = 2
+comptime DEFAULT_GEMM_TILED_MIN_BATCH = 8
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -110,7 +124,8 @@ def parse_gpu_budget_bytes(raw: String) raises -> Int:
 
 def _parse_positive(raw: String, env_name: String) raises -> Int:
     """Shared positive-whole-number parse for the attention
-    knobs; refuses by name like the other config values."""
+    and prefill GEMM knobs; refuses by name like the other
+    config values."""
     var parsed: Int
     try:
         parsed = Int(raw)
@@ -149,6 +164,28 @@ def parse_attn_split_span(raw: String) raises -> Int:
     return _parse_positive(raw, "MOJO_ENGINE_ATTN_SPLIT_SPAN_POSITIONS")
 
 
+def parse_prefill_gemm_min_batch(raw: String) raises -> Int:
+    """Parse and validate a prefill GEMM minimum batch value.
+
+    Split out of load() so the refusal names are directly
+    testable, exactly like parse_context_len. Raises
+    mojo_engine_config on anything that is not a positive
+    whole number.
+    """
+    return _parse_positive(raw, "MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH")
+
+
+def parse_gemm_tiled_min_batch(raw: String) raises -> Int:
+    """Parse and validate a tiled-GEMM minimum batch value.
+
+    Split out of load() so the refusal names are directly
+    testable, exactly like parse_context_len. Raises
+    mojo_engine_config on anything that is not a positive
+    whole number.
+    """
+    return _parse_positive(raw, "MOJO_ENGINE_GEMM_TILED_MIN_BATCH")
+
+
 struct EngineConfig(Copyable, Movable):
     """One loaded configuration; build via EngineConfig.load()."""
 
@@ -158,6 +195,8 @@ struct EngineConfig(Copyable, Movable):
     var attn_tile_positions: Int
     var attn_max_splits: Int
     var attn_split_span_positions: Int
+    var prefill_gemm_min_batch: Int
+    var gemm_tiled_min_batch: Int
 
     def __init__(
         out self,
@@ -167,6 +206,8 @@ struct EngineConfig(Copyable, Movable):
         attn_tile_positions: Int = DEFAULT_ATTN_TILE_POSITIONS,
         attn_max_splits: Int = DEFAULT_ATTN_MAX_SPLITS,
         attn_split_span_positions: Int = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
+        prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
+        gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -174,6 +215,8 @@ struct EngineConfig(Copyable, Movable):
         self.attn_tile_positions = attn_tile_positions
         self.attn_max_splits = attn_max_splits
         self.attn_split_span_positions = attn_split_span_positions
+        self.prefill_gemm_min_batch = prefill_gemm_min_batch
+        self.gemm_tiled_min_batch = gemm_tiled_min_batch
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -211,6 +254,16 @@ struct EngineConfig(Copyable, Movable):
         if raw_span != "":
             attn_span = parse_attn_split_span(raw_span)
 
+        var prefill_gemm_min_batch = DEFAULT_PREFILL_GEMM_MIN_BATCH
+        var raw_min = getenv("MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH")
+        if raw_min != "":
+            prefill_gemm_min_batch = parse_prefill_gemm_min_batch(raw_min)
+
+        var gemm_tiled_min_batch = DEFAULT_GEMM_TILED_MIN_BATCH
+        var raw_tiled = getenv("MOJO_ENGINE_GEMM_TILED_MIN_BATCH")
+        if raw_tiled != "":
+            gemm_tiled_min_batch = parse_gemm_tiled_min_batch(raw_tiled)
+
         return EngineConfig(
             model_path,
             context_len,
@@ -218,4 +271,6 @@ struct EngineConfig(Copyable, Movable):
             attn_tile,
             attn_splits,
             attn_span,
+            prefill_gemm_min_batch,
+            gemm_tiled_min_batch,
         )

@@ -82,6 +82,17 @@ trait ForwardModel:
 
     See the module header for why this is a trait on a struct
     and not a pair of function parameters in Mojo 1.2.
+
+    Wave D (Lane D1) adds ONE defaulted method, prefill():
+    the default is exactly the step loop generate() ran
+    through Wave C, so every existing implementer (the CPU
+    adapter, the test mock) keeps byte-identical behavior
+    without defining anything new. A model with a batched
+    prefill path (the GPU model, whose projections run as
+    GEMMs over the whole prompt) overrides it; the override
+    must return the same last hidden row the step loop would
+    (same tokens out - the trait surface does not change
+    observably).
     """
 
     def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
@@ -92,6 +103,17 @@ trait ForwardModel:
     def logits(mut self, hidden: List[Float32]) raises -> List[Float32]:
         """Finished logits for one hidden row."""
         ...
+
+    def prefill(mut self, prompt_ids: List[Int]) raises -> List[Float32]:
+        """Feed the prompt at positions 0..n-1 and return the
+        last position's hidden row. Default: the per-position
+        step loop (Wave B/C semantics, statement for
+        statement). Models may override with a batched path
+        whose per-position semantics are identical."""
+        var hidden = self.step(prompt_ids[0], 0)
+        for i in range(1, len(prompt_ids)):
+            hidden = self.step(prompt_ids[i], i)
+        return hidden^
 
 
 def generate[
@@ -114,10 +136,10 @@ def generate[
         )
     var n = len(prompt_ids)
     # Prefill: feed the prompt at positions 0..n-1, discarding
-    # every hidden row except the last.
-    var hidden = model.step(prompt_ids[0], 0)
-    for i in range(1, n):
-        hidden = model.step(prompt_ids[i], i)
+    # every hidden row except the last. The trait's default
+    # prefill is the per-position step loop; a model with a
+    # batched prefill path overrides it (same last row out).
+    var hidden = model.prefill(prompt_ids)
     _ = log_debug(
         "generate.prefill",
         "prompt ids " + String(n) + " positions 0.." + String(n - 1),

@@ -594,6 +594,14 @@ struct EngineConfig(Copyable, Movable):
     var serve_attach_warn_tokens: Int
     # -- Deep-telemetry addendum field (2026-11-08) --
     var gpu_peak_bandwidth_gbps: Float64
+    # -- Hash-chain field (zero-trust gate 3, 2026-11-08):
+    # the git head sha of the tree this binary was built
+    # from, supplied through config at launch
+    # (MOJO_ENGINE_BUILD_SHA) and stamped into every run
+    # record's hash chain. Empty when the operator does not
+    # supply it; the chain still computes, over the empty
+    # provenance, and the record shows it empty.
+    var build_sha: String
 
     def __init__(
         out self,
@@ -627,6 +635,7 @@ struct EngineConfig(Copyable, Movable):
         serve_backend_target: String = DEFAULT_SERVE_BACKEND_TARGET,
         serve_attach_warn_tokens: Int = DEFAULT_SERVE_ATTACH_WARN_TOKENS,
         gpu_peak_bandwidth_gbps: Float64 = DEFAULT_GPU_PEAK_BANDWIDTH_GBPS,
+        build_sha: String = "",
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -658,6 +667,7 @@ struct EngineConfig(Copyable, Movable):
         self.serve_backend_target = serve_backend_target
         self.serve_attach_warn_tokens = serve_attach_warn_tokens
         self.gpu_peak_bandwidth_gbps = gpu_peak_bandwidth_gbps
+        self.build_sha = build_sha
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -812,6 +822,10 @@ struct EngineConfig(Copyable, Movable):
         if raw_peak != "":
             gpu_peak_bandwidth_gbps = parse_gpu_peak_bandwidth_gbps(raw_peak)
 
+        # Build provenance for the run-record hash chain: a
+        # plain stamp, taken as given ("" when unset).
+        var build_sha = getenv("MOJO_ENGINE_BUILD_SHA")
+
         if serve_default_max_tokens > serve_max_tokens:
             raise Error(
                 "mojo_engine_config: MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS"
@@ -849,4 +863,5 @@ struct EngineConfig(Copyable, Movable):
             serve_backend_target,
             serve_attach_warn_tokens,
             gpu_peak_bandwidth_gbps,
+            build_sha,
         )

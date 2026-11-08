@@ -81,16 +81,20 @@ from serve.factsheet import fact_sheet, fact_sheet_json, scan_model_files
 from serve.history import (
     DEBUG_LEVEL_TRACE,
     MIB_BYTES,
+    ZERO_RECORD_HASH,
     RunRecord,
     append_record,
     bundle_json,
+    compute_record_sha256,
     effective_bandwidth_gbps,
     file_sha256_hex,
     history_json,
+    ids_csv,
     leaderboard_json,
     load_records,
     parse_bundle,
     parse_run_record,
+    record_chain_valid,
     utc_now_seconds,
 )
 from serve.http import (
@@ -177,6 +181,7 @@ struct ServeState(Movable):
     var fingerprint: String
     var fingerprint_note: String
     var model_file_bytes: Int
+    var last_record_sha: String
     var stats: ServeStats
     var ring: DebugRing
     var seq: Int
@@ -201,6 +206,15 @@ struct ServeState(Movable):
             self.model_file_bytes = fact_sheet(config.model_path).file_bytes
         except:
             self.model_file_bytes = 0
+        # Hash chain head (zero-trust gate 3): the last
+        # chained record already on disk, so a restart
+        # continues the chain instead of forking it. The
+        # zero hash when history is empty or pre-chain.
+        self.last_record_sha = String(ZERO_RECORD_HASH)
+        var existing = load_records(config.serve_history_dir)
+        for i in range(len(existing)):
+            if existing[i].record_sha256 != "":
+                self.last_record_sha = existing[i].record_sha256
         self.stats = ServeStats()
         self.ring = DebugRing(config.serve_debug_ring_lines)
         self.seq = 0
@@ -218,6 +232,8 @@ struct GenOutcome(Copyable, Movable):
     var ids: List[Int]
     var prefill_ms: Int
     var decode_ms: Int
+    var prefill_ns: Int
+    var decode_ns: Int
     var decode_steps: Int
     var reserved_mib: Int
     var kv_mib: Int
@@ -227,6 +243,8 @@ struct GenOutcome(Copyable, Movable):
         var ids: List[Int],
         prefill_ms: Int,
         decode_ms: Int,
+        prefill_ns: Int,
+        decode_ns: Int,
         decode_steps: Int,
         reserved_mib: Int,
         kv_mib: Int,
@@ -234,6 +252,8 @@ struct GenOutcome(Copyable, Movable):
         self.ids = ids^
         self.prefill_ms = prefill_ms
         self.decode_ms = decode_ms
+        self.prefill_ns = prefill_ns
+        self.decode_ns = decode_ns
         self.decode_steps = decode_steps
         self.reserved_mib = reserved_mib
         self.kv_mib = kv_mib
@@ -275,6 +295,8 @@ def _generate_timed[M: ForwardModel](
         out^,
         Int((t1 - t0) // 1_000_000),
         Int((t2 - t1) // 1_000_000),
+        Int(t1 - t0),
+        Int(t2 - t1),
         steps,
         reserved_mib,
         kv_mib,
@@ -414,6 +436,22 @@ def _do_chat(
             "bandwidth_pct_of_peak is measured against the"
             " configured GPU peak; this run used the CPU path"
         )
+    # Hash chain (zero-trust gate 3): compute this record's
+    # link at write time, inside the binary, over the build
+    # sha from config, the model fingerprint, the exact
+    # token ids, the nanosecond timings, and the previous
+    # record's hash.
+    var prompt_csv = ids_csv(prompt_ids)
+    var gen_csv = ids_csv(outcome.ids)
+    var rec_sha = compute_record_sha256(
+        st.config.build_sha,
+        st.fingerprint,
+        prompt_csv,
+        gen_csv,
+        outcome.prefill_ns,
+        outcome.decode_ns,
+        st.last_record_sha,
+    )
     # Record the run (amendments: every endpoint run, tagged).
     var rec = RunRecord(
         utc_now_seconds(),
@@ -438,9 +476,17 @@ def _do_chat(
         bandwidth_pct_of_peak=bw_pct,
         has_bandwidth_pct=has_pct,
         bandwidth_note=bw_note,
+        build_sha=st.config.build_sha,
+        prompt_ids_csv=prompt_csv,
+        generated_ids_csv=gen_csv,
+        prefill_ns=outcome.prefill_ns,
+        decode_ns=outcome.decode_ns,
+        prev_record_sha256=st.last_record_sha,
+        record_sha256=rec_sha,
     )
     try:
         append_record(st.config.serve_history_dir, rec)
+        st.last_record_sha = rec_sha
     except e:
         st.note("serve.history", "run record append failed: " + String(e))
     st.note(
@@ -748,6 +794,18 @@ def _do_ingest(mut st: ServeState, body: String) raises -> String:
     for i in range(len(records_raw)):
         try:
             var rec = parse_run_record(records_raw[i], i)
+            # Chain verification before acceptance (gate 3):
+            # a record carrying a hash whose inputs do not
+            # recompute is refused BY NAME and never stored.
+            # Pre-chain records (no hash) land as before and
+            # read back as unverifiable_pre_chain.
+            if rec.record_sha256 != "" and not record_chain_valid(rec):
+                raise Error(
+                    "serve_ingest_tampered_record: record "
+                    + String(i)
+                    + " carries a record_sha256 that does not"
+                    + " recompute from its chain inputs"
+                )
             append_record(st.config.serve_history_dir, rec^)
             accepted += 1
         except e:

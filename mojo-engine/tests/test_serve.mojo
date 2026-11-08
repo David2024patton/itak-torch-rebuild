@@ -25,16 +25,21 @@ from serve.factsheet import (
     model_id_of,
 )
 from serve.history import (
+    ZERO_RECORD_HASH,
     RunRecord,
     bundle_json,
+    chain_statuses,
+    compute_record_sha256,
     effective_bandwidth_gbps,
     file_sha256_hex,
     history_json,
+    ids_csv,
     leaderboard_json,
     load_records,
     parse_bundle,
     parse_run_record,
     prompt_bucket_of,
+    record_chain_valid,
     reference_rows,
     sha256_hex_of_bytes,
     valid_debug_level,
@@ -423,6 +428,143 @@ def test_telemetry_slots_round_trip() raises:
     assert_equal(old.debug_level, "benchmark")
     assert_false(old.has_eff_bandwidth)
     assert_false(old.has_bandwidth_pct)
+
+
+def _chained_record(
+    prev: String, prompt_csv: String, gen_csv: String, dec_ns: Int
+) -> RunRecord:
+    """A record the way serve_main writes one: hash
+    computed at write time over its chain inputs."""
+    var sha = compute_record_sha256(
+        "testbuild", "ab12", prompt_csv, gen_csv, 1000, dec_ns, prev
+    )
+    var atts = List[String]()
+    return RunRecord(
+        1700000000,
+        "dashboard",
+        "M",
+        "ab12",
+        "",
+        "gfx1100 / MAX 26.7",
+        6,
+        200,
+        32.65,
+        4,
+        16739,
+        260,
+        "",
+        atts^,
+        False,
+        "",
+        build_sha="testbuild",
+        prompt_ids_csv=prompt_csv,
+        generated_ids_csv=gen_csv,
+        prefill_ns=1000,
+        decode_ns=dec_ns,
+        prev_record_sha256=prev,
+        record_sha256=sha,
+    )
+
+
+def test_record_hash_chain() raises:
+    assert_equal(ids_csv(List[Int]()), "")
+    var two = List[Int]()
+    two.append(13796)
+    two.append(26)
+    assert_equal(ids_csv(two), "13796,26")
+    # Genesis record: previous is the zero hash; verifies.
+    var r1 = _chained_record(
+        String(ZERO_RECORD_HASH), "1,2,3", "13796,26", 5000
+    )
+    assert_true(record_chain_valid(r1))
+    var j = r1.to_json()
+    assert_true(j.find('"prompt_token_ids":[1,2,3]') != -1)
+    assert_true(j.find('"record_sha256":"') != -1)
+    var back = parse_run_record(j, 0)
+    assert_equal(back.record_sha256, r1.record_sha256)
+    assert_equal(back.prev_record_sha256, String(ZERO_RECORD_HASH))
+    assert_true(record_chain_valid(back))
+    # Second record links to the first; the sequence and
+    # the served history both verify.
+    var r2 = _chained_record(r1.record_sha256, "1,2,3", "1573", 4000)
+    var records = List[RunRecord]()
+    records.append(r1.copy())
+    records.append(r2.copy())
+    var statuses = chain_statuses(records)
+    assert_equal(statuses[0], "verified")
+    assert_equal(statuses[1], "verified")
+    var hj = history_json(records, "", "")
+    assert_true(hj.find('"chain_status":"verified"') != -1)
+    var lj = leaderboard_json(records)
+    assert_true(lj.find('"verified":2') != -1)
+    assert_true(lj.find('"tampered":0') != -1)
+
+
+def test_record_hash_chain_tamper() raises:
+    # A record whose stored hash was computed over OTHER
+    # inputs (decode_ns 5001 vs the stored 5000) does not
+    # recompute: TAMPERED_RECORD.
+    var bad_sha = compute_record_sha256(
+        "testbuild",
+        "ab12",
+        "1,2,3",
+        "13796,26",
+        1000,
+        5001,
+        String(ZERO_RECORD_HASH),
+    )
+    var atts = List[String]()
+    var bad = RunRecord(
+        1700000000,
+        "dashboard",
+        "M",
+        "ab12",
+        "",
+        "gfx1100 / MAX 26.7",
+        6,
+        200,
+        32.65,
+        4,
+        16739,
+        260,
+        "",
+        atts^,
+        False,
+        "",
+        build_sha="testbuild",
+        prompt_ids_csv="1,2,3",
+        generated_ids_csv="13796,26",
+        prefill_ns=1000,
+        decode_ns=5000,
+        prev_record_sha256=String(ZERO_RECORD_HASH),
+        record_sha256=bad_sha,
+    )
+    assert_false(record_chain_valid(bad))
+    var one = List[RunRecord]()
+    one.append(bad.copy())
+    assert_equal(chain_statuses(one)[0], "TAMPERED_RECORD")
+    # A self-consistent record pointing at the wrong
+    # previous hash breaks the LINK: also tampered.
+    var r1 = _chained_record(
+        String(ZERO_RECORD_HASH), "1,2,3", "13796,26", 5000
+    )
+    var orphan = _chained_record(
+        String(ZERO_RECORD_HASH), "1,2,3", "1573", 4000
+    )
+    var pair = List[RunRecord]()
+    pair.append(r1.copy())
+    pair.append(orphan.copy())
+    var st = chain_statuses(pair)
+    assert_equal(st[0], "verified")
+    assert_equal(st[1], "TAMPERED_RECORD")
+    # A pre-chain record is labelled, never silently
+    # verified and never called tampered.
+    var pre = List[RunRecord]()
+    pre.append(_sample_record())
+    assert_equal(chain_statuses(pre)[0], "unverifiable_pre_chain")
+    assert_true(
+        leaderboard_json(pre).find('"unverifiable_pre_chain":1') != -1
+    )
 
 
 def test_peak_bandwidth_config() raises:

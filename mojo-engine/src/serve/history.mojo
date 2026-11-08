@@ -155,6 +155,64 @@ def _opt_float(obj: String, key: String) raises -> Tuple[Float64, Bool]:
         return (Float64(0.0), False)
 
 
+comptime ZERO_RECORD_HASH = (
+    "0000000000000000000000000000000000000000000000000000000000000000"
+)
+
+
+def ids_csv(ids: List[Int]) -> String:
+    """Token ids as one comma-joined string: the run
+    record's stored form for the hash-chain inputs and the
+    exact text the chain hash covers."""
+    var out = String("")
+    for i in range(len(ids)):
+        if i > 0:
+            out += ","
+        out += String(ids[i])
+    return out
+
+
+def csv_of_raw_array(raw: String) -> String:
+    """Inverse of the record's array emission: strip the
+    brackets and spaces from a raw JSON number array,
+    leaving the comma-joined ids."""
+    var out = String("")
+    for b in raw.as_bytes():
+        if b != UInt8(91) and b != UInt8(93) and b != UInt8(32):
+            out += String(chr(Int(b)))
+    return out
+
+
+def compute_record_sha256(
+    build_sha: String,
+    model_fingerprint: String,
+    prompt_ids_csv: String,
+    generated_ids_csv: String,
+    prefill_ns: Int,
+    decode_ns: Int,
+    prev_record_sha256: String,
+) -> String:
+    """The hash-chain link (zero-trust gate 3, 2026-11-08):
+    SHA-256 over the build's git head sha, the model file
+    fingerprint, the prompt and generated token ids, the
+    prefill and decode nanoseconds, and the previous
+    record's hash, pipe-joined in that order. Pure Mojo
+    FIPS 180-4 (this module's own implementation); the
+    genesis record's previous hash is ZERO_RECORD_HASH."""
+    var payload = String("")
+    payload += build_sha + "|"
+    payload += model_fingerprint + "|"
+    payload += prompt_ids_csv + "|"
+    payload += generated_ids_csv + "|"
+    payload += String(prefill_ns) + "|"
+    payload += String(decode_ns) + "|"
+    payload += prev_record_sha256
+    var bytes = List[UInt8]()
+    for b in payload.as_bytes():
+        bytes.append(b)
+    return sha256_hex_of_bytes(bytes)
+
+
 struct RunRecord(Copyable, Movable):
     var timestamp: Int
     var source: String
@@ -200,6 +258,19 @@ struct RunRecord(Copyable, Movable):
     var op_host_device_sync_ms: Float64
     var has_op_timings: Bool
     var op_timings_note: String
+    # -- Hash-chain slots (zero-trust gate 3, 2026-11-08).
+    # The chain inputs ride the record so any reader can
+    # recompute the link: build provenance (git head sha
+    # supplied through config), the exact token ids, the
+    # nanosecond timings, the previous link, and this
+    # record's own hash.
+    var build_sha: String
+    var prompt_ids_csv: String
+    var generated_ids_csv: String
+    var prefill_ns: Int
+    var decode_ns: Int
+    var prev_record_sha256: String
+    var record_sha256: String
 
     def __init__(
         out self,
@@ -240,6 +311,13 @@ struct RunRecord(Copyable, Movable):
         op_host_device_sync_ms: Float64 = 0.0,
         has_op_timings: Bool = False,
         op_timings_note: String = OP_TIMINGS_NOTE,
+        build_sha: String = "",
+        prompt_ids_csv: String = "",
+        generated_ids_csv: String = "",
+        prefill_ns: Int = 0,
+        decode_ns: Int = 0,
+        prev_record_sha256: String = "",
+        record_sha256: String = "",
     ):
         self.timestamp = timestamp
         self.source = source
@@ -287,6 +365,13 @@ struct RunRecord(Copyable, Movable):
         self.op_host_device_sync_ms = op_host_device_sync_ms
         self.has_op_timings = has_op_timings
         self.op_timings_note = op_timings_note
+        self.build_sha = build_sha
+        self.prompt_ids_csv = prompt_ids_csv
+        self.generated_ids_csv = generated_ids_csv
+        self.prefill_ns = prefill_ns
+        self.decode_ns = decode_ns
+        self.prev_record_sha256 = prev_record_sha256
+        self.record_sha256 = record_sha256
 
     def to_json(self) -> String:
         var out = String("{")
@@ -386,8 +471,59 @@ struct RunRecord(Copyable, Movable):
         )
         out += "}"
         out += ',"op_timings_note":"' + json_escape(self.op_timings_note) + '"'
+        out += ',"build_sha":"' + json_escape(self.build_sha) + '"'
+        out += ',"prompt_token_ids":[' + self.prompt_ids_csv + "]"
+        out += ',"generated_token_ids":[' + self.generated_ids_csv + "]"
+        out += ',"prefill_ns":' + String(self.prefill_ns)
+        out += ',"decode_ns":' + String(self.decode_ns)
+        out += ',"prev_record_sha256":"' + json_escape(
+            self.prev_record_sha256
+        ) + '"'
+        out += ',"record_sha256":"' + json_escape(self.record_sha256) + '"'
         out += "}"
         return out
+
+
+def record_chain_valid(rec: RunRecord) -> Bool:
+    """Self-consistency of one chained record: the stored
+    hash recomputes exactly from the record's own chain
+    inputs. Pre-chain records (no hash) are not valid or
+    invalid here; chain_statuses labels them."""
+    if rec.record_sha256 == "":
+        return False
+    return rec.record_sha256 == compute_record_sha256(
+        rec.build_sha,
+        rec.model_fingerprint,
+        rec.prompt_ids_csv,
+        rec.generated_ids_csv,
+        rec.prefill_ns,
+        rec.decode_ns,
+        rec.prev_record_sha256,
+    )
+
+
+def chain_statuses(records: List[RunRecord]) -> List[String]:
+    """Per-record chain verdicts over a history sequence,
+    in order: "verified", "TAMPERED_RECORD" (recompute
+    failed or the link to the previous chained record is
+    broken), or "unverifiable_pre_chain" (the record
+    predates the chain and carries no hash). The expected
+    previous hash tracks the last chained record, mirroring
+    the writer: a pre-chain record does not break the
+    chain, it just is not part of it."""
+    var out = List[String]()
+    var expected_prev = String(ZERO_RECORD_HASH)
+    for i in range(len(records)):
+        ref rec = records[i]
+        if rec.record_sha256 == "":
+            out.append(String("unverifiable_pre_chain"))
+            continue
+        if not record_chain_valid(rec) or rec.prev_record_sha256 != expected_prev:
+            out.append(String("TAMPERED_RECORD"))
+        else:
+            out.append(String("verified"))
+        expected_prev = rec.record_sha256
+    return out^
 
 
 def _req_string(obj: String, key: String, idx: Int) raises -> String:
@@ -520,6 +656,29 @@ def parse_run_record(obj: String, idx: Int) raises -> RunRecord:
     var op_note = String(OP_TIMINGS_NOTE)
     if has_json_key(obj, "op_timings_note"):
         op_note = json_string_field(obj, "op_timings_note")
+    # Hash-chain slots are OPTIONAL on ingest too: pre-chain
+    # records carry none and land as unverifiable_pre_chain.
+    var c_build = String("")
+    var c_prompt = String("")
+    var c_gen = String("")
+    var c_pre_ns = 0
+    var c_dec_ns = 0
+    var c_prev = String("")
+    var c_sha = String("")
+    if has_json_key(obj, "build_sha"):
+        c_build = json_string_field(obj, "build_sha")
+    if has_json_key(obj, "prompt_token_ids"):
+        c_prompt = csv_of_raw_array(json_raw_field(obj, "prompt_token_ids"))
+    if has_json_key(obj, "generated_token_ids"):
+        c_gen = csv_of_raw_array(json_raw_field(obj, "generated_token_ids"))
+    if has_json_key(obj, "prefill_ns"):
+        c_pre_ns = json_int_field(obj, "prefill_ns", 0)
+    if has_json_key(obj, "decode_ns"):
+        c_dec_ns = json_int_field(obj, "decode_ns", 0)
+    if has_json_key(obj, "prev_record_sha256"):
+        c_prev = json_string_field(obj, "prev_record_sha256")
+    if has_json_key(obj, "record_sha256"):
+        c_sha = json_string_field(obj, "record_sha256")
     # Imported records keep their origin backend for
     # attribution; the origin IS the record's backend_target.
     return RunRecord(
@@ -560,6 +719,13 @@ def parse_run_record(obj: String, idx: Int) raises -> RunRecord:
         op_host_device_sync_ms=op_sync[0],
         has_op_timings=has_ops,
         op_timings_note=op_note,
+        build_sha=c_build,
+        prompt_ids_csv=c_prompt,
+        generated_ids_csv=c_gen,
+        prefill_ns=c_pre_ns,
+        decode_ns=c_dec_ns,
+        prev_record_sha256=c_prev,
+        record_sha256=c_sha,
     )
 
 
@@ -671,6 +837,10 @@ def append_record(dir_path: String, rec: RunRecord) raises:
 def history_json(
     records: List[RunRecord], source_filter: String, model_filter: String
 ) -> String:
+    # Chain verdicts are computed over the FULL sequence
+    # (linkage is positional), then stamped onto each shown
+    # record as "chain_status" (zero-trust gate 3).
+    var statuses = chain_statuses(records)
     var out = String('{"count":')
     var shown = List[String]()
     for i in range(len(records)):
@@ -678,7 +848,12 @@ def history_json(
             continue
         if model_filter != "" and records[i].model != model_filter:
             continue
-        shown.append(records[i].to_json())
+        var j = records[i].to_json()
+        # to_json always ends with the closing brace; the
+        # status rides inside the object.
+        var stamped = String(j.as_bytes()[: j.byte_length() - 1])
+        stamped += ',"chain_status":"' + statuses[i] + '"}'
+        shown.append(stamped)
     out += String(len(shown))
     out += ',"runs":['
     for i in range(len(shown)):
@@ -839,7 +1014,26 @@ def leaderboard_json(records: List[RunRecord]) -> String:
             out += ","
         first = False
         out += _row_json(refs[i])
-    out += "]}"
+    out += "]"
+    # Chain summary (zero-trust gate 3): the leaderboard
+    # verifies the loaded history's chain and reports the
+    # counts; per-record TAMPERED_RECORD flags ride
+    # /history's chain_status.
+    var statuses = chain_statuses(records)
+    var n_verified = 0
+    var n_tampered = 0
+    var n_pre = 0
+    for i in range(len(statuses)):
+        if statuses[i] == "verified":
+            n_verified += 1
+        elif statuses[i] == "TAMPERED_RECORD":
+            n_tampered += 1
+        else:
+            n_pre += 1
+    out += ',"chain":{"verified":' + String(n_verified)
+    out += ',"tampered":' + String(n_tampered)
+    out += ',"unverifiable_pre_chain":' + String(n_pre) + "}"
+    out += "}"
     return out
 
 

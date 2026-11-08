@@ -41,6 +41,12 @@
 #
 # logits() is C2's gpu_logits over the resident head weights.
 #
+# Wave D (Lane D1): prefill() / prefill_batch() add the
+# batched GEMM prefill path (projections via
+# src/kernels/gemm.mojo through gpu_layer_step_batch);
+# step() and logits() - the decode path - are untouched, and
+# prefill returns the same last hidden row step() would.
+#
 # Named refusals: gpu_model_bad_token (token outside vocab,
 # checked before any device work, mirroring
 # model_bad_token), gpu_model_bad_shape (hidden row width at
@@ -49,13 +55,18 @@
 # gpu_budget_exceeded, gpu_kv_window_wrapped, ...), propagated
 # untouched. Diag seam: phase `model`, model.mojo's phase.
 
-from config import DEFAULT_GPU_BUDGET_BYTES
+from config import (
+    DEFAULT_GEMM_TILED_MIN_BATCH,
+    DEFAULT_GPU_BUDGET_BYTES,
+    DEFAULT_PREFILL_GEMM_MIN_BATCH,
+)
 from diag import log_debug
 from generate.generate import ForwardModel
 from gpu.context import GpuRuntime, download_f32, upload_f32
 from gpu.device_kv import DeviceKvCache
 from gpu.weights import DeviceWeights
 from model.gpu_layer import gpu_layer_step, gpu_logits
+from model.gpu_layer_batch import gpu_layer_step_batch, batch_row_slice
 from model.model import GlimmerModel
 from ops.gpu_embedding import gpu_embed_token
 from ops.rms_norm import RMS_THREADS, rms_norm_kernel
@@ -72,13 +83,25 @@ struct GpuGlimmerModel(ForwardModel, Movable):
     var rt: GpuRuntime
     var weights: DeviceWeights
     var kv: DeviceKvCache
+    var prefill_gemm_min_batch: Int
+    var gemm_tiled_min_batch: Int
 
     def __init__(
         out self,
         var cpu_model: GlimmerModel,
         context_len: Int,
         budget_bytes: Int,
+        prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
+        gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
     ) raises:
+        if prefill_gemm_min_batch <= 0 or gemm_tiled_min_batch <= 0:
+            raise Error(
+                "gpu_model_bad_shape: prefill GEMM batch thresholds must"
+                " be positive, got "
+                + String(prefill_gemm_min_batch)
+                + "/"
+                + String(gemm_tiled_min_batch)
+            )
         # Build the device trio from the borrowed CPU model
         # BEFORE it moves into the struct: weights upload from
         # its cached bytes, the KV cache from its layer pattern
@@ -96,6 +119,8 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.rt = rt^
         self.weights = weights^
         self.kv = kv^
+        self.prefill_gemm_min_batch = prefill_gemm_min_batch
+        self.gemm_tiled_min_batch = gemm_tiled_min_batch
         _ = log_debug(
             "model",
             "gpu model built layers="
@@ -108,15 +133,29 @@ struct GpuGlimmerModel(ForwardModel, Movable):
 
     @staticmethod
     def open(
-        path: String, context_len: Int, budget_bytes: Int
+        path: String,
+        context_len: Int,
+        budget_bytes: Int,
+        prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
+        gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
     ) raises -> GpuGlimmerModel:
         """Open the CPU model at path (loader of record) and
         build the device model over it under the given budget
         cap (callers hand in EngineConfig.gpu_budget_bytes, so
         MOJO_ENGINE_GPU_BUDGET_BYTES is honored end to end).
-        Mirrors GlimmerModel.open's shape."""
+        The GEMM batch thresholds default from config.mojo;
+        the runner hands in EngineConfig's values so the
+        MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH /
+        MOJO_ENGINE_GEMM_TILED_MIN_BATCH overrides are honored
+        end to end. Mirrors GlimmerModel.open's shape."""
         var cpu_model = GlimmerModel.open(path)
-        return GpuGlimmerModel(cpu_model^, context_len, budget_bytes)
+        return GpuGlimmerModel(
+            cpu_model^,
+            context_len,
+            budget_bytes,
+            prefill_gemm_min_batch,
+            gemm_tiled_min_batch,
+        )
 
     def _plain_rms_norm(
         mut self, x: List[Float32], eps: Float32
@@ -205,14 +244,122 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             )
         return gpu_logits(self.rt, self.weights, self.cpu, hidden)
 
-    def forward_rows(mut self, tokens: List[Int]) raises -> List[Float32]:
-        """The step loop over a token list starting at layer
-        0's next device-cache position; returns the LAST hidden
-        row. The GPU twin of GlimmerModel.forward_rows, present
-        so the runner's prefill-measurement construction keeps
-        the identical shape on both paths."""
-        var pos = self.kv.next_position(0)
-        var hidden = List[Float32]()
-        for i in range(len(tokens)):
-            hidden = self.step(tokens[i], pos + i)
+    def _plain_rms_norm_batch(
+        mut self, x: List[Float32], batch: Int, eps: Float32
+    ) raises -> List[Float32]:
+        """The embedding norm over a flat batch: rms_norm_kernel
+        with a ones weight row, grid = batch rows. The batched
+        twin of _plain_rms_norm (same arithmetic per row)."""
+        var cfg = self.cpu.cfg.copy()
+        var n = cfg.hidden
+        if len(x) != batch * n or batch <= 0:
+            raise Error(
+                "gpu_model_bad_shape: embedding norm batch has "
+                + String(len(x))
+                + " elements, expected "
+                + String(batch * n)
+            )
+        var ones = List[Float32](capacity=n)
+        ones.resize(n, Float32(1.0))
+        var x_dev = upload_f32(self.rt, x)
+        var w_dev = upload_f32(self.rt, ones)
+        var y_dev = self.rt.ctx.enqueue_create_buffer[DType.float32](len(x))
+        self.rt.ctx.enqueue_function[rms_norm_kernel](
+            x_dev, w_dev, y_dev, Int32(n), eps,
+            grid_dim=batch, block_dim=RMS_THREADS,
+        )
+        self.rt.ctx.synchronize()
+        return download_f32(self.rt, y_dev, len(x))
+
+    def prefill_batch(
+        mut self, tokens: List[Int], start_position: Int
+    ) raises -> List[Float32]:
+        """Batched prefill (Wave D, Lane D1): the whole prompt
+        through the stack with GEMM projections, returning the
+        LAST hidden row. Per-position semantics are
+        gpu_layer_step's, batched by gpu_layer_step_batch:
+        embeddings gathered per token (the gather has no
+        projection to batch), the plain embedding norm as one
+        launch over the flat batch, then one batched layer
+        step per layer. Token/position validation matches
+        step()'s refusals, checked for the whole batch before
+        any device work."""
+        var cfg = self.cpu.cfg.copy()
+        var batch = len(tokens)
+        if batch == 0:
+            raise Error("gpu_model_bad_shape: prefill batch is empty")
+        if start_position < 0:
+            raise Error(
+                "gpu_model_bad_shape: negative start position "
+                + String(start_position)
+            )
+        for i in range(batch):
+            if tokens[i] < 0 or tokens[i] >= cfg.vocab:
+                raise Error(
+                    "gpu_model_bad_token: token id "
+                    + String(tokens[i])
+                    + " outside vocab "
+                    + String(cfg.vocab)
+                )
+        var x = List[Float32](capacity=batch * cfg.hidden)
+        x.resize(batch * cfg.hidden, Float32(0.0))
+        for i in range(batch):
+            var row = gpu_embed_token(self.rt, self.weights, tokens[i])
+            for j in range(cfg.hidden):
+                x[i * cfg.hidden + j] = row[j]
+        x = self._plain_rms_norm_batch(x, batch, cfg.rms_eps)
+        if self.cpu.capture_enabled:
+            self.cpu.capture_embed = batch_row_slice(
+                x, batch - 1, cfg.hidden
+            )
+        for layer in range(cfg.layers):
+            x = gpu_layer_step_batch(
+                self.rt,
+                self.weights,
+                self.kv,
+                self.cpu,
+                x,
+                batch,
+                layer,
+                start_position,
+                self.gemm_tiled_min_batch,
+            )
+        _ = log_debug(
+            "model",
+            "gpu prefill_batch tokens="
+            + String(batch)
+            + " start="
+            + String(start_position),
+        )
+        return batch_row_slice(x, batch - 1, cfg.hidden)
+
+    def prefill(
+        mut self, prompt_ids: List[Int]
+    ) raises -> List[Float32]:
+        """The ForwardModel prefill seam (Wave D): at or above
+        the configured GEMM minimum batch, the batched GEMM
+        path from the cache's next position; below it, the
+        trait default's step loop from position 0 - which for
+        a fresh model (generate()'s construction, the only
+        caller that mixes prefill with decode steps) is the
+        same start the batched path takes. Returns the last
+        hidden row either way."""
+        if len(prompt_ids) >= self.prefill_gemm_min_batch:
+            var pos = self.kv.next_position(0)
+            return self.prefill_batch(prompt_ids, pos)
+        var hidden = self.step(prompt_ids[0], 0)
+        for i in range(1, len(prompt_ids)):
+            hidden = self.step(prompt_ids[i], i)
         return hidden^
+
+    def forward_rows(mut self, tokens: List[Int]) raises -> List[Float32]:
+        """The token list from layer 0's next device-cache
+        position; returns the LAST hidden row. The GPU twin of
+        GlimmerModel.forward_rows, present so the runner's
+        prefill-measurement construction keeps the identical
+        shape on both paths. Wave D: this IS the prefill seam
+        (prefill() above) - the measurement now times the
+        batched path, and the Wave C per-row path remains
+        reachable by raising MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH
+        above the prompt length."""
+        return self.prefill(tokens)

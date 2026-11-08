@@ -26,8 +26,8 @@ RULES:
 An inference engine and serving platform rebuilt the way it should have been built the first time: a Rust core where the garbage collector cannot reach, the Go platform kept where Go is strongest, designed from the start for huge models on small hardware.
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-brightgreen)
-![Languages](https://img.shields.io/badge/languages-Rust%20%2B%20Go-orange)
-![Status](https://img.shields.io/badge/status-built%2C%20under%20review-blue)
+![Languages](https://img.shields.io/badge/languages-Rust%20%2B%20Go%20%2B%20Mojo-orange)
+![Status](https://img.shields.io/badge/status-do%20not%20ship%20(panel%202026--11--07)%2C%20fixes%20landing-red)
 
 </div>
 
@@ -99,7 +99,7 @@ Full map with links traced both ways: [docs/MAP.md](docs/MAP.md). Still designed
 
 ## Status
 
-The engine and platform exist and serve. The serving path today is the CPU reference backend behind the platform; the GPU-resident forward, the GPU speculative loop, and the prefix-KV store are proven on the card, not yet wired into the serving engine. The first double critic panel graded this tree DO NOT SHIP and its three fix waves landed in full; a second cold panel on 2026-11-07 graded the grown tree DO NOT SHIP again (83 findings, no criticals, the numeric core verified clean), and its safety, socket, platform-answer, proof-tool, and diagnostics fixes have landed, with the remaining categories and the card confirmation at the new shipped defaults (cooperative-matrix MMQ and split-K on) still ahead. No claim in this repo outruns its proof note. Detail: [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
+The engine and platform exist and serve. The serving path today is the CPU reference backend behind the platform; the GPU-resident forward, the GPU speculative loop, and the prefix-KV store are proven on the card, not yet wired into the serving engine. Two cold critic panels graded this tree DO NOT SHIP (2026-10-31 and 2026-11-07); every seat on both panels verified the numeric core clean, and every blocker sat at the serving boundary or in the written record (records: the panel entries in [STATUS.md](STATUS.md); the 2026-11-07 panel's merge report, CRITIC-ENGINE-MERGE.md). The first panel's three fix waves landed in full. The second panel's safety, socket, platform-answer, proof-tool, and diagnostics fixes landed the same day; its remaining categories (speculative-session desync, sampler and config validation, gate skip accounting, smaller robustness items) are still open in TODO.md. The card confirmation at the shipped defaults (cooperative-matrix MMQ and split-K on) has since run, on 2026-11-07: identity and golden legs passed at literally unset env, the combined prefill wall was measured at both prompt shapes, and the run's gate leg surfaced one test-binary environment race that is carried as a follow-up fix (bench/wave21-session-2026-11-07.md). Separately, the Mojo/MAX engine living on this branch (mojo-engine/) has since reached token-exact greedy parity at 19.35 tok/s decode (bench/mojo-engine-wave-d-2026-11-08.md). No claim in this repo outruns its proof note. Detail: [STATUS.md](STATUS.md) and [TODO.md](TODO.md).
 
 ## License
 

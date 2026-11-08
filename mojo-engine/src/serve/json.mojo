@@ -259,6 +259,183 @@ def json_int_field(body: String, key: String, default: Int) raises -> Int:
     return -value if neg else value
 
 
+def json_float_field(body: String, key: String, default: Float64) raises -> Float64:
+    """The numeric value of a field (integer or float form),
+    or `default` when absent. Used for run-record fields a
+    foreign bench may write either way (tok/s figures)."""
+    var at = _key_value_start(body, key)
+    if at == -1:
+        return default
+    var bytes = body.as_bytes()
+    var i = _skip_ws(body, at)
+    var start = i
+    if i < len(bytes) and bytes[i] == 45:
+        i += 1
+    var saw_digit = False
+    while i < len(bytes) and (
+        (48 <= Int(bytes[i]) and Int(bytes[i]) <= 57)
+        or bytes[i] == 46
+        or bytes[i] == 101
+        or bytes[i] == 69
+        or bytes[i] == 43
+        or bytes[i] == 45
+    ):
+        if 48 <= Int(bytes[i]) and Int(bytes[i]) <= 57:
+            saw_digit = True
+        i += 1
+    if not saw_digit:
+        raise Error("serve_bad_json: field '" + key + "' is not a number")
+    var text = String(body[byte=start:i])
+    try:
+        return Float64(text)
+    except:
+        raise Error("serve_bad_json: field '" + key + "' is not a number")
+
+
+def json_bool_field(body: String, key: String, default: Bool) raises -> Bool:
+    var at = _key_value_start(body, key)
+    if at == -1:
+        return default
+    var i = _skip_ws(body, at)
+    if body[byte=i : i + 4] == "true":
+        return True
+    if body[byte=i : i + 5] == "false":
+        return False
+    raise Error("serve_bad_json: field '" + key + "' is not a boolean")
+
+
+def json_raw_field(body: String, key: String) raises -> String:
+    """The raw JSON text of a field's value ("" when absent):
+    how an array/object field (sampler, attachments, rows) is
+    lifted out of a record for a dedicated sub-parse."""
+    var at = _key_value_start(body, key)
+    if at == -1:
+        return String("")
+    var bytes = body.as_bytes()
+    var i = _skip_ws(body, at)
+    var start = i
+    if i >= len(bytes):
+        raise Error("serve_bad_json: field '" + key + "' has no value")
+    var b = bytes[i]
+    if b == 34:  # string
+        var parsed = parse_json_string_at(body, i)
+        return String(body[byte=start : parsed[1]])
+    if b == 91 or b == 123:  # [ or {
+        var open_c = b
+        var close_c = UInt8(93) if b == 91 else UInt8(125)
+        var depth = 0
+        var in_str = False
+        var esc = False
+        while i < len(bytes):
+            var c = bytes[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == 92:
+                    esc = True
+                elif c == 34:
+                    in_str = False
+            else:
+                if c == 34:
+                    in_str = True
+                elif c == open_c:
+                    depth += 1
+                elif c == close_c:
+                    depth -= 1
+                    if depth == 0:
+                        return String(body[byte=start : i + 1])
+            i += 1
+        raise Error("serve_bad_json: field '" + key + "' value is unbalanced")
+    # scalar: up to the next comma or closing brace at this level
+    while i < len(bytes) and bytes[i] != 44 and bytes[i] != 125:
+        i += 1
+    return String(body[byte=start:i])
+
+
+def json_string_array_field(body: String, key: String) raises -> List[String]:
+    """A string array field's values ([] when absent)."""
+    var out = List[String]()
+    var raw = json_raw_field(body, key)
+    if raw == "":
+        return out^
+    var bytes = raw.as_bytes()
+    var i = 0
+    while i < len(bytes):
+        if bytes[i] == 34:
+            var parsed = parse_json_string_at(raw, i)
+            out.append(parsed[0])
+            i = parsed[1]
+        else:
+            i += 1
+    return out^
+
+
+def split_json_array(raw: String) raises -> List[String]:
+    """Split a top-level JSON array text into its element
+    texts (objects, arrays, scalars), honoring strings and
+    nesting. Refuses serve_bad_json when the text is not a
+    single array."""
+    var out = List[String]()
+    var bytes = raw.as_bytes()
+    var i = _skip_ws(raw, 0)
+    if i >= len(bytes) or bytes[i] != 91:
+        raise Error("serve_bad_json: expected a JSON array")
+    i += 1
+    i = _skip_ws(raw, i)
+    if i < len(bytes) and bytes[i] == 93:
+        return out^
+    while i < len(bytes):
+        var start = i
+        var c = bytes[i]
+        if c == 34:
+            var parsed = parse_json_string_at(raw, i)
+            out.append(String(raw[byte=start : parsed[1]]))
+            i = parsed[1]
+        elif c == 123 or c == 91:
+            var stack = List[UInt8]()
+            stack.append(c)
+            i += 1
+            var in_str = False
+            var esc = False
+            while i < len(bytes) and len(stack) > 0:
+                var cc = bytes[i]
+                if in_str:
+                    if esc:
+                        esc = False
+                    elif cc == 92:
+                        esc = True
+                    elif cc == 34:
+                        in_str = False
+                else:
+                    if cc == 34:
+                        in_str = True
+                    elif cc == 123 or cc == 91:
+                        stack.append(cc)
+                    elif cc == 125 or cc == 93:
+                        var want = UInt8(123) if cc == 125 else UInt8(91)
+                        if stack[len(stack) - 1] != want:
+                            raise Error(
+                                "serve_bad_json: mismatched brackets in array"
+                            )
+                        _ = stack.pop()
+                i += 1
+            if len(stack) > 0:
+                raise Error("serve_bad_json: unbalanced element in array")
+            out.append(String(raw[byte=start:i]))
+        else:
+            while i < len(bytes) and bytes[i] != 44 and bytes[i] != 93:
+                i += 1
+            out.append(String(raw[byte=start:i]))
+        i = _skip_ws(raw, i)
+        if i < len(bytes) and bytes[i] == 44:
+            i = _skip_ws(raw, i + 1)
+            continue
+        if i < len(bytes) and bytes[i] == 93:
+            return out^
+        raise Error("serve_bad_json: array element not followed by , or ]")
+    raise Error("serve_bad_json: unterminated JSON array")
+
+
 def json_content_strings(body: String) raises -> List[String]:
     """Every `"content": "..."` string value in order.
 

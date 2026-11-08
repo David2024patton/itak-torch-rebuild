@@ -142,6 +142,25 @@ comptime DEFAULT_SERVE_DEFAULT_MAX_TOKENS = 64
 comptime DEFAULT_SERVE_MAX_TOKENS = 512
 comptime DEFAULT_SERVE_DEBUG_RING_LINES = 200
 comptime DEFAULT_SERVE_MAX_CONTEXT_BYTES = 32768
+# History / fact-sheet / fingerprint knobs (amendments,
+# David 2026-11-08): history persists as JSON lines under
+# serve_history_dir (relative paths are under the process
+# working directory, which is mojo-engine/ in the bench
+# harness); the fact sheet registry dir is scanned for
+# *.gguf files whose fact sheets /models serves (the served
+# model is always listed first, read from its own file).
+# backend_target is a config STRING on purpose: the chip +
+# runtime the measurements were taken on is an operator fact
+# (gfx1100 / MAX 26.7 on David's card, an sm_XX / MAX string
+# on Chris's), recorded onto every run record, never guessed
+# or probed. attach_warn_tokens is the dashboard's client-side
+# archive budget pre-check threshold (Piece 3 guardrail): the
+# page enforces it, the value is published so the page and the
+# operator agree on one number.
+comptime DEFAULT_SERVE_HISTORY_DIR = "serve_history"
+comptime DEFAULT_SERVE_MODELS_DIR = "/mnt/models"
+comptime DEFAULT_SERVE_BACKEND_TARGET = "gfx1100 / MAX 26.7"
+comptime DEFAULT_SERVE_ATTACH_WARN_TOKENS = 4096
 
 
 def parse_context_len(raw: String) raises -> Int:
@@ -362,6 +381,36 @@ def parse_serve_max_context_bytes(raw: String) raises -> Int:
     return _parse_positive(raw, "MOJO_ENGINE_SERVE_MAX_CONTEXT_BYTES")
 
 
+def parse_serve_attach_warn_tokens(raw: String) raises -> Int:
+    """MOJO_ENGINE_SERVE_ATTACH_WARN_TOKENS: the dashboard's
+    client-side token-budget pre-check threshold for archive /
+    document context (Piece 3 guardrail, amendments)."""
+    return _parse_positive(raw, "MOJO_ENGINE_SERVE_ATTACH_WARN_TOKENS")
+
+
+def parse_serve_dir(raw: String, env_name: String) raises -> String:
+    """A directory path knob (history dir, models dir): any
+    non-empty path is accepted as text; existence is checked
+    by the consumer at use time with its own named refusal."""
+    if raw == "":
+        raise Error(
+            "mojo_engine_config: " + env_name + " must not be empty"
+        )
+    return raw
+
+
+def parse_serve_backend_target(raw: String) raises -> String:
+    """MOJO_ENGINE_SERVE_BACKEND_TARGET: the chip + runtime
+    string stamped onto every run record (an operator fact,
+    never probed)."""
+    if raw == "":
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_SERVE_BACKEND_TARGET"
+            " must not be empty"
+        )
+    return raw
+
+
 def parse_serve_host(raw: String) raises -> String:
     """MOJO_ENGINE_SERVE_HOST: dotted-quad IPv4 only (v1)."""
     _ = parse_ipv4(raw)
@@ -498,6 +547,10 @@ struct EngineConfig(Copyable, Movable):
     var serve_max_tokens: Int
     var serve_debug_ring_lines: Int
     var serve_max_context_bytes: Int
+    var serve_history_dir: String
+    var serve_models_dir: String
+    var serve_backend_target: String
+    var serve_attach_warn_tokens: Int
 
     def __init__(
         out self,
@@ -526,6 +579,10 @@ struct EngineConfig(Copyable, Movable):
         serve_max_tokens: Int = DEFAULT_SERVE_MAX_TOKENS,
         serve_debug_ring_lines: Int = DEFAULT_SERVE_DEBUG_RING_LINES,
         serve_max_context_bytes: Int = DEFAULT_SERVE_MAX_CONTEXT_BYTES,
+        serve_history_dir: String = DEFAULT_SERVE_HISTORY_DIR,
+        serve_models_dir: String = DEFAULT_SERVE_MODELS_DIR,
+        serve_backend_target: String = DEFAULT_SERVE_BACKEND_TARGET,
+        serve_attach_warn_tokens: Int = DEFAULT_SERVE_ATTACH_WARN_TOKENS,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -552,6 +609,10 @@ struct EngineConfig(Copyable, Movable):
         self.serve_max_tokens = serve_max_tokens
         self.serve_debug_ring_lines = serve_debug_ring_lines
         self.serve_max_context_bytes = serve_max_context_bytes
+        self.serve_history_dir = serve_history_dir
+        self.serve_models_dir = serve_models_dir
+        self.serve_backend_target = serve_backend_target
+        self.serve_attach_warn_tokens = serve_attach_warn_tokens
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -677,6 +738,30 @@ struct EngineConfig(Copyable, Movable):
                 raw_ctx_bytes
             )
 
+        var serve_history_dir = DEFAULT_SERVE_HISTORY_DIR
+        var raw_hist = getenv("MOJO_ENGINE_SERVE_HISTORY_DIR")
+        if raw_hist != "":
+            serve_history_dir = parse_serve_dir(
+                raw_hist, "MOJO_ENGINE_SERVE_HISTORY_DIR"
+            )
+
+        var serve_models_dir = DEFAULT_SERVE_MODELS_DIR
+        var raw_models = getenv("MOJO_ENGINE_SERVE_MODELS_DIR")
+        if raw_models != "":
+            serve_models_dir = parse_serve_dir(
+                raw_models, "MOJO_ENGINE_SERVE_MODELS_DIR"
+            )
+
+        var serve_backend_target = DEFAULT_SERVE_BACKEND_TARGET
+        var raw_backend = getenv("MOJO_ENGINE_SERVE_BACKEND_TARGET")
+        if raw_backend != "":
+            serve_backend_target = parse_serve_backend_target(raw_backend)
+
+        var serve_attach_warn_tokens = DEFAULT_SERVE_ATTACH_WARN_TOKENS
+        var raw_warn = getenv("MOJO_ENGINE_SERVE_ATTACH_WARN_TOKENS")
+        if raw_warn != "":
+            serve_attach_warn_tokens = parse_serve_attach_warn_tokens(raw_warn)
+
         if serve_default_max_tokens > serve_max_tokens:
             raise Error(
                 "mojo_engine_config: MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS"
@@ -709,4 +794,8 @@ struct EngineConfig(Copyable, Movable):
             serve_max_tokens,
             serve_debug_ring_lines,
             serve_max_context_bytes,
+            serve_history_dir,
+            serve_models_dir,
+            serve_backend_target,
+            serve_attach_warn_tokens,
         )

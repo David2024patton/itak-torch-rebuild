@@ -26,11 +26,17 @@ comptime ROUTE_MCP_TOOLS = 9
 comptime ROUTE_MCP_CALL = 10
 comptime ROUTE_MCP = 11
 comptime ROUTE_ATTACHMENT = 12
+comptime ROUTE_HISTORY = 13
+comptime ROUTE_HISTORY_EXPORT = 14
+comptime ROUTE_LEADERBOARD = 15
+comptime ROUTE_RUNS_INGEST = 16
+comptime ROUTE_MODEL_DETAIL = 17
 
 
 struct HttpRequest(Copyable, Movable):
     var method: String
     var path: String
+    var query: String
     var body: String
     var content_length: Int
 
@@ -38,11 +44,13 @@ struct HttpRequest(Copyable, Movable):
         out self,
         method: String,
         path: String,
+        query: String,
         body: String,
         content_length: Int,
     ):
         self.method = method
         self.path = path
+        self.query = query
         self.body = body
         self.content_length = content_length
 
@@ -118,12 +126,32 @@ def parse_http_request(raw: String) raises -> HttpRequest:
     var target = _slice(line, sp1 + 1, sp2)
     if not _slice(line, sp2 + 1, line.byte_length()).startswith("HTTP/"):
         raise Error("serve_http_bad_request: request line has no HTTP version")
-    # Strip any query string: routing is by path alone.
+    # Routing is by path; the query string rides along for
+    # the handlers that filter (/history?source=&model=).
     var q = _find_substring(target, "?", 0)
     var path = target if q == -1 else _slice(target, 0, q)
+    var query = String("") if q == -1 else _slice(target, q + 1, target.byte_length())
     var clen = header_content_length(raw)
     var body = _slice(raw, hend, raw.byte_length())
-    return HttpRequest(method, path, body, clen)
+    return HttpRequest(method, path, query, body, clen)
+
+
+def query_param(query: String, key: String) -> String:
+    """One query parameter's raw value ("" when absent; no
+    percent-decoding in v1 - filters are plain ASCII tags)."""
+    var needle = key + "="
+    var from_idx = 0
+    while True:
+        var at = _find_substring(query, needle, from_idx)
+        if at == -1:
+            return String("")
+        if at == 0 or query.as_bytes()[at - 1] == 38:  # '&'
+            var start = at + needle.byte_length()
+            var end = _find_substring(query, "&", start)
+            if end == -1:
+                end = query.byte_length()
+            return _slice(query, start, end)
+        from_idx = at + 1
 
 
 def route_request(method: String, path: String) -> Int:
@@ -134,6 +162,25 @@ def route_request(method: String, path: String) -> Int:
         return ROUTE_HEALTH if method == "GET" else ROUTE_METHOD_NOT_ALLOWED
     if path == "/v1/models":
         return ROUTE_MODELS if method == "GET" else ROUTE_METHOD_NOT_ALLOWED
+    if path.startswith("/v1/models/") and path.byte_length() > 11:
+        return (
+            ROUTE_MODEL_DETAIL if method == "GET" else ROUTE_METHOD_NOT_ALLOWED
+        )
+    if path == "/history":
+        return ROUTE_HISTORY if method == "GET" else ROUTE_METHOD_NOT_ALLOWED
+    if path == "/history/export":
+        return (
+            ROUTE_HISTORY_EXPORT if method == "GET"
+            else ROUTE_METHOD_NOT_ALLOWED
+        )
+    if path == "/leaderboard":
+        return (
+            ROUTE_LEADERBOARD if method == "GET" else ROUTE_METHOD_NOT_ALLOWED
+        )
+    if path == "/v1/runs/ingest":
+        return (
+            ROUTE_RUNS_INGEST if method == "POST" else ROUTE_METHOD_NOT_ALLOWED
+        )
     if path == "/v1/chat/completions":
         return ROUTE_CHAT if method == "POST" else ROUTE_METHOD_NOT_ALLOWED
     if path == "/stats":

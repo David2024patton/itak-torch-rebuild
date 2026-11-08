@@ -17,9 +17,12 @@ def openapi_json(model_name: String) -> String:
     out += ',"version":"' + ENGINE_VERSION + '"'
     out += (
         ',"description":"Mojo-only inference endpoint. Greedy sampler only in'
-        " v1; chat completions are non-streaming. Image input is accepted in"
-        " the request shape and refused by name (vision_not_ready) until a"
-        ' vision path lands."}'
+        " v1 (the greedy lock: temperature must be 0.0; top_k, top_p and seed"
+        " refuse serve_sampler_not_available); chat completions are"
+        " non-streaming. Image input is accepted in the request shape and"
+        " refused by name (vision_not_ready) until a vision path lands."
+        " Every run is recorded to the on-disk history with its source tag"
+        ' (dashboard, cli, mcp) and full telemetry."}'
     )
     out += ',"paths":{'
     out += (
@@ -27,17 +30,51 @@ def openapi_json(model_name: String) -> String:
         ' status","responses":{"200":{"description":"Health JSON"}}}}'
     )
     out += (
-        ',"/v1/models":{"get":{"summary":"OpenAI-shaped model'
-        ' list","responses":{"200":{"description":"Model list JSON"}}}}'
+        ',"/v1/models":{"get":{"summary":"Model registry: every model file in'
+        " the configured models directory plus the served model, each with"
+        ' its fact sheet","responses":{"200":{"description":"Registry'
+        ' JSON"}}}}'
+    )
+    out += (
+        ',"/v1/models/{id}":{"get":{"summary":"One model fact sheet by id'
+        ' (file base name without .gguf)","responses":{"200":{"description":'
+        '"Fact sheet JSON"},"404":{"description":"serve_model_not_found"}}}}'
+    )
+    out += (
+        ',"/history":{"get":{"summary":"Run history (JSON lines on disk,'
+        ' survives restart), filterable by ?source= and'
+        ' ?model=","responses":{"200":{"description":"History JSON"}}}}'
+    )
+    out += (
+        ',"/history/export":{"get":{"summary":"Run bundle export'
+        ' (mojo-engine-run-bundle, format_version 1, unsigned in'
+        ' v1)","responses":{"200":{"description":"Bundle JSON"}}}}'
+    )
+    out += (
+        ',"/v1/runs/ingest":{"post":{"summary":"Import a run bundle: every'
+        " record validated against the schema, bad records refused by name"
+        " and counted, imported rows marked imported with origin"
+        ' hardware","responses":{"200":{"description":"Accepted/rejected'
+        ' counts with refusal names"}}}}'
+    )
+    out += (
+        ',"/leaderboard":{"get":{"summary":"Leaderboard: measured rows per'
+        " model + hardware ranked by best decode tok/s, plus reference rows"
+        " (llama.cpp, paused Rust) marked"
+        ' reference","responses":{"200":{"description":"Leaderboard'
+        ' JSON"}}}}'
     )
     out += (
         ',"/v1/chat/completions":{"post":{"summary":"OpenAI-shaped chat'
         " completion (non-streaming, greedy). Accepts prompt or messages,"
-        " optional context_text (attachment text) and"
-        ' max_tokens.","responses":{"200":{"description":"chat.completion JSON'
-        " with usage and timings (ttft_ms is null until streaming"
-        ' lands)"},"422":{"description":"Named refusal, e.g.'
-        ' vision_not_ready"}}}}'
+        " optional context_text (attachment text), max_tokens, and the bench"
+        " fields source, attachments (file names) and quality_verdict for"
+        ' the run record.","responses":{"200":{"description":"chat.completion'
+        " JSON with usage, timings (prefill_ms and prefill_tok_s; ttft_ms is"
+        ' null in the non-streaming shape) and the sampler settings used'
+        ' (greedy, temperature 0.0)"},"422":{"description":"Named refusal,'
+        " e.g. vision_not_ready or"
+        ' serve_sampler_not_available"}}}}'
     )
     out += (
         ',"/v1/attachments/text":{"post":{"summary":"Validate browser-extracted'

@@ -97,6 +97,15 @@
 # head dim in shared memory), so the per-position shared-
 # memory tree reduction of the Wave B kernel (a barrier
 # chain per position) is gone: barriers happen per tile.
+# WAVE E (Lane E2): attention_tiled_direct_kernel is the
+# splits == 1 form of the tiled kernel with the merge folded
+# into the same launch (direct normalized write, no partial
+# buffers, no merge launch); its CPU twin is
+# attention_direct_cpu. The resident chain launches it
+# exactly when its split chooser returns 1 (the short
+# regime, stored <= one split span); splits >= 2 keep the
+# tiled + merge pair unchanged.
+#
 # Prefill note: this engine has no batched prefill kernel -
 # per the Wave C contract, prefill IS the step loop, so
 # prefill positions run through this same kernel at growing
@@ -926,6 +935,49 @@ def attention_split_cpu(
     )
 
 
+def attention_direct_cpu(
+    q: List[Float32],
+    keys: List[Float32],
+    values: List[Float32],
+    stored: Int,
+    num_q_heads: Int,
+    num_kv_heads: Int,
+    head_dim: Int,
+    tile: Int,
+) raises -> List[Float32]:
+    """Single-position GQA attention over PRE-ROTATED flat
+    stores, computed as ONE tiled pass with a direct
+    normalized write: the CPU twin of
+    attention_tiled_direct_kernel (Wave E, Lane E2).
+
+    The splits==1 shape of the split path with the merge
+    step folded in: the single partial's accumulator is
+    divided by its own sum per head, which is exactly what
+    attention_merge_partials_cpu does when it adopts the
+    one non-empty partial whole - so this twin's float path
+    is the partials path tile by tile plus that final
+    divide, and its outputs match attention_split_cpu at
+    splits == 1 to the last bit on the same fixtures (the
+    VM suite asserts exactly that)."""
+    var parts = attention_split_partials_cpu(
+        q, keys, values, stored, num_q_heads, num_kv_heads, head_dim, 1, tile
+    )
+    var out = List[Float32](capacity=num_q_heads * head_dim)
+    out.resize(num_q_heads * head_dim, Float32(0.0))
+    for h in range(num_q_heads):
+        var run_sum = parts[2][h]
+        if run_sum == Float32(0.0):
+            raise Error(
+                "attention_split_empty_partials: the single direct"
+                " partial for head "
+                + String(h)
+                + " is empty (sum zero)"
+            )
+        for d in range(head_dim):
+            out[h * head_dim + d] = parts[0][h * head_dim + d] / run_sum
+    return out^
+
+
 def attention_tiled_kernel[
     TILE: Int
 ](
@@ -1073,6 +1125,128 @@ def attention_tiled_kernel[
     if tid == 0:
         p_max[unsafe_offset=split * Int(num_q_heads) + head] = run_max
         p_sum[unsafe_offset=split * Int(num_q_heads) + head] = run_sum
+
+
+def attention_tiled_direct_kernel[
+    TILE: Int
+](
+    q: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    values: Pointer[Float32, MutAnyOrigin],
+    y: Pointer[Float32, MutAnyOrigin],
+    stored: Int32,
+    num_kv_heads: Int32,
+    num_q_heads: Int32,
+    head_dim: Int32,
+    group: Int32,
+    scale: Float32,
+):
+    """GPU tiled attention, DIRECT-OUTPUT form (Wave E,
+    Lane E2): the splits == 1 case of attention_tiled_kernel
+    with the merge folded into the same launch.
+
+    One block per Q head over the whole visible range; the
+    tile loop, shared-memory staging, and online-softmax
+    rescale points are the tiled kernel's, statement for
+    statement, so the float path is the splits==1 partials
+    path plus the merge's final divide by the head's own
+    sum - no approximation, and no partial buffers or
+    second (merge) launch. Buffers are PRE-ROTATED Q/K in
+    the visible-order flat layout, as everywhere in this
+    module. Host validates before launch: block_dim ==
+    ATTN_THREADS, head_dim <= ATTN_MAX_HEAD_DIM, TILE a
+    compiled size, and the caller launches this form only
+    when its split chooser returned 1."""
+    var head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    var kv_head = head // Int(group)
+    var row = Int(num_kv_heads) * hd
+    var nstored = Int(stored)
+    var tile_buf = stack_allocation[
+        TILE * ATTN_MAX_HEAD_DIM, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var scores = stack_allocation[
+        TILE, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var q_sh = stack_allocation[
+        ATTN_MAX_HEAD_DIM, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var red = stack_allocation[
+        ATTN_THREADS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    if tid < hd:
+        q_sh[unsafe_offset=tid] = q[unsafe_offset=head * hd + tid]
+    barrier()
+    var d = tid
+    var acc = Float32(0.0)
+    var run_max = ATTN_NEG_INF
+    var run_sum = Float32(0.0)
+    var tile_start = 0
+    while tile_start < nstored:
+        var tcount = TILE
+        if nstored - tile_start < tcount:
+            tcount = nstored - tile_start
+        var e = tid
+        while e < tcount * hd:
+            var t = e // hd
+            var dd = e % hd
+            tile_buf[unsafe_offset=e] = keys[
+                unsafe_offset=(tile_start + t) * row + kv_head * hd + dd
+            ]
+            e += ATTN_THREADS
+        barrier()
+        if tid < tcount:
+            var sc = Float32(0.0)
+            for dd2 in range(hd):
+                sc += (
+                    q_sh[unsafe_offset=dd2]
+                    * tile_buf[unsafe_offset=tid * hd + dd2]
+                )
+            scores[unsafe_offset=tid] = sc * scale
+        barrier()
+        if tid == 0:
+            var m = run_max
+            for t2 in range(tcount):
+                if scores[unsafe_offset=t2] > m:
+                    m = scores[unsafe_offset=t2]
+            red[unsafe_offset=0] = m
+        barrier()
+        var new_max = red[unsafe_offset=0]
+        var alpha = Float32(0.0)
+        if run_sum != Float32(0.0):
+            alpha = exp(run_max - new_max)
+        if tid < tcount:
+            scores[unsafe_offset=tid] = exp(scores[unsafe_offset=tid] - new_max)
+        barrier()
+        e = tid
+        while e < tcount * hd:
+            var t3 = e // hd
+            var dd3 = e % hd
+            tile_buf[unsafe_offset=e] = values[
+                unsafe_offset=(tile_start + t3) * row + kv_head * hd + dd3
+            ]
+            e += ATTN_THREADS
+        barrier()
+        if tid == 0:
+            var psum = Float32(0.0)
+            for t4 in range(tcount):
+                psum += scores[unsafe_offset=t4]
+            red[unsafe_offset=1] = psum
+        if d < hd:
+            var a = acc * alpha
+            for t5 in range(tcount):
+                a += (
+                    scores[unsafe_offset=t5]
+                    * tile_buf[unsafe_offset=t5 * hd + d]
+                )
+            acc = a
+        barrier()
+        run_sum = run_sum * alpha + red[unsafe_offset=1]
+        run_max = new_max
+        tile_start += TILE
+    if d < hd:
+        y[unsafe_offset=head * hd + d] = acc / run_sum
 
 
 def attention_merge_kernel(

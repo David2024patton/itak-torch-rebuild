@@ -191,6 +191,7 @@ from attention.attention import (
     ATTN_THREADS,
     attention_kernel,
     attention_merge_kernel,
+    attention_tiled_direct_kernel,
     attention_tiled_kernel,
     attn_split_count,
     attn_validate_tile,
@@ -1113,6 +1114,86 @@ def _launch_tiled(
         )
 
 
+def _launch_tiled_direct(
+    mut rt: GpuRuntime,
+    tile: Int,
+    q_dev: DeviceBuffer[DType.float32],
+    k_buf: DeviceBuffer[DType.float32],
+    v_buf: DeviceBuffer[DType.float32],
+    y_dev: DeviceBuffer[DType.float32],
+    stored: Int,
+    kv_heads: Int,
+    q_heads: Int,
+    head_dim: Int,
+    scale: Float32,
+) raises:
+    """One attention_tiled_direct_kernel launch at the
+    compiled instantiation for `tile` (attn_validate_tile
+    has already gated the value): the splits == 1 form -
+    one block per Q head, direct normalized output, no
+    partial buffers and no merge launch."""
+    if tile == 8:
+        rt.ctx.enqueue_function[attention_tiled_direct_kernel[8]](
+            q_dev,
+            k_buf,
+            v_buf,
+            y_dev,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            grid_dim=q_heads,
+            block_dim=ATTN_THREADS,
+        )
+    elif tile == 16:
+        rt.ctx.enqueue_function[attention_tiled_direct_kernel[16]](
+            q_dev,
+            k_buf,
+            v_buf,
+            y_dev,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            grid_dim=q_heads,
+            block_dim=ATTN_THREADS,
+        )
+    elif tile == 32:
+        rt.ctx.enqueue_function[attention_tiled_direct_kernel[32]](
+            q_dev,
+            k_buf,
+            v_buf,
+            y_dev,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            grid_dim=q_heads,
+            block_dim=ATTN_THREADS,
+        )
+    else:
+        rt.ctx.enqueue_function[attention_tiled_direct_kernel[64]](
+            q_dev,
+            k_buf,
+            v_buf,
+            y_dev,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            grid_dim=q_heads,
+            block_dim=ATTN_THREADS,
+        )
+
+
 def attention_device_resident(
     mut rt: GpuRuntime,
     mut kv: DeviceKvCache,
@@ -1183,39 +1264,62 @@ def attention_device_resident_cfg(
     var y_dev = _alloc_f32(rt, q_heads * head_dim)
     var k_vis = kv.gather_visible(rt, layer, False)
     var v_vis = kv.gather_visible(rt, layer, True)
-    var p_out = rt.ctx.enqueue_create_buffer[DType.float32](
-        splits * q_heads * head_dim
-    )
-    var p_max = rt.ctx.enqueue_create_buffer[DType.float32](splits * q_heads)
-    var p_sum = rt.ctx.enqueue_create_buffer[DType.float32](splits * q_heads)
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    _launch_tiled(
-        rt,
-        tile,
-        q_buf,
-        k_vis,
-        v_vis,
-        p_out,
-        p_max,
-        p_sum,
-        stored,
-        kv_heads,
-        q_heads,
-        head_dim,
-        scale,
-        splits,
-    )
-    rt.ctx.enqueue_function[attention_merge_kernel](
-        p_out,
-        p_max,
-        p_sum,
-        y_dev,
-        Int32(q_heads),
-        Int32(head_dim),
-        Int32(splits),
-        grid_dim=q_heads,
-        block_dim=ATTN_THREADS,
-    )
+    if splits == 1:
+        # Short regime (Wave E, Lane E2): the direct-output
+        # form - one launch, no partial buffers, no merge.
+        # Its float path is the splits==1 partials path plus
+        # the merge's final divide (see attention.mojo).
+        _launch_tiled_direct(
+            rt,
+            tile,
+            q_buf,
+            k_vis,
+            v_vis,
+            y_dev,
+            stored,
+            kv_heads,
+            q_heads,
+            head_dim,
+            scale,
+        )
+    else:
+        var p_out = rt.ctx.enqueue_create_buffer[DType.float32](
+            splits * q_heads * head_dim
+        )
+        var p_max = rt.ctx.enqueue_create_buffer[DType.float32](
+            splits * q_heads
+        )
+        var p_sum = rt.ctx.enqueue_create_buffer[DType.float32](
+            splits * q_heads
+        )
+        _launch_tiled(
+            rt,
+            tile,
+            q_buf,
+            k_vis,
+            v_vis,
+            p_out,
+            p_max,
+            p_sum,
+            stored,
+            kv_heads,
+            q_heads,
+            head_dim,
+            scale,
+            splits,
+        )
+        rt.ctx.enqueue_function[attention_merge_kernel](
+            p_out,
+            p_max,
+            p_sum,
+            y_dev,
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(splits),
+            grid_dim=q_heads,
+            block_dim=ATTN_THREADS,
+        )
     _ = log_debug(
         "gpu.layer",
         "attention resident tiled stored="

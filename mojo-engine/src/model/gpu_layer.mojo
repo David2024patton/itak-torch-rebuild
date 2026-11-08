@@ -828,7 +828,7 @@ def _gemv_u8_buf(
             x_buf,
             y_dev,
             Int32(view.cols),
-            grid_dim=view.rows,
+            grid_dim=view.rows // Q5_ROWS_PER_WG,
             block_dim=Q5_THREADS,
         )
     elif view.type_id == DT_F16:

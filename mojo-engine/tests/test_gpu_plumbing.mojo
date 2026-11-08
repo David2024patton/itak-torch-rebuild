@@ -20,8 +20,10 @@ from gpu.device_kv import (
     kv_append_refusal,
     kv_buffer_bytes,
     kv_capacity_positions,
+    kv_gather_needed,
     kv_slot_of,
     kv_total_bytes,
+    kv_visible_slot,
 )
 from gpu.weights import meta_index, slot_resident_bytes
 from kv.cache import LayerKind, glimmer_layer_pattern
@@ -122,8 +124,10 @@ def test_kv_total_glimmer_contract_number() raises:
 
 
 # Refusal names on the pure KV paths: shape before order
-# (B1's order), the Wave C wrap refusal, the global capacity
-# refusal, and the construction-side names.
+# (B1's order), the global capacity refusal, and the
+# construction-side names. Wave D: windowed wraps earn NO
+# refusal (the ring evicts, B1-exact); the Wave C name
+# gpu_kv_window_wrapped is retired from this cache.
 def test_kv_refusal_names_pure() raises:
     var windowed = LayerKind.make_windowed(4)
     var glob = LayerKind.make_global()
@@ -144,16 +148,16 @@ def test_kv_refusal_names_pure() raises:
         kv_append_refusal(windowed, 4, 2, 3, 8, 8, 8),
         "gpu_kv_out_of_order_position",
     )
-    # The Wave C limit: a windowed append at position == window
-    # (in order) would wrap and refuses by name.
-    assert_equal(
-        kv_append_refusal(windowed, 4, 4, 4, 8, 8, 8),
-        "gpu_kv_window_wrapped",
-    )
+    # Wave D: a windowed append at/past position == window
+    # (in order) wraps the ring and is LEGAL, B1-exact.
+    assert_equal(kv_append_refusal(windowed, 4, 4, 4, 8, 8, 8), "")
+    assert_equal(kv_append_refusal(windowed, 4, 9, 9, 8, 8, 8), "")
     var real_window = LayerKind.make_windowed(2048)
     assert_equal(
-        kv_append_refusal(real_window, 2048, 2048, 2048, 256, 256, 256),
-        "gpu_kv_window_wrapped",
+        kv_append_refusal(real_window, 2048, 2048, 2048, 256, 256, 256), ""
+    )
+    assert_equal(
+        kv_append_refusal(real_window, 2048, 2049, 2049, 256, 256, 256), ""
     )
     assert_equal(
         kv_append_refusal(real_window, 2048, 2047, 2047, 256, 256, 256), ""
@@ -225,6 +229,33 @@ def test_weights_slot_arithmetic() raises:
     # (output_norm.weight) is the separate final-norm buffer.
     assert_equal(meta_index(51, 13) + 1, 730)
     print("gpu weights: slot bytes and meta indices exact")
+
+
+# Visible-order arithmetic (Wave D): the gather's slot map.
+# Window 4, first_visible 3 (positions 3,4,5,6 visible after
+# appends 0..6): slots are 3,0,1,2. A first_visible landing
+# on slot 0 needs no gather; globals never do.
+def test_kv_visible_order_arithmetic() raises:
+    var w4 = LayerKind.make_windowed(4)
+    var glob = LayerKind.make_global()
+    assert_equal(kv_visible_slot(w4, 3, 0), 3)
+    assert_equal(kv_visible_slot(w4, 3, 1), 0)
+    assert_equal(kv_visible_slot(w4, 3, 2), 1)
+    assert_equal(kv_visible_slot(w4, 3, 3), 2)
+    assert_equal(kv_visible_slot(w4, 0, 2), 2)
+    assert_equal(kv_visible_slot(w4, 2048, 5), 1)
+    var w2048 = LayerKind.make_windowed(2048)
+    assert_equal(kv_visible_slot(w2048, 2048, 5), 5)
+    assert_equal(kv_visible_slot(w2048, 1, 2047), 0)
+    assert_equal(kv_visible_slot(glob, 0, 777), 777)
+    assert_true(kv_gather_needed(w4, 3), "wrapped window must gather")
+    assert_true(kv_gather_needed(w4, 2049), "first_visible 2049 % 4 = 1")
+    assert_true(not kv_gather_needed(w4, 0), "pre-wrap needs no gather")
+    assert_true(
+        not kv_gather_needed(w4, 2048), "first_visible on slot 0: raw order"
+    )
+    assert_true(not kv_gather_needed(glob, 0), "global never gathers")
+    print("gpu kv visible order: slot map + gather-needed exact")
 
 
 def main() raises:

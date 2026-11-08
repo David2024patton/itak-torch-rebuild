@@ -44,3 +44,19 @@ def greedy_argmax(logits: List[Float32]) raises -> Int:
         "greedy_argmax chose id " + String(best) + " logit " + String(best_val),
     )
     return best
+
+
+def golden_first_match(got: List[Int], expected: List[Int]) -> Bool:
+    """The golden checker: True only when `got` covers the
+    whole expected prefix, token for token. This is the one
+    comparison every golden gate uses (the CLI's
+    GOLDEN_FIRST8_MATCH line and the suite's poison gates),
+    so a judge defect cannot hide in a private copy of the
+    loop: tests/test_poison_gates.mojo feeds this function a
+    flipped 8th token and asserts it answers False."""
+    if len(got) < len(expected):
+        return False
+    for i in range(len(expected)):
+        if got[i] != expected[i]:
+            return False
+    return True

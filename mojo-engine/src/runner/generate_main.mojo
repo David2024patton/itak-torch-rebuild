@@ -45,6 +45,7 @@ from std.time import perf_counter_ns
 from config import ENGINE_NAME, ENGINE_VERSION, EngineConfig
 from diag import debug_value_enabled, log_debug
 from generate.generate import generate
+from generate.sampler import golden_first_match
 from model.gpu_model import GpuGlimmerModel
 from model.model import GlimmerForwardAdapter, GlimmerModel
 from tokenizer.gguf_vocab import load_tokenizer_data
@@ -104,13 +105,10 @@ def _report_results(
     )
 
     var golden = _golden()
-    var gmatch = 1
-    if len(tokens_out) < len(golden):
-        gmatch = 0
-    else:
-        for i in range(len(golden)):
-            if tokens_out[i] != golden[i]:
-                gmatch = 0
+    # The comparison itself is generate.sampler's
+    # golden_first_match, the same function the suite's
+    # poison gates exercise with a flipped 8th token.
+    var gmatch = 1 if golden_first_match(tokens_out, golden) else 0
     print("GOLDEN_FIRST8_MATCH", String(gmatch))
     _ = log_debug(
         "runner",

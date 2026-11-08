@@ -32,7 +32,7 @@
 #           raises -> List[Float32]   # one position through
 #           # the model; appends to the KV cache internally;
 #           # returns the final hidden row for that position
-#       def logits(self, hidden: List[Float32])
+#       def logits(mut self, hidden: List[Float32])
 #           raises -> List[Float32]   # finished logits (after
 #           # final norm, head, final_logit transform) for one
 #           # hidden row
@@ -89,7 +89,7 @@ trait ForwardModel:
         internally, return that position's final hidden row."""
         ...
 
-    def logits(self, hidden: List[Float32]) raises -> List[Float32]:
+    def logits(mut self, hidden: List[Float32]) raises -> List[Float32]:
         """Finished logits for one hidden row."""
         ...
 

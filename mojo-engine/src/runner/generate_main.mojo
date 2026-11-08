@@ -133,14 +133,18 @@ def _report_prefill(prefill_ms: Int, generate_ms: Int):
 
 
 def _run_gpu(
-    path: String, context_len: Int, tok: Tokenizer, prompt: List[Int]
+    path: String,
+    context_len: Int,
+    budget_bytes: Int,
+    tok: Tokenizer,
+    prompt: List[Int],
 ) raises:
     """The Wave C GPU path: same run, same prints, driven by
     GpuGlimmerModel. Prefill is measured on a second fresh GPU
     model stepping the same prompt ids (forward_rows), the
     identical construction to the CPU path below."""
     var t0 = perf_counter_ns()
-    var model = GpuGlimmerModel.open(path, context_len)
+    var model = GpuGlimmerModel.open(path, context_len, budget_bytes)
     var t_load = perf_counter_ns()
     print("LOAD_MS", String((t_load - t0) // 1_000_000))
 
@@ -151,7 +155,7 @@ def _run_gpu(
     _report_results(tok, out, generate_ms)
 
     # Prefill timing on a second fresh GPU model (see header).
-    var fresh = GpuGlimmerModel.open(path, context_len)
+    var fresh = GpuGlimmerModel.open(path, context_len, budget_bytes)
     var t_pf0 = perf_counter_ns()
     _ = fresh.forward_rows(prompt.copy())
     var t_pf1 = perf_counter_ns()
@@ -189,7 +193,9 @@ def run() raises:
     var use_gpu = _use_gpu()
     print("MODEL_PATH_KIND", "gpu" if use_gpu else "cpu")
     if use_gpu:
-        _run_gpu(path, config.context_len, tok, prompt)
+        _run_gpu(
+            path, config.context_len, config.gpu_budget_bytes, tok, prompt
+        )
         return
 
     var t0 = perf_counter_ns()

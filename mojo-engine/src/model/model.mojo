@@ -686,5 +686,7 @@ struct GlimmerForwardAdapter(ForwardModel, Movable):
     def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
         return self.model.step(token_id, position)
 
-    def logits(self, hidden: List[Float32]) raises -> List[Float32]:
+    def logits(
+        mut self, hidden: List[Float32]
+    ) raises -> List[Float32]:
         return self.model.logits(hidden)

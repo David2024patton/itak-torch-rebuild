@@ -17,7 +17,7 @@
 # env vars, config.mojo's law). The budget cap comes from
 # GpuRuntime's construction (Lane C1 owns the
 # MOJO_ENGINE_GPU_BUDGET_BYTES config value; the runner hands
-# the default cap constant in until C1's config field lands).
+# EngineConfig.gpu_budget_bytes in (config field: Lane C1).
 #
 # step() mirrors GlimmerModel.step statement for statement:
 #   1. embedding row on device (gpu_embed_token, C2);
@@ -49,14 +49,10 @@
 # gpu_budget_exceeded, gpu_kv_window_wrapped, ...), propagated
 # untouched. Diag seam: phase `model`, model.mojo's phase.
 
+from config import DEFAULT_GPU_BUDGET_BYTES
 from diag import log_debug
 from generate.generate import ForwardModel
-from gpu.context import (
-    DEFAULT_GPU_BUDGET_BYTES,
-    GpuRuntime,
-    download_f32,
-    upload_f32,
-)
+from gpu.context import GpuRuntime, download_f32, upload_f32
 from gpu.device_kv import DeviceKvCache
 from gpu.weights import DeviceWeights
 from model.gpu_layer import gpu_layer_step, gpu_logits
@@ -87,9 +83,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         # BEFORE it moves into the struct: weights upload from
         # its cached bytes, the KV cache from its layer pattern
         # at the configured context length.
-        var rt = GpuRuntime(budget_bytes)
-        var weights = DeviceWeights(rt, cpu_model)
-        var kv = DeviceKvCache(
+        var rt = GpuRuntime.create(budget_bytes)
+        var weights = DeviceWeights.build(rt, cpu_model)
+        var kv = DeviceKvCache.build(
             rt,
             cpu_model.cfg.kinds.copy(),
             cpu_model.cfg.kv_heads,
@@ -111,17 +107,19 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         )
 
     @staticmethod
-    def open(path: String, context_len: Int) raises -> GpuGlimmerModel:
+    def open(
+        path: String, context_len: Int, budget_bytes: Int
+    ) raises -> GpuGlimmerModel:
         """Open the CPU model at path (loader of record) and
-        build the device model over it at the default budget
-        cap. Mirrors GlimmerModel.open's shape."""
+        build the device model over it under the given budget
+        cap (callers hand in EngineConfig.gpu_budget_bytes, so
+        MOJO_ENGINE_GPU_BUDGET_BYTES is honored end to end).
+        Mirrors GlimmerModel.open's shape."""
         var cpu_model = GlimmerModel.open(path)
-        return GpuGlimmerModel(
-            cpu_model^, context_len, DEFAULT_GPU_BUDGET_BYTES
-        )
+        return GpuGlimmerModel(cpu_model^, context_len, budget_bytes)
 
     def _plain_rms_norm(
-        self, x: List[Float32], eps: Float32
+        mut self, x: List[Float32], eps: Float32
     ) raises -> List[Float32]:
         """The CPU step's weightless embedding norm, on device:
         rms_norm_kernel with a ones weight row, grid = 1 row.
@@ -191,7 +189,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         )
         return x^
 
-    def logits(self, hidden: List[Float32]) raises -> List[Float32]:
+    def logits(
+        mut self, hidden: List[Float32]
+    ) raises -> List[Float32]:
         """Finished logits for one hidden row: C2's gpu_logits
         (final norm, head GEMV, scale-then-softcap on device).
         """
@@ -203,7 +203,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
                 + ", hidden is "
                 + String(cfg.hidden)
             )
-        return gpu_logits(self.rt, self.weights, hidden)
+        return gpu_logits(self.rt, self.weights, self.cpu, hidden)
 
     def forward_rows(mut self, tokens: List[Int]) raises -> List[Float32]:
         """The step loop over a token list starting at layer

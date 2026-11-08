@@ -49,7 +49,9 @@ struct MockModel(Copyable, ForwardModel, Movable):
         hidden[1] = Float32(position)
         return hidden^
 
-    def logits(self, hidden: List[Float32]) raises -> List[Float32]:
+    def logits(
+        mut self, hidden: List[Float32]
+    ) raises -> List[Float32]:
         if len(hidden) != MOCK_HIDDEN:
             raise Error(
                 "generate_hidden_shape: mock logits expected hidden width "

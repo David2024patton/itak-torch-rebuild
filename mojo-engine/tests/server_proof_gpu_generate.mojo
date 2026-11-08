@@ -60,7 +60,9 @@ def run() raises:
     print("GPU_GENERATE_PROOF context_len", String(PROOF_CONTEXT_LEN))
 
     var t0 = perf_counter_ns()
-    var model = GpuGlimmerModel.open(path, PROOF_CONTEXT_LEN)
+    var model = GpuGlimmerModel.open(
+        path, PROOF_CONTEXT_LEN, config.gpu_budget_bytes
+    )
     var t_load = perf_counter_ns()
     print("LOAD_MS", String((t_load - t0) // 1_000_000))
 

@@ -401,6 +401,141 @@ run log read directly): 189 tests run, 189 passed, 0
 failed, 0 skipped across 33 test files, run_tests: PASS,
 engine hello gate at 1.7.
 
+## Deep-telemetry addendum (schema level, 2026-11-08)
+
+From David's deep-telemetry review; the heavy kernel
+instrumentation is Piece 4B for the kernel wave, not this
+lane.
+
+- debug_level on chat requests: "benchmark" (default),
+  "profile", "trace". Unknown values are refused by name
+  (serve_bad_debug_level). The value used is echoed in the
+  response and recorded on the run record; the dashboard
+  carries the toggle and the OpenAPI text names the field.
+  All three modes behave the same at the engine level in
+  this lane (no per-layer device checks exist yet); the
+  field exists so clients, the dashboard toggle, and
+  history records carry it from day one. Modes accepted
+  and recorded; instrumentation lands with the kernel
+  wave.
+- Telemetry slots on the run record, same honesty rule
+  (a value only where the engine measures it, otherwise
+  null plus a named reason): effective_bandwidth_gbps is
+  model file bytes times decode steps divided by decode
+  seconds (the standard bytes-per-step convention; the
+  file size overstates Glimmer's true weights by 0.08
+  percent, 16,756,683,904 file bytes against
+  16,743,567,360 weight bytes). bandwidth_pct_of_peak is
+  measured against the configured card peak
+  (gpu_peak_bandwidth_gbps, env
+  MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS, default 960 for
+  the RX 7900 XTX, never hardcoded in math code) and is
+  computed on GPU runs only; CPU runs carry the bandwidth
+  value with the percentage null and a named note. GPU
+  clock, temperature, and power start/end slots are null
+  with the note "gpu clock, temperature, and power are
+  not exposed by MAX 26.7 to Mojo". The per-op timing
+  bucket object (embedding, projection,
+  attention_or_state, ffn, host_device_sync, in ms) is
+  null with its note; per-op timers are Piece 4B.
+- Trace mode, the cheap part only: before generation the
+  debug stream emits the tokenized prompt ID array, then
+  one line stating plainly that top-5 logits and
+  per-layer checksums are not emitted by this build and
+  land with the kernel wave. Nothing pretends otherwise.
+- Proof (card window 5c, staging e79ba0e): the golden
+  dashboard chat ran at debug_level "trace"; the record
+  carries effective_bandwidth_gbps 515.06 and
+  bandwidth_pct_of_peak 53.65 against the 960 config
+  peak, prefill 210 ms, decode 32.79 tok/s. Window 5 was
+  a CPU-path accident (the window script omitted
+  MOJO_ENGINE_GPU, so its chat never finished; the window
+  still closed out cleanly with tenants restored) and
+  window 5b found the history defect recorded under the
+  zero-trust gates below; window 5c is the proof of
+  record.
+
+## Zero-trust gates (2026-11-08)
+
+1. Hardware witness. Inside the flock window a sampler
+   read the card about every 100 ms for the whole window
+   (gpu_busy_percent, mem_info_vram_used, and hwmon
+   power1_average) into a timestamped sidecar log. The
+   card on this server is /sys/class/drm/card2 (AMD,
+   vendor 0x1002, hwmon6); card1 is the Intel iGPU and
+   has no amdgpu counters, and the window 5b sampler read
+   that wrong card and recorded -1s, which is why window
+   5c exists. Window 5c sidecar:
+   ~/gpu-serve-api/window5c_witness.log, 1,484 samples.
+   Verdict PASS: peak mem_info_vram_used 23,412,727,808
+   bytes (21.8 GiB, above the 15.5 GiB bar) while the
+   model was loaded, gpu_busy_percent took many distinct
+   values during generation (not flat), and card power
+   swung from 4 W to 335 W across the generation span.
+2. Poison pre-checks. The golden comparison now lives in
+   one place (generate.sampler.golden_first_match) used
+   by the CLI judge. tests/test_poison_gates.mojo is
+   wired into tests/run_tests.sh and runs the negative
+   controls before any positive check is trusted: the
+   checker fed an expected sequence with the 8th token
+   flipped from 1212 to 1213 answers False in both
+   directions (the true sequence passes as the positive
+   control), and the fact-sheet judge refuses a tiny
+   fixture copy with one magic byte flipped
+   (gguf_bad_magic) while the untouched fixture parses.
+   The card window ran the same discipline on content: a
+   deliberately wrong expected continuation was asserted
+   to mismatch before the golden assert ran. Suite: 2/2.
+3. Hash-chained run history (amends the unsigned-bundles
+   note below). Every record the endpoint writes carries
+   record_sha256, computed inside the Mojo binary at
+   write time with the engine's own FIPS 180-4 SHA-256
+   over a pipe-joined payload: the build's git head sha,
+   the model file sha256, the prompt token ids, the
+   generated token ids, prefill nanoseconds, decode
+   nanoseconds, and the previous record's hash (a zero
+   hash for the genesis record). The build sha is
+   SUPPLIED THROUGH CONFIG (env MOJO_ENGINE_BUILD_SHA),
+   not stamped at build time; the record shows it (window
+   5c: e79ba0ec29585d24ad8cfd6ad1732ce30fcdbfcc, the
+   staged tree the binary was built from). The chain
+   inputs ride the record so any reader can recompute.
+   /history stamps each record with chain_status:
+   "verified", "TAMPERED_RECORD" (hash does not
+   recompute, or the link to the previous chained record
+   is broken), or "unverifiable_pre_chain" (records
+   written before the chain existed; they do not move the
+   chain head). /leaderboard carries the three counts.
+   Ingest verifies chained records before accepting them:
+   a hash that does not recompute is refused by name
+   (serve_ingest_tampered_record) and never stored;
+   pre-chain records still land and are labelled. Wire
+   proof: the window 5c bundle with one hex character of
+   record_sha256 flipped was ingested by a scratch serve
+   as accepted 0, rejected 1, named
+   serve_ingest_tampered_record; the untouched bundle was
+   accepted 1. Bundles stay unsigned as documents
+   (format_version 1) but now carry the chain. On the
+   SHA-256 source: the Mojo standard library available
+   here offers no SHA-256 and libcrypto FFI did not link
+   (recorded in the main note), so the chain uses the
+   engine's own FIPS 180-4 implementation; no weaker hash
+   was substituted.
+- Defect found by the gate process: window 5b's /history
+  served unparseable JSON. The chain_status stamper built
+  the record string from a span of bytes, which renders
+  the byte list instead of decoding UTF-8, so the served
+  record's tail was a list of byte values. The disk
+  record and the chain verdict were correct throughout.
+  Fixed in e79ba0e (byte-indexed string slice) with a
+  suite assertion that the literal quoted hash fields
+  survive in the served history; window 5c's /history
+  parses and shows chain_status "verified".
+
+Final suite on the finished tree (e79ba0e): 197 tests
+run, 197 passed, 0 failed across 34 test files,
+run_tests: PASS, engine hello gate at 1.7.
+
 ## Not built / known limits
 
 - No streaming; TTFT is therefore prefill-bound (recorded,
@@ -410,7 +545,13 @@ engine hello gate at 1.7.
 - No sampler family (temperature/top-k/top-p sampling);
   the greedy lock refuses them by name.
 - Per-request model rebuild (see the generation contract).
-- Bundles unsigned (format_version 1 leaves room).
+- Bundles unsigned as documents (format_version 1 leaves
+  room); the run records inside them are hash-chained and
+  ingest verifies the chain (see zero-trust gates).
+- debug_level modes are recorded but engine-identical
+  until the kernel wave; GPU clock, temperature, and
+  power slots and the per-op timing buckets are null with
+  named reasons by design.
 - MCP bridge is a subset, not a full MCP server.
 - History load skips unparseable lines silently (they stay
   in the file); ingest is the path that refuses by name.

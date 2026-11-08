@@ -79,19 +79,44 @@
 # (running max, running sum, per-channel accumulators
 # rescaled per position), the score row is never
 # materialized, and each position's dot is a shared-memory
-# tree reduction. What is still OWED, recorded plainly:
-# shared-memory staging of K/V tiles and split-KV parallelism
-# across position blocks (the block-per-head grid leaves the
-# card underfilled at 32 blocks for very long contexts);
-# both are tuning work after the correctness wave, and the
-# current shape was chosen because it is the flash-decoding
-# form whose online-softmax arithmetic is provable against
-# the CPU twin at the 1e-5 class bar today.
+# tree reduction. That kernel is RETAINED unchanged as the
+# Wave B reference shape (the A/B baseline in the proofs).
+#
+# WAVE D (Lane D2, occupancy): attention_tiled_kernel +
+# attention_merge_kernel below are the production GPU path.
+# The tiled kernel stages K/V tiles of TILE positions in
+# shared memory (one tile buffer, reused for K then V), one
+# block per (Q head, split): the KV sequence is SPLIT across
+# blocks (split-KV), each block runs the same online-softmax
+# over its range tile by tile and writes an UNNORMALIZED
+# partial (acc, max, sum); the merge kernel combines the
+# partials in split order with exact logsumexp rescaling
+# (each partial rescaled by exp(its max - the combined max),
+# no approximation). Scores are computed per tile from the
+# staged K (one thread per position, sequential over the
+# head dim in shared memory), so the per-position shared-
+# memory tree reduction of the Wave B kernel (a barrier
+# chain per position) is gone: barriers happen per tile.
+# Prefill note: this engine has no batched prefill kernel -
+# per the Wave C contract, prefill IS the step loop, so
+# prefill positions run through this same kernel at growing
+# stored counts; the split chooser keeps splits at 1 until
+# the stored count passes one split span, so short prefill
+# steps pay no merge cost beyond the trivial 1-split pass.
+# The CPU twins of the split path (attention_split_partials_
+# cpu / attention_merge_partials_cpu / attention_split_cpu)
+# mirror the kernels' Float32 arithmetic tile by tile and
+# are the VM-side proof surface. Trial record (tile sizes,
+# split factors, kept structure): bench/mojo-engine-wave-d-
+# 2026-11-07.md.
 #
 # Named refusals: attention_cpu_bad_shape,
 # attention_cpu_nondivisible_heads,
 # attention_cpu_no_visible_keys, attention_cpu_bad_position,
-# attention_cpu_bad_rope_base.
+# attention_cpu_bad_rope_base, attention_tiled_bad_tile,
+# attention_split_bad_shape, attention_split_bad_splits,
+# attention_split_bad_config, attention_split_bad_range,
+# attention_split_empty_partials.
 
 from std.math import sqrt, exp, isnan, isinf
 from max.gpu import thread_idx, block_idx, block_dim, barrier
@@ -524,5 +549,574 @@ def attention_kernel(
         run_sum = run_sum * alpha + w
         run_max = new_max
         barrier()
+    if d < hd:
+        y[unsafe_offset=head * hd + d] = acc / run_sum
+
+
+# ---------------------------------------------------------------------------
+# Wave D (Lane D2): shared-memory K/V tiling + split-KV.
+#
+# Constants: the tiled kernel is compiled for tile sizes
+# 8/16/32/64 positions (attn_validate_tile is the host-side
+# gate) and head_dim up to ATTN_MAX_HEAD_DIM (= ATTN_THREADS,
+# one thread per channel, the Wave B kernel's same limit).
+# ATTN_NEG_INF is the online-softmax sentinel: the largest
+# finite Float32 magnitude, negated, so sentinel arithmetic
+# (exp of a huge negative difference) underflows to 0
+# instead of producing NaN; the merge additionally guards
+# empty partials (sum == 0) explicitly.
+# ---------------------------------------------------------------------------
+
+comptime ATTN_MAX_HEAD_DIM = 128
+comptime ATTN_NEG_INF = Float32(-3.4028235e38)
+
+
+def attn_validate_tile(tile: Int) raises:
+    """Refuse by name a tile size with no compiled kernel
+    instantiation (8/16/32/64 positions)."""
+    if tile != 8 and tile != 16 and tile != 32 and tile != 64:
+        raise Error(
+            "attention_tiled_bad_tile: tile positions must be one of"
+            " 8/16/32/64 (the compiled instantiations), got "
+            + String(tile)
+        )
+
+
+def attn_split_count(stored: Int, span: Int, max_splits: Int) raises -> Int:
+    """How many split-KV partials a stored count earns: 1
+    while stored fits one span, else ceil(stored / span)
+    capped at max_splits. Pure; the chooser gpu_layer uses."""
+    if stored <= 0 or span <= 0 or max_splits <= 0:
+        raise Error(
+            "attention_split_bad_config: stored, span and max_splits"
+            " must be positive, got stored "
+            + String(stored)
+            + " span "
+            + String(span)
+            + " max_splits "
+            + String(max_splits)
+        )
+    if stored <= span:
+        return 1
+    var n = (stored + span - 1) // span
+    if n > max_splits:
+        n = max_splits
+    return n
+
+
+def attn_split_range(
+    stored: Int, splits: Int, split: Int
+) raises -> Tuple[Int, Int]:
+    """(start, length) of one split's position range: ranges
+    partition [0, stored) in order, lengths differ by at most
+    one, earlier splits take the remainder. splits > stored
+    is legal: trailing splits are empty (length 0) and their
+    partials merge as no-ops. Pure; shared by the CPU twin,
+    the host launcher, and the tests (the kernel recomputes
+    the same arithmetic inline)."""
+    if stored < 0 or splits <= 0 or split < 0 or split >= splits:
+        raise Error(
+            "attention_split_bad_range: stored "
+            + String(stored)
+            + " splits "
+            + String(splits)
+            + " split "
+            + String(split)
+            + " is not a valid split range request"
+        )
+    var base = stored // splits
+    var rem = stored % splits
+    if split < rem:
+        return (split * (base + 1), base + 1)
+    return (rem * (base + 1) + (split - rem) * base, base)
+
+
+def _validate_split(
+    q_len: Int,
+    keys_len: Int,
+    values_len: Int,
+    stored: Int,
+    num_q_heads: Int,
+    num_kv_heads: Int,
+    head_dim: Int,
+    splits: Int,
+) raises:
+    """Shape gate for the split path over PRE-ROTATED stores;
+    refusal names are the attention_split_ family."""
+    if head_dim < 2 or head_dim % 2 != 0 or head_dim > ATTN_MAX_HEAD_DIM:
+        raise Error(
+            "attention_split_bad_shape: head_dim must be even, >= 2 and <= "
+            + String(ATTN_MAX_HEAD_DIM)
+            + ", got "
+            + String(head_dim)
+        )
+    if num_q_heads <= 0 or num_kv_heads <= 0:
+        raise Error(
+            "attention_split_bad_shape: head counts must be > 0, got "
+            + String(num_q_heads)
+            + " q heads, "
+            + String(num_kv_heads)
+            + " kv heads"
+        )
+    if num_q_heads % num_kv_heads != 0:
+        raise Error(
+            "attention_split_bad_shape: "
+            + String(num_q_heads)
+            + " q heads do not divide into "
+            + String(num_kv_heads)
+            + " kv heads"
+        )
+    if splits <= 0:
+        raise Error(
+            "attention_split_bad_splits: splits must be > 0, got "
+            + String(splits)
+        )
+    if stored <= 0:
+        raise Error(
+            "attention_split_bad_shape: stored must be > 0, got "
+            + String(stored)
+        )
+    if q_len != num_q_heads * head_dim:
+        raise Error(
+            "attention_split_bad_shape: q has "
+            + String(q_len)
+            + " elements, expected "
+            + String(num_q_heads * head_dim)
+        )
+    var row = num_kv_heads * head_dim
+    if keys_len != stored * row or values_len != stored * row:
+        raise Error(
+            "attention_split_bad_shape: keys/values have "
+            + String(keys_len)
+            + "/"
+            + String(values_len)
+            + " elements, expected "
+            + String(stored * row)
+            + " each ([stored][num_kv_heads][head_dim])"
+        )
+
+
+def attention_split_partials_cpu(
+    q: List[Float32],
+    keys: List[Float32],
+    values: List[Float32],
+    stored: Int,
+    num_q_heads: Int,
+    num_kv_heads: Int,
+    head_dim: Int,
+    splits: Int,
+    tile: Int,
+) raises -> Tuple[List[Float32], List[Float32], List[Float32]]:
+    """CPU twin of attention_tiled_kernel: the partials.
+
+    q/keys are PRE-ROTATED (the GPU kernels' contract);
+    values raw, all in the flat visible-order layout. Returns
+    (partial_out, partial_max, partial_sum) with layouts
+    [splits][num_q_heads][head_dim] and [splits][num_q_heads]:
+    partial_out is the UNNORMALIZED online-softmax
+    accumulator (divide by partial_sum after merging - never
+    before). The Float32 arithmetic mirrors the kernel tile
+    by tile: per tile, scores from ascending-dim dots, the
+    tile max folded into the running max, one rescale by
+    exp(old max - new max) (0 on the first tile), probs
+    exp(score - new max), accumulate, sum. Mirroring the tile
+    structure matters: the rescale points are part of the
+    float path, so a different tile gives a different (still
+    in-bar) rounding, exactly as on device.
+    """
+    _validate_split(
+        len(q),
+        len(keys),
+        len(values),
+        stored,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        splits,
+    )
+    attn_validate_tile(tile)
+    var group = num_q_heads // num_kv_heads
+    var row = num_kv_heads * head_dim
+    var scale = Float32(1.0) / sqrt(Float32(head_dim))
+    var p_out = List[Float32](capacity=splits * num_q_heads * head_dim)
+    p_out.resize(splits * num_q_heads * head_dim, Float32(0.0))
+    var p_max = List[Float32](capacity=splits * num_q_heads)
+    p_max.resize(splits * num_q_heads, ATTN_NEG_INF)
+    var p_sum = List[Float32](capacity=splits * num_q_heads)
+    p_sum.resize(splits * num_q_heads, Float32(0.0))
+    for h in range(num_q_heads):
+        var kv_head = h // group
+        for s in range(splits):
+            var rng = attn_split_range(stored, splits, s)
+            var start = rng[0]
+            var end = start + rng[1]
+            var acc = List[Float32](capacity=head_dim)
+            acc.resize(head_dim, Float32(0.0))
+            var run_max = ATTN_NEG_INF
+            var run_sum = Float32(0.0)
+            var ts = start
+            while ts < end:
+                var tcount = tile
+                if end - ts < tcount:
+                    tcount = end - ts
+                var scores = List[Float32](capacity=tcount)
+                scores.resize(tcount, Float32(0.0))
+                for t in range(tcount):
+                    var k_off = (ts + t) * row + kv_head * head_dim
+                    var dot = Float32(0.0)
+                    for d in range(head_dim):
+                        dot += q[h * head_dim + d] * keys[k_off + d]
+                    scores[t] = dot * scale
+                var new_max = run_max
+                for t in range(tcount):
+                    if scores[t] > new_max:
+                        new_max = scores[t]
+                var alpha = Float32(0.0)
+                if run_sum != Float32(0.0):
+                    alpha = exp(run_max - new_max)
+                var probs = List[Float32](capacity=tcount)
+                probs.resize(tcount, Float32(0.0))
+                var psum = Float32(0.0)
+                for t in range(tcount):
+                    probs[t] = exp(scores[t] - new_max)
+                    psum += probs[t]
+                for d in range(head_dim):
+                    var a = acc[d] * alpha
+                    for t in range(tcount):
+                        var v_off = (ts + t) * row + kv_head * head_dim
+                        a += probs[t] * values[v_off + d]
+                    acc[d] = a
+                run_sum = run_sum * alpha + psum
+                run_max = new_max
+                ts += tile
+            var base = (s * num_q_heads + h) * head_dim
+            for d in range(head_dim):
+                p_out[base + d] = acc[d]
+            p_max[s * num_q_heads + h] = run_max
+            p_sum[s * num_q_heads + h] = run_sum
+    _ = log_debug(
+        "attention.split",
+        "partials q_heads "
+        + String(num_q_heads)
+        + " stored "
+        + String(stored)
+        + " splits "
+        + String(splits)
+        + " tile "
+        + String(tile),
+    )
+    return (p_out^, p_max^, p_sum^)
+
+
+def attention_merge_partials_cpu(
+    p_out: List[Float32],
+    p_max: List[Float32],
+    p_sum: List[Float32],
+    splits: Int,
+    num_q_heads: Int,
+    head_dim: Int,
+) raises -> List[Float32]:
+    """CPU twin of attention_merge_kernel: combine partials
+    in split order by exact logsumexp rescaling.
+
+    For each head: walk the splits; a split with sum 0 is
+    empty and skipped; the first non-empty split is adopted
+    whole; every later split rescales BOTH accumulators by
+    exp(max - combined max) before adding, so the merged
+    (acc, sum) is the single-pass online-softmax state for
+    the union of the ranges, and the output is acc / sum.
+    No approximation: the rescale factors are the exact
+    exponentials of the max differences.
+    """
+    if splits <= 0:
+        raise Error(
+            "attention_split_bad_splits: splits must be > 0, got "
+            + String(splits)
+        )
+    if num_q_heads <= 0 or head_dim <= 0:
+        raise Error(
+            "attention_split_bad_shape: head counts must be > 0, got "
+            + String(num_q_heads)
+            + " q heads, head_dim "
+            + String(head_dim)
+        )
+    if (
+        len(p_out) != splits * num_q_heads * head_dim
+        or len(p_max) != splits * num_q_heads
+        or len(p_sum) != splits * num_q_heads
+    ):
+        raise Error(
+            "attention_split_bad_shape: partial buffers have "
+            + String(len(p_out))
+            + "/"
+            + String(len(p_max))
+            + "/"
+            + String(len(p_sum))
+            + " elements for splits "
+            + String(splits)
+            + " q_heads "
+            + String(num_q_heads)
+            + " head_dim "
+            + String(head_dim)
+        )
+    var out = List[Float32](capacity=num_q_heads * head_dim)
+    out.resize(num_q_heads * head_dim, Float32(0.0))
+    for h in range(num_q_heads):
+        var acc = List[Float32](capacity=head_dim)
+        acc.resize(head_dim, Float32(0.0))
+        var run_max = ATTN_NEG_INF
+        var run_sum = Float32(0.0)
+        for s in range(splits):
+            var ps = p_sum[s * num_q_heads + h]
+            if ps == Float32(0.0):
+                continue
+            var pm = p_max[s * num_q_heads + h]
+            var base = (s * num_q_heads + h) * head_dim
+            if run_sum == Float32(0.0):
+                run_max = pm
+                run_sum = ps
+                for d in range(head_dim):
+                    acc[d] = p_out[base + d]
+            else:
+                var new_max = run_max if run_max > pm else pm
+                var a1 = exp(run_max - new_max)
+                var a2 = exp(pm - new_max)
+                for d in range(head_dim):
+                    acc[d] = acc[d] * a1 + p_out[base + d] * a2
+                run_sum = run_sum * a1 + ps * a2
+                run_max = new_max
+        if run_sum == Float32(0.0):
+            raise Error(
+                "attention_split_empty_partials: every split partial for head "
+                + String(h)
+                + " is empty (all sums zero)"
+            )
+        for d in range(head_dim):
+            out[h * head_dim + d] = acc[d] / run_sum
+    return out^
+
+
+def attention_split_cpu(
+    q: List[Float32],
+    keys: List[Float32],
+    values: List[Float32],
+    stored: Int,
+    num_q_heads: Int,
+    num_kv_heads: Int,
+    head_dim: Int,
+    splits: Int,
+    tile: Int,
+) raises -> List[Float32]:
+    """Single-position GQA attention over PRE-ROTATED flat
+    stores, computed as tiled partials + exact merge: the
+    full CPU twin of the GPU tiled + merge launch pair."""
+    var parts = attention_split_partials_cpu(
+        q,
+        keys,
+        values,
+        stored,
+        num_q_heads,
+        num_kv_heads,
+        head_dim,
+        splits,
+        tile,
+    )
+    return attention_merge_partials_cpu(
+        parts[0], parts[1], parts[2], splits, num_q_heads, head_dim
+    )
+
+
+def attention_tiled_kernel[
+    TILE: Int
+](
+    q: Pointer[Float32, MutAnyOrigin],
+    keys: Pointer[Float32, MutAnyOrigin],
+    values: Pointer[Float32, MutAnyOrigin],
+    p_out: Pointer[Float32, MutAnyOrigin],
+    p_max: Pointer[Float32, MutAnyOrigin],
+    p_sum: Pointer[Float32, MutAnyOrigin],
+    stored: Int32,
+    num_kv_heads: Int32,
+    num_q_heads: Int32,
+    head_dim: Int32,
+    group: Int32,
+    scale: Float32,
+    splits: Int32,
+):
+    """GPU tiled split-KV attention: partials, one block per
+    (Q head, split).
+
+    Buffers are PRE-ROTATED Q/K in the visible-order flat
+    layout (the Wave B kernel's contract). Block index x is
+    head * splits + split; the block owns attn_split_range's
+    range for its split and writes its unnormalized partial
+    (acc, max, sum) for attention_merge_kernel to combine.
+    Online softmax stays (no materialized score row; scores
+    live in a TILE-sized shared array). Per tile: K is staged
+    into the shared tile buffer cooperatively, scores are
+    computed from shared (one thread per position, ascending
+    dim), the tile max folds into the running max with one
+    rescale, then V replaces K in the same buffer and the
+    per-channel accumulators update from shared. Host
+    validates before launch: block_dim == ATTN_THREADS,
+    head_dim <= ATTN_MAX_HEAD_DIM, TILE a compiled size.
+    """
+    var n_splits = Int(splits)
+    var head = Int(block_idx.x) // n_splits
+    var split = Int(block_idx.x) % n_splits
+    var tid = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    var kv_head = head // Int(group)
+    var row = Int(num_kv_heads) * hd
+    var nstored = Int(stored)
+    var base_chunk = nstored // n_splits
+    var rem = nstored % n_splits
+    var start: Int
+    var length: Int
+    if split < rem:
+        start = split * (base_chunk + 1)
+        length = base_chunk + 1
+    else:
+        start = rem * (base_chunk + 1) + (split - rem) * base_chunk
+        length = base_chunk
+    var end = start + length
+    var tile_buf = stack_allocation[
+        TILE * ATTN_MAX_HEAD_DIM, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var scores = stack_allocation[
+        TILE, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var q_sh = stack_allocation[
+        ATTN_MAX_HEAD_DIM, Float32, address_space=AddressSpace.SHARED
+    ]()
+    var red = stack_allocation[
+        ATTN_THREADS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    if tid < hd:
+        q_sh[unsafe_offset=tid] = q[unsafe_offset=head * hd + tid]
+    barrier()
+    var d = tid
+    var acc = Float32(0.0)
+    var run_max = ATTN_NEG_INF
+    var run_sum = Float32(0.0)
+    var tile_start = start
+    while tile_start < end:
+        var tcount = TILE
+        if end - tile_start < tcount:
+            tcount = end - tile_start
+        # Stage the K tile: element e is (t, dd) row-major.
+        var e = tid
+        while e < tcount * hd:
+            var t = e // hd
+            var dd = e % hd
+            tile_buf[unsafe_offset=e] = keys[
+                unsafe_offset=(tile_start + t) * row + kv_head * hd + dd
+            ]
+            e += ATTN_THREADS
+        barrier()
+        # Scores from shared: one thread per tile position.
+        if tid < tcount:
+            var s = Float32(0.0)
+            for dd2 in range(hd):
+                s += (
+                    q_sh[unsafe_offset=dd2]
+                    * tile_buf[unsafe_offset=tid * hd + dd2]
+                )
+            scores[unsafe_offset=tid] = s * scale
+        barrier()
+        if tid == 0:
+            var m = run_max
+            for t2 in range(tcount):
+                if scores[unsafe_offset=t2] > m:
+                    m = scores[unsafe_offset=t2]
+            red[unsafe_offset=0] = m
+        barrier()
+        var new_max = red[unsafe_offset=0]
+        var alpha = Float32(0.0)
+        if run_sum != Float32(0.0):
+            alpha = exp(run_max - new_max)
+        if tid < tcount:
+            scores[unsafe_offset=tid] = exp(scores[unsafe_offset=tid] - new_max)
+        barrier()
+        # Stage the V tile into the same shared buffer (the K
+        # tile is dead once every score thread has read it,
+        # which the barrier above guarantees).
+        e = tid
+        while e < tcount * hd:
+            var t3 = e // hd
+            var dd3 = e % hd
+            tile_buf[unsafe_offset=e] = values[
+                unsafe_offset=(tile_start + t3) * row + kv_head * hd + dd3
+            ]
+            e += ATTN_THREADS
+        barrier()
+        if tid == 0:
+            var psum = Float32(0.0)
+            for t4 in range(tcount):
+                psum += scores[unsafe_offset=t4]
+            red[unsafe_offset=1] = psum
+        if d < hd:
+            var a = acc * alpha
+            for t5 in range(tcount):
+                a += (
+                    scores[unsafe_offset=t5]
+                    * tile_buf[unsafe_offset=t5 * hd + d]
+                )
+            acc = a
+        barrier()
+        run_sum = run_sum * alpha + red[unsafe_offset=1]
+        run_max = new_max
+        tile_start += TILE
+    var p_base = (split * Int(num_q_heads) + head) * hd
+    if d < hd:
+        p_out[unsafe_offset=p_base + d] = acc
+    if tid == 0:
+        p_max[unsafe_offset=split * Int(num_q_heads) + head] = run_max
+        p_sum[unsafe_offset=split * Int(num_q_heads) + head] = run_sum
+
+
+def attention_merge_kernel(
+    p_out: Pointer[Float32, MutAnyOrigin],
+    p_max: Pointer[Float32, MutAnyOrigin],
+    p_sum: Pointer[Float32, MutAnyOrigin],
+    y: Pointer[Float32, MutAnyOrigin],
+    num_q_heads: Int32,
+    head_dim: Int32,
+    splits: Int32,
+):
+    """GPU split-KV merge: one block per Q head, one thread
+    per channel, splits combined in order with exact
+    logsumexp rescaling (exp of max differences), mirroring
+    attention_merge_partials_cpu statement for statement,
+    including the empty-partial (sum == 0) skip and the
+    first-non-empty adoption. Output y[head][d] = acc / sum.
+    Host guarantees at least one non-empty partial per head
+    (stored >= 1 upstream)."""
+    var head = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var hd = Int(head_dim)
+    var qh = Int(num_q_heads)
+    var d = tid
+    var acc = Float32(0.0)
+    var run_max = ATTN_NEG_INF
+    var run_sum = Float32(0.0)
+    for s in range(Int(splits)):
+        var ps = p_sum[unsafe_offset=s * qh + head]
+        if ps != Float32(0.0):
+            var pm = p_max[unsafe_offset=s * qh + head]
+            var base = (s * qh + head) * hd
+            if run_sum == Float32(0.0):
+                run_max = pm
+                run_sum = ps
+                if d < hd:
+                    acc = p_out[unsafe_offset=base + d]
+            else:
+                var new_max = run_max if run_max > pm else pm
+                var a1 = exp(run_max - new_max)
+                var a2 = exp(pm - new_max)
+                if d < hd:
+                    acc = acc * a1 + p_out[unsafe_offset=base + d] * a2
+                run_sum = run_sum * a1 + ps * a2
+                run_max = new_max
     if d < hd:
         y[unsafe_offset=head * hd + d] = acc / run_sum

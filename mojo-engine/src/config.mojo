@@ -34,6 +34,20 @@ comptime GPU_CARD_TOTAL_BYTES = 25769803776
 comptime GPU_RESERVE_BYTES = 1073741824
 comptime DEFAULT_GPU_BUDGET_BYTES = GPU_CARD_TOTAL_BYTES - GPU_RESERVE_BYTES
 
+# Prefill GEMM knobs (Wave D, Lane D1): a prompt batch at or
+# above PREFILL_GEMM_MIN_BATCH rows takes the batched GEMM
+# projection path on device (below it the per-row GEMV path is
+# kept - at one or two rows the GEMV launches are already the
+# cheap shape, and decode always uses GEMV); at or above
+# GEMM_TILED_MIN_BATCH rows the register-tiled GEMM structure
+# is used instead of the straightforward batched one. Setting
+# PREFILL_GEMM_MIN_BATCH above any real prompt length disables
+# the GEMM path entirely (the A/B control the Wave D timing
+# harness uses). Both are positive whole numbers, refused by
+# name like every other value here.
+comptime DEFAULT_PREFILL_GEMM_MIN_BATCH = 2
+comptime DEFAULT_GEMM_TILED_MIN_BATCH = 8
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -87,19 +101,82 @@ def parse_gpu_budget_bytes(raw: String) raises -> Int:
     return parsed
 
 
+def parse_prefill_gemm_min_batch(raw: String) raises -> Int:
+    """Parse and validate a prefill GEMM minimum batch value.
+
+    Split out of load() so the refusal names are directly
+    testable, exactly like parse_context_len. Raises
+    mojo_engine_config on anything that is not a positive
+    whole number.
+    """
+    var parsed: Int
+    try:
+        parsed = Int(raw)
+    except:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH is not a"
+            " whole number: '"
+            + raw
+            + "'"
+        )
+    if parsed <= 0:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH must be"
+            " positive, got "
+            + String(parsed)
+        )
+    return parsed
+
+
+def parse_gemm_tiled_min_batch(raw: String) raises -> Int:
+    """Parse and validate a tiled-GEMM minimum batch value.
+
+    Split out of load() so the refusal names are directly
+    testable, exactly like parse_context_len. Raises
+    mojo_engine_config on anything that is not a positive
+    whole number.
+    """
+    var parsed: Int
+    try:
+        parsed = Int(raw)
+    except:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GEMM_TILED_MIN_BATCH is not a"
+            " whole number: '"
+            + raw
+            + "'"
+        )
+    if parsed <= 0:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GEMM_TILED_MIN_BATCH must be"
+            " positive, got "
+            + String(parsed)
+        )
+    return parsed
+
+
 struct EngineConfig(Copyable, Movable):
     """One loaded configuration; build via EngineConfig.load()."""
 
     var model_path: String
     var context_len: Int
     var gpu_budget_bytes: Int
+    var prefill_gemm_min_batch: Int
+    var gemm_tiled_min_batch: Int
 
     def __init__(
-        out self, model_path: String, context_len: Int, gpu_budget_bytes: Int
+        out self,
+        model_path: String,
+        context_len: Int,
+        gpu_budget_bytes: Int,
+        prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
+        gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
     ):
         self.model_path = model_path
         self.context_len = context_len
         self.gpu_budget_bytes = gpu_budget_bytes
+        self.prefill_gemm_min_batch = prefill_gemm_min_batch
+        self.gemm_tiled_min_batch = gemm_tiled_min_batch
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -122,4 +199,20 @@ struct EngineConfig(Copyable, Movable):
         if raw_budget != "":
             gpu_budget_bytes = parse_gpu_budget_bytes(raw_budget)
 
-        return EngineConfig(model_path, context_len, gpu_budget_bytes)
+        var prefill_gemm_min_batch = DEFAULT_PREFILL_GEMM_MIN_BATCH
+        var raw_min = getenv("MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH")
+        if raw_min != "":
+            prefill_gemm_min_batch = parse_prefill_gemm_min_batch(raw_min)
+
+        var gemm_tiled_min_batch = DEFAULT_GEMM_TILED_MIN_BATCH
+        var raw_tiled = getenv("MOJO_ENGINE_GEMM_TILED_MIN_BATCH")
+        if raw_tiled != "":
+            gemm_tiled_min_batch = parse_gemm_tiled_min_batch(raw_tiled)
+
+        return EngineConfig(
+            model_path,
+            context_len,
+            gpu_budget_bytes,
+            prefill_gemm_min_batch,
+            gemm_tiled_min_batch,
+        )

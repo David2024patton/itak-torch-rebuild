@@ -16,8 +16,12 @@ from config import (
     EngineConfig,
     GPU_CARD_TOTAL_BYTES,
     GPU_RESERVE_BYTES,
+    DEFAULT_GEMM_TILED_MIN_BATCH,
+    DEFAULT_PREFILL_GEMM_MIN_BATCH,
     parse_context_len,
+    parse_gemm_tiled_min_batch,
     parse_gpu_budget_bytes,
+    parse_prefill_gemm_min_batch,
 )
 
 
@@ -27,6 +31,10 @@ def test_defaults_in_clean_env() raises:
     assert_equal(cfg.model_path, DEFAULT_MODEL_PATH)
     assert_equal(cfg.context_len, 131072)
     assert_equal(cfg.gpu_budget_bytes, DEFAULT_GPU_BUDGET_BYTES)
+    assert_equal(cfg.prefill_gemm_min_batch, DEFAULT_PREFILL_GEMM_MIN_BATCH)
+    assert_equal(cfg.gemm_tiled_min_batch, DEFAULT_GEMM_TILED_MIN_BATCH)
+    assert_equal(cfg.prefill_gemm_min_batch, 2)
+    assert_equal(cfg.gemm_tiled_min_batch, 8)
 
 
 def test_gpu_budget_default_arithmetic() raises:
@@ -97,6 +105,25 @@ def test_parse_refuses_by_name() raises:
         )
         saw += 1
     assert_equal(saw, 3)
+
+
+def test_parse_gemm_knobs_accept_and_refuse() raises:
+    assert_equal(parse_prefill_gemm_min_batch("2"), 2)
+    assert_equal(parse_prefill_gemm_min_batch("4096"), 4096)
+    assert_equal(parse_gemm_tiled_min_batch("8"), 8)
+    for raw in ["abc", "0", "-3", "1.5"]:
+        var refused = False
+        try:
+            _ = parse_prefill_gemm_min_batch(raw)
+        except e:
+            refused = String(e).find("mojo_engine_config") != -1
+        assert_true(refused, "min batch must refuse by name: " + raw)
+        refused = False
+        try:
+            _ = parse_gemm_tiled_min_batch(raw)
+        except e:
+            refused = String(e).find("mojo_engine_config") != -1
+        assert_true(refused, "tiled min batch must refuse by name: " + raw)
 
 
 def main() raises:

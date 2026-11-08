@@ -1,7 +1,11 @@
 # Mojo/MAX engine: design
 
-Status: Waves A, B, and C landed, 2026-11-07/08, branch
-`mojo-max-engine`, engine version 1.4. Wave B is CLOSED: the
+Status: Waves A, B, C, and D landed, 2026-11-07/08, branch
+`mojo-max-engine`, engine version 1.5. Wave D (the speed
+wave) is CLOSED: all four lanes integrated (D1 GEMM prefill,
+D2 attention occupancy, D3 GEMV tuning beyond K1, D4
+activation residency + device KV wrap), record in
+`bench/mojo-engine-wave-d-2026-11-08.md`. Wave B is CLOSED: the
 end-to-end golden passed on the real Glimmer file (first 8
 generated tokens exactly [13796, 26, 1573, 373, 290, 2167,
 26899, 1212]), rung 3 (teacher-forced) passed 8/8, and rung 2
@@ -69,8 +73,15 @@ Each step lands as its own lane on this branch, proves parity
 3. **Attention. DONE (Wave B, Lane B2), GPU-proven.** Scores,
    masking, the sliding-window and global layer split, a
    flash-style decoding kernel (online softmax, no
-   materialized score row); shared-memory K/V tile staging
-   and split-KV parallelism are still owed.
+   materialized score row). **OCCUPANCY DONE (Wave D, Lane
+   D2):** shared-memory K/V tile staging (tile 32) and
+   split-KV parallelism (exact logsumexp merge, splits by
+   stored count, span 512, cap 8) are the production GPU
+   path; at stored 4,096 the tiled split launch measured
+   486.9 us against the Wave B kernel's 3,138.4 us
+   interleaved (6.45x), correctness inside the Wave B bars
+   on every fixture including 4,096-position RoPE and
+   NoPE; record in bench/mojo-engine-wave-d-d2-2026-11-07.md.
 4. **One full layer, then all layers. DONE (Wave B, Lane
    B3).** The full 52-layer forward runs per position on the
    CPU path; rung 1 (synthetic, both layer kinds, Float64
@@ -99,12 +110,25 @@ Each step lands as its own lane on this branch, proves parity
    prefill 684 ms, decode 0.1511 s/step (about 6.62 tok/s),
    model open about 31.8 s (CPU model read plus device
    upload). Still owed, recorded in the wave note: a
-   device-side visible-order KV gather (the GPU path
-   refuses windowed appends that would wrap the 2,048 ring;
-   contexts past the window stay on the CPU path),
-   attention shared-memory tiling / split-KV occupancy work,
-   activation residency (activations cross per op in this
-   wave's shape), and GEMV tuning beyond K1.
+   device-side visible-order KV gather, attention
+   shared-memory tiling / split-KV occupancy work,
+   activation residency, and GEMV tuning beyond K1.
+   **ALL FOUR LANDED IN WAVE D** (Lanes D4, D2, D4, and D3
+   respectively): windowed layers now run past the 2,048
+   wrap on device, layer activations stay resident across
+   the layer's ops (1.91x/1.60x warm medians on the C2
+   harness shapes), and Q6_K/Q5_K/F16 GEMVs are tuned
+   (410.9 / 361.9 / 717.9 GB/s). Wave D also added the
+   batched GEMM prefill path (Lane D1): one GEMM launch per
+   projection for the whole prompt batch, GEMM outputs
+   bit-identical to the GEMV kernels per row, 1,022-token
+   prefill 1.83x on its lane tree (74,636 ms vs 136,467 ms)
+   and 402 ms for the 6-token golden prompt against Wave
+   C's 684 ms. Still owed after Wave D: activation
+   residency INSIDE prefill (KV appends and causal
+   attention still run per position there), the
+   temperature/top-k/top-p sampler family, and the serving
+   seam (step 7).
 6. **Sampler. GREEDY LANDED (Wave B, Lane B4).** First-max
    tie-break, EOS excluded per engine.rs. The
    temperature/top-k/top-p family is still to come.
@@ -133,6 +157,21 @@ recomputes dequant per element, loads a byte at a time, and has
 no subgroup reduction. Tuning is therefore budgeted work in
 every kernel lane's plan, never an afterthought and never a
 surprise. No kernel is called fast on a port's numbers.
+
+Measured state after Wave D (2026-11-08): K1 624.1 GB/s
+(74.4% of the wgpu median; its correctness gate is the
+binding constraint and the bar question stays David's open
+call), Q6_K 410.9 GB/s, Q5_K 361.9 GB/s, F16 717.9 GB/s
+(D3); decode on the D3 lane tree 9.09 tok/s against Wave
+C's 6.62; prefill 402 ms for the 6-token prompt and
+74,636 ms at 1,022 tokens on the D1 lane tree (1.83x over
+the Wave C path interleaved); attention at stored 4,096
+runs 6.45x the Wave B kernel (D2). Reference points on the
+same card: the paused Rust engine's plain decode about
+34.5 tok/s, llama.cpp Vulkan decode 44.59 tok/s - the
+remaining decode gap is the next speed target, and its
+named lever is prefill/decode activation residency plus
+further kernel tuning, in that order of evidence.
 
 ## Licensing constraints (facts, as of MAX 26.7)
 

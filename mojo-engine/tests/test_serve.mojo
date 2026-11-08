@@ -13,6 +13,10 @@
 from std.testing import TestSuite, assert_true, assert_false, assert_equal
 
 from gguf.loader import parse_gguf
+from config import (
+    DEFAULT_GPU_PEAK_BANDWIDTH_GBPS,
+    parse_gpu_peak_bandwidth_gbps,
+)
 from serve.dashboard import dashboard_html
 from serve.factsheet import (
     compute_split,
@@ -23,6 +27,7 @@ from serve.factsheet import (
 from serve.history import (
     RunRecord,
     bundle_json,
+    effective_bandwidth_gbps,
     file_sha256_hex,
     history_json,
     leaderboard_json,
@@ -32,6 +37,7 @@ from serve.history import (
     prompt_bucket_of,
     reference_rows,
     sha256_hex_of_bytes,
+    valid_debug_level,
 )
 from serve.http import (
     ROUTE_CHAT,
@@ -209,6 +215,29 @@ def test_greedy_lock() raises:
     )
 
 
+def test_debug_level_parse() raises:
+    # Absent means benchmark, the default.
+    var a = parse_chat_request('{"prompt":"x"}', 64, 512, 32768)
+    assert_equal(a.debug_level, "benchmark")
+    var b = parse_chat_request(
+        '{"prompt":"x","debug_level":"profile"}', 64, 512, 32768
+    )
+    assert_equal(b.debug_level, "profile")
+    var c = parse_chat_request(
+        '{"prompt":"x","debug_level":"trace"}', 64, 512, 32768
+    )
+    assert_equal(c.debug_level, "trace")
+    # Unknown values refuse BY NAME, never coerced.
+    assert_equal(
+        _refusal_name('{"prompt":"x","debug_level":"verbose"}'),
+        "serve_bad_debug_level",
+    )
+    assert_true(valid_debug_level("benchmark"))
+    assert_true(valid_debug_level("profile"))
+    assert_true(valid_debug_level("trace"))
+    assert_false(valid_debug_level(""))
+
+
 def test_chat_refusals_by_name() raises:
     assert_equal(
         _refusal_name('{"prompt":"x","image":"data:..."}'),
@@ -242,6 +271,7 @@ def test_response_and_health_shapes() raises:
     assert_true(r.find('"prefill_ms":900') != -1)
     assert_true(r.find('"ttft_ms":null') != -1)
     assert_true(r.find('"temperature":0.0') != -1)
+    assert_true(r.find('"debug_level":"benchmark"') != -1)
     assert_equal(model_display_name("/a/b/Qwen3.5-9B.gguf"), "Qwen3.5-9B")
 
 
@@ -328,6 +358,87 @@ def test_record_round_trip() raises:
     assert_true(back.imported)
     assert_equal(back.origin_backend, "gfx1100 / MAX 26.7")
     assert_equal(len(back.attachments), 1)
+
+
+def test_bandwidth_math() raises:
+    # 1 GB streamed per step, 10 steps, 100 ms: 100 GB/s.
+    assert_true(
+        abs(effective_bandwidth_gbps(1_000_000_000, 10, 100) - 100.0) < 0.01
+    )
+    # Nothing measured means no number, never a guess.
+    assert_equal(effective_bandwidth_gbps(0, 10, 100), 0.0)
+    assert_equal(effective_bandwidth_gbps(1_000_000_000, 0, 100), 0.0)
+    assert_equal(effective_bandwidth_gbps(1_000_000_000, 10, 0), 0.0)
+
+
+def test_telemetry_slots_round_trip() raises:
+    # A record with measured bandwidth and a trace level
+    # keeps both through JSON and back through ingest.
+    var atts = List[String]()
+    var rec = RunRecord(
+        1700000000,
+        "dashboard",
+        "M",
+        "ab12",
+        "",
+        "gfx1100 / MAX 26.7",
+        128,
+        200,
+        32.65,
+        16,
+        16739,
+        260,
+        "",
+        atts^,
+        False,
+        "",
+        debug_level="trace",
+        eff_bandwidth_gbps=512.5,
+        has_eff_bandwidth=True,
+        bandwidth_pct_of_peak=53.4,
+        has_bandwidth_pct=True,
+    )
+    var j = rec.to_json()
+    assert_true(j.find('"debug_level":"trace"') != -1)
+    assert_true(j.find('"effective_bandwidth_gbps":512.5') != -1)
+    assert_true(j.find('"bandwidth_pct_of_peak":53.4') != -1)
+    # GPU clock/temp/power are null with the named reason,
+    # and the per-op buckets are null with theirs.
+    assert_true(j.find('"gpu_clock_mhz_start":null') != -1)
+    assert_true(j.find('"gpu_power_w_end":null') != -1)
+    assert_true(j.find("not exposed by MAX 26.7") != -1)
+    assert_true(j.find('"op_timings_ms":{"embedding":null') != -1)
+    assert_true(j.find("kernel wave (goal Piece 4B)") != -1)
+    var back = parse_run_record(j, 0)
+    assert_equal(back.debug_level, "trace")
+    assert_true(back.has_eff_bandwidth)
+    assert_true(abs(back.eff_bandwidth_gbps - 512.5) < 0.01)
+    assert_true(back.has_bandwidth_pct)
+    assert_true(abs(back.bandwidth_pct_of_peak - 53.4) < 0.01)
+    assert_false(back.has_gpu_telemetry)
+    assert_false(back.has_op_timings)
+    # An OLD record (no addendum keys) still ingests, with
+    # the default level and null slots.
+    var old = parse_run_record(_sample_record().to_json(), 0)
+    assert_equal(old.debug_level, "benchmark")
+    assert_false(old.has_eff_bandwidth)
+    assert_false(old.has_bandwidth_pct)
+
+
+def test_peak_bandwidth_config() raises:
+    assert_equal(DEFAULT_GPU_PEAK_BANDWIDTH_GBPS, 960.0)
+    assert_true(abs(parse_gpu_peak_bandwidth_gbps("960") - 960.0) < 0.01)
+    assert_true(abs(parse_gpu_peak_bandwidth_gbps("1048.6") - 1048.6) < 0.01)
+    try:
+        _ = parse_gpu_peak_bandwidth_gbps("fast")
+        assert_true(False)
+    except e:
+        assert_equal(error_code_of(String(e)), "mojo_engine_config")
+    try:
+        _ = parse_gpu_peak_bandwidth_gbps("0")
+        assert_true(False)
+    except e:
+        assert_equal(error_code_of(String(e)), "mojo_engine_config")
 
 
 def test_ingest_validation_by_name() raises:
@@ -428,6 +539,10 @@ def test_dashboard_wiring() raises:
         "vision",
         "data-dl",
         "temperature:0.0",
+        # Deep-telemetry addendum: the debug-level toggle
+        # exists and rides the chat payload.
+        'id="debugLevel"',
+        "debug_level:",
         # readZip must close its function body; window 4
         # caught a one-brace-short ending via node --check.
         "return files;}}",

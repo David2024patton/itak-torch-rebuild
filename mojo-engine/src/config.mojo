@@ -161,6 +161,11 @@ comptime DEFAULT_SERVE_HISTORY_DIR = "serve_history"
 comptime DEFAULT_SERVE_MODELS_DIR = "/mnt/models"
 comptime DEFAULT_SERVE_BACKEND_TARGET = "gfx1100 / MAX 26.7"
 comptime DEFAULT_SERVE_ATTACH_WARN_TOKENS = 4096
+# Card peak memory bandwidth (GB/s) for the run record's
+# bandwidth_pct_of_peak. An operator fact about the card
+# (RX 7900 XTX: 960 GB/s), from config, never hardcoded in
+# the record math (deep-telemetry addendum, 2026-11-08).
+comptime DEFAULT_GPU_PEAK_BANDWIDTH_GBPS = 960.0
 
 
 def parse_context_len(raw: String) raises -> Int:
@@ -388,6 +393,42 @@ def parse_serve_attach_warn_tokens(raw: String) raises -> Int:
     return _parse_positive(raw, "MOJO_ENGINE_SERVE_ATTACH_WARN_TOKENS")
 
 
+def parse_gpu_peak_bandwidth_gbps(raw: String) raises -> Float64:
+    """MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS: the card's peak
+    memory bandwidth in GB/s, the denominator of the run
+    record's bandwidth_pct_of_peak (deep-telemetry addendum).
+    Digits with at most one dot, strictly positive; anything
+    else refuses as mojo_engine_config."""
+    var digits = 0
+    var dots = 0
+    for b in raw.as_bytes():
+        if b >= 48 and b <= 57:
+            digits += 1
+        elif b == 46:
+            dots += 1
+        else:
+            raise Error(
+                "mojo_engine_config: MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS"
+                " '"
+                + raw
+                + "' is not a plain positive number"
+            )
+    if digits == 0 or dots > 1:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS"
+            " '"
+            + raw
+            + "' is not a plain positive number"
+        )
+    var value = Float64(raw)
+    if value <= 0.0:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS"
+            " must be positive"
+        )
+    return value
+
+
 def parse_serve_dir(raw: String, env_name: String) raises -> String:
     """A directory path knob (history dir, models dir): any
     non-empty path is accepted as text; existence is checked
@@ -551,6 +592,8 @@ struct EngineConfig(Copyable, Movable):
     var serve_models_dir: String
     var serve_backend_target: String
     var serve_attach_warn_tokens: Int
+    # -- Deep-telemetry addendum field (2026-11-08) --
+    var gpu_peak_bandwidth_gbps: Float64
 
     def __init__(
         out self,
@@ -583,6 +626,7 @@ struct EngineConfig(Copyable, Movable):
         serve_models_dir: String = DEFAULT_SERVE_MODELS_DIR,
         serve_backend_target: String = DEFAULT_SERVE_BACKEND_TARGET,
         serve_attach_warn_tokens: Int = DEFAULT_SERVE_ATTACH_WARN_TOKENS,
+        gpu_peak_bandwidth_gbps: Float64 = DEFAULT_GPU_PEAK_BANDWIDTH_GBPS,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -613,6 +657,7 @@ struct EngineConfig(Copyable, Movable):
         self.serve_models_dir = serve_models_dir
         self.serve_backend_target = serve_backend_target
         self.serve_attach_warn_tokens = serve_attach_warn_tokens
+        self.gpu_peak_bandwidth_gbps = gpu_peak_bandwidth_gbps
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -762,6 +807,11 @@ struct EngineConfig(Copyable, Movable):
         if raw_warn != "":
             serve_attach_warn_tokens = parse_serve_attach_warn_tokens(raw_warn)
 
+        var gpu_peak_bandwidth_gbps = DEFAULT_GPU_PEAK_BANDWIDTH_GBPS
+        var raw_peak = getenv("MOJO_ENGINE_GPU_PEAK_BANDWIDTH_GBPS")
+        if raw_peak != "":
+            gpu_peak_bandwidth_gbps = parse_gpu_peak_bandwidth_gbps(raw_peak)
+
         if serve_default_max_tokens > serve_max_tokens:
             raise Error(
                 "mojo_engine_config: MOJO_ENGINE_SERVE_DEFAULT_MAX_TOKENS"
@@ -798,4 +848,5 @@ struct EngineConfig(Copyable, Movable):
             serve_models_dir,
             serve_backend_target,
             serve_attach_warn_tokens,
+            gpu_peak_bandwidth_gbps,
         )

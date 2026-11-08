@@ -15,6 +15,7 @@
 # serve_bad_json / serve_missing_field family from json.mojo.
 
 from config import ENGINE_NAME, ENGINE_VERSION
+from serve.history import DEBUG_LEVEL_BENCHMARK, valid_debug_level
 from serve.json import (
     has_json_key,
     json_content_strings,
@@ -97,6 +98,7 @@ struct ChatRequest(Copyable, Movable):
     var source: String
     var attachments: List[String]
     var quality_verdict: String
+    var debug_level: String
 
     def __init__(
         out self,
@@ -106,6 +108,7 @@ struct ChatRequest(Copyable, Movable):
         source: String,
         var attachments: List[String],
         quality_verdict: String,
+        debug_level: String = DEBUG_LEVEL_BENCHMARK,
     ):
         self.prompt_text = prompt_text
         self.context_text = context_text
@@ -113,6 +116,7 @@ struct ChatRequest(Copyable, Movable):
         self.source = source
         self.attachments = attachments^
         self.quality_verdict = quality_verdict
+        self.debug_level = debug_level
 
 
 def chat_request_has_image(body: String) raises -> Bool:
@@ -234,7 +238,22 @@ def parse_chat_request(
     var verdict = String("")
     if has_json_key(body, "quality_verdict"):
         verdict = json_string_field(body, "quality_verdict")
-    return ChatRequest(prompt, context, max_tokens, source, attachments^, verdict)
+    # debug_level (deep-telemetry addendum): benchmark by
+    # default; profile and trace accepted and recorded. An
+    # unknown value refuses BY NAME rather than being
+    # silently coerced.
+    var level = String(DEBUG_LEVEL_BENCHMARK)
+    if has_json_key(body, "debug_level"):
+        level = json_string_field(body, "debug_level")
+        if not valid_debug_level(level):
+            raise Error(
+                "serve_bad_debug_level: debug_level '"
+                + level
+                + "' is not benchmark|profile|trace"
+            )
+    return ChatRequest(
+        prompt, context, max_tokens, source, attachments^, verdict, level
+    )
 
 
 def effective_prompt(req: ChatRequest) -> String:
@@ -256,6 +275,7 @@ def chat_response_json(
     total_ms: Int,
     prefill_ms: Int,
     decode_tok_s: Float64,
+    debug_level: String = DEBUG_LEVEL_BENCHMARK,
 ) -> String:
     """OpenAI-shaped chat.completion plus a timings object
     and the sampler settings actually used (the greedy lock:
@@ -288,6 +308,7 @@ def chat_response_json(
     out += ',"decode_tok_s":' + String(decode_tok_s)
     out += ',"ttft_ms":null}'
     out += ',"sampler":{"name":"greedy","temperature":0.0,"seed":null}'
+    out += ',"debug_level":"' + json_escape(debug_level) + '"'
     out += "}"
     return out
 

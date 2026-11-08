@@ -94,6 +94,67 @@ def valid_source(source: String) -> Bool:
     return source == "dashboard" or source == "cli" or source == "mcp"
 
 
+# -- Deep-telemetry addendum (David's review, 2026-11-08) ------
+
+comptime DEBUG_LEVEL_BENCHMARK = "benchmark"
+comptime DEBUG_LEVEL_PROFILE = "profile"
+comptime DEBUG_LEVEL_TRACE = "trace"
+
+comptime GPU_TELEMETRY_NOTE = (
+    "gpu clock, temperature, and power are not exposed by MAX 26.7 to Mojo"
+)
+comptime OP_TIMINGS_NOTE = (
+    "per-op timing lands with the kernel wave (goal Piece 4B);"
+    " v1 measures the prefill/decode split only"
+)
+
+
+def valid_debug_level(level: String) -> Bool:
+    """The chat request's debug_level field: benchmark
+    (default), profile, or trace. In this lane all three are
+    accepted and recorded and behave the same at the engine
+    level (no per-layer device checks exist yet); trace adds
+    the token-id line to the debug stream. The heavy
+    instrumentation lands with the kernel wave."""
+    return (
+        level == DEBUG_LEVEL_BENCHMARK
+        or level == DEBUG_LEVEL_PROFILE
+        or level == DEBUG_LEVEL_TRACE
+    )
+
+
+def effective_bandwidth_gbps(
+    model_file_bytes: Int, decode_steps: Int, decode_ms: Int
+) -> Float64:
+    """Effective decode bandwidth in GB/s by the standard
+    bytes-per-step convention: every decode step streams the
+    model's weights once, so model file bytes x decode steps
+    / measured decode seconds. Returns 0.0 when nothing was
+    measured (no steps or no time); callers store null then,
+    never the 0. The peak for the percentage comes from
+    config (gpu_peak_bandwidth_gbps), never from here."""
+    if model_file_bytes <= 0 or decode_steps <= 0 or decode_ms <= 0:
+        return Float64(0.0)
+    var bytes_streamed = Float64(model_file_bytes) * Float64(decode_steps)
+    var seconds = Float64(decode_ms) / 1000.0
+    return bytes_streamed / seconds / 1_000_000_000.0
+
+
+def _opt_float(obj: String, key: String) raises -> Tuple[Float64, Bool]:
+    """An optional numeric-or-null field: (value, present).
+    Absent key or JSON null reads as not present; a present
+    number parses through the raw field text."""
+    if not has_json_key(obj, key):
+        return (Float64(0.0), False)
+    var raw = json_raw_field(obj, key)
+    if raw == "" or raw == "null":
+        return (Float64(0.0), False)
+    try:
+        return (Float64(raw), True)
+    except:
+        return (Float64(0.0), False)
+
+
 struct RunRecord(Copyable, Movable):
     var timestamp: Int
     var source: String
@@ -114,6 +175,31 @@ struct RunRecord(Copyable, Movable):
     var attachments: List[String]
     var imported: Bool
     var origin_backend: String
+    # -- Deep-telemetry addendum slots (2026-11-08). Every
+    # slot follows the honesty rule: a value only where the
+    # engine actually measures it, otherwise null in JSON
+    # plus a named reason in the sibling note field.
+    var debug_level: String
+    var eff_bandwidth_gbps: Float64
+    var has_eff_bandwidth: Bool
+    var bandwidth_pct_of_peak: Float64
+    var has_bandwidth_pct: Bool
+    var bandwidth_note: String
+    var gpu_clock_mhz_start: Float64
+    var gpu_clock_mhz_end: Float64
+    var gpu_temp_c_start: Float64
+    var gpu_temp_c_end: Float64
+    var gpu_power_w_start: Float64
+    var gpu_power_w_end: Float64
+    var has_gpu_telemetry: Bool
+    var gpu_telemetry_note: String
+    var op_embedding_ms: Float64
+    var op_projection_ms: Float64
+    var op_attention_or_state_ms: Float64
+    var op_ffn_ms: Float64
+    var op_host_device_sync_ms: Float64
+    var has_op_timings: Bool
+    var op_timings_note: String
 
     def __init__(
         out self,
@@ -133,6 +219,27 @@ struct RunRecord(Copyable, Movable):
         var attachments: List[String],
         imported: Bool,
         origin_backend: String,
+        debug_level: String = DEBUG_LEVEL_BENCHMARK,
+        eff_bandwidth_gbps: Float64 = 0.0,
+        has_eff_bandwidth: Bool = False,
+        bandwidth_pct_of_peak: Float64 = 0.0,
+        has_bandwidth_pct: Bool = False,
+        bandwidth_note: String = "",
+        gpu_clock_mhz_start: Float64 = 0.0,
+        gpu_clock_mhz_end: Float64 = 0.0,
+        gpu_temp_c_start: Float64 = 0.0,
+        gpu_temp_c_end: Float64 = 0.0,
+        gpu_power_w_start: Float64 = 0.0,
+        gpu_power_w_end: Float64 = 0.0,
+        has_gpu_telemetry: Bool = False,
+        gpu_telemetry_note: String = GPU_TELEMETRY_NOTE,
+        op_embedding_ms: Float64 = 0.0,
+        op_projection_ms: Float64 = 0.0,
+        op_attention_or_state_ms: Float64 = 0.0,
+        op_ffn_ms: Float64 = 0.0,
+        op_host_device_sync_ms: Float64 = 0.0,
+        has_op_timings: Bool = False,
+        op_timings_note: String = OP_TIMINGS_NOTE,
     ):
         self.timestamp = timestamp
         self.source = source
@@ -159,6 +266,27 @@ struct RunRecord(Copyable, Movable):
         self.attachments = attachments^
         self.imported = imported
         self.origin_backend = origin_backend
+        self.debug_level = debug_level
+        self.eff_bandwidth_gbps = eff_bandwidth_gbps
+        self.has_eff_bandwidth = has_eff_bandwidth
+        self.bandwidth_pct_of_peak = bandwidth_pct_of_peak
+        self.has_bandwidth_pct = has_bandwidth_pct
+        self.bandwidth_note = bandwidth_note
+        self.gpu_clock_mhz_start = gpu_clock_mhz_start
+        self.gpu_clock_mhz_end = gpu_clock_mhz_end
+        self.gpu_temp_c_start = gpu_temp_c_start
+        self.gpu_temp_c_end = gpu_temp_c_end
+        self.gpu_power_w_start = gpu_power_w_start
+        self.gpu_power_w_end = gpu_power_w_end
+        self.has_gpu_telemetry = has_gpu_telemetry
+        self.gpu_telemetry_note = gpu_telemetry_note
+        self.op_embedding_ms = op_embedding_ms
+        self.op_projection_ms = op_projection_ms
+        self.op_attention_or_state_ms = op_attention_or_state_ms
+        self.op_ffn_ms = op_ffn_ms
+        self.op_host_device_sync_ms = op_host_device_sync_ms
+        self.has_op_timings = has_op_timings
+        self.op_timings_note = op_timings_note
 
     def to_json(self) -> String:
         var out = String("{")
@@ -199,6 +327,65 @@ struct RunRecord(Copyable, Movable):
         out += ',"imported":' + ("true" if self.imported else "false")
         if self.imported:
             out += ',"origin_backend":"' + json_escape(self.origin_backend) + '"'
+        # Deep-telemetry addendum slots: values only where
+        # measured, null plus the note otherwise.
+        out += ',"debug_level":"' + json_escape(self.debug_level) + '"'
+        if self.has_eff_bandwidth:
+            out += ',"effective_bandwidth_gbps":' + String(
+                self.eff_bandwidth_gbps
+            )
+        else:
+            out += ',"effective_bandwidth_gbps":null'
+        if self.has_bandwidth_pct:
+            out += ',"bandwidth_pct_of_peak":' + String(
+                self.bandwidth_pct_of_peak
+            )
+        else:
+            out += ',"bandwidth_pct_of_peak":null'
+        out += ',"bandwidth_note":"' + json_escape(self.bandwidth_note) + '"'
+        out += ',"gpu_clock_mhz_start":' + (
+            String(self.gpu_clock_mhz_start) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_clock_mhz_end":' + (
+            String(self.gpu_clock_mhz_end) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_temp_c_start":' + (
+            String(self.gpu_temp_c_start) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_temp_c_end":' + (
+            String(self.gpu_temp_c_end) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_power_w_start":' + (
+            String(self.gpu_power_w_start) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_power_w_end":' + (
+            String(self.gpu_power_w_end) if self.has_gpu_telemetry else "null"
+        )
+        out += ',"gpu_telemetry_note":"' + json_escape(
+            self.gpu_telemetry_note
+        ) + '"'
+        out += ',"op_timings_ms":{'
+        out += '"embedding":' + (
+            String(self.op_embedding_ms) if self.has_op_timings else "null"
+        )
+        out += ',"projection":' + (
+            String(self.op_projection_ms) if self.has_op_timings else "null"
+        )
+        out += ',"attention_or_state":' + (
+            String(self.op_attention_or_state_ms)
+            if self.has_op_timings
+            else "null"
+        )
+        out += ',"ffn":' + (
+            String(self.op_ffn_ms) if self.has_op_timings else "null"
+        )
+        out += ',"host_device_sync":' + (
+            String(self.op_host_device_sync_ms)
+            if self.has_op_timings
+            else "null"
+        )
+        out += "}"
+        out += ',"op_timings_note":"' + json_escape(self.op_timings_note) + '"'
         out += "}"
         return out
 
@@ -283,6 +470,56 @@ def parse_run_record(obj: String, idx: Int) raises -> RunRecord:
     if has_json_key(obj, "quality_verdict"):
         verdict = json_string_field(obj, "quality_verdict")
     var attachments = json_string_array_field(obj, "attachments")
+    # Deep-telemetry slots are OPTIONAL on ingest: bundles
+    # written before the addendum (or by other benches) carry
+    # none of them and must still land, with the slots null
+    # and the standard notes. A present debug_level must be
+    # one of the three, by name.
+    var level = String(DEBUG_LEVEL_BENCHMARK)
+    if has_json_key(obj, "debug_level"):
+        level = json_string_field(obj, "debug_level")
+        if not valid_debug_level(level):
+            raise Error(
+                "serve_ingest_bad_record: record "
+                + String(idx)
+                + " has debug_level '"
+                + level
+                + "', not benchmark|profile|trace"
+            )
+    var bw = _opt_float(obj, "effective_bandwidth_gbps")
+    var pct = _opt_float(obj, "bandwidth_pct_of_peak")
+    var bw_note = String("")
+    if has_json_key(obj, "bandwidth_note"):
+        bw_note = json_string_field(obj, "bandwidth_note")
+    var clock0 = _opt_float(obj, "gpu_clock_mhz_start")
+    var clock1 = _opt_float(obj, "gpu_clock_mhz_end")
+    var temp0 = _opt_float(obj, "gpu_temp_c_start")
+    var temp1 = _opt_float(obj, "gpu_temp_c_end")
+    var pow0 = _opt_float(obj, "gpu_power_w_start")
+    var pow1 = _opt_float(obj, "gpu_power_w_end")
+    var has_gpu_tel = (
+        clock0[1] or clock1[1] or temp0[1] or temp1[1] or pow0[1] or pow1[1]
+    )
+    var gpu_note = String(GPU_TELEMETRY_NOTE)
+    if has_json_key(obj, "gpu_telemetry_note"):
+        gpu_note = json_string_field(obj, "gpu_telemetry_note")
+    var op_emb: Tuple[Float64, Bool] = (Float64(0.0), False)
+    var op_proj: Tuple[Float64, Bool] = (Float64(0.0), False)
+    var op_attn: Tuple[Float64, Bool] = (Float64(0.0), False)
+    var op_ffn: Tuple[Float64, Bool] = (Float64(0.0), False)
+    var op_sync: Tuple[Float64, Bool] = (Float64(0.0), False)
+    if has_json_key(obj, "op_timings_ms"):
+        var ops = json_raw_field(obj, "op_timings_ms")
+        if ops != "" and ops != "null":
+            op_emb = _opt_float(ops, "embedding")
+            op_proj = _opt_float(ops, "projection")
+            op_attn = _opt_float(ops, "attention_or_state")
+            op_ffn = _opt_float(ops, "ffn")
+            op_sync = _opt_float(ops, "host_device_sync")
+    var has_ops = op_emb[1] or op_proj[1] or op_attn[1] or op_ffn[1] or op_sync[1]
+    var op_note = String(OP_TIMINGS_NOTE)
+    if has_json_key(obj, "op_timings_note"):
+        op_note = json_string_field(obj, "op_timings_note")
     # Imported records keep their origin backend for
     # attribution; the origin IS the record's backend_target.
     return RunRecord(
@@ -302,6 +539,27 @@ def parse_run_record(obj: String, idx: Int) raises -> RunRecord:
         attachments^,
         True,
         backend,
+        debug_level=level,
+        eff_bandwidth_gbps=bw[0],
+        has_eff_bandwidth=bw[1],
+        bandwidth_pct_of_peak=pct[0],
+        has_bandwidth_pct=pct[1],
+        bandwidth_note=bw_note,
+        gpu_clock_mhz_start=clock0[0],
+        gpu_clock_mhz_end=clock1[0],
+        gpu_temp_c_start=temp0[0],
+        gpu_temp_c_end=temp1[0],
+        gpu_power_w_start=pow0[0],
+        gpu_power_w_end=pow1[0],
+        has_gpu_telemetry=has_gpu_tel,
+        gpu_telemetry_note=gpu_note,
+        op_embedding_ms=op_emb[0],
+        op_projection_ms=op_proj[0],
+        op_attention_or_state_ms=op_attn[0],
+        op_ffn_ms=op_ffn[0],
+        op_host_device_sync_ms=op_sync[0],
+        has_op_timings=has_ops,
+        op_timings_note=op_note,
     )
 
 

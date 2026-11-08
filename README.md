@@ -49,12 +49,12 @@ The design target has not changed since the original: huge model capability on h
 
 Measured on the target hardware, an AMD Radeon RX 7900 XTX (24 GB, gfx1100), against the real Muse-Glimmer-30B GGUF:
 
-- The tokenizer matches the reference token for token on Glimmer's vocabulary (16/16 bench prompts, 16/16 decode round-trips; crates/tokenizer/CONFORMANCE.md).
-- The loader covers the real file completely: 731 of 731 tensors through the coverage gate, zero missing, zero unexpected.
-- The device-resident GPU forward reproduces the golden continuation exactly, 8 of 8 tokens (bench/gpu-resident-2026-10-30.md).
+- The tokenizer matches the reference token for token on the recorded bench suite: 16 of 16 prompts and 16 of 16 decode round-trips on Glimmer's vocabulary (crates/tokenizer/CONFORMANCE.md). The claim covers that suite, not arbitrary text.
+- The loader covers the real file completely: 731 of 731 tensors through the coverage gate, zero missing, zero unexpected (proof: the glimmer_inventory coverage run against the real file on the server, 2026-10-29; the run record is in STATUS.md).
+- The device-resident GPU forward reproduces the golden continuation exactly on the recorded check, 8 of 8 tokens (bench/gpu-resident-2026-10-30.md).
 - The speculative verify loop (DFlash draft plus rejection sampling) produces a stream token-identical to plain greedy over 16 tokens on the real files (bench/spec-loop-2026-10-30.md).
 - The serving pair passed its live proof run on the real file: sampling parity, two concurrent slots with independent outputs, embeddings geometry, and chat-template prompt ids matching llama.cpp 63 for 63 (bench/t917-proof-2026-10-30.md).
-- The reference-stack record the design stands on: llama.cpp decodes Glimmer Q4_K_M at 44.31 tok/s (Vulkan, llama-bench tg128 after pp512) on this card, and the DFlash depth sweep on the llama-server /completion harness found its operating point at depth 6, 107.39 tok/s (bench/gpu-proof-2026-10-30.md; full record in docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md). The two numbers come from different harnesses and are not compared against each other; DECISIONS.md (2026-10-30) designates the sweep harness as the comparison shape.
+- The reference-stack baselines the design stands on, both from llama.cpp's own harnesses, not from this engine: llama.cpp decodes Glimmer Q4_K_M at 44.31 tok/s (Vulkan, llama-bench tg128 after pp512) on this card. The DFlash depth sweep on the llama-server /completion harness measured its operating point at depth 6, 107.39 tok/s, with draft acceptance of 1,749 of 3,235 proposed tokens (0.541) at that depth; the full depth table (depths 1 through 16, median of 9 runs per cell, acceptance per depth) is in bench/gpu-proof-2026-10-30.md, and the full record in docs/research/2026-10-26-glimmer-7900xtx-benchmarks.md. The two numbers come from different harnesses and are not compared against each other; DECISIONS.md (2026-10-30) designates the sweep harness as the comparison shape.
 
 ## Quickstart
 

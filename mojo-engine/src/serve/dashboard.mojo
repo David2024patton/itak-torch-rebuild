@@ -231,7 +231,7 @@ def _dashboard_js() -> String:
     js += "if(attached.kind===\"image\"){payload.image=attached.image;}"
     js += "try{var r=await fetch(\"/v1/chat/completions\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(payload)});"
     js += "var data=await r.json();"
-    js += "if(data.error){$(\"reply\").textContent=\"Refusal: \"+(data.error.code||\"error\")+\" \\u2014 \"+(data.error.message||\"\");transcript.push({role:\"system\",text:\"refusal \"+(data.error.code||\"\")+\" for prompt: \"+prompt});}"
+    js += "if(data.error){$(\"reply\").textContent=\"Refusal: \"+(data.error.code||\"error\")+\": \"+(data.error.message||\"\");transcript.push({role:\"system\",text:\"refusal \"+(data.error.code||\"\")+\" for prompt: \"+prompt});}"
     js += "else{var content=data.choices[0].message.content;$(\"reply\").textContent=content;var t=data.timings||{};var u=data.usage||{};"
     js += "$(\"timings\").innerHTML=\"run \"+(rep+1)+\"/\"+reps+\" \\u00b7 prompt tokens \"+u.prompt_tokens+\" \\u00b7 completion tokens \"+u.completion_tokens+\"<br>prefill \"+t.prefill_ms+\" ms (\"+Number(t.prefill_tok_s).toFixed(1)+\" tok/s) \\u00b7 decode \"+Number(t.decode_tok_s).toFixed(2)+\" tok/s \\u00b7 total \"+t.total_ms+\" ms \\u00b7 ttft \"+(t.ttft_ms===null?\"n/a (non-streaming)\":t.ttft_ms)+\" \\u00b7 sampler greedy temp \"+data.sampler.temperature;"
     js += "transcript.push({role:\"user\",text:prompt});transcript.push({role:\"assistant\",text:content});}"

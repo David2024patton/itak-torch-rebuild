@@ -137,11 +137,17 @@ from kernels.k1_gemv import (
     ROWS_PER_WG as K1_ROWS_PER_WG,
 )
 from kernels.q6k_gemv import q6k_gemv_kernel, THREADS as Q6_THREADS
-from kernels.q5k_gemv import q5k_gemv_kernel, THREADS as Q5_THREADS
+from kernels.q5k_gemv import (
+    q5k_gemv_kernel,
+    THREADS as Q5_THREADS,
+    ROWS_PER_WG as Q5_ROWS_PER_WG,
+)
 from kernels.f32_gemv import (
     f32_gemv_kernel,
     f16_gemv_kernel,
     THREADS as F_THREADS,
+    F32_THREADS,
+    ROWS_PER_WG as F_ROWS_PER_WG,
 )
 from ops.rms_norm import rms_norm_kernel, RMS_THREADS
 from ops.rope import rope_kernel
@@ -208,6 +214,24 @@ def gpu_layer_check_proj(
             + String(rows)
             + " is not a multiple of the K1 workgroup tile "
             + String(K1_ROWS_PER_WG)
+        )
+    if type_id == DT_Q5_K and rows % Q5_ROWS_PER_WG != 0:
+        raise Error(
+            "gpu_layer_bad_shape: "
+            + name
+            + " rows "
+            + String(rows)
+            + " is not a multiple of the Q5_K workgroup tile "
+            + String(Q5_ROWS_PER_WG)
+        )
+    if type_id == DT_F16 and rows % F_ROWS_PER_WG != 0:
+        raise Error(
+            "gpu_layer_bad_shape: "
+            + name
+            + " rows "
+            + String(rows)
+            + " is not a multiple of the plain-float workgroup tile "
+            + String(F_ROWS_PER_WG)
         )
 
 
@@ -384,7 +408,7 @@ def _gemv_u8_device(
             x_dev,
             y_dev,
             Int32(view.cols),
-            grid_dim=view.rows,
+            grid_dim=view.rows // Q5_ROWS_PER_WG,
             block_dim=Q5_THREADS,
         )
     elif view.type_id == DT_F16:
@@ -393,7 +417,7 @@ def _gemv_u8_device(
             x_dev,
             y_dev,
             Int32(view.cols),
-            grid_dim=view.rows,
+            grid_dim=view.rows // F_ROWS_PER_WG,
             block_dim=F_THREADS,
         )
     else:
@@ -423,7 +447,7 @@ def _gemv_f32_device(
         y_dev,
         Int32(view.cols),
         grid_dim=view.rows,
-        block_dim=F_THREADS,
+        block_dim=F32_THREADS,
     )
     rt.ctx.synchronize()
     _ = log_debug("gpu.layer", "gemv f32 " + view.name)

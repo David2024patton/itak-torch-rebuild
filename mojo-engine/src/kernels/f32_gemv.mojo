@@ -1,5 +1,6 @@
 # f32_gemv.mojo - the plain-float GEMV kernels (F32 and F16
-# weight storage) for the Mojo/MAX engine. Lane A3.
+# weight storage) for the Mojo/MAX engine. Lane A3 (straight
+# ports), tuned in lane mojo-d3-gemv (Wave D, 2026-11-07).
 #
 # Real Glimmer tensors in this family (census 2026-10-29): the
 # norm weights are F32 vectors (attn_norm, attn_q_norm and
@@ -17,6 +18,27 @@
 # F16 weights arrive as raw bytes, two per element, little
 # endian, exactly as stored. Every bad shape refuses by name.
 #
+# TUNED SHAPES (Wave D): the tuned-K1 lessons translated to
+# plain floats, with opposite outcomes per dtype, both
+# measured in cleared-card window 1 (bench note
+# bench/mojo-d3-gemv-ladder-2026-11-07.md). The F16 kernel
+# took the full translation and kept it: 2 rows per
+# 128-thread workgroup as 8 groups of 16, each group
+# striding the row in 256-element segments, one thread
+# owning four quads per segment (quads t, t+16, t+32, t+48,
+# so consecutive threads read consecutive quads), each quad
+# arriving as two u32 words decoded through the bit-trick
+# f16 route, activation quads loaded once per segment and
+# shared by both rows, K1's segmented shuffle_xor butterfly
+# plus a short shared-memory finish: 180.19 -> 717.94 GB/s
+# median (3.98x the port). The same shape applied to F32
+# measured 415.42 against the port's 432.13 GB/s median,
+# slower in every rep - the port was already a clean
+# streaming kernel and the vec4 segment shape bought
+# nothing - so the F32 tuned iteration was REJECTED and
+# f32_gemv_kernel below is the Wave A port, unchanged. The
+# CPU twins below are byte-behaved and unchanged.
+#
 # Standalone usage mirrors k1_gemv:
 #   f32_gemv <fixture_dir> [--dtype f32|f16] [--rows N]
 #            [--cols N] [--iters N] [--warmup N] [--out PATH]
@@ -28,17 +50,57 @@ from std.sys import argv, exit
 from max.gpu import thread_idx, block_idx, barrier
 from max.gpu.host import DeviceContext
 from max.gpu.memory import AddressSpace
-from std.memory import stack_allocation
+from max.gpu.primitives.warp import shuffle_xor
+from std.memory import stack_allocation, bitcast
 
 from diag import log_debug
 from kernels.dequant import f16_to_f32, note_loaded
 
-comptime THREADS = 256
+comptime THREADS = 128
+comptime F32_THREADS = 256
+comptime ROWS_PER_WG = 2
+comptime GROUP_THREADS = 16
+comptime GROUPS = THREADS // GROUP_THREADS
+comptime SEG_ELEMS = 256
 
 
 def refuse(what: String, detail: String) -> None:
     print("REFUSAL f32_gemv_mojo: ", what, ": ", detail, sep="")
     exit(2)
+
+
+def f16_to_f32_gpu(bits: UInt32) -> Float32:
+    # Bit-trick f16 -> f32 for the GPU path, the same
+    # construction k1_gemv.mojo carries (and the shipped wgpu
+    # kernels use): normals rebias the exponent into f32 bits
+    # directly, subnormals go through frac * 2^-24 (exact),
+    # inf/NaN keep their class.
+    var sign = (bits >> 15) & 1
+    var exp = (bits >> 10) & 31
+    var frac = bits & 1023
+    if exp == 31:
+        return bitcast[DType.float32, 1](
+            SIMD[DType.uint32, 1]((sign << 31) | 0x7F800000 | (frac << 13))
+        )
+    if exp == 0:
+        var v = Float32(frac) * Float32(5.9604644775390625e-08)
+        if sign == 1:
+            return -v
+        return v
+    return bitcast[DType.float32, 1](
+        SIMD[DType.uint32, 1]((sign << 31) | ((exp + 112) << 23) | (frac << 13))
+    )
+
+
+def f16_quad_from_words(lo: UInt32, hi: UInt32) -> SIMD[DType.float32, 4]:
+    # One F16 quad (4 halves, little endian across the two
+    # words) decoded to f32, element order preserved.
+    var out = SIMD[DType.float32, 4]()
+    out[0] = f16_to_f32_gpu(lo & 0xFFFF)
+    out[1] = f16_to_f32_gpu(lo >> 16)
+    out[2] = f16_to_f32_gpu(hi & 0xFFFF)
+    out[3] = f16_to_f32_gpu(hi >> 16)
+    return out
 
 
 def f32_gemv_kernel(
@@ -47,20 +109,26 @@ def f32_gemv_kernel(
     y: Pointer[Float32, MutAnyOrigin],
     cols: Int32,
 ):
+    # The Wave A straight port, restored after the tuned
+    # iteration was measured and rejected (see the header):
+    # one row per 256-thread workgroup, scalar loads, a
+    # shared-memory tree reduction. On the synthetic timing
+    # fixture the port's streaming shape beat the vec4
+    # segment shape in every rep, so this kernel keeps it.
     var row = Int(block_idx.x)
     var tid = Int(thread_idx.x)
     var base = row * Int(cols)
     var shared = stack_allocation[
-        THREADS, Float32, address_space=AddressSpace.SHARED
+        F32_THREADS, Float32, address_space=AddressSpace.SHARED
     ]()
     var acc = Float32(0.0)
-    var steps = Int(cols) // THREADS
+    var steps = Int(cols) // F32_THREADS
     for k in range(steps):
-        var col = tid + k * THREADS
+        var col = tid + k * F32_THREADS
         acc += w[unsafe_offset=base + col] * x[unsafe_offset=col]
     shared[unsafe_offset=tid] = acc
     barrier()
-    var stride = THREADS // 2
+    var stride = F32_THREADS // 2
     while stride > 0:
         if tid < stride:
             shared[unsafe_offset=tid] = (
@@ -78,33 +146,109 @@ def f16_gemv_kernel(
     y: Pointer[Float32, MutAnyOrigin],
     cols: Int32,
 ):
-    var row = Int(block_idx.x)
-    var tid = Int(thread_idx.x)
-    var base = row * Int(cols) * 2
+    # The F32 kernel's tuned shape over F16 storage: weights
+    # arrive as raw half bytes, each quad as two u32 words
+    # decoded by f16_quad_from_words. Quad element e sits at
+    # byte 2e, a multiple of 8, so both words are aligned.
+    var lane = Int(thread_idx.x)
+    var group = lane // GROUP_THREADS
+    var t = lane % GROUP_THREADS
+    var row0 = Int(block_idx.x) * ROWS_PER_WG
+    var w32 = w.unsafe_bitcast[UInt32]()
+    var words_per_row = Int(cols) // 2
+    var base0 = row0 * words_per_row
+    var base1 = (row0 + 1) * words_per_row
     var shared = stack_allocation[
-        THREADS, Float32, address_space=AddressSpace.SHARED
+        ROWS_PER_WG * GROUPS, Float32, address_space=AddressSpace.SHARED
     ]()
-    var acc = Float32(0.0)
-    var steps = Int(cols) // THREADS
-    for k in range(steps):
-        var col = tid + k * THREADS
-        var off = base + col * 2
-        var bits = UInt16(w[unsafe_offset=off]) | (
-            UInt16(w[unsafe_offset=off + 1]) << 8
-        )
-        acc += f16_to_f32(bits) * x[unsafe_offset=col]
-    shared[unsafe_offset=tid] = acc
-    barrier()
-    var stride = THREADS // 2
-    while stride > 0:
-        if tid < stride:
-            shared[unsafe_offset=tid] = (
-                shared[unsafe_offset=tid] + shared[unsafe_offset=tid + stride]
+    var acc0 = Float32(0.0)
+    var acc1 = Float32(0.0)
+    var segments = Int(cols) // SEG_ELEMS
+    for seg in range(group, segments, GROUPS):
+        var xb = seg * SEG_ELEMS + t * 4
+        var xa = x.unsafe_load[width=4](xb)
+        var xbq = x.unsafe_load[width=4](xb + 64)
+        var xc = x.unsafe_load[width=4](xb + 128)
+        var xd = x.unsafe_load[width=4](xb + 192)
+        # Weight word-pair index of a quad: element e is half
+        # e, word e // 2; a quad starts at an even half pair.
+        var wb = seg * (SEG_ELEMS // 2) + t * 2
+        acc0 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base0 + wb),
+                w32.unsafe_load[width=1](base0 + wb + 1),
             )
-        barrier()
-        stride //= 2
-    if tid == 0:
-        y[unsafe_offset=row] = shared[unsafe_offset=0]
+            * xa
+        ).reduce_add()
+        acc0 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base0 + wb + 32),
+                w32.unsafe_load[width=1](base0 + wb + 33),
+            )
+            * xbq
+        ).reduce_add()
+        acc0 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base0 + wb + 64),
+                w32.unsafe_load[width=1](base0 + wb + 65),
+            )
+            * xc
+        ).reduce_add()
+        acc0 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base0 + wb + 96),
+                w32.unsafe_load[width=1](base0 + wb + 97),
+            )
+            * xd
+        ).reduce_add()
+        acc1 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base1 + wb),
+                w32.unsafe_load[width=1](base1 + wb + 1),
+            )
+            * xa
+        ).reduce_add()
+        acc1 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base1 + wb + 32),
+                w32.unsafe_load[width=1](base1 + wb + 33),
+            )
+            * xbq
+        ).reduce_add()
+        acc1 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base1 + wb + 64),
+                w32.unsafe_load[width=1](base1 + wb + 65),
+            )
+            * xc
+        ).reduce_add()
+        acc1 += (
+            f16_quad_from_words(
+                w32.unsafe_load[width=1](base1 + wb + 96),
+                w32.unsafe_load[width=1](base1 + wb + 97),
+            )
+            * xd
+        ).reduce_add()
+    acc0 += shuffle_xor(acc0, UInt32(1))
+    acc0 += shuffle_xor(acc0, UInt32(2))
+    acc0 += shuffle_xor(acc0, UInt32(4))
+    acc0 += shuffle_xor(acc0, UInt32(8))
+    acc1 += shuffle_xor(acc1, UInt32(1))
+    acc1 += shuffle_xor(acc1, UInt32(2))
+    acc1 += shuffle_xor(acc1, UInt32(4))
+    acc1 += shuffle_xor(acc1, UInt32(8))
+    if t == 0:
+        shared[unsafe_offset=group] = acc0
+        shared[unsafe_offset=GROUPS + group] = acc1
+    barrier()
+    if lane == 0:
+        var s0 = Float32(0.0)
+        var s1 = Float32(0.0)
+        for g in range(GROUPS):
+            s0 += shared[unsafe_offset=g]
+            s1 += shared[unsafe_offset=GROUPS + g]
+        y[unsafe_offset=row0] = s0
+        y[unsafe_offset=row0 + 1] = s1
 
 
 def check_shape(
@@ -219,11 +363,17 @@ def main() raises:
     var iters = Int(arg_value(args, "--iters", "0"))
     var warmup = Int(arg_value(args, "--warmup", "3"))
     var out_path = arg_value(args, "--out", fixture_dir + "/mojo_out_f32.bin")
-    if cols % THREADS != 0:
+    if cols % SEG_ELEMS != 0:
         refuse(
             "bad shape",
-            "cols must be a multiple of the 256-thread block, got "
+            "cols must be a multiple of the 256-element segment, got "
             + String(cols),
+        )
+    if dtype == "f16" and rows % ROWS_PER_WG != 0:
+        refuse(
+            "bad shape",
+            "rows must be a multiple of the 2-row workgroup tile, got "
+            + String(rows),
         )
     var elem_bytes = 4 if dtype == "f32" else 2
     var weights_bytes = rows * cols * elem_bytes
@@ -258,7 +408,12 @@ def main() raises:
             w_src[i] = wp[unsafe_offset=i]
         ctx.enqueue_copy(src_buf=w_src, dst_buf=w_dev)
         ctx.enqueue_function[f32_gemv_kernel](
-            w_dev, x_dev, o_dev, Int32(cols), grid_dim=rows, block_dim=THREADS
+            w_dev,
+            x_dev,
+            o_dev,
+            Int32(cols),
+            grid_dim=rows,
+            block_dim=F32_THREADS,
         )
         ctx.synchronize()
         if iters > 0:
@@ -269,7 +424,7 @@ def main() raises:
                     o_dev,
                     Int32(cols),
                     grid_dim=rows,
-                    block_dim=THREADS,
+                    block_dim=F32_THREADS,
                 )
             ctx.synchronize()
             var t0 = perf_counter_ns()
@@ -280,7 +435,7 @@ def main() raises:
                     o_dev,
                     Int32(cols),
                     grid_dim=rows,
-                    block_dim=THREADS,
+                    block_dim=F32_THREADS,
                 )
             ctx.synchronize()
             var elapsed = Float64(perf_counter_ns() - t0) / 1.0e9
@@ -293,7 +448,12 @@ def main() raises:
             w_src[i] = w_host[i]
         ctx.enqueue_copy(src_buf=w_src, dst_buf=w_dev)
         ctx.enqueue_function[f16_gemv_kernel](
-            w_dev, x_dev, o_dev, Int32(cols), grid_dim=rows, block_dim=THREADS
+            w_dev,
+            x_dev,
+            o_dev,
+            Int32(cols),
+            grid_dim=rows // ROWS_PER_WG,
+            block_dim=THREADS,
         )
         ctx.synchronize()
         if iters > 0:
@@ -303,7 +463,7 @@ def main() raises:
                     x_dev,
                     o_dev,
                     Int32(cols),
-                    grid_dim=rows,
+                    grid_dim=rows // ROWS_PER_WG,
                     block_dim=THREADS,
                 )
             ctx.synchronize()
@@ -314,7 +474,7 @@ def main() raises:
                     x_dev,
                     o_dev,
                     Int32(cols),
-                    grid_dim=rows,
+                    grid_dim=rows // ROWS_PER_WG,
                     block_dim=THREADS,
                 )
             ctx.synchronize()

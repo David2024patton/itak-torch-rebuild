@@ -693,15 +693,19 @@ def run() raises:
         "loading tokenizer + fact sheet for " + config.model_path,
     )
     var data = load_tokenizer_data(config.model_path)
+    _ = log_debug("serve", "tokenizer data loaded; building tokenizer")
     var tok = Tokenizer.build(data^)
+    _ = log_debug("serve", "tokenizer built")
     # Fingerprint the served model file (sha256 over its
     # bytes) so its run records are attributable.
     var fingerprint = String("")
     var fingerprint_note = String("")
     try:
         fingerprint = file_sha256_hex(config.model_path)
+        _ = log_debug("serve", "model fingerprint sha256=" + fingerprint)
     except e:
         fingerprint_note = "sha256 failed at serve start: " + String(e)
+        _ = log_debug("serve", "fingerprint failed: " + String(e))
     var st = ServeState(config^, tok^, fingerprint, fingerprint_note)
     var octets = parse_ipv4(st.config.serve_host)
     var listener = TcpListener.bind_listen(octets, st.config.serve_port)

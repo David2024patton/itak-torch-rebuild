@@ -142,6 +142,7 @@ def _gpu_generate_phase(
     prompt: List[Int],
     prefill_gemm_min_batch: Int,
     gemm_tiled_min_batch: Int,
+    prefill_batch_min_tokens: Int,
 ) raises -> Tuple[List[Int], Int, Int]:
     """Build the GPU model, time its load, generate, and
     DESTROY the model on return. Wave C integration fix: the
@@ -161,6 +162,7 @@ def _gpu_generate_phase(
         attn_span,
         prefill_gemm_min_batch,
         gemm_tiled_min_batch,
+        prefill_batch_min_tokens,
     )
     var t_load = perf_counter_ns()
     var load_ms = Int((t_load - t0) // 1_000_000)
@@ -181,6 +183,7 @@ def _gpu_prefill_phase(
     prompt: List[Int],
     prefill_gemm_min_batch: Int,
     gemm_tiled_min_batch: Int,
+    prefill_batch_min_tokens: Int,
 ) raises -> Int:
     """Build a fresh GPU model (the generate model is already
     destroyed), time forward_rows over the prompt ids, and
@@ -195,6 +198,7 @@ def _gpu_prefill_phase(
         attn_span,
         prefill_gemm_min_batch,
         gemm_tiled_min_batch,
+        prefill_batch_min_tokens,
     )
     var t_pf0 = perf_counter_ns()
     _ = fresh.forward_rows(prompt.copy())
@@ -213,6 +217,7 @@ def _run_gpu(
     prompt: List[Int],
     prefill_gemm_min_batch: Int,
     gemm_tiled_min_batch: Int,
+    prefill_batch_min_tokens: Int,
 ) raises:
     """The Wave C GPU path: same run, same prints, driven by
     GpuGlimmerModel. Prefill is measured on a second fresh GPU
@@ -230,6 +235,7 @@ def _run_gpu(
         prompt,
         prefill_gemm_min_batch,
         gemm_tiled_min_batch,
+        prefill_batch_min_tokens,
     )
     var out = phase[0].copy()
     print("LOAD_MS", String(phase[1]))
@@ -245,6 +251,7 @@ def _run_gpu(
         prompt,
         prefill_gemm_min_batch,
         gemm_tiled_min_batch,
+        prefill_batch_min_tokens,
     )
     _report_prefill(prefill_ms, phase[2])
 
@@ -290,6 +297,7 @@ def run() raises:
             prompt,
             config.prefill_gemm_min_batch,
             config.gemm_tiled_min_batch,
+            config.prefill_batch_min_tokens,
         )
         return
 

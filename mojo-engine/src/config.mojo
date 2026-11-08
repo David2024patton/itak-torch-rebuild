@@ -106,6 +106,20 @@ comptime DEFAULT_HIDDEN = 6656
 comptime DEFAULT_VOCAB = 202048
 # ===== END Wave E Lane E3 block (defaults) =====
 
+# Prefill routing knob (Wave E, Lane E1): a prompt at or
+# above PREFILL_BATCH_MIN_TOKENS tokens takes the batched
+# prefill route (GEMM projections + resident batch layer
+# step + batched tiled attention); below it, prefill runs
+# the per-row resident step loop. The route is taken only
+# when BOTH this knob and PREFILL_GEMM_MIN_BATCH admit the
+# prompt, so the Wave D A/B control (raising the GEMM
+# minimum above any prompt length) still forces the
+# per-row arm on its own. The default is set from the
+# measured batch-vs-per-row crossover on the real model;
+# the trial record is
+# bench/mojo-engine-wave-e1-batch-2026-11-08.md.
+comptime DEFAULT_PREFILL_BATCH_MIN_TOKENS = 64
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -210,6 +224,24 @@ def parse_prefill_gemm_min_batch(raw: String) raises -> Int:
     whole number.
     """
     return _parse_positive(raw, "MOJO_ENGINE_PREFILL_GEMM_MIN_BATCH")
+
+
+def parse_prefill_batch_min_tokens(raw: String) raises -> Int:
+    """Parse and validate a prefill batch-route minimum
+    token count (Wave E): prompts at or above it take the
+    batched prefill route."""
+    return _parse_positive(raw, "MOJO_ENGINE_PREFILL_BATCH_MIN_TOKENS")
+
+
+def prefill_uses_batch(
+    prompt_len: Int, gemm_min_batch: Int, batch_min_tokens: Int
+) -> Bool:
+    """The prefill routing rule (pure, VM-testable): the
+    batched route serves a prompt only when its length
+    reaches BOTH the GEMM minimum batch (the Wave D A/B
+    control) and the batch-route minimum token count (the
+    Wave E crossover knob)."""
+    return prompt_len >= gemm_min_batch and prompt_len >= batch_min_tokens
 
 
 def parse_gemm_tiled_min_batch(raw: String) raises -> Int:
@@ -344,6 +376,7 @@ struct EngineConfig(Copyable, Movable):
     var hidden: Int
     var vocab: Int
     # -- END Wave E Lane E3 fields --
+    var prefill_batch_min_tokens: Int
 
     def __init__(
         out self,
@@ -364,6 +397,7 @@ struct EngineConfig(Copyable, Movable):
         hidden: Int = DEFAULT_HIDDEN,
         vocab: Int = DEFAULT_VOCAB,
         # -- END Wave E Lane E3 init params --
+        prefill_batch_min_tokens: Int = DEFAULT_PREFILL_BATCH_MIN_TOKENS,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -382,6 +416,7 @@ struct EngineConfig(Copyable, Movable):
         self.hidden = hidden
         self.vocab = vocab
         # -- END Wave E Lane E3 init assignments --
+        self.prefill_batch_min_tokens = prefill_batch_min_tokens
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -466,6 +501,11 @@ struct EngineConfig(Copyable, Movable):
             vocab = parse_vocab(raw_vocab)
         # -- END Wave E Lane E3 load --
 
+        var prefill_batch_min_tokens = DEFAULT_PREFILL_BATCH_MIN_TOKENS
+        var raw_route = getenv("MOJO_ENGINE_PREFILL_BATCH_MIN_TOKENS")
+        if raw_route != "":
+            prefill_batch_min_tokens = parse_prefill_batch_min_tokens(raw_route)
+
         return EngineConfig(
             model_path,
             context_len,
@@ -484,4 +524,5 @@ struct EngineConfig(Copyable, Movable):
             hidden,
             vocab,
             # -- END Wave E Lane E3 load return values --
+            prefill_batch_min_tokens,
         )

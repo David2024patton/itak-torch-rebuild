@@ -69,7 +69,9 @@ from config import (
     DEFAULT_ATTN_TILE_POSITIONS,
     DEFAULT_GEMM_TILED_MIN_BATCH,
     DEFAULT_GPU_BUDGET_BYTES,
+    DEFAULT_PREFILL_BATCH_MIN_TOKENS,
     DEFAULT_PREFILL_GEMM_MIN_BATCH,
+    prefill_uses_batch,
 )
 from diag import log_debug
 from generate.generate import ForwardModel
@@ -77,7 +79,7 @@ from gpu.context import GpuRuntime, download_f32, upload_f32
 from gpu.device_kv import DeviceKvCache
 from gpu.weights import DeviceWeights
 from model.gpu_layer import gpu_layer_step_cfg, gpu_logits
-from model.gpu_layer_batch import gpu_layer_step_batch, batch_row_slice
+from model.gpu_layer_batch import gpu_layer_step_batch_cfg, batch_row_slice
 from model.model import GlimmerModel
 from ops.gpu_embedding import gpu_embed_token
 from ops.rms_norm import RMS_THREADS, rms_norm_kernel
@@ -105,6 +107,14 @@ struct GpuGlimmerModel(ForwardModel, Movable):
     # the batch size that takes its register-tiled structure.
     var prefill_gemm_min_batch: Int
     var gemm_tiled_min_batch: Int
+    # Wave E prefill routing knob (config seam): the prompt
+    # length at or above which prefill takes the batched
+    # route (see config.prefill_uses_batch for the rule).
+    # LAST field and LAST __init__ parameter, deliberately:
+    # appending at the end keeps every existing positional
+    # construction site landing its arguments in the same
+    # parameters (the Wave D positional-slip lesson).
+    var prefill_batch_min_tokens: Int
 
     def __init__(
         out self,
@@ -116,6 +126,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         attn_split_span_positions: Int = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
         prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
         gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
+        prefill_batch_min_tokens: Int = DEFAULT_PREFILL_BATCH_MIN_TOKENS,
     ) raises:
         if prefill_gemm_min_batch <= 0 or gemm_tiled_min_batch <= 0:
             raise Error(
@@ -124,6 +135,12 @@ struct GpuGlimmerModel(ForwardModel, Movable):
                 + String(prefill_gemm_min_batch)
                 + "/"
                 + String(gemm_tiled_min_batch)
+            )
+        if prefill_batch_min_tokens <= 0:
+            raise Error(
+                "gpu_model_bad_shape: prefill batch-route minimum tokens"
+                " must be positive, got "
+                + String(prefill_batch_min_tokens)
             )
         # Build the device trio from the borrowed CPU model
         # BEFORE it moves into the struct: weights upload from
@@ -147,6 +164,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.attn_split_span_positions = attn_split_span_positions
         self.prefill_gemm_min_batch = prefill_gemm_min_batch
         self.gemm_tiled_min_batch = gemm_tiled_min_batch
+        self.prefill_batch_min_tokens = prefill_batch_min_tokens
         _ = log_debug(
             "model",
             "gpu model built layers="
@@ -170,6 +188,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         budget_bytes: Int,
         prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
         gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
+        prefill_batch_min_tokens: Int = DEFAULT_PREFILL_BATCH_MIN_TOKENS,
     ) raises -> GpuGlimmerModel:
         """Open the CPU model at path (loader of record) and
         build the device model over it under the given budget
@@ -192,6 +211,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
             prefill_gemm_min_batch,
             gemm_tiled_min_batch,
+            prefill_batch_min_tokens,
         )
 
     @staticmethod
@@ -392,7 +412,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         if self.cpu.capture_enabled:
             self.cpu.capture_embed = batch_row_slice(x, batch - 1, cfg.hidden)
         for layer in range(cfg.layers):
-            x = gpu_layer_step_batch(
+            x = gpu_layer_step_batch_cfg(
                 self.rt,
                 self.weights,
                 self.kv,
@@ -402,6 +422,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
                 layer,
                 start_position,
                 self.gemm_tiled_min_batch,
+                self.attn_tile_positions,
+                self.attn_max_splits,
+                self.attn_split_span_positions,
             )
         _ = log_debug(
             "model",
@@ -413,15 +436,23 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         return batch_row_slice(x, batch - 1, cfg.hidden)
 
     def prefill(mut self, prompt_ids: List[Int]) raises -> List[Float32]:
-        """The ForwardModel prefill seam (Wave D): at or above
-        the configured GEMM minimum batch, the batched GEMM
-        path from the cache's next position; below it, the
-        trait default's step loop from position 0 - which for
-        a fresh model (generate()'s construction, the only
-        caller that mixes prefill with decode steps) is the
-        same start the batched path takes. Returns the last
-        hidden row either way."""
-        if len(prompt_ids) >= self.prefill_gemm_min_batch:
+        """The ForwardModel prefill seam (Wave D, routing
+        rule Wave E): the batched route serves the prompt
+        only when its length reaches BOTH the configured
+        GEMM minimum batch and the configured batch-route
+        minimum token count (config.prefill_uses_batch -
+        the measured crossover knob,
+        MOJO_ENGINE_PREFILL_BATCH_MIN_TOKENS); below either,
+        the per-row resident step loop from position 0 -
+        which for a fresh model (generate()'s construction,
+        the only caller that mixes prefill with decode
+        steps) is the same start the batched path takes.
+        Returns the last hidden row either way."""
+        if prefill_uses_batch(
+            len(prompt_ids),
+            self.prefill_gemm_min_batch,
+            self.prefill_batch_min_tokens,
+        ):
             var pos = self.kv.next_position(0)
             return self.prefill_batch(prompt_ids, pos)
         var hidden = self.step(prompt_ids[0], 0)

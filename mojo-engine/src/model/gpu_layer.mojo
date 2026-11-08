@@ -125,6 +125,14 @@
 #     position), .key_buffer(layer), .value_buffer(layer),
 #     .stored_len(layer), .first_visible_position(layer).
 #
+# PROFILE timing (Wave E, Lane E2): with MOJO_ENGINE_DEBUG
+# on, gpu_layer_step_cfg prints one PROFILE_LAYER line per
+# layer call and gpu_logits one PROFILE_LOGITS line, each
+# carrying the call's wall time in microseconds (the closing
+# download synchronizes the queue, so the interval covers
+# every launch of the call). Off by default; when off there
+# is no behavior change beyond the seam's own env check.
+#
 # Named refusals: gpu_layer_bad_shape,
 # gpu_layer_unsupported_dtype, gpu_layer_shape_mismatch,
 # gpu_kv_window_wrapped (windowed append beyond the window,
@@ -132,11 +140,12 @@
 # not 0 - the Wave C direct-buffer limit).
 
 from std.math import sqrt, exp
+from std.time import perf_counter_ns
 
 from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceBuffer
 
-from diag import log_debug
+from diag import log_debug, debug_enabled
 from gpu.context import (
     GpuRuntime,
     upload_f32,
@@ -1265,6 +1274,8 @@ def gpu_logits(
     GEMV by the output slot's dtype + final_logit_kernel
     (scale then softcap, both from the CPU model's config).
     Same math as GlimmerModel.logits."""
+    var prof = debug_enabled()
+    var prof_t0 = perf_counter_ns()
     var cfg = cpu_model.cfg.copy()
     if len(hidden) != cfg.hidden:
         raise Error(
@@ -1302,7 +1313,17 @@ def gpu_logits(
         block_dim=GATE_THREADS,
     )
     _ = log_debug("gpu.layer", "logits rows=" + String(raw_len))
-    return download_f32(rt, y_dev, raw_len)
+    var logits_out = download_f32(rt, y_dev, raw_len)
+    if prof:
+        # PROFILE_LOGITS (Wave E lane E2, MOJO_ENGINE_DEBUG
+        # gated): wall time of one gpu_logits call. The
+        # download above synchronizes the queue, so the
+        # interval covers every launch of the head chain.
+        print(
+            "PROFILE_LOGITS wall_us="
+            + String(Int(perf_counter_ns() - prof_t0) // 1000)
+        )
+    return logits_out^
 
 
 def gpu_layer_step_hostchain(
@@ -1456,6 +1477,8 @@ def gpu_layer_step_cfg(
     order as the hostchain step. Windowed layers run PAST
     the window here: the KV ring wraps (B1 semantics) and
     attention reads through the visible-order gather."""
+    var prof = debug_enabled()
+    var prof_t0 = perf_counter_ns()
     var cfg = cpu_model.cfg.copy()
     if layer < 0 or layer >= cfg.layers:
         raise Error(
@@ -1585,7 +1608,28 @@ def gpu_layer_step_cfg(
         POST_NORM_EPS,
     )
     var result = _residual_add_buf(rt, residual2, ffn, cfg.hidden)
-    return download_f32(rt, result, cfg.hidden)
+    var layer_out = download_f32(rt, result, cfg.hidden)
+    if prof:
+        # PROFILE_LAYER (Wave E lane E2, MOJO_ENGINE_DEBUG
+        # gated): wall time of one resident layer step. The
+        # download above synchronizes the queue, so the
+        # interval covers every launch of the layer; the one
+        # print per layer lands between layers (inside the
+        # NEXT layer's interval, a sub-1% bias at ~1 ms
+        # layers, stated in the lane note). When the seam is
+        # off this is two getenv-class checks and no other
+        # behavior change.
+        print(
+            "PROFILE_LAYER layer="
+            + String(layer)
+            + " position="
+            + String(position)
+            + " sliding="
+            + String(1 if sliding else 0)
+            + " wall_us="
+            + String(Int(perf_counter_ns() - prof_t0) // 1000)
+        )
+    return layer_out^
 
 
 def gpu_layer_step_resident(

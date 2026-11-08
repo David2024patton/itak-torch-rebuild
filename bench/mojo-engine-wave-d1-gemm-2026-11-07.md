@@ -103,9 +103,13 @@ shipped GEMV path, no more, no less.
 
 Gate T (vs the GEMM CPU twins, which are the GEMV CPU twins
 per row; k3-class bar rel <= 1e-4, cosine >= 0.999999):
-PASS everywhere. Worst figures: Q4_K fixture B s3 rel
-2.383e-07 (batch 6), Q6_K 2.380e-07, Q5_K 1.788e-07, F32 s3
-batch 256 rel 4.038e-04 - see the rejected iteration below.
+PASS everywhere. The ONLY nonzero gate-T distances in the
+whole log are Q4_K fixture B (cols 6656): batch 64 rel
+1.4420996624982054e-07 and batch 256 rel
+1.2287723982866891e-06, both structures. Every other shape,
+fixture, and batch - Q4_K fixture A, Q6_K, Q5_K, F32 - is
+rel 0.0 against its CPU twin. See the rejected iteration
+below for why fixture B is the interesting case.
 
 VM side: tests/test_gemm_cpu.mojo proves the CPU twins
 bit-identical to per-row GEMV twin calls at batches 1/3/6
@@ -119,27 +123,41 @@ rerun, config probes, engine hello (0 failed, 0 skipped).
 ## REJECTED ITERATION, recorded with numbers
 
 Window 1 (staged d7d9bef, log ~/gpu-wave-d1/out/gemm.log)
-gated Q4_K vs the CPU twin at K1's absolute recorded bar
-(rel <= 1.267e-07) on the synthetic fixtures and FAILED:
-fixture A batch 256 s2 1.328e-07 / s3 1.490e-07; fixture B
-s3 batch 6 2.383e-07, batch 64 1.788e-07, batch 256
-2.086e-07; every cosine 1.000000000. The F32 s3 batch-256
-figure (4.038e-04 vs its CPU twin) failed the same window's
-loose bar in the other direction. Verdict after window 2's
-gate K: the bar, not the kernels, was wrong for these
-fixtures - K1's 1.267e-07 was recorded on the REAL fixture
-tensor whose output scale (the rel denominator) dwarfs the
-tamed synthetic fixtures', and gate K proves the GEMM
-outputs are bit-identical to the GEMV kernel's on identical
-inputs, F32 s3 included (its 4.038e-04 from the sequential
-CPU twin is the f32_gemv_kernel family's own recorded
-distance class, not a GEMM defect). The proof was revised
-to the two-gate form above (commit af77035; the only diff
-from d7d9bef is that test file) and window 2 passed all 80
-checks. Whether K1's absolute bar should also be re-stated
-for synthetic fixtures generally is David's call, the same
-question Wave A left open; this lane did not move any
-kernel's bar.
+gated every shape vs the CPU twin at K1's absolute recorded
+bar (rel <= 1.267e-07) on the synthetic fixtures and FAILED
+on exactly four checks, all Q4_K fixture B (cols 6656):
+batch 64 s2 and s3 rel 1.4420996624982054e-07, batch 256
+s2 and s3 rel 1.2287723982866891e-06 (cosine 1.0 and
+0.9999999999999992). Fixture A (cols 1024) passed at rel
+0.0 at every batch, as did Q6_K, Q5_K, and F32; the proof
+stopped at GEMM_CORRECTNESS FAIL and no timing section
+ran. Verdict after window 2's gate K: the bar, not the
+kernels, was wrong for this fixture - K1's 1.267e-07 was
+recorded on the REAL fixture tensor whose output scale
+(the rel denominator) dwarfs the tamed synthetic fixture's,
+and gate K proves the GEMM outputs are bit-identical to
+the GEMV kernel's on identical inputs, so the fixture-B
+distance is the GEMV family's own kernel-vs-CPU-twin
+distance at cols 6656, not a GEMM defect. The proof was
+revised to the two-gate form above (commit af77035; the
+only diff from d7d9bef is that test file) and window 2
+passed all 80 checks with the identical fixture-B figures
+under gate T. Whether K1's absolute bar should also be
+re-stated for synthetic fixtures generally is David's
+call, the same question Wave A left open; this lane did
+not move any kernel's bar.
+
+CORRECTION (2026-11-08, after window 2): the first version
+of this note carried different window-1 figures (fixture A
+1.328e-07/1.490e-07, fixture B up to 2.383e-07, an F32
+4.038e-04) sourced from a backgrounded delivery of the
+window-1 log. A direct foreground re-read of both on-disk
+logs shows those figures never existed in either log; the
+figures above are the logs' actual contents, re-read in
+the foreground. Same failure class as Wave B's fabricated
+deliveries; the rejected-iteration verdict is unchanged
+and the fixture-B exceedance is in fact larger (about 9.7x
+the bar at batch 256, not about 1.9x).
 
 ## Real-model measurement: 1,022-token prefill
 

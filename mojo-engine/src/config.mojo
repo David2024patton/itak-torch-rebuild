@@ -7,6 +7,7 @@
 # BY NAME at load time instead of being silently clamped or
 # ignored. Nothing else in the engine reads env vars directly.
 
+from std.math import isnan, isinf
 from std.os import getenv
 
 # The new engine line starts at 1.1 under the repo's versioning
@@ -68,6 +69,42 @@ comptime DEFAULT_ATTN_SPLIT_SPAN_POSITIONS = 512
 # name like every other value here.
 comptime DEFAULT_PREFILL_GEMM_MIN_BATCH = 2
 comptime DEFAULT_GEMM_TILED_MIN_BATCH = 8
+
+# =====================================================================
+# BEGIN Wave E Lane E3 block: Glimmer op defaults, folded in
+# from src/ops/ (Wave A open item). Keep this block together:
+# lane E1 also edits this file and the merge is meant to stay
+# mechanical.
+#
+# Before this fold, the ops modules each carried their own
+# recorded-Glimmer defaults as GLIMMER_* comptime constants
+# (rms_norm.mojo GLIMMER_RMS_EPS, rope.mojo GLIMMER_ROPE_BASE /
+# GLIMMER_HEAD_DIM, final_logit.mojo GLIMMER_LOGIT_SCALE /
+# GLIMMER_LOGIT_SOFTCAP, embedding.mojo GLIMMER_HIDDEN /
+# GLIMMER_VOCAB). The defaults now live ONLY here, as
+# EngineConfig fields with MOJO_ENGINE_* env overrides, and
+# the ops take these values as parameters as they always did -
+# callers that name the recorded model pass the config values.
+#
+# Precedence, stated plainly so nobody misreads this fold as
+# a behavior change: for a LOADED model, the values in effect
+# are the ones GlimmerModel reads from the GGUF file itself
+# (ModelConfig in src/model/model.mojo: rms_eps, rope_base,
+# logit_scale, logit_softcap, hidden, head_dim, vocab), and
+# those are unchanged by this fold and do NOT read these
+# fields. These EngineConfig fields are the recorded defaults
+# for callers/tests that name the Glimmer model without a
+# file in hand - exactly what the GLIMMER_* constants served.
+# The numeric values are byte-for-byte the old constants.
+# =====================================================================
+comptime DEFAULT_RMS_EPS = Float32(1.0e-5)
+comptime DEFAULT_ROPE_BASE = Float32(500000.0)
+comptime DEFAULT_LOGIT_SCALE = Float32(0.1961161345243454)
+comptime DEFAULT_LOGIT_SOFTCAP = Float32(20.0)
+comptime DEFAULT_HEAD_DIM = 128
+comptime DEFAULT_HIDDEN = 6656
+comptime DEFAULT_VOCAB = 202048
+# ===== END Wave E Lane E3 block (defaults) =====
 
 
 def parse_context_len(raw: String) raises -> Int:
@@ -186,6 +223,107 @@ def parse_gemm_tiled_min_batch(raw: String) raises -> Int:
     return _parse_positive(raw, "MOJO_ENGINE_GEMM_TILED_MIN_BATCH")
 
 
+# =====================================================================
+# BEGIN Wave E Lane E3 block: parsers for the Glimmer op
+# defaults above. Same discipline as the other values here:
+# split out of load() so the refusal names are directly
+# testable, every bad value refused as mojo_engine_config
+# naming its env var.
+# =====================================================================
+
+
+def _parse_float(raw: String, env_name: String) raises -> Float32:
+    """Shared finite-float parse for the op-default knobs.
+
+    Float64(raw) refuses non-numeric text itself; NaN and the
+    infinities PARSE in Mojo, so they are refused here by
+    name, matching the ops' own bad-value rules (their CPU
+    twins refuse non-finite eps/base/scale/cap by name too).
+    """
+    var parsed: Float64
+    try:
+        parsed = Float64(raw)
+    except:
+        raise Error(
+            "mojo_engine_config: "
+            + env_name
+            + " is not a number: '"
+            + raw
+            + "'"
+        )
+    if isnan(parsed) or isinf(parsed):
+        raise Error(
+            "mojo_engine_config: "
+            + env_name
+            + " must be finite, got '"
+            + raw
+            + "'"
+        )
+    return Float32(parsed)
+
+
+def parse_rms_eps(raw: String) raises -> Float32:
+    """MOJO_ENGINE_RMS_EPS: RMSNorm epsilon; the op refuses
+    eps <= 0 by name, so config does too."""
+    var v = _parse_float(raw, "MOJO_ENGINE_RMS_EPS")
+    if v <= Float32(0.0):
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_RMS_EPS must be positive, got "
+            + String(v)
+        )
+    return v
+
+
+def parse_rope_base(raw: String) raises -> Float32:
+    """MOJO_ENGINE_ROPE_BASE: RoPE frequency base; the op
+    refuses base <= 1 by name, so config does too."""
+    var v = _parse_float(raw, "MOJO_ENGINE_ROPE_BASE")
+    if v <= Float32(1.0):
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_ROPE_BASE must be > 1, got "
+            + String(v)
+        )
+    return v
+
+
+def parse_logit_scale(raw: String) raises -> Float32:
+    """MOJO_ENGINE_LOGIT_SCALE: final-logit scale; any finite
+    value is legal (the op refuses only non-finite)."""
+    return _parse_float(raw, "MOJO_ENGINE_LOGIT_SCALE")
+
+
+def parse_logit_softcap(raw: String) raises -> Float32:
+    """MOJO_ENGINE_LOGIT_SOFTCAP: final-logit softcap; the op
+    refuses cap < 0 by name (0 = no cap), so config does too.
+    """
+    var v = _parse_float(raw, "MOJO_ENGINE_LOGIT_SOFTCAP")
+    if v < Float32(0.0):
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_LOGIT_SOFTCAP must be"
+            " >= 0 (0 = no cap), got "
+            + String(v)
+        )
+    return v
+
+
+def parse_head_dim(raw: String) raises -> Int:
+    """MOJO_ENGINE_HEAD_DIM: attention head dimension."""
+    return _parse_positive(raw, "MOJO_ENGINE_HEAD_DIM")
+
+
+def parse_hidden(raw: String) raises -> Int:
+    """MOJO_ENGINE_HIDDEN: model hidden width."""
+    return _parse_positive(raw, "MOJO_ENGINE_HIDDEN")
+
+
+def parse_vocab(raw: String) raises -> Int:
+    """MOJO_ENGINE_VOCAB: tokenizer vocabulary size."""
+    return _parse_positive(raw, "MOJO_ENGINE_VOCAB")
+
+
+# ===== END Wave E Lane E3 block (parsers) =====
+
+
 struct EngineConfig(Copyable, Movable):
     """One loaded configuration; build via EngineConfig.load()."""
 
@@ -197,6 +335,15 @@ struct EngineConfig(Copyable, Movable):
     var attn_split_span_positions: Int
     var prefill_gemm_min_batch: Int
     var gemm_tiled_min_batch: Int
+    # -- BEGIN Wave E Lane E3 fields: Glimmer op defaults --
+    var rms_eps: Float32
+    var rope_base: Float32
+    var logit_scale: Float32
+    var logit_softcap: Float32
+    var head_dim: Int
+    var hidden: Int
+    var vocab: Int
+    # -- END Wave E Lane E3 fields --
 
     def __init__(
         out self,
@@ -208,6 +355,15 @@ struct EngineConfig(Copyable, Movable):
         attn_split_span_positions: Int = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
         prefill_gemm_min_batch: Int = DEFAULT_PREFILL_GEMM_MIN_BATCH,
         gemm_tiled_min_batch: Int = DEFAULT_GEMM_TILED_MIN_BATCH,
+        # -- BEGIN Wave E Lane E3 init params --
+        rms_eps: Float32 = DEFAULT_RMS_EPS,
+        rope_base: Float32 = DEFAULT_ROPE_BASE,
+        logit_scale: Float32 = DEFAULT_LOGIT_SCALE,
+        logit_softcap: Float32 = DEFAULT_LOGIT_SOFTCAP,
+        head_dim: Int = DEFAULT_HEAD_DIM,
+        hidden: Int = DEFAULT_HIDDEN,
+        vocab: Int = DEFAULT_VOCAB,
+        # -- END Wave E Lane E3 init params --
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -217,6 +373,15 @@ struct EngineConfig(Copyable, Movable):
         self.attn_split_span_positions = attn_split_span_positions
         self.prefill_gemm_min_batch = prefill_gemm_min_batch
         self.gemm_tiled_min_batch = gemm_tiled_min_batch
+        # -- BEGIN Wave E Lane E3 init assignments --
+        self.rms_eps = rms_eps
+        self.rope_base = rope_base
+        self.logit_scale = logit_scale
+        self.logit_softcap = logit_softcap
+        self.head_dim = head_dim
+        self.hidden = hidden
+        self.vocab = vocab
+        # -- END Wave E Lane E3 init assignments --
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -264,6 +429,43 @@ struct EngineConfig(Copyable, Movable):
         if raw_tiled != "":
             gemm_tiled_min_batch = parse_gemm_tiled_min_batch(raw_tiled)
 
+        # -- BEGIN Wave E Lane E3 load: Glimmer op defaults --
+        var rms_eps = DEFAULT_RMS_EPS
+        var raw_eps = getenv("MOJO_ENGINE_RMS_EPS")
+        if raw_eps != "":
+            rms_eps = parse_rms_eps(raw_eps)
+
+        var rope_base = DEFAULT_ROPE_BASE
+        var raw_base = getenv("MOJO_ENGINE_ROPE_BASE")
+        if raw_base != "":
+            rope_base = parse_rope_base(raw_base)
+
+        var logit_scale = DEFAULT_LOGIT_SCALE
+        var raw_scale = getenv("MOJO_ENGINE_LOGIT_SCALE")
+        if raw_scale != "":
+            logit_scale = parse_logit_scale(raw_scale)
+
+        var logit_softcap = DEFAULT_LOGIT_SOFTCAP
+        var raw_cap = getenv("MOJO_ENGINE_LOGIT_SOFTCAP")
+        if raw_cap != "":
+            logit_softcap = parse_logit_softcap(raw_cap)
+
+        var head_dim = DEFAULT_HEAD_DIM
+        var raw_hd = getenv("MOJO_ENGINE_HEAD_DIM")
+        if raw_hd != "":
+            head_dim = parse_head_dim(raw_hd)
+
+        var hidden = DEFAULT_HIDDEN
+        var raw_hidden = getenv("MOJO_ENGINE_HIDDEN")
+        if raw_hidden != "":
+            hidden = parse_hidden(raw_hidden)
+
+        var vocab = DEFAULT_VOCAB
+        var raw_vocab = getenv("MOJO_ENGINE_VOCAB")
+        if raw_vocab != "":
+            vocab = parse_vocab(raw_vocab)
+        # -- END Wave E Lane E3 load --
+
         return EngineConfig(
             model_path,
             context_len,
@@ -273,4 +475,13 @@ struct EngineConfig(Copyable, Movable):
             attn_span,
             prefill_gemm_min_batch,
             gemm_tiled_min_batch,
+            # -- BEGIN Wave E Lane E3 load return values --
+            rms_eps,
+            rope_base,
+            logit_scale,
+            logit_softcap,
+            head_dim,
+            hidden,
+            vocab,
+            # -- END Wave E Lane E3 load return values --
         )

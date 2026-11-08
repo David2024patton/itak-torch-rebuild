@@ -16,8 +16,11 @@
 # eps is a PARAMETER, never a literal inside the math: the caller
 # sources it from config / GGUF metadata (src/config.mojo is the
 # engine's config home; the loader lane supplies the file value).
-# GLIMMER_RMS_EPS below is only the recorded Glimmer default for
-# callers/tests that name the real model.
+# Wave E (Lane E3): the recorded Glimmer default that used to
+# live here as GLIMMER_RMS_EPS now lives in src/config.mojo as
+# DEFAULT_RMS_EPS / EngineConfig.rms_eps (env
+# MOJO_ENGINE_RMS_EPS), the one home for defaults; callers and
+# tests that name the real model take it from there.
 #
 # Named refusals: rms_norm_cpu_bad_shape / rms_norm_cpu_bad_eps /
 # rms_norm_plain_cpu_bad_shape / rms_norm_plain_cpu_bad_eps.
@@ -29,7 +32,6 @@ from std.memory import stack_allocation
 
 from diag import log_debug
 
-comptime GLIMMER_RMS_EPS = Float32(1.0e-5)
 comptime RMS_THREADS = 256
 
 

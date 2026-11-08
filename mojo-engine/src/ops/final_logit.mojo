@@ -21,6 +21,12 @@
 #
 # scale and cap are PARAMETERS sourced from config / GGUF
 # metadata, never literals in the math.
+# Wave E (Lane E3): the recorded Glimmer defaults that used
+# to live here as GLIMMER_LOGIT_SCALE / GLIMMER_LOGIT_SOFTCAP
+# now live in src/config.mojo as DEFAULT_LOGIT_SCALE /
+# DEFAULT_LOGIT_SOFTCAP (EngineConfig.logit_scale /
+# .logit_softcap, env MOJO_ENGINE_LOGIT_SCALE /
+# MOJO_ENGINE_LOGIT_SOFTCAP).
 #
 # Named refusals: final_logit_cpu_bad_scale /
 # final_logit_cpu_bad_cap.
@@ -29,10 +35,6 @@ from std.math import tanh, isnan, isinf
 from max.gpu import thread_idx, block_idx, block_dim
 
 from diag import log_debug
-
-comptime GLIMMER_LOGIT_SCALE = Float32(0.1961161345243454)
-comptime GLIMMER_LOGIT_SOFTCAP = Float32(20.0)
-
 
 def final_logit_cpu(
     x: List[Float32], scale: Float32, cap: Float32

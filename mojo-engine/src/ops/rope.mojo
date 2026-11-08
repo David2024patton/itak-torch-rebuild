@@ -37,8 +37,13 @@ from max.gpu import thread_idx, block_idx, block_dim
 
 from diag import log_debug
 
-comptime GLIMMER_ROPE_BASE = Float32(500000.0)
-comptime GLIMMER_HEAD_DIM = 128
+# Wave E (Lane E3): the recorded Glimmer defaults that used
+# to live here as GLIMMER_ROPE_BASE / GLIMMER_HEAD_DIM now
+# live in src/config.mojo as DEFAULT_ROPE_BASE /
+# DEFAULT_HEAD_DIM (EngineConfig.rope_base / .head_dim, env
+# MOJO_ENGINE_ROPE_BASE / MOJO_ENGINE_HEAD_DIM); base and
+# head_dim stay parameters of the ops below, as they always
+# were.
 
 
 def rope_cpu(

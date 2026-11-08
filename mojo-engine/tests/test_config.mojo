@@ -28,6 +28,21 @@ from config import (
     parse_gemm_tiled_min_batch,
     parse_gpu_budget_bytes,
     parse_prefill_gemm_min_batch,
+    # Wave E Lane E3: Glimmer op defaults folded from src/ops/.
+    DEFAULT_HEAD_DIM,
+    DEFAULT_HIDDEN,
+    DEFAULT_LOGIT_SCALE,
+    DEFAULT_LOGIT_SOFTCAP,
+    DEFAULT_RMS_EPS,
+    DEFAULT_ROPE_BASE,
+    DEFAULT_VOCAB,
+    parse_head_dim,
+    parse_hidden,
+    parse_logit_scale,
+    parse_logit_softcap,
+    parse_rms_eps,
+    parse_rope_base,
+    parse_vocab,
 )
 
 
@@ -171,6 +186,108 @@ def test_parse_gemm_knobs_accept_and_refuse() raises:
         except e:
             refused = String(e).find("mojo_engine_config") != -1
         assert_true(refused, "tiled min batch must refuse by name: " + raw)
+
+
+# Wave E Lane E3: the Glimmer op defaults folded in from
+# src/ops/ (GLIMMER_RMS_EPS, GLIMMER_ROPE_BASE,
+# GLIMMER_LOGIT_SCALE / GLIMMER_LOGIT_SOFTCAP, GLIMMER_HEAD_DIM,
+# GLIMMER_HIDDEN, GLIMMER_VOCAB) keep their exact recorded
+# values as EngineConfig defaults, stated here as literals so
+# a drift in either the constant or the value fails by name.
+def test_glimmer_op_defaults_are_the_recorded_ones() raises:
+    assert_true(DEFAULT_RMS_EPS == Float32(1.0e-5), "rms eps default")
+    assert_true(DEFAULT_ROPE_BASE == Float32(500000.0), "rope base default")
+    assert_true(
+        DEFAULT_LOGIT_SCALE == Float32(0.1961161345243454),
+        "logit scale default",
+    )
+    assert_true(DEFAULT_LOGIT_SOFTCAP == Float32(20.0), "softcap default")
+    assert_equal(DEFAULT_HEAD_DIM, 128)
+    assert_equal(DEFAULT_HIDDEN, 6656)
+    assert_equal(DEFAULT_VOCAB, 202048)
+    var cfg = EngineConfig.load()
+    assert_true(cfg.rms_eps == DEFAULT_RMS_EPS, "cfg rms_eps default")
+    assert_true(cfg.rope_base == DEFAULT_ROPE_BASE, "cfg rope_base default")
+    assert_true(
+        cfg.logit_scale == DEFAULT_LOGIT_SCALE, "cfg logit_scale default"
+    )
+    assert_true(
+        cfg.logit_softcap == DEFAULT_LOGIT_SOFTCAP, "cfg softcap default"
+    )
+    assert_equal(cfg.head_dim, DEFAULT_HEAD_DIM)
+    assert_equal(cfg.hidden, DEFAULT_HIDDEN)
+    assert_equal(cfg.vocab, DEFAULT_VOCAB)
+
+
+def test_parse_glimmer_op_knobs_accept() raises:
+    assert_true(parse_rms_eps("0.001") == Float32(0.001), "rms eps parse")
+    assert_true(parse_rms_eps("1e-5") == Float32(1.0e-5), "rms eps sci")
+    assert_true(
+        parse_rope_base("500000") == Float32(500000.0), "rope base parse"
+    )
+    assert_true(parse_logit_scale("0.5") == Float32(0.5), "scale parse")
+    assert_true(
+        parse_logit_softcap("20") == Float32(20.0), "softcap parse"
+    )
+    assert_true(
+        parse_logit_softcap("0") == Float32(0.0), "softcap 0 = no cap"
+    )
+    assert_equal(parse_head_dim("128"), 128)
+    assert_equal(parse_hidden("6656"), 6656)
+    assert_equal(parse_vocab("202048"), 202048)
+
+
+def test_parse_glimmer_op_knobs_refuse_by_name() raises:
+    # (which parser, raw) pairs; every one must refuse naming
+    # mojo_engine_config AND its own env var.
+    var cases = List[Tuple[Int, String, String]]()
+    cases.append((0, String("abc"), String("MOJO_ENGINE_RMS_EPS")))
+    cases.append((0, String("0"), String("MOJO_ENGINE_RMS_EPS")))
+    cases.append((0, String("-1"), String("MOJO_ENGINE_RMS_EPS")))
+    cases.append((0, String("nan"), String("MOJO_ENGINE_RMS_EPS")))
+    cases.append((0, String("inf"), String("MOJO_ENGINE_RMS_EPS")))
+    cases.append((1, String("abc"), String("MOJO_ENGINE_ROPE_BASE")))
+    cases.append((1, String("1"), String("MOJO_ENGINE_ROPE_BASE")))
+    cases.append((1, String("0.5"), String("MOJO_ENGINE_ROPE_BASE")))
+    cases.append((2, String("abc"), String("MOJO_ENGINE_LOGIT_SCALE")))
+    cases.append((2, String("nan"), String("MOJO_ENGINE_LOGIT_SCALE")))
+    cases.append((3, String("-1"), String("MOJO_ENGINE_LOGIT_SOFTCAP")))
+    cases.append((3, String("inf"), String("MOJO_ENGINE_LOGIT_SOFTCAP")))
+    cases.append((4, String("0"), String("MOJO_ENGINE_HEAD_DIM")))
+    cases.append((5, String("abc"), String("MOJO_ENGINE_HIDDEN")))
+    cases.append((6, String("-2"), String("MOJO_ENGINE_VOCAB")))
+    var saw = 0
+    for i in range(len(cases)):
+        var which = cases[i][0]
+        var raw = cases[i][1]
+        var env_name = cases[i][2]
+        try:
+            if which == 0:
+                _ = parse_rms_eps(raw)
+            elif which == 1:
+                _ = parse_rope_base(raw)
+            elif which == 2:
+                _ = parse_logit_scale(raw)
+            elif which == 3:
+                _ = parse_logit_softcap(raw)
+            elif which == 4:
+                _ = parse_head_dim(raw)
+            elif which == 5:
+                _ = parse_hidden(raw)
+            else:
+                _ = parse_vocab(raw)
+            assert_true(False, "bad op knob must refuse: " + raw)
+        except e:
+            assert_true(
+                String(e).find("mojo_engine_config") != -1,
+                "refusal must name mojo_engine_config",
+            )
+            assert_true(
+                String(e).find(env_name) != -1,
+                "refusal must name its env var " + env_name,
+            )
+            saw += 1
+    assert_equal(saw, len(cases))
 
 
 def main() raises:

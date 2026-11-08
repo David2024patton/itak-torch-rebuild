@@ -14,11 +14,8 @@
 from std.math import sqrt
 from std.testing import TestSuite, assert_true
 
-from ops.rms_norm import (
-    GLIMMER_RMS_EPS,
-    rms_norm_cpu,
-    rms_norm_plain_cpu,
-)
+from config import DEFAULT_RMS_EPS
+from ops.rms_norm import rms_norm_cpu, rms_norm_plain_cpu
 
 
 def _fixture(n: Int, seed: Int) -> List[Float32]:
@@ -62,8 +59,8 @@ def test_rms_norm_glimmer_eps_fixture() raises:
     var w = _fixture(128, 7)
     for i in range(len(w)):
         w[i] = Float32(1.0) + w[i] / Float32(8.0)
-    var got = rms_norm_cpu(x, w, GLIMMER_RMS_EPS)
-    var err = _max_rel(got, _ref(x, w, GLIMMER_RMS_EPS))
+    var got = rms_norm_cpu(x, w, DEFAULT_RMS_EPS)
+    var err = _max_rel(got, _ref(x, w, DEFAULT_RMS_EPS))
     print("rms_norm 128 eps=1e-5: max_rel", err)
     assert_true(err <= 1.0e-5, "rms_norm max rel above 1e-5 bar")
 
@@ -99,8 +96,8 @@ def test_rms_norm_plain_and_eps_is_parameter() raises:
     var x = _fixture(64, 5)
     var ones = List[Float32](capacity=64)
     ones.resize(64, Float32(1.0))
-    var plain = rms_norm_plain_cpu(x, GLIMMER_RMS_EPS)
-    var err = _max_rel(plain, _ref(x, ones, GLIMMER_RMS_EPS))
+    var plain = rms_norm_plain_cpu(x, DEFAULT_RMS_EPS)
+    var err = _max_rel(plain, _ref(x, ones, DEFAULT_RMS_EPS))
     print("rms_norm_plain 64: max_rel", err)
     assert_true(err <= 1.0e-5, "plain form above bar")
     # eps is a parameter: the Rust large-eps case, eps=4 on
@@ -122,7 +119,7 @@ def test_rms_norm_refusals_by_name() raises:
     short_w.resize(2, Float32(1.0))
     var saw = 0
     try:
-        _ = rms_norm_cpu(x, short_w, GLIMMER_RMS_EPS)
+        _ = rms_norm_cpu(x, short_w, DEFAULT_RMS_EPS)
     except e:
         if String(e).find("rms_norm_cpu_bad_shape") != -1:
             saw += 1
@@ -133,7 +130,7 @@ def test_rms_norm_refusals_by_name() raises:
             saw += 1
     var empty = List[Float32]()
     try:
-        _ = rms_norm_plain_cpu(empty, GLIMMER_RMS_EPS)
+        _ = rms_norm_plain_cpu(empty, DEFAULT_RMS_EPS)
     except e:
         if String(e).find("rms_norm_plain_cpu_bad_shape") != -1:
             saw += 1

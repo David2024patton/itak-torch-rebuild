@@ -29,8 +29,13 @@ from max.gpu import thread_idx, block_idx, block_dim
 
 from diag import log_debug
 
-comptime GLIMMER_HIDDEN = 6656
-comptime GLIMMER_VOCAB = 202048
+# Wave E (Lane E3): the recorded Glimmer dimensions that used
+# to live here as GLIMMER_HIDDEN / GLIMMER_VOCAB now live in
+# src/config.mojo as DEFAULT_HIDDEN / DEFAULT_VOCAB
+# (EngineConfig.hidden / .vocab, env MOJO_ENGINE_HIDDEN /
+# MOJO_ENGINE_VOCAB). They had no consumer in this module:
+# hidden is a parameter of the gathers below, as it always
+# was.
 
 
 def embedding_cpu(

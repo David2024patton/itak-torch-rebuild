@@ -14,7 +14,8 @@
 from std.math import sin, cos, pow, sqrt
 from std.testing import TestSuite, assert_true
 
-from ops.rope import GLIMMER_ROPE_BASE, rope_cpu
+from config import DEFAULT_ROPE_BASE
+from ops.rope import rope_cpu
 
 
 def _ref(
@@ -78,8 +79,8 @@ def test_rope_glimmer_shape_positions() raises:
     pos.resize(3, 0)
     pos[1] = 3
     pos[2] = 17
-    var got = rope_cpu(x, pos, HD, GLIMMER_ROPE_BASE)
-    var err = _max_abs(got, _ref(x, pos, HD, GLIMMER_ROPE_BASE))
+    var got = rope_cpu(x, pos, HD, DEFAULT_ROPE_BASE)
+    var err = _max_abs(got, _ref(x, pos, HD, DEFAULT_ROPE_BASE))
     print("rope glimmer 3x128 base=500000: max_abs", err)
     assert_true(err <= 1.0e-5, "glimmer-shape rope above bar")
     for i in range(HD):

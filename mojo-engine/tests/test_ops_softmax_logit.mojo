@@ -16,11 +16,8 @@
 from std.math import exp, tanh
 from std.testing import TestSuite, assert_true
 
-from ops.final_logit import (
-    GLIMMER_LOGIT_SCALE,
-    GLIMMER_LOGIT_SOFTCAP,
-    final_logit_cpu,
-)
+from config import DEFAULT_LOGIT_SCALE, DEFAULT_LOGIT_SOFTCAP
+from ops.final_logit import final_logit_cpu
 from ops.softmax import softmax_cpu
 
 
@@ -98,12 +95,12 @@ def test_final_logit_glimmer_values_and_no_cap() raises:
     x.resize(N, Float32(0.0))
     for i in range(N):
         x[i] = Float32(((i * 7) % 29) - 14) * Float32(3.0)
-    var got = final_logit_cpu(x, GLIMMER_LOGIT_SCALE, GLIMMER_LOGIT_SOFTCAP)
+    var got = final_logit_cpu(x, DEFAULT_LOGIT_SCALE, DEFAULT_LOGIT_SOFTCAP)
     var worst = Float64(0.0)
     for i in range(N):
-        var z = Float64(x[i]) * Float64(GLIMMER_LOGIT_SCALE)
-        var expected = Float64(GLIMMER_LOGIT_SOFTCAP) * tanh(
-            z / Float64(GLIMMER_LOGIT_SOFTCAP)
+        var z = Float64(x[i]) * Float64(DEFAULT_LOGIT_SCALE)
+        var expected = Float64(DEFAULT_LOGIT_SOFTCAP) * tanh(
+            z / Float64(DEFAULT_LOGIT_SOFTCAP)
         )
         var d = Float64(got[i]) - expected
         if d < 0:
@@ -111,8 +108,8 @@ def test_final_logit_glimmer_values_and_no_cap() raises:
         if d > worst:
             worst = d
         assert_true(
-            got[i] <= GLIMMER_LOGIT_SOFTCAP
-            and got[i] >= -GLIMMER_LOGIT_SOFTCAP,
+            got[i] <= DEFAULT_LOGIT_SOFTCAP
+            and got[i] >= -DEFAULT_LOGIT_SOFTCAP,
             "softcap bounds every logit",
         )
     print("final_logit glimmer scale/cap 64: max_abs", worst)

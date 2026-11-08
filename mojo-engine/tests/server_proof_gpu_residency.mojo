@@ -145,7 +145,8 @@ def main() raises:
             var host_out = gpu_layer_step_hostchain(
                 rt, weights, kv_h, cpu_model, x.copy(), target, 0
             )
-            var host_ms = Int((perf_counter_ns() - t0) // 1_000_000)
+            var host_ns = Int(perf_counter_ns() - t0)
+            var host_ms = host_ns // 1_000_000
             rt.kv_bytes = 0
             var kv_r = DeviceKvCache.build(
                 rt,
@@ -158,10 +159,11 @@ def main() raises:
             var res_out = gpu_layer_step_resident(
                 rt, weights, kv_r, cpu_model, x.copy(), target, 0
             )
-            var res_ms = Int((perf_counter_ns() - t1) // 1_000_000)
+            var res_ns = Int(perf_counter_ns() - t1)
+            var res_ms = res_ns // 1_000_000
             if timed:
-                host_times.append(host_ms)
-                res_times.append(res_ms)
+                host_times.append(host_ns)
+                res_times.append(res_ns)
             # Correctness: resident every round, hostchain in
             # the warmup round (baseline sanity).
             var cmp = _compare(res_out, cpu_out)
@@ -184,6 +186,10 @@ def main() raises:
                 + String(host_ms)
                 + " resident_ms="
                 + String(res_ms)
+                + " hostchain_us="
+                + String(host_ns // 1000)
+                + " resident_us="
+                + String(res_ns // 1000)
                 + " resident_cosine="
                 + String(cmp[0])
                 + " resident_max_rel="
@@ -218,9 +224,13 @@ def main() raises:
             "RESIDENCY layer="
             + String(target)
             + " hostchain_median_ms="
-            + String(host_med)
+            + String(host_med // 1_000_000)
             + " resident_median_ms="
-            + String(res_med)
+            + String(res_med // 1_000_000)
+            + " hostchain_median_us="
+            + String(host_med // 1000)
+            + " resident_median_us="
+            + String(res_med // 1000)
             + " speedup_x="
             + String(ratio)
         )

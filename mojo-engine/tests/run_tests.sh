@@ -59,6 +59,6 @@ echo "== engine hello =="
 out=$(env -u MOJO_ENGINE_MODEL_PATH -u MOJO_ENGINE_CONTEXT_LEN \
     mojo run -I src src/main.mojo) || fail "engine hello"
 echo "$out"
-echo "$out" | grep -q "mojo-engine 1.7" || fail "hello missing name/version"
+echo "$out" | grep -q "mojo-engine 1.07" || fail "hello missing name/version"
 
 echo "run_tests: PASS"

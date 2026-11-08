@@ -14,11 +14,16 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "run_tests: FAIL: $*" >&2; exit 1; }
 
+# Wave E hygiene (Lane E3, item 2): the timing harness verdict-line
+# extraction self-test (synthetic logs; pure shell, no toolchain).
+bash tests/wave_c_timing_extract_test.sh >/dev/null 2>&1 \
+    || fail "wave_c verdict extraction self-test"
+
 # Mojo 1.2 has no `mojo test` subcommand; the toolchain's own
 # runner is std.testing.TestSuite, discovered and run by each
 # test file's main() under `mojo run`.
 echo "== TestSuite files (clean env, seam off) =="
-for t in tests/test_diag.mojo tests/test_config.mojo tests/test_k1_cpu.mojo tests/test_loader.mojo tests/test_loader_full.mojo tests/test_q6k_cpu.mojo tests/test_q5k_cpu.mojo tests/test_f32_cpu.mojo tests/test_ops_rms_norm.mojo tests/test_ops_rope.mojo tests/test_ops_swiglu_residual.mojo tests/test_ops_softmax_logit.mojo tests/test_ops_embedding.mojo tests/test_k1_gpu_helpers.mojo tests/test_q6k_gpu_helpers.mojo tests/test_q5k_gpu_helpers.mojo tests/test_f32_gpu_helpers.mojo tests/test_tokenizer.mojo tests/test_tokenizer_gguf.mojo tests/test_kv_cache.mojo tests/test_attention_cpu.mojo tests/test_attention_split_cpu.mojo tests/test_generate.mojo tests/test_model_layer.mojo tests/test_gpu_plumbing.mojo tests/test_gpu_layer_vm.mojo tests/test_gpu_embedding_vm.mojo tests/test_gemm_cpu.mojo tests/test_gpu_prefill_vm.mojo; do
+for t in tests/test_diag.mojo tests/test_config.mojo tests/test_k1_cpu.mojo tests/test_loader.mojo tests/test_loader_full.mojo tests/test_q6k_cpu.mojo tests/test_q5k_cpu.mojo tests/test_f32_cpu.mojo tests/test_ops_rms_norm.mojo tests/test_ops_rope.mojo tests/test_ops_swiglu_residual.mojo tests/test_ops_softmax_logit.mojo tests/test_ops_embedding.mojo tests/test_k1_gpu_helpers.mojo tests/test_q6k_gpu_helpers.mojo tests/test_q5k_gpu_helpers.mojo tests/test_f32_gpu_helpers.mojo tests/test_tokenizer.mojo tests/test_tokenizer_gguf.mojo tests/test_kv_cache.mojo tests/test_attention_cpu.mojo tests/test_attention_split_cpu.mojo tests/test_generate.mojo tests/test_model_layer.mojo tests/test_gpu_plumbing.mojo tests/test_gpu_layer_vm.mojo tests/test_gpu_embedding_vm.mojo tests/test_gemm_cpu.mojo tests/test_gpu_prefill_vm.mojo tests/test_wave_e_batch_vm.mojo; do
     env -u MOJO_ENGINE_DEBUG -u MOJO_ENGINE_MODEL_PATH \
         -u MOJO_ENGINE_CONTEXT_LEN \
         mojo run -I src "$t" || fail "TestSuite $t (seam off)"

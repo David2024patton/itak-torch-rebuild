@@ -410,9 +410,15 @@ def fact_sheet(path: String) raises -> FactSheet:
     var mtp_prefixes = List[String]()
     mtp_prefixes.append("mtp.")
     var mtp_tensors = count_prefixed(gf, mtp_prefixes)
+    # Vision metadata block: clip.* keys on llama-style vision
+    # files, or the arch-prefixed <arch>.vision.block_count the
+    # qwen35 family writes (verified on the staged Qwen3.5-9B
+    # vision file: qwen35.vision.block_count = 27; a clip-only
+    # check reported metadata_block false on that file).
     var has_vision_block = (
         gf.has_metadata("clip.vision.block_count")
         or gf.has_metadata("clip.block_count")
+        or gf.has_metadata(arch + ".vision.block_count")
     )
 
     var companion = String("")

@@ -23,6 +23,17 @@ comptime DEFAULT_MODEL_PATH = (
 )
 comptime DEFAULT_CONTEXT_LEN = 131072
 
+# GPU memory budget (Wave C): the RX 7900 XTX carries
+# 25,769,803,776 B total; the engine keeps a 1 GiB reserve for
+# the rest of the system, so the default budget cap is the
+# card total minus the reserve = 24,696,061,952 B. Device
+# construction refuses by name (gpu_budget_exceeded, in
+# src/gpu/context.mojo) when the computed resident total
+# (weights + KV + scratch envelope) exceeds this cap.
+comptime GPU_CARD_TOTAL_BYTES = 25769803776
+comptime GPU_RESERVE_BYTES = 1073741824
+comptime DEFAULT_GPU_BUDGET_BYTES = GPU_CARD_TOTAL_BYTES - GPU_RESERVE_BYTES
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -49,15 +60,46 @@ def parse_context_len(raw: String) raises -> Int:
     return parsed
 
 
+def parse_gpu_budget_bytes(raw: String) raises -> Int:
+    """Parse and validate a GPU budget byte count.
+
+    Split out of load() so the refusal names are directly
+    testable, exactly like parse_context_len. Raises
+    mojo_engine_config on anything that is not a positive
+    whole number.
+    """
+    var parsed: Int
+    try:
+        parsed = Int(raw)
+    except:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GPU_BUDGET_BYTES is not a"
+            " whole number: '"
+            + raw
+            + "'"
+        )
+    if parsed <= 0:
+        raise Error(
+            "mojo_engine_config: MOJO_ENGINE_GPU_BUDGET_BYTES must be"
+            " positive, got "
+            + String(parsed)
+        )
+    return parsed
+
+
 struct EngineConfig(Copyable, Movable):
     """One loaded configuration; build via EngineConfig.load()."""
 
     var model_path: String
     var context_len: Int
+    var gpu_budget_bytes: Int
 
-    def __init__(out self, model_path: String, context_len: Int):
+    def __init__(
+        out self, model_path: String, context_len: Int, gpu_budget_bytes: Int
+    ):
         self.model_path = model_path
         self.context_len = context_len
+        self.gpu_budget_bytes = gpu_budget_bytes
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -75,4 +117,9 @@ struct EngineConfig(Copyable, Movable):
         if raw_ctx != "":
             context_len = parse_context_len(raw_ctx)
 
-        return EngineConfig(model_path, context_len)
+        var gpu_budget_bytes = DEFAULT_GPU_BUDGET_BYTES
+        var raw_budget = getenv("MOJO_ENGINE_GPU_BUDGET_BYTES")
+        if raw_budget != "":
+            gpu_budget_bytes = parse_gpu_budget_bytes(raw_budget)
+
+        return EngineConfig(model_path, context_len, gpu_budget_bytes)

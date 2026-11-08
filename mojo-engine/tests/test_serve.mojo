@@ -184,6 +184,13 @@ def test_greedy_lock() raises:
         '{"prompt":"x","temperature":0.0}', 64, 512, 32768
     )
     assert_equal(ok.prompt_text, "x")
+    # The integer form 0 is the same zero (David's
+    # clarification, 2026-11-08): standard OpenAI clients and
+    # the MCP bridge may send either JSON form; both accepted.
+    var ok_int = parse_chat_request(
+        '{"prompt":"x","temperature":0}', 64, 512, 32768
+    )
+    assert_equal(ok_int.prompt_text, "x")
     assert_equal(
         _refusal_name('{"prompt":"x","temperature":0.7}'),
         "serve_sampler_not_available",

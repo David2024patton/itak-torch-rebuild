@@ -134,7 +134,10 @@ def chat_request_has_image(body: String) raises -> Bool:
 
 def _check_greedy_lock(body: String) raises:
     """The greedy lock (amendments): temperature must be 0
-    when present; top_k / top_p / seed refuse by name when
+    when present, in either JSON form (integer 0 or float
+    0.0; both parse to 0.0 through json_float_field, per
+    David's 2026-11-08 clarification); a nonzero temperature
+    refuses by name. top_k / top_p / seed refuse by name when
     present at all (v1 has no sampler for them, and a seed
     with greedy decoding would be a lie)."""
     if has_json_key(body, "temperature"):

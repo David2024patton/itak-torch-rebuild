@@ -15,6 +15,7 @@ def main():
         var cfg = EngineConfig.load()
         print("model_path", cfg.model_path)
         print("context_len", cfg.context_len)
+        print("gpu_budget_bytes", cfg.gpu_budget_bytes)
     except e:
         print("REFUSAL", e)
         exit(2)

@@ -1,13 +1,24 @@
 # Mojo/MAX engine: design
 
-Status: Waves A and B landed, 2026-11-07/08, branch
-`mojo-max-engine`, engine version 1.3. Wave B is CLOSED: the
+Status: Waves A, B, and C landed, 2026-11-07/08, branch
+`mojo-max-engine`, engine version 1.4. Wave B is CLOSED: the
 end-to-end golden passed on the real Glimmer file (first 8
 generated tokens exactly [13796, 26, 1573, 373, 290, 2167,
 26899, 1212]), rung 3 (teacher-forced) passed 8/8, and rung 2
-was counted by an independent Python Float64 spot check. The
-full records are `bench/mojo-engine-wave-a-2026-11-07.md`
-and `bench/mojo-engine-wave-b-2026-11-07.md`.
+was counted by an independent Python Float64 spot check.
+Wave C is CLOSED: the same generation now runs on the GPU
+(device-resident weights and KV, per-position step semantics
+unchanged) and the end-to-end golden passed on device -
+GOLDEN_FIRST8_MATCH 1 in two consecutive runs, all 16 tokens
+identical to the CPU run, teacher-forced 8/8 on device with
+winning logits matching the CPU rung-3 record to about
+1e-3. First GPU numbers (no verdict beyond the arithmetic):
+prefill 684 ms for the 6-token prompt (CPU: 1,411,755 ms),
+decode 0.1511 s/step, about 6.62 tok/s (CPU: about 253.6
+s/step). The full records are
+`bench/mojo-engine-wave-a-2026-11-07.md`,
+`bench/mojo-engine-wave-b-2026-11-07.md`, and
+`bench/mojo-engine-wave-c-2026-11-07.md`.
 This branch starts the engine over on Mojo and MAX, on David's
 order ("pause rust and golang.. create a new branch and let's
 start over with Max and Mojo"). The Rust and Go trees are paused,
@@ -76,6 +87,24 @@ Each step lands as its own lane on this branch, proves parity
    (no verdict): prefill 1,411,755 ms for the 6-token prompt,
    decode about 253.6 s per step (about 0.0039 tok/s);
    speed is a later wave's work.
+   **GPU PORT DONE (Wave C, Lanes C1-C4); GOLDEN VERDICT
+   PASS ON DEVICE.** The forward now also runs as a
+   device-resident GPU model (src/gpu/ plumbing, GPU layer
+   assembly, GpuGlimmerModel behind the same ForwardModel
+   trait, runner selects it with MOJO_ENGINE_GPU): weights
+   and KV resident on the card (20,933,677,056 B reserved of
+   the 24,696,061,952 B budget cap at full context), the
+   end-to-end golden passed on device twice, and the
+   teacher-forced walk passed 8/8 on device. GPU numbers:
+   prefill 684 ms, decode 0.1511 s/step (about 6.62 tok/s),
+   model open about 31.8 s (CPU model read plus device
+   upload). Still owed, recorded in the wave note: a
+   device-side visible-order KV gather (the GPU path
+   refuses windowed appends that would wrap the 2,048 ring;
+   contexts past the window stay on the CPU path),
+   attention shared-memory tiling / split-KV occupancy work,
+   activation residency (activations cross per op in this
+   wave's shape), and GEMV tuning beyond K1.
 6. **Sampler. GREEDY LANDED (Wave B, Lane B4).** First-max
    tie-break, EOS excluded per engine.rs. The
    temperature/top-k/top-p family is still to come.

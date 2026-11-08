@@ -837,7 +837,7 @@ def _gemv_u8_buf(
             x_buf,
             y_dev,
             Int32(view.cols),
-            grid_dim=view.rows,
+            grid_dim=view.rows // F_ROWS_PER_WG,
             block_dim=F_THREADS,
         )
     else:
@@ -865,7 +865,7 @@ def _gemv_f32_buf(
         y_dev,
         Int32(view.cols),
         grid_dim=view.rows,
-        block_dim=F_THREADS,
+        block_dim=F32_THREADS,
     )
     return y_dev^
 

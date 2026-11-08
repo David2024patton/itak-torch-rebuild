@@ -92,11 +92,16 @@ from kernels.k1_gemv import (
     ROWS_PER_WG as K1_RPW,
 )
 from kernels.q6k_gemv import q6k_gemv_kernel, THREADS as Q6_THREADS
-from kernels.q5k_gemv import q5k_gemv_kernel, THREADS as Q5_THREADS
+from kernels.q5k_gemv import (
+    q5k_gemv_kernel,
+    THREADS as Q5_THREADS,
+    ROWS_PER_WG as Q5_RPW,
+)
 from kernels.f32_gemv import (
     f32_gemv_kernel,
     f16_gemv_kernel,
     THREADS as F_THREADS,
+    F32_THREADS,
 )
 from max.gpu.host import DeviceBuffer
 
@@ -242,7 +247,7 @@ def gemv_kernel_ref_bytes(
                 xb_dev,
                 y_dev,
                 Int32(cols),
-                grid_dim=rows,
+                grid_dim=rows // Q5_RPW,
                 block_dim=Q5_THREADS,
             )
         rt.ctx.synchronize()
@@ -360,7 +365,7 @@ def run_bytes_shape(
                 Int32(batch),
                 Int32(rows),
                 grid_dim=gemm_tiled_grid(rows, batch),
-                block_dim=Q6_THREADS,
+                block_dim=Q5_THREADS,
             )
         rt.ctx.synchronize()
         var got_s3 = download_f32(rt, y2_dev, batch * rows)
@@ -410,7 +415,7 @@ def run_f32_shape(mut rt: GpuRuntime) raises -> Int:
                 yk_dev,
                 Int32(COLS),
                 grid_dim=ROWS,
-                block_dim=F_THREADS,
+                block_dim=F32_THREADS,
             )
             rt.ctx.synchronize()
             var krow = download_f32(rt, yk_dev, ROWS)

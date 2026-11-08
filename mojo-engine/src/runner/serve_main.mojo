@@ -272,13 +272,20 @@ def _run_generation(
     die with the call."""
     ref cfg = st.config
     if st.gpu:
-        var model = GpuGlimmerModel.open_attn(
-            cfg.model_path,
+        # The 9-arg constructor with every knob from config,
+        # exactly as the proven runner builds it (open_attn
+        # would pin the GEMM batch knobs at their defaults and
+        # silently drop the MOJO_ENGINE_PREFILL_* overrides).
+        var model = GpuGlimmerModel(
+            GlimmerModel.open(cfg.model_path)^,
             cfg.context_len,
             cfg.gpu_budget_bytes,
             cfg.attn_tile_positions,
             cfg.attn_max_splits,
             cfg.attn_split_span_positions,
+            cfg.prefill_gemm_min_batch,
+            cfg.gemm_tiled_min_batch,
+            cfg.prefill_batch_min_tokens,
         )
         var reserved = model.rt.total_reserved()
         var kv_mib = model.kv.total_bytes // MIB_BYTES

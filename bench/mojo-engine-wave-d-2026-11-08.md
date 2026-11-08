@@ -179,8 +179,102 @@ never moved.
    status updated (steps 3 and 5 owed lists marked
    landed, speed-law measured state added).
 
-[INTEGRATED NUMBERS + GOLDEN: filled from the landing
-verification window on the pushed tree - see below.]
+## Integrated verification (the landing windows)
+
+The integrated tree was verified in cleared-card windows
+staged from the exact pushed commits (git archive,
+STAGED_COMMIT stamp, staged file hashes verified against
+the branch). Three landing defects were found and fixed
+as their own commits during this verification; each is
+recorded here because each is a real integration seam,
+not a lane defect:
+
+1. 44ab4cf - D1's GEMM proof predated D3's kernel
+   promotion: its gate-K reference launches used the
+   pre-D3 geometries (Q5_K grid = rows instead of
+   rows // ROWS_PER_WG=4; F32 block = the shared
+   THREADS=128 instead of F32_THREADS=256; the Q5_K
+   tiled GEMM launched with Q6's thread count). The
+   proof read garbage rows on the integrated tree while
+   every GEMM-vs-GEMV check stayed bit-identical. Proof
+   launch geometry updated; engine kernels untouched.
+2. c907f1f - the D1 merge put __init__'s attention
+   parameters between budget_bytes and the GEMM
+   thresholds, so GpuGlimmerModel.open()'s positional
+   call landed prefill_gemm_min_batch=2 into
+   attn_tile_positions; the first decode step refused
+   attention_tiled_bad_tile. open() now passes the
+   recorded attention defaults explicitly.
+3. 1716407 - the D2 reconciliation's resident GEMV
+   dispatch (_gemv_u8_buf) launched q5k_gemv_kernel
+   with grid_dim=rows, again the pre-D3 geometry; the
+   promoted kernel computes 4 rows per workgroup, so
+   decode steps read only the first quarter of
+   output.weight's rows and produced token 0 after the
+   first generated token. Its hostchain twin already
+   carried rows // Q5_ROWS_PER_WG. One-line fix.
+
+FINAL TREE (1716407, staged and hash-verified), full
+harness (tests/wave_d_timing.sh), one window:
+
+- GEMM proof: GEMM_CORRECTNESS PASS, GEMM_PROOF PASS,
+  zero FAIL lines (80 checks).
+- Teacher-forced golden: TEACHER_FORCED_GPU 8/8
+  (total_ms 454, against 1,215 ms on D1's lane tree -
+  the D3 GEMVs and D4 residency at work in the step
+  path).
+- End-to-end runner, GPU path: GOLDEN_FIRST8_MATCH 1,
+  TEXT_STRICT_OK 1, 16 tokens [13796, 26, 1573, 373,
+  290, 2167, 26899, 1212, 6996, 310, 11698, 341, 290,
+  2167, 26899, 1212], text " Paris. It is the most
+  populous city in France and the most populous" -
+  identical to the Wave B/C records. 6-token prefill
+  422 ms (Wave C: 684 ms; D1 lane: 402 ms). Decode
+  51.7 ms/step approx, 19.35 tok/s over the 16-token
+  run (D3 lane measure was 9.09 tok/s on its tree; the
+  integrated step path is faster still because the
+  teacher-forced and runner steps now run the resident
+  chain end to end).
+- 1,022-token prefill on the integrated tree:
+  PREFILL1022_VERDICT PASS, argmax 302 exact in every
+  arm and round, cross-arm last-hidden rel 1.74e-07.
+  Timings, stated with the arm meanings on THIS tree:
+  the GEMM arm (min batch 2) measured 76,579 ms
+  (13.35 tok/s) and the per-row arm (min batch
+  1,000,000) measured 48,415 ms (21.11 tok/s), so the
+  harness's speedup reads 0.63x - INVERTED against
+  D1's lane result (74,636 ms vs 136,467 ms, 1.83x).
+  The inversion is real and is D2+D4's doing, not a
+  GEMM regression: the GEMM arm's absolute time matches
+  its lane figure (76.6 s vs 74.6 s), while the per-row
+  arm got 2.8x faster than on D1's tree because the
+  per-row path now runs D4's resident chain and D2's
+  tiled attention instead of the Wave C hostchain. At
+  batch 1,022 the batched path's per-position causal
+  attention over host rows is the remaining cost (the
+  owed item below). Both arms produce the same last
+  hidden row inside 1.74e-07; the GEMM path stays the
+  default because it is the only arm whose cost falls
+  as kernels improve, and its kernel-level win (2.0x at
+  batch 64) is unchanged.
+- Per-layer proof on the integrated tree (run in the
+  first window): GPU_LAYER_PROOF PASS, layer 0 cosine
+  0.9999999999985238, layer 3 cosine 0.9999999999983641,
+  logits argmax 150015 exact both paths.
+
+Server closeout, as observed: the Glimmer llama-server
+(PID 27465 at window entry) was stopped for the first
+window and LEFT DOWN per David's standing order; port
+8080 verified CLEAR at final closeout. The embedding
+llama-server (port 8091, the cortex-embed payload) was
+never stopped and answers /health ok; cortex-embed.
+service itself was INACTIVE on entry and remains
+inactive (its payload runs outside the unit; restoring
+the unit was not attempted - non-interactive start is
+polkit-blocked, as D1's note recorded). Containers
+cortex-cortex-1 and cortex-cortex-surrealdb-1 up
+throughout, never touched. VRAM at closeout:
+1,939,746,816 B (the embedding payload's footprint).
 
 ## What remains owed after Wave D
 
@@ -190,7 +284,19 @@ verification window on the pushed tree - see below.]
   (D1's own analysis; the kernel-level win is 2.0-2.1x,
   the end-to-end win 1.83x, the gap is this shape).
 - The batch layer step on the tiled split-KV attention
-  (see the integration seam above).
+  (see the integration seam above). This is now the
+  measured prefill bottleneck: on the integrated tree
+  the per-row resident path prefills 1,022 tokens in
+  48.4 s against the batched path's 76.6 s, so wiring
+  residency + tiled attention INTO the batch step (or
+  routing long prefills through the resident step loop
+  until then) is the first speed item of the next wave.
+- Launch-geometry drift is a named hazard after this
+  landing: three of the wave's integration defects were
+  the same shape (a caller keeping a kernel's old
+  grid/block geometry after another lane changed the
+  kernel). Any future kernel promotion must grep every
+  enqueue site for that kernel in the same commit.
 - Decode's remaining gap to the reference points (Rust
   engine ~34.5 tok/s, llama Vulkan 44.59 tok/s on this
   card).

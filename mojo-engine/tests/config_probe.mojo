@@ -16,6 +16,9 @@ def main():
         print("model_path", cfg.model_path)
         print("context_len", cfg.context_len)
         print("gpu_budget_bytes", cfg.gpu_budget_bytes)
+        print("attn_tile_positions", cfg.attn_tile_positions)
+        print("attn_max_splits", cfg.attn_max_splits)
+        print("attn_split_span_positions", cfg.attn_split_span_positions)
     except e:
         print("REFUSAL", e)
         exit(2)

@@ -34,6 +34,27 @@ comptime GPU_CARD_TOTAL_BYTES = 25769803776
 comptime GPU_RESERVE_BYTES = 1073741824
 comptime DEFAULT_GPU_BUDGET_BYTES = GPU_CARD_TOTAL_BYTES - GPU_RESERVE_BYTES
 
+# Attention occupancy knobs (Wave D, Lane D2): the GPU
+# attention path stages K/V in shared-memory tiles of
+# DEFAULT_ATTN_TILE_POSITIONS positions and, once the stored
+# sequence grows past one split span, splits the KV sequence
+# across workgroups (split-KV) up to DEFAULT_ATTN_MAX_SPLITS
+# partials merged by exact logsumexp rescaling. These are the
+# operator-tunable defaults; the attention module validates
+# the tile against its compiled instantiations by name
+# (attention_tiled_bad_tile) and the split chooser's inputs
+# by name (attention_split_bad_config). Trial record:
+# bench/mojo-engine-wave-d-2026-11-07.md.
+comptime DEFAULT_ATTN_TILE_POSITIONS = 32
+comptime DEFAULT_ATTN_MAX_SPLITS = 8
+# Span 512 (not the 1024 first cut): the recorded card
+# trials (bench/mojo-engine-wave-d-2026-11-07.md) show the
+# split path still gaining at 8 splits on the 4,096-position
+# fixture (tile 32: 512 us at 8 splits vs 896 us at 4), so
+# the chooser reaches 8 splits at 4,096 stored; at or below
+# 512 stored the launch stays single-split.
+comptime DEFAULT_ATTN_SPLIT_SPAN_POSITIONS = 512
+
 
 def parse_context_len(raw: String) raises -> Int:
     """Parse and validate a context length value.
@@ -87,19 +108,72 @@ def parse_gpu_budget_bytes(raw: String) raises -> Int:
     return parsed
 
 
+def _parse_positive(raw: String, env_name: String) raises -> Int:
+    """Shared positive-whole-number parse for the attention
+    knobs; refuses by name like the other config values."""
+    var parsed: Int
+    try:
+        parsed = Int(raw)
+    except:
+        raise Error(
+            "mojo_engine_config: "
+            + env_name
+            + " is not a whole number: '"
+            + raw
+            + "'"
+        )
+    if parsed <= 0:
+        raise Error(
+            "mojo_engine_config: "
+            + env_name
+            + " must be positive, got "
+            + String(parsed)
+        )
+    return parsed
+
+
+def parse_attn_tile_positions(raw: String) raises -> Int:
+    """MOJO_ENGINE_ATTN_TILE_POSITIONS: positions per shared-
+    memory K/V tile in the GPU attention kernels."""
+    return _parse_positive(raw, "MOJO_ENGINE_ATTN_TILE_POSITIONS")
+
+
+def parse_attn_max_splits(raw: String) raises -> Int:
+    """MOJO_ENGINE_ATTN_MAX_SPLITS: the split-KV cap."""
+    return _parse_positive(raw, "MOJO_ENGINE_ATTN_MAX_SPLITS")
+
+
+def parse_attn_split_span(raw: String) raises -> Int:
+    """MOJO_ENGINE_ATTN_SPLIT_SPAN_POSITIONS: stored positions
+    per split-KV partial (splits engage past one span)."""
+    return _parse_positive(raw, "MOJO_ENGINE_ATTN_SPLIT_SPAN_POSITIONS")
+
+
 struct EngineConfig(Copyable, Movable):
     """One loaded configuration; build via EngineConfig.load()."""
 
     var model_path: String
     var context_len: Int
     var gpu_budget_bytes: Int
+    var attn_tile_positions: Int
+    var attn_max_splits: Int
+    var attn_split_span_positions: Int
 
     def __init__(
-        out self, model_path: String, context_len: Int, gpu_budget_bytes: Int
+        out self,
+        model_path: String,
+        context_len: Int,
+        gpu_budget_bytes: Int,
+        attn_tile_positions: Int = DEFAULT_ATTN_TILE_POSITIONS,
+        attn_max_splits: Int = DEFAULT_ATTN_MAX_SPLITS,
+        attn_split_span_positions: Int = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
     ):
         self.model_path = model_path
         self.context_len = context_len
         self.gpu_budget_bytes = gpu_budget_bytes
+        self.attn_tile_positions = attn_tile_positions
+        self.attn_max_splits = attn_max_splits
+        self.attn_split_span_positions = attn_split_span_positions
 
     @staticmethod
     def load() raises -> EngineConfig:
@@ -122,4 +196,26 @@ struct EngineConfig(Copyable, Movable):
         if raw_budget != "":
             gpu_budget_bytes = parse_gpu_budget_bytes(raw_budget)
 
-        return EngineConfig(model_path, context_len, gpu_budget_bytes)
+        var attn_tile = DEFAULT_ATTN_TILE_POSITIONS
+        var raw_tile = getenv("MOJO_ENGINE_ATTN_TILE_POSITIONS")
+        if raw_tile != "":
+            attn_tile = parse_attn_tile_positions(raw_tile)
+
+        var attn_splits = DEFAULT_ATTN_MAX_SPLITS
+        var raw_splits = getenv("MOJO_ENGINE_ATTN_MAX_SPLITS")
+        if raw_splits != "":
+            attn_splits = parse_attn_max_splits(raw_splits)
+
+        var attn_span = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS
+        var raw_span = getenv("MOJO_ENGINE_ATTN_SPLIT_SPAN_POSITIONS")
+        if raw_span != "":
+            attn_span = parse_attn_split_span(raw_span)
+
+        return EngineConfig(
+            model_path,
+            context_len,
+            gpu_budget_bytes,
+            attn_tile,
+            attn_splits,
+            attn_span,
+        )

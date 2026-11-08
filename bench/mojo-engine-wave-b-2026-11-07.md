@@ -1,10 +1,10 @@
 # Mojo engine Wave B: KV cache, attention, model forward, generation loop
 
-Date: 2026-11-07. Branch `mojo-max-engine`. Engine version
-STAYS 1.2: the wave's closing rung (the end-to-end golden on
-the server) was still running when this note was written, and
-the version bump to 1.3 belongs to the landing that carries
-the golden verdict. Remote main never moved off b416987.
+Date: 2026-11-07, closed 2026-11-08. Branch
+`mojo-max-engine`. Engine version 1.3 as of the wave's
+closing commit: the golden verdict is in and it PASSED (see
+THE GOLDEN VERDICT below for rung 2 counted, rung 3 8/8, and
+the end-to-end run). Remote main never moved off b416987.
 
 Suite at this writing (VM, `tests/run_tests.sh` via pixi):
 107 tests green (Wave A 78 + B1 9 + B2 7 + B4 9 + B3 4),
@@ -141,14 +141,11 @@ one) and output_type=13 (Q5_K). RUNG 2 EXECUTED: layer 0
 157.77914571017027, max 19.754636764526367, first8
 [1.254974, -0.3695352, -0.49299628, 1.3146128, -0.27929068,
 1.1605207, 0.099737644, 0.68446195]. The independent Python
-Float64 spot check of those two rows has NOT been run yet,
-so rung 2 is EXECUTED BUT NOT COUNTED. RUNG 3 was still
-executing when this update was written (the process was
-alive at ~98% CPU in the teacher-forced forward; a full
-52-layer step at the rung-2 rate is minutes, and rung 3
-needs 13 of them); its per-position lines land in the same
-log, followed by the window's restore lines (VRAM_RESTORED3,
-TENANT_EMBED3, WAVE_B_WINDOW3_DONE).
+Float64 spot check of those two rows has since been RUN and
+rung 2 is COUNTED (see THE GOLDEN VERDICT). RUNG 3 ran to
+completion in the same window; its per-position lines, its
+exit line, and the window's restore lines are all in
+~/gpu-wave-b/proof3.log (verdict in THE GOLDEN VERDICT).
 
 ## Integration record
 
@@ -162,32 +159,89 @@ integration).
 
 ## THE GOLDEN VERDICT
 
-PENDING: rung 3's verdict (in flight, see above) and the
-end-to-end run (integrated tree, real file, B4 generate over
-the B3 adapter), which has NOT been run as a separate rung
-beyond the proof harness's teacher-forced rung 3. The wave
-is therefore NOT declared complete. What remains, in order:
-(1) read the rung-3 results from ~/gpu-wave-b/proof3.log,
-verify the window's restore lines, and run the rung-2 Python
-spot check; (2) wire the end-to-end runner (a main that
-opens the real model, wraps it in GlimmerForwardAdapter,
-tokenizes "The capital of France is" with the Wave A
-tokenizer + BOS, runs B4 generate for 16 tokens at eos
-200001, prints the ids) and run it in a cleared window: PASS
-is exactly first-8 == [13796, 26, 1573, 373, 290, 2167,
-26899, 1212]; (3) record decode tok/s and prefill time from
-that run (first-light numbers, no verdict); (4) bump the
-engine to 1.3, finish the DESIGN.md step statuses, and close
-the wave. If rung 3 or the end-to-end run diverges, the
-parity ladder's next step is per-layer capture diffing at
-position 0 (captures are built into B3 for exactly this).
+PASS, on all three rungs, closed 2026-11-08.
+
+RUNG 2 COUNTED. The independent Python Float64 spot check
+(~/gpu-wave-b/spot_check_rung2.py: GGUF parsed and
+dequantized from the raw file bytes in float64, each
+dequantizer self-checked against a scalar transcription of
+the Mojo element functions on 200 random elements per
+tensor; layer math recomputed independently at position 0,
+where attention is exact and RoPE is the identity) agrees
+with the Mojo-recorded rows at float32 noise level:
+layer 0 sum rel diff 1.674e-07, max rel diff 9.814e-07,
+first8 max abs diff 3.414e-06; layer 3 sum rel diff
+1.029e-06, max rel diff 9.188e-07, first8 max abs diff
+2.435e-06. SPOT_CHECK PASS.
+
+RUNG 3 PASS 8/8. The teacher-forced walk in
+~/gpu-wave-b/proof3.log completed with PROOF3_EXIT 0:
+predictions 13796, 26, 1573, 373, 290, 2167, 26899, 1212,
+every one equal to its golden id (winning logits 17.34,
+18.88, 17.27, 19.25, 17.75, 16.75, 16.04, 15.78; full-step
+times 236,040 to 245,846 ms; prediction section total
+1,823,416 ms). Top-5 at index 0: 13796 (17.343933), then
+262, 290, 1085, 1437, a sane margin.
+
+END-TO-END PASS. The runner (src/runner/generate_main.mojo,
+commit 4dc4921, its own feature commit on this branch)
+opened the real file through the loader, built the prompt
+with the Wave A tokenizer plus BOS (printed PROMPT_IDS
+[200000, 954, 7963, 323, 11698, 373], exactly the Rust
+harness's construction), wrapped the model in
+GlimmerForwardAdapter, and ran B4 generate for 16 tokens
+greedy at eos 200001 in a fresh cleared-card window staged
+from 4dc4921 (git archive, STAGED_COMMIT stamp, staged
+generate_main.mojo sha256 516e780b... equal to the
+worktree's). Produced TOKENS [13796, 26, 1573, 373, 290,
+2167, 26899, 1212, 6996, 310, 11698, 341, 290, 2167, 26899,
+1212]: the first 8 are exactly the golden, and the runner's
+own GOLDEN_FIRST8_MATCH printed 1. Decoded text (strict
+decode verified, TEXT_STRICT_OK 1): " Paris. It is the most
+populous city in France and the most populous" -- fluent,
+on-prompt, and the repeated "26899, 1212" tail (", Paris")
+is the model's own phrasing, not a loop artifact in our
+plumbing. RUNNER_EXIT 0.
+
+FIRST-LIGHT NUMBERS (CPU path, no verdict attached; speed
+tuning is a later wave): model open 24,425 ms; prefill
+1,411,755 ms for the 6 prompt positions (measured on a
+second fresh model stepping the same ids, forward_rows);
+generate total 5,216,444 ms for 16 tokens; decode about
+253.6 s per step, about 0.00394 tok/s ((generate minus
+prefill) over the 15 decode steps, the runner's stated
+approximation).
+
+With the golden passed, the closing commit bumps the engine
+to 1.3 and marks DESIGN.md step 5 landed (steps 3 and 4
+proven; step 6 stays greedy-only).
 
 ## Server closeout
 
 B2's window: exact bookends, tenants healthy, port 8080
-clear. The B3/end-to-end window self-restores its tenants by
-trap on any exit; its closeout lines (VRAM_RESTORED,
-TENANT_EMBED, container status, WAVE_B_WINDOW_DONE) land in
-~/gpu-wave-b/proof.log and must be read back before the wave
-closes. Glimmer serving stayed down; no reboot anywhere in
-this wave.
+clear. The rung 2/3 window (proof3.log) closed with
+PROOF3_EXIT 0, TENANT_EMBED3 active, WAVE_B_WINDOW3_DONE
+present, VRAM_DRAINED3 exactly 33,271,808 B and
+VRAM_RESTORED3 2,584,600,576 B. The end-to-end window
+(~/gpu-wave-b-e2e/run.log, staged 4dc4921) closed with
+RUNNER_EXIT 0, TENANT_EMBED active (re-verified after the
+window), VRAM_DRAINED exactly 33,271,808 B, VRAM_RESTORED
+2,584,621,056 B, PORT8080 0 before and after,
+WAVE_B_E2E_WINDOW_DONE present.
+
+One tenant-set change, recorded plainly because it moves
+the restored bookend: the restored VRAM is now about
+2.58 GB, not the 8,932,147,200 B of earlier windows. The
+cortex-cortex-chat-1 and cortex-cortex-embed-1 containers
+no longer exist on the host: both this window's stop and
+its restore logged "No such container" for them, and the
+rung 3 window's restore listing (TENANT3) already showed
+only cortex-cortex-1 and cortex-cortex-surrealdb-1, which
+were never stopped and remain up. The absence predates the
+end-to-end window (its VRAM_DRAINED still measured the full
+33,271,808 B, i.e. the embed service was the only GPU
+tenant left to drain) and was not caused by it; the current
+tenant set's restored level is the 2.58 GB bookend both
+closing windows measured. cortex-embed.service is active.
+Glimmer serving stayed down; production llama-server
+untouched; no reboot anywhere in this wave.

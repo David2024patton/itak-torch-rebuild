@@ -29,6 +29,7 @@ from serve.history import (
     parse_run_record,
     prompt_bucket_of,
     reference_rows,
+    sha256_hex_of_bytes,
 )
 from serve.http import (
     ROUTE_CHAT,
@@ -426,6 +427,33 @@ def test_mcp_tools_list() raises:
     var tools = mcp_tools_json()
     for name in ["chat", "health", "stats", "debug_log", "history", "leaderboard"]:
         assert_true(tools.find('"name":"' + name + '"') != -1)
+
+
+def test_sha256_fips_vector() raises:
+    # FIPS 180-4 worked example: SHA-256("abc").
+    var abc = List[UInt8]()
+    for c in "abc".as_bytes():
+        abc.append(c)
+    assert_equal(
+        sha256_hex_of_bytes(abc),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    )
+    var empty = List[UInt8]()
+    assert_equal(
+        sha256_hex_of_bytes(empty),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    )
+    # 56-byte FIPS example (exercises the two-block padding edge).
+    var msg = String(
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+    )
+    var bytes = List[UInt8]()
+    for c in msg.as_bytes():
+        bytes.append(c)
+    assert_equal(
+        sha256_hex_of_bytes(bytes),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+    )
 
 
 def main() raises:

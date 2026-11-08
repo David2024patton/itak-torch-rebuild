@@ -133,16 +133,17 @@ def q6k_stream_quads(
 
 
 def load_word(w16: Pointer[UInt16, MutAnyOrigin], byte_off: Int) -> UInt32:
-    # One little-endian u32 rebuilt from its two aligned u16
-    # halves. Every byte offset the Q6_K kernel builds a word
-    # at is even (the block base is a multiple of 210's factor
-    # 2 and every in-block word offset is a multiple of 4), so
-    # both halves are aligned u16 loads even when the block
-    # itself starts two bytes into a u32.
-    var idx = byte_off // 2
-    return UInt32(w16.unsafe_load[width=1](idx)) | (
-        UInt32(w16.unsafe_load[width=1](idx + 1)) << 16
-    )
+    # One little-endian u32 as a single u16x2 vector load,
+    # bitcast to the word it spells. Every byte offset the
+    # Q6_K kernel builds a word at is even (the block base is
+    # a multiple of 210's factor 2 and every in-block word
+    # offset is a multiple of 4), so the pair load is aligned
+    # even when the block itself starts two bytes into a u32.
+    # (Iteration 1 rebuilt the word from two scalar u16 loads
+    # plus shift/or; the vector form is the same bytes with
+    # half the load instructions - the VM helper test proves
+    # both this route and the byte assembly agree.)
+    return bitcast[DType.uint32, 1](w16.unsafe_load[width=2](byte_off // 2))
 
 
 def signed_scale(w: Pointer[UInt8, MutAnyOrigin], off: Int) -> Float32:

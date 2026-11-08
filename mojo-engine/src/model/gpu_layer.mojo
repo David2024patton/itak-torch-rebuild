@@ -782,6 +782,34 @@ def _swiglu_device(
 # exactly as the host helpers carry List lengths.
 
 
+def _alloc_f32(
+    mut rt: GpuRuntime, n: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """A raw (UNINITIALIZED) device float32 buffer of n
+    elements, for resident-chain outputs that their kernel
+    writes IN FULL before any read (Wave E, Lane E2: the
+    create_zero_f32 zero-fill launch per op - about 21 per
+    layer - was pure overhead on this chain). Full-write
+    audit, kernel by kernel: rms_norm_kernel writes every
+    row element; the GEMV family (k1/q6k/q5k/f32/f16) writes
+    every output row its launch grid covers, and
+    gpu_layer_check_proj refuses row counts the tile cannot
+    cover exactly; rope_kernel's launch covers exactly the
+    input's pairs (rope_launch_shape); attention_merge_kernel
+    and the splits==1 direct kernel write every head/channel;
+    attn_gate_kernel, swiglu_kernel, residual_add_kernel and
+    final_logit_kernel write every element under their
+    bounds guard. Any future kernel that ACCUMULATES into
+    its output or writes partially must NOT take its output
+    from here - it needs create_zero_f32."""
+    if n <= 0:
+        raise Error(
+            "gpu_layer_bad_shape: raw alloc length must be positive, got "
+            + String(n)
+        )
+    return rt.ctx.enqueue_create_buffer[DType.float32](n)
+
+
 def _rms_norm_buf(
     mut rt: GpuRuntime,
     x_buf: DeviceBuffer[DType.float32],
@@ -792,7 +820,7 @@ def _rms_norm_buf(
 ) raises -> DeviceBuffer[DType.float32]:
     gpu_layer_check_norm(n, row_len, row_len)
     var rows = n // row_len
-    var y_dev = create_zero_f32(rt, n)
+    var y_dev = _alloc_f32(rt, n)
     rt.ctx.enqueue_function[rms_norm_kernel](
         x_buf,
         w_buf,
@@ -812,7 +840,7 @@ def _gemv_u8_buf(
     x_len: Int,
 ) raises -> DeviceBuffer[DType.float32]:
     gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, x_len)
-    var y_dev = create_zero_f32(rt, view.rows)
+    var y_dev = _alloc_f32(rt, view.rows)
     if view.type_id == DT_Q4_K:
         rt.ctx.enqueue_function[k1_gemv_kernel](
             view.buffer,
@@ -867,7 +895,7 @@ def _gemv_f32_buf(
     x_len: Int,
 ) raises -> DeviceBuffer[DType.float32]:
     gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, x_len)
-    var y_dev = create_zero_f32(rt, view.rows)
+    var y_dev = _alloc_f32(rt, view.rows)
     rt.ctx.enqueue_function[f32_gemv_kernel](
         view.buffer,
         x_buf,
@@ -972,7 +1000,7 @@ def _rope_buf(
             + String(vectors * head_dim)
         )
     var shape = rope_launch_shape(vectors * (head_dim // 2))
-    var y_dev = create_zero_f32(rt, n)
+    var y_dev = _alloc_f32(rt, n)
     var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
     for i in range(vectors):
         pos_host[i] = Int32(position)
@@ -1152,7 +1180,7 @@ def attention_device_resident_cfg(
         raise Error("gpu_layer_bad_shape: attention Q row shape is empty")
     attn_validate_tile(tile)
     var splits = attn_split_count(stored, split_span, max_splits)
-    var y_dev = create_zero_f32(rt, q_heads * head_dim)
+    var y_dev = _alloc_f32(rt, q_heads * head_dim)
     var k_vis = kv.gather_visible(rt, layer, False)
     var v_vis = kv.gather_visible(rt, layer, True)
     var p_out = rt.ctx.enqueue_create_buffer[DType.float32](
@@ -1206,7 +1234,7 @@ def _attn_gate_buf(
     g_buf: DeviceBuffer[DType.float32],
     n: Int,
 ) raises -> DeviceBuffer[DType.float32]:
-    var y_dev = create_zero_f32(rt, n)
+    var y_dev = _alloc_f32(rt, n)
     var grid = (n + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[attn_gate_kernel](
         a_buf,
@@ -1225,7 +1253,7 @@ def _swiglu_buf(
     u_buf: DeviceBuffer[DType.float32],
     n: Int,
 ) raises -> DeviceBuffer[DType.float32]:
-    var y_dev = create_zero_f32(rt, n)
+    var y_dev = _alloc_f32(rt, n)
     var grid = (n + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[swiglu_kernel](
         g_buf,
@@ -1248,7 +1276,7 @@ def _residual_add_buf(
     plain f32 per-element add residual_add_cpu does on host
     rows, so the resident chain's arithmetic matches the
     hostchain's exactly."""
-    var y_dev = create_zero_f32(rt, n)
+    var y_dev = _alloc_f32(rt, n)
     var grid = (n + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[residual_add_kernel](
         a_buf,
@@ -1301,7 +1329,7 @@ def gpu_logits(
     )
     var raw = _proj_output_buf(rt, weights, cpu_model, normed, cfg.hidden)
     var raw_len = cpu_model.output.rows
-    var y_dev = create_zero_f32(rt, raw_len)
+    var y_dev = _alloc_f32(rt, raw_len)
     var grid = (raw_len + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[final_logit_kernel](
         raw,

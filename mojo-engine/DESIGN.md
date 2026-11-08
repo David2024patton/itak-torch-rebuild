@@ -1,7 +1,19 @@
 # Mojo/MAX engine: design
 
-Status: Waves A, B, C, and D landed, 2026-11-07/08, branch
-`mojo-max-engine`, engine version 1.5. Wave D (the speed
+Status: Waves A, B, C, D, and E landed, 2026-11-07/08, branch
+`mojo-max-engine`, engine version 1.6. Wave E is CLOSED:
+the batch (GEMM) prefill step now runs the resident chain
+and the tiled split-KV attention (E1: 1,022-token batch arm
+34,852 ms against the per-row arm's 45,042 ms on the final
+tree, inversion removed; routing rule per-row below 16
+tokens, batch at/above, as a config knob), decode launch
+overhead cut (E2: zero-fill launches removed, splits==1
+direct-output attention; step+logits wall 35,230 -> 32,491
+us steady state), and the Wave A/C hygiene debts paid (E3:
+budget-ledger unreserve, harness verdict-line extraction,
+GLIMMER_* defaults folded into EngineConfig); golden PASS
+on the final tree, record in
+`bench/mojo-engine-wave-e-2026-11-08.md`. Wave D (the speed
 wave) is CLOSED: all four lanes integrated (D1 GEMM prefill,
 D2 attention occupancy, D3 GEMV tuning beyond K1, D4
 activation residency + device KV wrap), record in
@@ -126,9 +138,13 @@ Each step lands as its own lane on this branch, proves parity
    and 402 ms for the 6-token golden prompt against Wave
    C's 684 ms. Still owed after Wave D: activation
    residency INSIDE prefill (KV appends and causal
-   attention still run per position there), the
-   temperature/top-k/top-p sampler family, and the serving
-   seam (step 7).
+   attention still run per position there) - LANDED IN
+   WAVE E (Lane E1: the batch step is resident and runs
+   the batched tiled split-KV attention; prefill routes
+   per-row below 16 tokens and batched at/above, by the
+   MOJO_ENGINE_PREFILL_BATCH_MIN_TOKENS knob). The
+   temperature/top-k/top-p sampler family and the serving
+   seam (step 7) remain owed.
 6. **Sampler. GREEDY LANDED (Wave B, Lane B4).** First-max
    tie-break, EOS excluded per engine.rs. The
    temperature/top-k/top-p family is still to come.
@@ -172,6 +188,23 @@ same card: the paused Rust engine's plain decode about
 remaining decode gap is the next speed target, and its
 named lever is prefill/decode activation residency plus
 further kernel tuning, in that order of evidence.
+
+Measured state after Wave E (2026-11-08): prefill
+residency landed in the batch step; on the final tree
+the 1,022-token arms read batch 34,852 ms (29.3 tok/s)
+against per-row 45,042 ms (22.7 tok/s) interleaved, and
+the 6-token prefill 217 ms (per-row route). Decode:
+E2's profile showed the step is launch-bound (about
+3,900 enqueues/step; isolated ops sum well above the
+whole-layer wall); zero-fill launch removal and the
+splits==1 direct-output attention cut the steady-state
+step+logits wall from 35,230 to 32,491 us (28.38 ->
+30.78 tok/s by that measure); the runner's approximate
+decode read 20.35 tok/s on the final tree. The next
+named decode lever is step-level activation residency:
+the hidden row still crosses host<->device between all
+52 layers, and the KV append's mid-layer synchronize
+caps host lookahead.
 
 ## Licensing constraints (facts, as of MAX 26.7)
 

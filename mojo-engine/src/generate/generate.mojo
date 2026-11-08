@@ -104,9 +104,7 @@ trait ForwardModel:
         """Finished logits for one hidden row."""
         ...
 
-    def prefill(
-        mut self, prompt_ids: List[Int]
-    ) raises -> List[Float32]:
+    def prefill(mut self, prompt_ids: List[Int]) raises -> List[Float32]:
         """Feed the prompt at positions 0..n-1 and return the
         last position's hidden row. Default: the per-position
         step loop (Wave B/C semantics, statement for

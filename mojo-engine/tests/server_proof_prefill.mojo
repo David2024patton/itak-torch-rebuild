@@ -61,7 +61,10 @@ def make_tokens(n: Int) -> List[Int]:
 
 
 def arm_prefill(
-    path: String, budget: Int, tiled_min: Int, min_batch: Int,
+    path: String,
+    budget: Int,
+    tiled_min: Int,
+    min_batch: Int,
     tokens: List[Int],
 ) raises -> Tuple[Int, Int, List[Float32], Int]:
     """One fresh model, one timed forward_rows over the
@@ -110,7 +113,12 @@ def run() raises:
     var config = EngineConfig.load()
     var path = config.model_path
     print("PREFILL_PROOF model_path", path)
-    print("PREFILL_PROOF tokens", String(N_TOKENS), "context_len", String(PROOF_CONTEXT_LEN))
+    print(
+        "PREFILL_PROOF tokens",
+        String(N_TOKENS),
+        "context_len",
+        String(PROOF_CONTEXT_LEN),
+    )
     var tokens = make_tokens(N_TOKENS)
     var new_ms = List[Int]()
     var old_ms = List[Int]()
@@ -123,16 +131,25 @@ def run() raises:
             var min_batch = NEW_MIN_BATCH if is_new else OLD_MIN_BATCH
             var label = "new" if is_new else "old"
             var res = arm_prefill(
-                path, config.gpu_budget_bytes, config.gemm_tiled_min_batch,
-                min_batch, tokens,
+                path,
+                config.gpu_budget_bytes,
+                config.gemm_tiled_min_batch,
+                min_batch,
+                tokens,
             )
             print(
-                "PREFILL1022 arm=" + label
-                + " round=" + String(round)
-                + " load_ms=" + String(res[0])
-                + " prefill_ms=" + String(res[1])
-                + " tok_s=" + String(Float64(N_TOKENS) / (Float64(res[1]) / 1000.0))
-                + " argmax=" + String(res[3])
+                "PREFILL1022 arm="
+                + label
+                + " round="
+                + String(round)
+                + " load_ms="
+                + String(res[0])
+                + " prefill_ms="
+                + String(res[1])
+                + " tok_s="
+                + String(Float64(N_TOKENS) / (Float64(res[1]) / 1000.0))
+                + " argmax="
+                + String(res[3])
             )
             if is_new:
                 new_ms.append(res[1])
@@ -144,11 +161,16 @@ def run() raises:
             else:
                 var cmp = compare_rows(res[2], ref_hidden)
                 print(
-                    "PREFILL1022_COMPARE arm=" + label
-                    + " round=" + String(round)
-                    + " rel=" + String(cmp[0])
-                    + " cosine=" + String(cmp[1])
-                    + " argmax_match=" + String(1 if res[3] == ref_argmax else 0)
+                    "PREFILL1022_COMPARE arm="
+                    + label
+                    + " round="
+                    + String(round)
+                    + " rel="
+                    + String(cmp[0])
+                    + " cosine="
+                    + String(cmp[1])
+                    + " argmax_match="
+                    + String(1 if res[3] == ref_argmax else 0)
                 )
                 if cmp[0] > 1.0e-4 or cmp[1] < 0.999999 or res[3] != ref_argmax:
                     ok = False
@@ -158,11 +180,16 @@ def run() raises:
     # with two samples the min is the cleaner machine figure,
     # stated as such.
     print(
-        "PREFILL1022_SUMMARY new_ms_min=" + String(new_med)
-        + " old_ms_min=" + String(old_med)
-        + " new_tok_s=" + String(Float64(N_TOKENS) / (Float64(new_med) / 1000.0))
-        + " old_tok_s=" + String(Float64(N_TOKENS) / (Float64(old_med) / 1000.0))
-        + " speedup=" + String(Float64(old_med) / Float64(new_med))
+        "PREFILL1022_SUMMARY new_ms_min="
+        + String(new_med)
+        + " old_ms_min="
+        + String(old_med)
+        + " new_tok_s="
+        + String(Float64(N_TOKENS) / (Float64(new_med) / 1000.0))
+        + " old_tok_s="
+        + String(Float64(N_TOKENS) / (Float64(old_med) / 1000.0))
+        + " speedup="
+        + String(Float64(old_med) / Float64(new_med))
     )
     print("PREFILL1022_VERDICT", "PASS" if ok else "FAIL")
     if not ok:

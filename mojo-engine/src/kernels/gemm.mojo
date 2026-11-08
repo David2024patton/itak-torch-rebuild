@@ -193,9 +193,7 @@ def _slice_f32(x: List[Float32], off: Int, n: Int) -> List[Float32]:
     return out^
 
 
-def _place_f32(
-    mut y: List[Float32], off: Int, row: List[Float32]
-):
+def _place_f32(mut y: List[Float32], off: Int, row: List[Float32]):
     for i in range(len(row)):
         y[off + i] = row[i]
 

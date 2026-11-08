@@ -56,7 +56,11 @@ def slice_row(x: List[Float32], b: Int, cols: Int) -> List[Float32]:
 
 
 def assert_rows_exact(
-    got: List[Float32], want_row: List[Float32], b: Int, rows: Int, label: String
+    got: List[Float32],
+    want_row: List[Float32],
+    b: Int,
+    rows: Int,
+    label: String,
 ) raises:
     for r in range(rows):
         assert_true(

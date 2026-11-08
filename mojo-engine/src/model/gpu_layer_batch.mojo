@@ -153,7 +153,9 @@ def batch_row_slice(x: List[Float32], i: Int, width: Int) -> List[Float32]:
     return out^
 
 
-def batch_row_place(mut x: List[Float32], i: Int, width: Int, row: List[Float32]):
+def batch_row_place(
+    mut x: List[Float32], i: Int, width: Int, row: List[Float32]
+):
     for j in range(width):
         x[i * width + j] = row[j]
 
@@ -176,8 +178,13 @@ def _rms_norm_batch(
     var x_dev = upload_f32(rt, x)
     var y_dev = create_zero_f32(rt, len(x))
     rt.ctx.enqueue_function[rms_norm_kernel](
-        x_dev, w_buf, y_dev, Int32(row_len), eps,
-        grid_dim=rows, block_dim=RMS_THREADS,
+        x_dev,
+        w_buf,
+        y_dev,
+        Int32(row_len),
+        eps,
+        grid_dim=rows,
+        block_dim=RMS_THREADS,
     )
     rt.ctx.synchronize()
     return download_f32(rt, y_dev, len(x))
@@ -201,14 +208,22 @@ def _gemm_u8_batch(
     if view.type_id == DT_Q4_K:
         if tiled:
             rt.ctx.enqueue_function[k1_gemm_tiled_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_k1_tiled_grid(view.rows, batch),
                 block_dim=K1_THREADS,
             )
         else:
             rt.ctx.enqueue_function[k1_gemm_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_k1_grid(view.rows, batch),
                 block_dim=K1_THREADS,
@@ -216,14 +231,22 @@ def _gemm_u8_batch(
     elif view.type_id == DT_Q6_K:
         if tiled:
             rt.ctx.enqueue_function[q6k_gemm_tiled_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_tiled_grid(view.rows, batch),
                 block_dim=Q6_THREADS,
             )
         else:
             rt.ctx.enqueue_function[q6k_gemm_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_plain_grid(view.rows, batch),
                 block_dim=Q6_THREADS,
@@ -231,14 +254,22 @@ def _gemm_u8_batch(
     elif view.type_id == DT_Q5_K:
         if tiled:
             rt.ctx.enqueue_function[q5k_gemm_tiled_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_tiled_grid(view.rows, batch),
                 block_dim=Q6_THREADS,
             )
         else:
             rt.ctx.enqueue_function[q5k_gemm_kernel](
-                view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+                view.buffer,
+                x_dev,
+                y_dev,
+                Int32(view.cols),
+                Int32(batch),
                 Int32(view.rows),
                 grid_dim=gemm_plain_grid(view.rows, batch),
                 block_dim=Q6_THREADS,
@@ -253,8 +284,12 @@ def _gemm_u8_batch(
     rt.ctx.synchronize()
     _ = log_debug(
         "gpu.layer",
-        "gemm " + view.name + " batch=" + String(batch)
-        + " tiled=" + String(tiled),
+        "gemm "
+        + view.name
+        + " batch="
+        + String(batch)
+        + " tiled="
+        + String(tiled),
     )
     return download_f32(rt, y_dev, batch * view.rows)
 
@@ -274,14 +309,22 @@ def _gemm_f32_batch(
     var y_dev = create_zero_f32(rt, batch * view.rows)
     if batch >= tiled_min_batch:
         rt.ctx.enqueue_function[f32_gemm_tiled_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            Int32(batch),
             Int32(view.rows),
             grid_dim=gemm_tiled_grid(view.rows, batch),
             block_dim=F_THREADS,
         )
     else:
         rt.ctx.enqueue_function[f32_gemm_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), Int32(batch),
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            Int32(batch),
             Int32(view.rows),
             grid_dim=gemm_plain_grid(view.rows, batch),
             block_dim=F_THREADS,
@@ -292,8 +335,13 @@ def _gemm_f32_batch(
 
 
 def _check_view_batch(
-    name: String, type_id: Int, rows: Int, cols: Int,
-    cpu_type: Int, cpu_rows: Int, cpu_cols: Int,
+    name: String,
+    type_id: Int,
+    rows: Int,
+    cols: Int,
+    cpu_type: Int,
+    cpu_rows: Int,
+    cpu_cols: Int,
 ) raises:
     if type_id != cpu_type or rows != cpu_rows or cols != cpu_cols:
         raise Error(
@@ -384,7 +432,12 @@ def _proj_layer_batch(
     if cpu_type == DT_F32:
         var fview = weights.slot_f32(layer, suffix_index)
         _check_view_batch(
-            name, fview.type_id, fview.rows, fview.cols, cpu_type, cpu_rows,
+            name,
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
             cpu_cols,
         )
         return _gemm_f32_batch(rt, fview, x, batch, tiled_min_batch)
@@ -424,8 +477,13 @@ def _rope_batch(
     var pos_dev = rt.ctx.enqueue_create_buffer[DType.int32](vectors)
     rt.ctx.enqueue_copy(src_buf=pos_host, dst_buf=pos_dev)
     rt.ctx.enqueue_function[rope_kernel](
-        x_dev, y_dev, pos_dev, Int32(head_dim), base,
-        grid_dim=shape[0], block_dim=shape[1],
+        x_dev,
+        y_dev,
+        pos_dev,
+        Int32(head_dim),
+        base,
+        grid_dim=shape[0],
+        block_dim=shape[1],
     )
     rt.ctx.synchronize()
     return download_f32(rt, y_dev, len(x))
@@ -474,10 +532,17 @@ def _attention_at(
     var v_buf = kv.value_buffer(layer)
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
     rt.ctx.enqueue_function[attention_kernel](
-        q_dev, k_buf, v_buf, y_dev,
-        Int32(stored), Int32(kv_heads), Int32(head_dim),
-        Int32(q_heads // kv_heads), scale,
-        grid_dim=q_heads, block_dim=ATTN_THREADS,
+        q_dev,
+        k_buf,
+        v_buf,
+        y_dev,
+        Int32(stored),
+        Int32(kv_heads),
+        Int32(head_dim),
+        Int32(q_heads // kv_heads),
+        scale,
+        grid_dim=q_heads,
+        block_dim=ATTN_THREADS,
     )
     rt.ctx.synchronize()
     return download_f32(rt, y_dev, q_heads * head_dim)
@@ -498,7 +563,11 @@ def _attn_gate_batch(
     var y_dev = create_zero_f32(rt, len(attn))
     var grid = (len(attn) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[attn_gate_kernel](
-        a_dev, g_dev, y_dev, Int32(len(attn)), grid_dim=grid,
+        a_dev,
+        g_dev,
+        y_dev,
+        Int32(len(attn)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
@@ -520,7 +589,11 @@ def _swiglu_batch(
     var y_dev = create_zero_f32(rt, len(gate))
     var grid = (len(gate) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[swiglu_kernel](
-        g_dev, u_dev, y_dev, Int32(len(gate)), grid_dim=grid,
+        g_dev,
+        u_dev,
+        y_dev,
+        Int32(len(gate)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
@@ -577,8 +650,7 @@ def gpu_layer_step_batch(
             + String(start_position + batch - 1)
             + " would wrap its window "
             + String(kind.window)
-            + "; the CPU path is the fallback beyond the window"
-            " (Wave C limit)"
+            + "; the CPU path is the fallback beyond the window (Wave C limit)"
         )
     _ = log_debug(
         "gpu.layer",
@@ -591,37 +663,60 @@ def gpu_layer_step_batch(
     )
     var residual = x.copy()
     var h = _rms_norm_batch(
-        rt, residual,
+        rt,
+        residual,
         _norm_buffer_batch(weights, cpu_model, layer, 0, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        cfg.hidden,
+        cfg.rms_eps,
     )
-    var q = _proj_layer_batch(rt, weights, cpu_model, layer, 1, h, batch, tiled_min_batch)
-    var k = _proj_layer_batch(rt, weights, cpu_model, layer, 2, h, batch, tiled_min_batch)
-    var v = _proj_layer_batch(rt, weights, cpu_model, layer, 3, h, batch, tiled_min_batch)
+    var q = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 1, h, batch, tiled_min_batch
+    )
+    var k = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 2, h, batch, tiled_min_batch
+    )
+    var v = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 3, h, batch, tiled_min_batch
+    )
     q = _rms_norm_batch(
-        rt, q,
+        rt,
+        q,
         _norm_buffer_batch(weights, cpu_model, layer, 4, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     k = _rms_norm_batch(
-        rt, k,
+        rt,
+        k,
         _norm_buffer_batch(weights, cpu_model, layer, 5, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     var q_for_attn = q.copy()
     if sliding:
         k = _rope_batch(
-            rt, k, batch, cfg.kv_heads, cfg.head_dim, start_position,
+            rt,
+            k,
+            batch,
+            cfg.kv_heads,
+            cfg.head_dim,
+            start_position,
             cfg.rope_base_swa,
         )
         q_for_attn = _rope_batch(
-            rt, q, batch, cfg.q_heads, cfg.head_dim, start_position,
+            rt,
+            q,
+            batch,
+            cfg.q_heads,
+            cfg.head_dim,
+            start_position,
             cfg.rope_base_swa,
         )
     var k_width = cfg.kv_heads * cfg.head_dim
     for i in range(batch):
         kv.append(
-            rt, layer,
+            rt,
+            layer,
             batch_row_slice(k, i, k_width),
             batch_row_slice(v, i, k_width),
             start_position + i,
@@ -631,33 +726,54 @@ def gpu_layer_step_batch(
     attn.resize(batch * attn_width, Float32(0.0))
     for i in range(batch):
         var row = _attention_at(
-            rt, kv, batch_row_slice(q_for_attn, i, attn_width), layer,
-            cfg.q_heads, cfg.kv_heads, cfg.head_dim,
+            rt,
+            kv,
+            batch_row_slice(q_for_attn, i, attn_width),
+            layer,
+            cfg.q_heads,
+            cfg.kv_heads,
+            cfg.head_dim,
             start_position + i + 1,
         )
         batch_row_place(attn, i, attn_width, row)
-    var gate = _proj_layer_batch(rt, weights, cpu_model, layer, 7, h, batch, tiled_min_batch)
+    var gate = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 7, h, batch, tiled_min_batch
+    )
     var gated = _attn_gate_batch(rt, attn, gate)
-    var out = _proj_layer_batch(rt, weights, cpu_model, layer, 6, gated, batch, tiled_min_batch)
+    var out = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 6, gated, batch, tiled_min_batch
+    )
     out = _rms_norm_batch(
-        rt, out,
+        rt,
+        out,
         _norm_buffer_batch(weights, cpu_model, layer, 8, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     var after_attn = residual_add_cpu(residual, out)
     var residual2 = after_attn.copy()
     var h2 = _rms_norm_batch(
-        rt, residual2,
+        rt,
+        residual2,
         _norm_buffer_batch(weights, cpu_model, layer, 9, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        cfg.hidden,
+        cfg.rms_eps,
     )
-    var gate_ffn = _proj_layer_batch(rt, weights, cpu_model, layer, 10, h2, batch, tiled_min_batch)
-    var up_ffn = _proj_layer_batch(rt, weights, cpu_model, layer, 11, h2, batch, tiled_min_batch)
+    var gate_ffn = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 10, h2, batch, tiled_min_batch
+    )
+    var up_ffn = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 11, h2, batch, tiled_min_batch
+    )
     var act = _swiglu_batch(rt, gate_ffn, up_ffn)
-    var ffn = _proj_layer_batch(rt, weights, cpu_model, layer, 12, act, batch, tiled_min_batch)
+    var ffn = _proj_layer_batch(
+        rt, weights, cpu_model, layer, 12, act, batch, tiled_min_batch
+    )
     ffn = _rms_norm_batch(
-        rt, ffn,
+        rt,
+        ffn,
         _norm_buffer_batch(weights, cpu_model, layer, 13, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     return residual_add_cpu(residual2, ffn)

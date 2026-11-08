@@ -23,7 +23,9 @@ from model.gpu_layer_batch import (
 
 def test_check_proj_batch_accepts_glimmer_shapes() raises:
     gpu_layer_check_proj_batch("attn_q", DT_Q4_K, 4096, 6656, 6, 6 * 6656)
-    gpu_layer_check_proj_batch("ffn_down", DT_Q6_K, 6656, 19968, 256, 256 * 19968)
+    gpu_layer_check_proj_batch(
+        "ffn_down", DT_Q6_K, 6656, 19968, 256, 256 * 19968
+    )
     gpu_layer_check_proj_batch("output", DT_Q5_K, 202048, 6656, 1, 6656)
     gpu_layer_check_proj_batch("normlike", DT_F32, 6656, 6656, 64, 64 * 6656)
 
@@ -51,17 +53,20 @@ def test_check_proj_batch_refuses_by_name() raises:
     except e:
         names.append(String(e))
     assert_true(
-        names[0].find("gpu_layer_bad_shape") != -1, "flat length refusal misnamed"
+        names[0].find("gpu_layer_bad_shape") != -1,
+        "flat length refusal misnamed",
     )
     assert_true(
         names[1].find("gpu_layer_unsupported_dtype") != -1,
         "F16 batch refusal misnamed",
     )
     assert_true(
-        names[2].find("gpu_layer_bad_shape") != -1, "odd Q4 rows refusal misnamed"
+        names[2].find("gpu_layer_bad_shape") != -1,
+        "odd Q4 rows refusal misnamed",
     )
     assert_true(
-        names[3].find("gpu_layer_bad_shape") != -1, "zero batch refusal misnamed"
+        names[3].find("gpu_layer_bad_shape") != -1,
+        "zero batch refusal misnamed",
     )
 
 

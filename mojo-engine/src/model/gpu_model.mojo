@@ -165,9 +165,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         """
         var n = len(x)
         if n == 0:
-            raise Error(
-                "gpu_model_bad_shape: embedding norm got an empty row"
-            )
+            raise Error("gpu_model_bad_shape: embedding norm got an empty row")
         var ones = List[Float32](capacity=n)
         ones.resize(n, Float32(1.0))
         var x_dev = upload_f32(self.rt, x)
@@ -185,9 +183,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.rt.ctx.synchronize()
         return download_f32(self.rt, y_dev, n)
 
-    def step(
-        mut self, token_id: Int, position: Int
-    ) raises -> List[Float32]:
+    def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
         """One token at one absolute position through the whole
         stack on device; appends to the device KV cache (inside
         gpu_layer_step); returns the final hidden row. Mirrors
@@ -202,8 +198,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             )
         if position < 0:
             raise Error(
-                "gpu_model_bad_shape: negative position "
-                + String(position)
+                "gpu_model_bad_shape: negative position " + String(position)
             )
         var x = gpu_embed_token(self.rt, self.weights, token_id)
         x = self._plain_rms_norm(x, cfg.rms_eps)
@@ -228,9 +223,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         )
         return x^
 
-    def logits(
-        mut self, hidden: List[Float32]
-    ) raises -> List[Float32]:
+    def logits(mut self, hidden: List[Float32]) raises -> List[Float32]:
         """Finished logits for one hidden row: C2's gpu_logits
         (final norm, head GEMV, scale-then-softcap on device).
         """
@@ -265,8 +258,13 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         var w_dev = upload_f32(self.rt, ones)
         var y_dev = self.rt.ctx.enqueue_create_buffer[DType.float32](len(x))
         self.rt.ctx.enqueue_function[rms_norm_kernel](
-            x_dev, w_dev, y_dev, Int32(n), eps,
-            grid_dim=batch, block_dim=RMS_THREADS,
+            x_dev,
+            w_dev,
+            y_dev,
+            Int32(n),
+            eps,
+            grid_dim=batch,
+            block_dim=RMS_THREADS,
         )
         self.rt.ctx.synchronize()
         return download_f32(self.rt, y_dev, len(x))
@@ -309,9 +307,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
                 x[i * cfg.hidden + j] = row[j]
         x = self._plain_rms_norm_batch(x, batch, cfg.rms_eps)
         if self.cpu.capture_enabled:
-            self.cpu.capture_embed = batch_row_slice(
-                x, batch - 1, cfg.hidden
-            )
+            self.cpu.capture_embed = batch_row_slice(x, batch - 1, cfg.hidden)
         for layer in range(cfg.layers):
             x = gpu_layer_step_batch(
                 self.rt,
@@ -333,9 +329,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         )
         return batch_row_slice(x, batch - 1, cfg.hidden)
 
-    def prefill(
-        mut self, prompt_ids: List[Int]
-    ) raises -> List[Float32]:
+    def prefill(mut self, prompt_ids: List[Int]) raises -> List[Float32]:
         """The ForwardModel prefill seam (Wave D): at or above
         the configured GEMM minimum batch, the batched GEMM
         path from the cache's next position; below it, the

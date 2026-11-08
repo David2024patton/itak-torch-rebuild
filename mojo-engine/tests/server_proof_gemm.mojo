@@ -81,7 +81,6 @@ from kernels.q6k_gemv import q6k_gemv_kernel, THREADS as Q6_THREADS
 from kernels.f32_gemv import THREADS as F_THREADS
 
 
-
 def lcg_next(state: UInt32) -> UInt32:
     return state * 1664525 + 1013904223
 
@@ -96,7 +95,9 @@ def make_x(batch: Int, cols: Int, seed: UInt32) -> List[Float32]:
     return x^
 
 
-def make_bytes(rows: Int, cols: Int, sb_bytes: Int, seed: UInt32) -> List[UInt8]:
+def make_bytes(
+    rows: Int, cols: Int, sb_bytes: Int, seed: UInt32
+) -> List[UInt8]:
     var row_bytes = (cols // 256) * sb_bytes
     var w = List[UInt8](capacity=rows * row_bytes)
     w.resize(rows * row_bytes, UInt8(0))
@@ -129,8 +130,11 @@ def tame_q6k(mut w: List[UInt8], rows: Int, cols: Int):
 
 
 def check(
-    label: String, got: List[Float32], refv: List[Float32],
-    rel_bar: Float64, cos_bar: Float64,
+    label: String,
+    got: List[Float32],
+    refv: List[Float32],
+    rel_bar: Float64,
+    cos_bar: Float64,
 ) -> Bool:
     var max_abs = Float64(0.0)
     var scale = Float64(0.0)
@@ -158,15 +162,25 @@ def check(
     var cosine = dot / (sqrt(ng) * sqrt(nr))
     var ok = rel <= rel_bar and cosine >= cos_bar
     print(
-        "GEMM_CHECK", label, "rel", String(rel), "cosine", String(cosine),
+        "GEMM_CHECK",
+        label,
+        "rel",
+        String(rel),
+        "cosine",
+        String(cosine),
         "PASS" if ok else "FAIL",
     )
     return ok
 
 
 def run_bytes_shape(
-    mut rt: GpuRuntime, shape: String, w: List[UInt8], rows: Int, cols: Int,
-    rel_bar: Float64, cos_bar: Float64,
+    mut rt: GpuRuntime,
+    shape: String,
+    w: List[UInt8],
+    rows: Int,
+    cols: Int,
+    rel_bar: Float64,
+    cos_bar: Float64,
 ) raises -> Int:
     var fails = 0
     for batch in [1, 6, 64, 256]:
@@ -183,48 +197,89 @@ def run_bytes_shape(
         var y_dev = create_zero_f32(rt, batch * rows)
         if shape == "q4k" or shape == "q4kB":
             rt.ctx.enqueue_function[k1_gemm_kernel](
-                w_dev, x_dev, y_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_k1_grid(rows, batch), block_dim=K1_THREADS,
+                w_dev,
+                x_dev,
+                y_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_k1_grid(rows, batch),
+                block_dim=K1_THREADS,
             )
         elif shape == "q6k":
             rt.ctx.enqueue_function[q6k_gemm_kernel](
-                w_dev, x_dev, y_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_plain_grid(rows, batch), block_dim=Q6_THREADS,
+                w_dev,
+                x_dev,
+                y_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_plain_grid(rows, batch),
+                block_dim=Q6_THREADS,
             )
         else:
             rt.ctx.enqueue_function[q5k_gemm_kernel](
-                w_dev, x_dev, y_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_plain_grid(rows, batch), block_dim=Q6_THREADS,
+                w_dev,
+                x_dev,
+                y_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_plain_grid(rows, batch),
+                block_dim=Q6_THREADS,
             )
         rt.ctx.synchronize()
         if not check(
             shape + " s2 batch=" + String(batch),
-            download_f32(rt, y_dev, batch * rows), refv, rel_bar, cos_bar,
+            download_f32(rt, y_dev, batch * rows),
+            refv,
+            rel_bar,
+            cos_bar,
         ):
             fails += 1
         var y2_dev = create_zero_f32(rt, batch * rows)
         if shape == "q4k" or shape == "q4kB":
             rt.ctx.enqueue_function[k1_gemm_tiled_kernel](
-                w_dev, x_dev, y2_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_k1_tiled_grid(rows, batch), block_dim=K1_THREADS,
+                w_dev,
+                x_dev,
+                y2_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_k1_tiled_grid(rows, batch),
+                block_dim=K1_THREADS,
             )
         elif shape == "q6k":
             rt.ctx.enqueue_function[q6k_gemm_tiled_kernel](
-                w_dev, x_dev, y2_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_tiled_grid(rows, batch), block_dim=Q6_THREADS,
+                w_dev,
+                x_dev,
+                y2_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_tiled_grid(rows, batch),
+                block_dim=Q6_THREADS,
             )
         else:
             rt.ctx.enqueue_function[q5k_gemm_tiled_kernel](
-                w_dev, x_dev, y2_dev, Int32(cols), Int32(batch), Int32(rows),
-                grid_dim=gemm_tiled_grid(rows, batch), block_dim=Q6_THREADS,
+                w_dev,
+                x_dev,
+                y2_dev,
+                Int32(cols),
+                Int32(batch),
+                Int32(rows),
+                grid_dim=gemm_tiled_grid(rows, batch),
+                block_dim=Q6_THREADS,
             )
         rt.ctx.synchronize()
         if not check(
             shape + " s3 batch=" + String(batch),
-            download_f32(rt, y2_dev, batch * rows), refv, rel_bar, cos_bar,
+            download_f32(rt, y2_dev, batch * rows),
+            refv,
+            rel_bar,
+            cos_bar,
         ):
             fails += 1
-
 
     return fails
 
@@ -246,29 +301,44 @@ def run_f32_shape(mut rt: GpuRuntime) raises -> Int:
         var x_dev = upload_f32(rt, x)
         var y_dev = create_zero_f32(rt, batch * ROWS)
         rt.ctx.enqueue_function[f32_gemm_kernel](
-            w_dev, x_dev, y_dev, Int32(COLS), Int32(batch), Int32(ROWS),
-            grid_dim=gemm_plain_grid(ROWS, batch), block_dim=F_THREADS,
+            w_dev,
+            x_dev,
+            y_dev,
+            Int32(COLS),
+            Int32(batch),
+            Int32(ROWS),
+            grid_dim=gemm_plain_grid(ROWS, batch),
+            block_dim=F_THREADS,
         )
         rt.ctx.synchronize()
         if not check(
             "f32 s2 batch=" + String(batch),
-            download_f32(rt, y_dev, batch * ROWS), refv,
-            Float64(1.0e-4), Float64(0.999999),
+            download_f32(rt, y_dev, batch * ROWS),
+            refv,
+            Float64(1.0e-4),
+            Float64(0.999999),
         ):
             fails += 1
         var y2_dev = create_zero_f32(rt, batch * ROWS)
         rt.ctx.enqueue_function[f32_gemm_tiled_kernel](
-            w_dev, x_dev, y2_dev, Int32(COLS), Int32(batch), Int32(ROWS),
-            grid_dim=gemm_tiled_grid(ROWS, batch), block_dim=F_THREADS,
+            w_dev,
+            x_dev,
+            y2_dev,
+            Int32(COLS),
+            Int32(batch),
+            Int32(ROWS),
+            grid_dim=gemm_tiled_grid(ROWS, batch),
+            block_dim=F_THREADS,
         )
         rt.ctx.synchronize()
         if not check(
             "f32 s3 batch=" + String(batch),
-            download_f32(rt, y2_dev, batch * ROWS), refv,
-            Float64(1.0e-4), Float64(0.999999),
+            download_f32(rt, y2_dev, batch * ROWS),
+            refv,
+            Float64(1.0e-4),
+            Float64(0.999999),
         ):
             fails += 1
-
 
     return fails
 
@@ -309,16 +379,24 @@ def timing_q4k(mut rt: GpuRuntime) raises:
                 # Warmup: one full GEMV pass, then time PASSES.
                 for _ in range(BATCH):
                     rt.ctx.enqueue_function[k1_gemv_kernel](
-                        w_dev, xr_dev, yr_dev, Int32(COLS),
-                        grid_dim=ROWS // K1_RPW, block_dim=K1_THREADS,
+                        w_dev,
+                        xr_dev,
+                        yr_dev,
+                        Int32(COLS),
+                        grid_dim=ROWS // K1_RPW,
+                        block_dim=K1_THREADS,
                     )
                 rt.ctx.synchronize()
                 var t0 = perf_counter_ns()
                 for _ in range(PASSES):
                     for _ in range(BATCH):
                         rt.ctx.enqueue_function[k1_gemv_kernel](
-                            w_dev, xr_dev, yr_dev, Int32(COLS),
-                            grid_dim=ROWS // K1_RPW, block_dim=K1_THREADS,
+                            w_dev,
+                            xr_dev,
+                            yr_dev,
+                            Int32(COLS),
+                            grid_dim=ROWS // K1_RPW,
+                            block_dim=K1_THREADS,
                         )
                 rt.ctx.synchronize()
                 gemv_ms.append(
@@ -326,16 +404,26 @@ def timing_q4k(mut rt: GpuRuntime) raises:
                 )
             elif which == 1:
                 rt.ctx.enqueue_function[k1_gemm_kernel](
-                    w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                    Int32(ROWS), grid_dim=gemm_k1_grid(ROWS, BATCH),
+                    w_dev,
+                    x_dev,
+                    y_dev,
+                    Int32(COLS),
+                    Int32(BATCH),
+                    Int32(ROWS),
+                    grid_dim=gemm_k1_grid(ROWS, BATCH),
                     block_dim=K1_THREADS,
                 )
                 rt.ctx.synchronize()
                 var t1 = perf_counter_ns()
                 for _ in range(PASSES):
                     rt.ctx.enqueue_function[k1_gemm_kernel](
-                        w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                        Int32(ROWS), grid_dim=gemm_k1_grid(ROWS, BATCH),
+                        w_dev,
+                        x_dev,
+                        y_dev,
+                        Int32(COLS),
+                        Int32(BATCH),
+                        Int32(ROWS),
+                        grid_dim=gemm_k1_grid(ROWS, BATCH),
                         block_dim=K1_THREADS,
                     )
                 rt.ctx.synchronize()
@@ -344,16 +432,26 @@ def timing_q4k(mut rt: GpuRuntime) raises:
                 )
             else:
                 rt.ctx.enqueue_function[k1_gemm_tiled_kernel](
-                    w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                    Int32(ROWS), grid_dim=gemm_k1_tiled_grid(ROWS, BATCH),
+                    w_dev,
+                    x_dev,
+                    y_dev,
+                    Int32(COLS),
+                    Int32(BATCH),
+                    Int32(ROWS),
+                    grid_dim=gemm_k1_tiled_grid(ROWS, BATCH),
                     block_dim=K1_THREADS,
                 )
                 rt.ctx.synchronize()
                 var t2 = perf_counter_ns()
                 for _ in range(PASSES):
                     rt.ctx.enqueue_function[k1_gemm_tiled_kernel](
-                        w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                        Int32(ROWS), grid_dim=gemm_k1_tiled_grid(ROWS, BATCH),
+                        w_dev,
+                        x_dev,
+                        y_dev,
+                        Int32(COLS),
+                        Int32(BATCH),
+                        Int32(ROWS),
+                        grid_dim=gemm_k1_tiled_grid(ROWS, BATCH),
                         block_dim=K1_THREADS,
                     )
                 rt.ctx.synchronize()
@@ -363,8 +461,18 @@ def timing_q4k(mut rt: GpuRuntime) raises:
     var g = median3(gemv_ms[0], gemv_ms[1], gemv_ms[2])
     var a = median3(s2_ms[0], s2_ms[1], s2_ms[2])
     var b = median3(s3_ms[0], s3_ms[1], s3_ms[2])
-    print("GEMM_TIMING q4k shape 19968x6656 batch 64 weight_bytes", String(weight_bytes))
-    print("GEMM_TIMING q4k gemv_ms_per_pass", String(g), "s2_ms_per_pass", String(a), "s3_ms_per_pass", String(b))
+    print(
+        "GEMM_TIMING q4k shape 19968x6656 batch 64 weight_bytes",
+        String(weight_bytes),
+    )
+    print(
+        "GEMM_TIMING q4k gemv_ms_per_pass",
+        String(g),
+        "s2_ms_per_pass",
+        String(a),
+        "s3_ms_per_pass",
+        String(b),
+    )
     print(
         "GEMM_TIMING q4k gemv_streamed_GB_s",
         String(Float64(weight_bytes) * Float64(BATCH) / (g / 1000.0) / 1.0e9),
@@ -399,16 +507,24 @@ def timing_q6k(mut rt: GpuRuntime) raises:
             if which == 0:
                 for _ in range(BATCH):
                     rt.ctx.enqueue_function[q6k_gemv_kernel](
-                        w_dev, xr_dev, yr_dev, Int32(COLS),
-                        grid_dim=ROWS, block_dim=Q6_THREADS,
+                        w_dev,
+                        xr_dev,
+                        yr_dev,
+                        Int32(COLS),
+                        grid_dim=ROWS,
+                        block_dim=Q6_THREADS,
                     )
                 rt.ctx.synchronize()
                 var t0 = perf_counter_ns()
                 for _ in range(PASSES):
                     for _ in range(BATCH):
                         rt.ctx.enqueue_function[q6k_gemv_kernel](
-                            w_dev, xr_dev, yr_dev, Int32(COLS),
-                            grid_dim=ROWS, block_dim=Q6_THREADS,
+                            w_dev,
+                            xr_dev,
+                            yr_dev,
+                            Int32(COLS),
+                            grid_dim=ROWS,
+                            block_dim=Q6_THREADS,
                         )
                 rt.ctx.synchronize()
                 gemv_ms.append(
@@ -416,16 +532,26 @@ def timing_q6k(mut rt: GpuRuntime) raises:
                 )
             elif which == 1:
                 rt.ctx.enqueue_function[q6k_gemm_kernel](
-                    w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                    Int32(ROWS), grid_dim=gemm_plain_grid(ROWS, BATCH),
+                    w_dev,
+                    x_dev,
+                    y_dev,
+                    Int32(COLS),
+                    Int32(BATCH),
+                    Int32(ROWS),
+                    grid_dim=gemm_plain_grid(ROWS, BATCH),
                     block_dim=Q6_THREADS,
                 )
                 rt.ctx.synchronize()
                 var t1 = perf_counter_ns()
                 for _ in range(PASSES):
                     rt.ctx.enqueue_function[q6k_gemm_kernel](
-                        w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                        Int32(ROWS), grid_dim=gemm_plain_grid(ROWS, BATCH),
+                        w_dev,
+                        x_dev,
+                        y_dev,
+                        Int32(COLS),
+                        Int32(BATCH),
+                        Int32(ROWS),
+                        grid_dim=gemm_plain_grid(ROWS, BATCH),
                         block_dim=Q6_THREADS,
                     )
                 rt.ctx.synchronize()
@@ -434,16 +560,26 @@ def timing_q6k(mut rt: GpuRuntime) raises:
                 )
             else:
                 rt.ctx.enqueue_function[q6k_gemm_tiled_kernel](
-                    w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                    Int32(ROWS), grid_dim=gemm_tiled_grid(ROWS, BATCH),
+                    w_dev,
+                    x_dev,
+                    y_dev,
+                    Int32(COLS),
+                    Int32(BATCH),
+                    Int32(ROWS),
+                    grid_dim=gemm_tiled_grid(ROWS, BATCH),
                     block_dim=Q6_THREADS,
                 )
                 rt.ctx.synchronize()
                 var t2 = perf_counter_ns()
                 for _ in range(PASSES):
                     rt.ctx.enqueue_function[q6k_gemm_tiled_kernel](
-                        w_dev, x_dev, y_dev, Int32(COLS), Int32(BATCH),
-                        Int32(ROWS), grid_dim=gemm_tiled_grid(ROWS, BATCH),
+                        w_dev,
+                        x_dev,
+                        y_dev,
+                        Int32(COLS),
+                        Int32(BATCH),
+                        Int32(ROWS),
+                        grid_dim=gemm_tiled_grid(ROWS, BATCH),
                         block_dim=Q6_THREADS,
                     )
                 rt.ctx.synchronize()
@@ -453,8 +589,18 @@ def timing_q6k(mut rt: GpuRuntime) raises:
     var g = median3(gemv_ms[0], gemv_ms[1], gemv_ms[2])
     var a = median3(s2_ms[0], s2_ms[1], s2_ms[2])
     var b = median3(s3_ms[0], s3_ms[1], s3_ms[2])
-    print("GEMM_TIMING q6k shape 6656x19968 batch 64 weight_bytes", String(weight_bytes))
-    print("GEMM_TIMING q6k gemv_ms_per_pass", String(g), "s2_ms_per_pass", String(a), "s3_ms_per_pass", String(b))
+    print(
+        "GEMM_TIMING q6k shape 6656x19968 batch 64 weight_bytes",
+        String(weight_bytes),
+    )
+    print(
+        "GEMM_TIMING q6k gemv_ms_per_pass",
+        String(g),
+        "s2_ms_per_pass",
+        String(a),
+        "s3_ms_per_pass",
+        String(b),
+    )
     print(
         "GEMM_TIMING q6k gemv_streamed_GB_s",
         String(Float64(weight_bytes) * Float64(BATCH) / (g / 1000.0) / 1.0e9),
@@ -471,17 +617,25 @@ def run() raises:
     var w4 = make_bytes(64, 1024, 144, UInt32(42))
     tame_q4k(w4, 64, 1024, 144)
     var failures = 0
-    failures += run_bytes_shape(rt, "q4k", w4, 64, 1024, Float64(1.267e-07), Float64(0.9999999995))
+    failures += run_bytes_shape(
+        rt, "q4k", w4, 64, 1024, Float64(1.267e-07), Float64(0.9999999995)
+    )
     var w6 = make_bytes(64, 1024, 210, UInt32(43))
     tame_q6k(w6, 64, 1024)
-    failures += run_bytes_shape(rt, "q6k", w6, 64, 1024, Float64(1.0e-4), Float64(0.999999))
+    failures += run_bytes_shape(
+        rt, "q6k", w6, 64, 1024, Float64(1.0e-4), Float64(0.999999)
+    )
     var w5 = make_bytes(64, 1024, 176, UInt32(44))
     tame_q4k(w5, 64, 1024, 176)
-    failures += run_bytes_shape(rt, "q5k", w5, 64, 1024, Float64(1.0e-4), Float64(0.999999))
+    failures += run_bytes_shape(
+        rt, "q5k", w5, 64, 1024, Float64(1.0e-4), Float64(0.999999)
+    )
     failures += run_f32_shape(rt)
     var w4b = make_bytes(64, 6656, 144, UInt32(46))
     tame_q4k(w4b, 64, 6656, 144)
-    failures += run_bytes_shape(rt, "q4kB", w4b, 64, 6656, Float64(1.267e-07), Float64(0.9999999995))
+    failures += run_bytes_shape(
+        rt, "q4kB", w4b, 64, 6656, Float64(1.267e-07), Float64(0.9999999995)
+    )
     print("GEMM_CORRECTNESS", "PASS" if failures == 0 else "FAIL")
     if failures != 0:
         exit(1)

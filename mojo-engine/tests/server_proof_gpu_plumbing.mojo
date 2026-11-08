@@ -21,12 +21,15 @@
 #    identical formula rows, element-exact: a small synthetic
 #    cache (window 4 + global sibling) and the real 2048
 #    window at positions 0..2047 with boundary reads.
-# 5. The Wave C wrap limit, stated and exercised plainly: at
-#    position 2048 on a 2048 window (and position 4 on the
-#    window-4 cache) the DEVICE append refuses
-#    gpu_kv_window_wrapped, while B1's CPU cache accepts the
-#    same appends and evicts (its proven semantics, recorded
-#    here as the deviation the contract orders).
+# 5. Wave D (Lane D4) update: the Wave C wrap limit is
+#    RETIRED. At position 2048 on a 2048 window (and position
+#    4 on the window-4 cache) the DEVICE append now ACCEPTS
+#    and evicts exactly as B1's CPU cache does, and the
+#    wrapped rows read back element-exact against the CPU
+#    cache. The full wrap proof (visible-order gather,
+#    generation past 2048) is tests/
+#    server_proof_gpu_kv_wrap.mojo; this file keeps the
+#    boundary legs at parity scale.
 #
 # Exits nonzero on any failure. Row formula (exact small
 # integers in f32, distinct per position, same as B1's suite):
@@ -86,7 +89,9 @@ def _rows(
     return (k^, v^)
 
 
-def _rows_equal(name: String, got: List[Float32], expected: List[Float32]) -> Bool:
+def _rows_equal(
+    name: String, got: List[Float32], expected: List[Float32]
+) -> Bool:
     if len(got) != len(expected):
         print("PROOF MISMATCH", name, "len", len(got), "vs", len(expected))
         return False
@@ -243,7 +248,10 @@ def run() raises -> Bool:
         ok = False
     print("PROOF kv capacity layer0 (windowed)", kv.capacity_positions(0))
     print("PROOF kv capacity layer3 (global)", kv.capacity_positions(3))
-    if kv.capacity_positions(0) != 2048 or kv.capacity_positions(3) != cfg.context_len:
+    if (
+        kv.capacity_positions(0) != 2048
+        or kv.capacity_positions(3) != cfg.context_len
+    ):
         print("PROOF FAIL KV capacities wrong")
         ok = False
     var reserved = rt.total_reserved()
@@ -294,28 +302,44 @@ def run() raises -> Bool:
         "first_visible w",
         dev_s.first_visible_position(0),
     )
-    # Wrap refusal on the tiny window, and B1's contrary
-    # (proven) behavior recorded on the same rows.
+    # Wave D: the tiny window WRAPS on device, B1-exact.
+    # Both caches accept position 4 and evict position 0;
+    # every visible row then compares element-exact, and the
+    # evicted position refuses on device by its B1 name.
     var rows4 = _rows(2, 4, 4)
-    var saw_wrap = False
-    try:
-        dev_s.append(rt, 0, rows4[0], rows4[1], 4)
-    except e:
-        saw_wrap = String(e).find("gpu_kv_window_wrapped") != -1
-        print("PROOF tiny-window wrap refusal:", e)
-    if not saw_wrap:
-        print("PROOF FAIL tiny-window wrap did not refuse gpu_kv_window_wrapped")
-        ok = False
+    dev_s.append(rt, 0, rows4[0], rows4[1], 4)
     cpu_s.append(0, rows4[0], rows4[1], 4)
     print(
-        "PROOF B1_DEVIATION cpu accepted window-4 position 4: stored",
-        cpu_s.stored_len(0),
+        "PROOF B1_PARITY window-4 position 4 accepted on both: stored",
+        dev_s.stored_len(0),
         "first_visible",
+        dev_s.first_visible_position(0),
+        "cpu stored",
+        cpu_s.stored_len(0),
+        "cpu first_visible",
         cpu_s.first_visible_position(0),
-        "(B1 evicts; the Wave C device path refuses the wrap)",
     )
-    var cpu4 = cpu_s.key_row(0, 4)
-    if not _rows_equal("cpu window-4 position 4 K (B1 semantics)", cpu4, rows4[0]):
+    if dev_s.stored_len(0) != cpu_s.stored_len(
+        0
+    ) or dev_s.first_visible_position(0) != cpu_s.first_visible_position(0):
+        print("PROOF FAIL window-4 wrap stored/first_visible disagree")
+        ok = False
+    for pos in range(1, 5):
+        var dk_w = dev_s.read_key_row(rt, 0, pos)
+        var ck_w = cpu_s.key_row(0, pos)
+        if not _rows_equal("wrapped window-4 K pos " + String(pos), dk_w, ck_w):
+            ok = False
+        var dv_w = dev_s.read_value_row(rt, 0, pos)
+        var cv_w = cpu_s.value_row(0, pos)
+        if not _rows_equal("wrapped window-4 V pos " + String(pos), dv_w, cv_w):
+            ok = False
+    var saw_evicted_s = False
+    try:
+        _ = dev_s.read_key_row(rt, 0, 0)
+    except e:
+        saw_evicted_s = String(e).find("gpu_kv_position_evicted") != -1
+    if not saw_evicted_s:
+        print("PROOF FAIL wrapped window-4 evicted read not refused by name")
         ok = False
     # Global sibling continues in order on device, exact.
     for pos in range(4, 6):
@@ -356,7 +380,7 @@ def run() raises -> Bool:
     if not saw_unwritten:
         print("PROOF FAIL unwritten read not refused by name")
         ok = False
-    print("PROOF synthetic refusals wrap/order/shape/unwritten named")
+    print("PROOF synthetic refusals order/shape/unwritten named")
 
     # ---- 4b. real 2048 window, positions 0..2047 --------------
     var pattern_r = List[LayerKind]()
@@ -389,50 +413,52 @@ def run() raises -> Bool:
     for pos in [0, 1, 777, 2046, 2047]:
         var dk3 = dev_r.read_key_row(rt, 0, pos)
         var ck3 = cpu_r.key_row(0, pos)
-        if not _rows_equal(
-            "real-window K pos " + String(pos), dk3, ck3
-        ):
+        if not _rows_equal("real-window K pos " + String(pos), dk3, ck3):
             ok = False
         var dv3 = dev_r.read_value_row(rt, 0, pos)
         var cv3 = cpu_r.value_row(0, pos)
-        if not _rows_equal(
-            "real-window V pos " + String(pos), dv3, cv3
-        ):
+        if not _rows_equal("real-window V pos " + String(pos), dv3, cv3):
             ok = False
     for pos in [0, 7]:
         var dk4 = dev_r.read_key_row(rt, 1, pos)
         var ck4 = cpu_r.key_row(1, pos)
         if not _rows_equal("real-window global K pos " + String(pos), dk4, ck4):
             ok = False
-    # Boundary: device refuses the wrap at 2048; B1 accepts
-    # 2048/2049 and evicts 0/1 (its own suite proves the same).
+    # Boundary (Wave D): BOTH caches accept 2048/2049 and
+    # evict 0/1; the wrapped device rows read back
+    # element-exact against the CPU cache.
     var rows2048 = _rows(2, 128, 2048)
-    var saw_wrap_real = False
-    try:
-        dev_r.append(rt, 0, rows2048[0], rows2048[1], 2048)
-    except e:
-        saw_wrap_real = String(e).find("gpu_kv_window_wrapped") != -1
-        print("PROOF real-window wrap refusal:", e)
-    if not saw_wrap_real:
-        print("PROOF FAIL real-window 2048 did not refuse the wrap")
-        ok = False
+    dev_r.append(rt, 0, rows2048[0], rows2048[1], 2048)
     cpu_r.append(0, rows2048[0], rows2048[1], 2048)
     var rows2049 = _rows(2, 128, 2049)
+    dev_r.append(rt, 0, rows2049[0], rows2049[1], 2049)
     cpu_r.append(0, rows2049[0], rows2049[1], 2049)
     print(
-        "PROOF B1_DEVIATION cpu accepted 2048/2049: stored",
-        cpu_r.stored_len(0),
+        "PROOF B1_PARITY both accepted 2048/2049: device stored",
+        dev_r.stored_len(0),
         "first_visible",
+        dev_r.first_visible_position(0),
+        "cpu stored",
+        cpu_r.stored_len(0),
+        "cpu first_visible",
         cpu_r.first_visible_position(0),
-        "(B1 ring eviction; device refuses per the Wave C limit)",
     )
+    if dev_r.stored_len(0) != cpu_r.stored_len(
+        0
+    ) or dev_r.first_visible_position(0) != cpu_r.first_visible_position(0):
+        print("PROOF FAIL real-window wrap stored/first_visible disagree")
+        ok = False
     for pos in [2047, 2048, 2049]:
+        var dk5 = dev_r.read_key_row(rt, 0, pos)
         var ck5 = cpu_r.key_row(0, pos)
-        var expect5 = _rows(2, 128, pos)
         if not _rows_equal(
-            "cpu real-window K pos " + String(pos) + " (B1 semantics)",
-            ck5,
-            expect5[0],
+            "wrapped real-window K pos " + String(pos), dk5, ck5
+        ):
+            ok = False
+        var dv5 = dev_r.read_value_row(rt, 0, pos)
+        var cv5 = cpu_r.value_row(0, pos)
+        if not _rows_equal(
+            "wrapped real-window V pos " + String(pos), dv5, cv5
         ):
             ok = False
 

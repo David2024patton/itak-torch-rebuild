@@ -112,6 +112,8 @@ def dashboard_html(
     out += "<input type=\"number\" id=\"reps\" value=\"1\" min=\"1\" max=\"20\">\n"
     out += "<label for=\"maxtok\">Max tokens</label>\n"
     out += "<input type=\"number\" id=\"maxtok\" value=\"64\" min=\"1\" max=\"512\">\n"
+    out += "<label for=\"debugLevel\">Debug level</label>\n"
+    out += "<select id=\"debugLevel\"><option value=\"benchmark\">benchmark</option><option value=\"profile\">profile</option><option value=\"trace\">trace</option></select>\n"
     out += (
         "<div><button id=\"sendBtn\">Send</button>"
         "<button id=\"attachBtn\" class=\"alt\">Attach file</button>"
@@ -226,7 +228,7 @@ def _dashboard_js() -> String:
     js += "async function sendChat(allowOversize){var prompt=$(\"prompt\").value;var reps=Math.max(1,Math.min(20,parseInt($(\"reps\").value)||1));"
     js += "var maxTok=parseInt($(\"maxtok\").value)||64;var btn=$(\"sendBtn\");btn.disabled=true;"
     js += "if(attached.kind===\"text\"&&!allowOversize&&estimateTokens(attached.text)>WARN_TOKENS){$(\"reply\").textContent=\"Refused by the token budget pre-check: estimated \"+estimateTokens(attached.text)+\" tokens over the \"+WARN_TOKENS+\" cap. Click the override to send anyway.\";btn.disabled=false;return;}"
-    js += "for(var rep=0;rep<reps;rep++){var payload={prompt:prompt,max_tokens:maxTok,source:\"dashboard\",temperature:0.0};"
+    js += "for(var rep=0;rep<reps;rep++){var payload={prompt:prompt,max_tokens:maxTok,source:\"dashboard\",temperature:0.0,debug_level:$(\"debugLevel\").value};"
     js += "if(attached.kind===\"text\"){payload.context_text=attached.text;payload.attachments=attached.names;}"
     js += "if(attached.kind===\"image\"){payload.image=attached.image;}"
     js += "try{var r=await fetch(\"/v1/chat/completions\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(payload)});"

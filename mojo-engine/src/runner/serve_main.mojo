@@ -79,10 +79,12 @@ from model.model import GlimmerForwardAdapter, GlimmerModel
 from serve.dashboard import dashboard_html
 from serve.factsheet import fact_sheet, fact_sheet_json, scan_model_files
 from serve.history import (
+    DEBUG_LEVEL_TRACE,
     MIB_BYTES,
     RunRecord,
     append_record,
     bundle_json,
+    effective_bandwidth_gbps,
     file_sha256_hex,
     history_json,
     leaderboard_json,
@@ -174,6 +176,7 @@ struct ServeState(Movable):
     var gpu: Bool
     var fingerprint: String
     var fingerprint_note: String
+    var model_file_bytes: Int
     var stats: ServeStats
     var ring: DebugRing
     var seq: Int
@@ -190,6 +193,14 @@ struct ServeState(Movable):
         self.gpu = _use_gpu()
         self.fingerprint = fingerprint
         self.fingerprint_note = fingerprint_note
+        # Model file size for the record's effective
+        # bandwidth (bytes-per-step convention); 0 when the
+        # header read fails, and the slot stays null then.
+        self.model_file_bytes = 0
+        try:
+            self.model_file_bytes = fact_sheet(config.model_path).file_bytes
+        except:
+            self.model_file_bytes = 0
         self.stats = ServeStats()
         self.ring = DebugRing(config.serve_debug_ring_lines)
         self.seq = 0
@@ -207,6 +218,7 @@ struct GenOutcome(Copyable, Movable):
     var ids: List[Int]
     var prefill_ms: Int
     var decode_ms: Int
+    var decode_steps: Int
     var reserved_mib: Int
     var kv_mib: Int
 
@@ -215,12 +227,14 @@ struct GenOutcome(Copyable, Movable):
         var ids: List[Int],
         prefill_ms: Int,
         decode_ms: Int,
+        decode_steps: Int,
         reserved_mib: Int,
         kv_mib: Int,
     ):
         self.ids = ids^
         self.prefill_ms = prefill_ms
         self.decode_ms = decode_ms
+        self.decode_steps = decode_steps
         self.reserved_mib = reserved_mib
         self.kv_mib = kv_mib
 
@@ -245,6 +259,7 @@ def _generate_timed[M: ForwardModel](
     var hidden = model.prefill(prompt_ids)
     var t1 = perf_counter_ns()
     var out = List[Int]()
+    var steps = 0
     while True:
         var row = model.logits(hidden)
         var next_id = greedy_argmax(row)
@@ -253,12 +268,14 @@ def _generate_timed[M: ForwardModel](
         out.append(next_id)
         if len(out) >= max_tokens:
             break
+        steps += 1
         hidden = model.step(next_id, n + len(out) - 1)
     var t2 = perf_counter_ns()
     return GenOutcome(
         out^,
         Int((t1 - t0) // 1_000_000),
         Int((t2 - t1) // 1_000_000),
+        steps,
         reserved_mib,
         kv_mib,
     )
@@ -325,6 +342,25 @@ def _do_chat(
     var body_ids = st.tok.encode(text)
     for i in range(len(body_ids)):
         prompt_ids.append(body_ids[i])
+    # Trace mode, the cheap part only (addendum): the debug
+    # stream gets the tokenized prompt ids before generation,
+    # and one plain line about what trace does NOT emit in
+    # this build. Top-5 logits and per-layer checksums need
+    # device-side work and land with the kernel wave.
+    if req.debug_level == DEBUG_LEVEL_TRACE:
+        var ids_text = String("prompt_token_ids=[")
+        for i in range(len(prompt_ids)):
+            if i > 0:
+                ids_text += ", "
+            ids_text += String(prompt_ids[i])
+        ids_text += "]"
+        st.note("serve.trace", ids_text)
+        st.note(
+            "serve.trace",
+            "trace limits: top-5 logits and per-layer checksums"
+            " are not emitted by this build; they land with the"
+            " kernel wave (goal Piece 4B)",
+        )
     var t_start = perf_counter_ns()
     var outcome = _run_generation(st, prompt_ids, req.max_tokens)
     var total_ms = Int((perf_counter_ns() - t_start) // 1_000_000)
@@ -351,7 +387,33 @@ def _do_chat(
         total_ms,
         outcome.prefill_ms,
         decode_tok_s,
+        req.debug_level,
     )
+    # Effective decode bandwidth (addendum): measured from
+    # the model file size, the decode steps actually run,
+    # and the decode wall time. The percentage is against
+    # the CONFIG peak and only on GPU runs; on the CPU path
+    # the percentage would compare against the wrong card,
+    # so it stays null with the reason recorded.
+    var bw = effective_bandwidth_gbps(
+        st.model_file_bytes, outcome.decode_steps, outcome.decode_ms
+    )
+    var has_bw = bw > 0.0
+    var bw_pct = Float64(0.0)
+    var has_pct = False
+    var bw_note = String("")
+    if not has_bw:
+        bw_note = String(
+            "no decode steps measured; nothing to stream against"
+        )
+    elif st.gpu:
+        bw_pct = bw / st.config.gpu_peak_bandwidth_gbps * 100.0
+        has_pct = True
+    else:
+        bw_note = String(
+            "bandwidth_pct_of_peak is measured against the"
+            " configured GPU peak; this run used the CPU path"
+        )
     # Record the run (amendments: every endpoint run, tagged).
     var rec = RunRecord(
         utc_now_seconds(),
@@ -370,6 +432,12 @@ def _do_chat(
         req.attachments.copy(),
         False,
         String(""),
+        debug_level=req.debug_level,
+        eff_bandwidth_gbps=bw,
+        has_eff_bandwidth=has_bw,
+        bandwidth_pct_of_peak=bw_pct,
+        has_bandwidth_pct=has_pct,
+        bandwidth_note=bw_note,
     )
     try:
         append_record(st.config.serve_history_dir, rec)

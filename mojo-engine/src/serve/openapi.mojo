@@ -66,7 +66,9 @@ def openapi_json(model_name: String) -> String:
     )
     out += (
         ',"/v1/chat/completions":{"post":{"summary":"OpenAI-shaped chat'
-        " completion (non-streaming, greedy). Accepts prompt or messages,"
+        " completion (non-streaming, greedy). debug_level is benchmark,"
+        " profile or trace (default benchmark; recorded on the run"
+        " record). Accepts prompt or messages,"
         " optional context_text (attachment text), max_tokens, and the bench"
         " fields source, attachments (file names) and quality_verdict for"
         ' the run record.","responses":{"200":{"description":"chat.completion'

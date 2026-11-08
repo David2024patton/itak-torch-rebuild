@@ -6,8 +6,13 @@
 #   gpu_logits(rt, weights, cpu_model, hidden) -> List[Float32]
 #   gpu_layer_step(rt, weights, kv, cpu_model, x, layer,
 #                  position) -> List[Float32]
-#   gpu_layer_step_resident(...) - same signature, the
-#     device-resident chain gpu_layer_step now runs.
+#   gpu_layer_step_cfg(same args, attn_tile, attn_max_splits,
+#     attn_span) - the device-resident chain with explicit
+#     Wave D attention knobs; gpu_layer_step delegates to it
+#     with the config defaults, and
+#   gpu_layer_step_resident(...) - same signature minus the
+#     knobs, the config-default resident form (the D4 proof's
+#     entry point, delegating to gpu_layer_step_cfg).
 #   gpu_layer_step_hostchain(...) - the original Wave C
 #     per-op host-chained step, kept as the A/B baseline the
 #     residency proof measures against (and the only path
@@ -15,7 +20,12 @@
 #     launches attention on the raw KV buffers).
 #   attention_device_resident(rt, kv, q_buf, layer, q_heads,
 #     kv_heads, head_dim) -> DeviceBuffer - the resident
-#     attention launch over the visible-order KV gather.
+#     attention launch over the visible-order KV gather, with
+#     the config-default attention knobs;
+#   attention_device_resident_cfg(same args, tile, max_splits,
+#     span) - the same launch with explicit knobs: the D2
+#     tiled split-KV pair (attention_tiled_kernel +
+#     attention_merge_kernel) over the gathered buffers.
 # (The contract's gpu_logits shorthand omits cpu_model; the
 # CPU model is a parameter here because the task fixes the
 # final-logit scale/softcap as "from the CPU model's config
@@ -47,7 +57,21 @@
 # 52 times per step; (2) inside attention past a KV wrap,
 # the visible-order gather is a device-to-device copy, not a
 # host crossing. No other activation leaves the card inside
-# a layer. Statement for statement the CPU
+# RECONCILIATION (Wave D, D2+D4): the resident chain's
+# attention launch is D2's TILED SPLIT-KV pair, not the
+# Wave B attention_kernel: attention_device_resident_cfg
+# gathers the layer's visible rows (DeviceKvCache.
+# gather_visible: [stored][kv_heads][head_dim] flat, rows in
+# absolute-position order, PRE-ROTATED K - exactly the
+# layout D2's kernels consume, the same layout the Wave B
+# kernel and D2's standalone proof consume), then launches
+# attention_tiled_kernel + attention_merge_kernel over the
+# gathered buffers. Tile / max splits / split span are
+# parameters threaded from EngineConfig (src/config.mojo);
+# the split chooser keeps splits at 1 at or below one span.
+# The hostchain A/B baseline below is NOT retargeted: it
+# still launches the Wave B attention_kernel exactly as in
+# Wave C. Statement for statement the CPU
 # GlimmerModel.layer_step / .logits (model.mojo), with every
 # projection and op launched on device:
 #   rms_norm_kernel (grid = row count, width = row length;
@@ -154,7 +178,19 @@ from ops.rope import rope_kernel
 from ops.swiglu import swiglu_kernel
 from ops.residual import residual_add_cpu, residual_add_kernel
 from ops.final_logit import final_logit_kernel
-from attention.attention import attention_kernel, ATTN_THREADS
+from attention.attention import (
+    ATTN_THREADS,
+    attention_kernel,
+    attention_merge_kernel,
+    attention_tiled_kernel,
+    attn_split_count,
+    attn_validate_tile,
+)
+from config import (
+    DEFAULT_ATTN_MAX_SPLITS,
+    DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
+    DEFAULT_ATTN_TILE_POSITIONS,
+)
 
 comptime GATE_THREADS = 256
 
@@ -945,6 +981,101 @@ def _rope_buf(
     return y_dev^
 
 
+def _launch_tiled(
+    mut rt: GpuRuntime,
+    tile: Int,
+    q_dev: DeviceBuffer[DType.float32],
+    k_buf: DeviceBuffer[DType.float32],
+    v_buf: DeviceBuffer[DType.float32],
+    p_out: DeviceBuffer[DType.float32],
+    p_max: DeviceBuffer[DType.float32],
+    p_sum: DeviceBuffer[DType.float32],
+    stored: Int,
+    kv_heads: Int,
+    q_heads: Int,
+    head_dim: Int,
+    scale: Float32,
+    splits: Int,
+) raises:
+    """One attention_tiled_kernel launch at the compiled
+    instantiation for `tile` (attn_validate_tile has already
+    gated the value). Ported from Lane D2's gpu_layer launch
+    helper, unchanged apart from taking resident buffers."""
+    var grid = q_heads * splits
+    if tile == 8:
+        rt.ctx.enqueue_function[attention_tiled_kernel[8]](
+            q_dev,
+            k_buf,
+            v_buf,
+            p_out,
+            p_max,
+            p_sum,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            Int32(splits),
+            grid_dim=grid,
+            block_dim=ATTN_THREADS,
+        )
+    elif tile == 16:
+        rt.ctx.enqueue_function[attention_tiled_kernel[16]](
+            q_dev,
+            k_buf,
+            v_buf,
+            p_out,
+            p_max,
+            p_sum,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            Int32(splits),
+            grid_dim=grid,
+            block_dim=ATTN_THREADS,
+        )
+    elif tile == 32:
+        rt.ctx.enqueue_function[attention_tiled_kernel[32]](
+            q_dev,
+            k_buf,
+            v_buf,
+            p_out,
+            p_max,
+            p_sum,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            Int32(splits),
+            grid_dim=grid,
+            block_dim=ATTN_THREADS,
+        )
+    else:
+        rt.ctx.enqueue_function[attention_tiled_kernel[64]](
+            q_dev,
+            k_buf,
+            v_buf,
+            p_out,
+            p_max,
+            p_sum,
+            Int32(stored),
+            Int32(kv_heads),
+            Int32(q_heads),
+            Int32(head_dim),
+            Int32(q_heads // kv_heads),
+            scale,
+            Int32(splits),
+            grid_dim=grid,
+            block_dim=ATTN_THREADS,
+        )
+
+
 def attention_device_resident(
     mut rt: GpuRuntime,
     mut kv: DeviceKvCache,
@@ -954,13 +1085,53 @@ def attention_device_resident(
     kv_heads: Int,
     head_dim: Int,
 ) raises -> DeviceBuffer[DType.float32]:
-    """attention_kernel over the layer's VISIBLE rows in
-    absolute-position order, Q resident. The K/V sources are
+    """The resident attention launch with the config-default
+    tile / split knobs; see attention_device_resident_cfg."""
+    return attention_device_resident_cfg(
+        rt,
+        kv,
+        q_buf,
+        layer,
+        q_heads,
+        kv_heads,
+        head_dim,
+        DEFAULT_ATTN_TILE_POSITIONS,
+        DEFAULT_ATTN_MAX_SPLITS,
+        DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
+    )
+
+
+def attention_device_resident_cfg(
+    mut rt: GpuRuntime,
+    mut kv: DeviceKvCache,
+    q_buf: DeviceBuffer[DType.float32],
+    layer: Int,
+    q_heads: Int,
+    kv_heads: Int,
+    head_dim: Int,
+    tile: Int,
+    max_splits: Int,
+    split_span: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """Tiled split-KV attention over the layer's VISIBLE rows
+    in absolute-position order, Q resident (Wave D D2+D4
+    reconciliation). The K/V sources are
     DeviceKvCache.gather_visible buffers: the raw buffers
     themselves when their slot order already is the visible
-    order, a device-side visible-order gather past a wrap
-    (Wave D; the hostchain path below still refuses there).
-    """
+    order, a device-side visible-order gather past a wrap.
+    LAYOUT AGREEMENT (checked against both lanes): the
+    gather output is flat [stored][kv_heads][head_dim] with
+    row i the visible row at absolute position
+    first_visible + i - exactly the visible-order layout
+    attention_tiled_kernel / attention_merge_kernel consume
+    (and the layout D2's gpu_proof_attention_tiled proof fed
+    them), so the launch needs no adaptation; the kernels'
+    PRE-ROTATED Q/K contract is unchanged (rotation stays
+    the caller's rope step, at write time for K). Each
+    (head, split) block writes an unnormalized partial;
+    the merge kernel combines them with exact logsumexp
+    rescaling. No per-op sync: the context's single queue
+    orders the tiled launch before the merge."""
     var stored = kv.stored_len(layer)
     if stored <= 0:
         raise Error(
@@ -970,22 +1141,52 @@ def attention_device_resident(
         )
     if q_heads * head_dim <= 0:
         raise Error("gpu_layer_bad_shape: attention Q row shape is empty")
+    attn_validate_tile(tile)
+    var splits = attn_split_count(stored, split_span, max_splits)
     var y_dev = create_zero_f32(rt, q_heads * head_dim)
     var k_vis = kv.gather_visible(rt, layer, False)
     var v_vis = kv.gather_visible(rt, layer, True)
+    var p_out = rt.ctx.enqueue_create_buffer[DType.float32](
+        splits * q_heads * head_dim
+    )
+    var p_max = rt.ctx.enqueue_create_buffer[DType.float32](splits * q_heads)
+    var p_sum = rt.ctx.enqueue_create_buffer[DType.float32](splits * q_heads)
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
-    rt.ctx.enqueue_function[attention_kernel](
+    _launch_tiled(
+        rt,
+        tile,
         q_buf,
         k_vis,
         v_vis,
-        y_dev,
-        Int32(stored),
-        Int32(kv_heads),
-        Int32(head_dim),
-        Int32(q_heads // kv_heads),
+        p_out,
+        p_max,
+        p_sum,
+        stored,
+        kv_heads,
+        q_heads,
+        head_dim,
         scale,
+        splits,
+    )
+    rt.ctx.enqueue_function[attention_merge_kernel](
+        p_out,
+        p_max,
+        p_sum,
+        y_dev,
+        Int32(q_heads),
+        Int32(head_dim),
+        Int32(splits),
         grid_dim=q_heads,
         block_dim=ATTN_THREADS,
+    )
+    _ = log_debug(
+        "gpu.layer",
+        "attention resident tiled stored="
+        + String(stored)
+        + " tile="
+        + String(tile)
+        + " splits="
+        + String(splits),
     )
     return y_dev^
 
@@ -1233,7 +1434,7 @@ def gpu_layer_step_hostchain(
     return residual_add_cpu(residual2, ffn)
 
 
-def gpu_layer_step_resident(
+def gpu_layer_step_cfg(
     mut rt: GpuRuntime,
     weights: DeviceWeights,
     mut kv: DeviceKvCache,
@@ -1241,6 +1442,9 @@ def gpu_layer_step_resident(
     x: List[Float32],
     layer: Int,
     position: Int,
+    attn_tile: Int,
+    attn_max_splits: Int,
+    attn_split_span: Int,
 ) raises -> List[Float32]:
     """One token's hidden row through one layer, activations
     RESIDENT on device across the whole layer (Wave D): the
@@ -1330,8 +1534,17 @@ def gpu_layer_step_resident(
             rt, q, q_w, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
         )
     kv.append_device(rt, layer, k, v, position)
-    var attn = attention_device_resident(
-        rt, kv, q, layer, cfg.q_heads, cfg.kv_heads, cfg.head_dim
+    var attn = attention_device_resident_cfg(
+        rt,
+        kv,
+        q,
+        layer,
+        cfg.q_heads,
+        cfg.kv_heads,
+        cfg.head_dim,
+        attn_tile,
+        attn_max_splits,
+        attn_split_span,
     )
     var gate = _proj_layer_buf(rt, weights, cpu_model, layer, 7, h, cfg.hidden)
     var gated = _attn_gate_buf(rt, attn, gate, q_w)
@@ -1375,6 +1588,32 @@ def gpu_layer_step_resident(
     return download_f32(rt, result, cfg.hidden)
 
 
+def gpu_layer_step_resident(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    mut kv: DeviceKvCache,
+    cpu_model: GlimmerModel,
+    x: List[Float32],
+    layer: Int,
+    position: Int,
+) raises -> List[Float32]:
+    """The resident chain with the config-default attention
+    knobs (Lane D4's entry point; the body lives in
+    gpu_layer_step_cfg)."""
+    return gpu_layer_step_cfg(
+        rt,
+        weights,
+        kv,
+        cpu_model,
+        x,
+        layer,
+        position,
+        DEFAULT_ATTN_TILE_POSITIONS,
+        DEFAULT_ATTN_MAX_SPLITS,
+        DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
+    )
+
+
 def _ffn_width(cpu_model: GlimmerModel, layer: Int) -> Int:
     """The FFN intermediate width: the ffn_gate slot's rows
     (suffix 10), the width gate/up produce and down consumes.
@@ -1393,9 +1632,19 @@ def gpu_layer_step(
     position: Int,
 ) raises -> List[Float32]:
     """One token's hidden row through one layer on device.
-    Wave D: the resident chain (gpu_layer_step_resident);
-    the Wave C hostchain survives above as the A/B baseline.
+    Wave D: the resident chain (gpu_layer_step_cfg's body,
+    with the config-default attention knobs here); the
+    Wave C hostchain survives above as the A/B baseline.
     """
-    return gpu_layer_step_resident(
-        rt, weights, kv, cpu_model, x, layer, position
+    return gpu_layer_step_cfg(
+        rt,
+        weights,
+        kv,
+        cpu_model,
+        x,
+        layer,
+        position,
+        DEFAULT_ATTN_TILE_POSITIONS,
+        DEFAULT_ATTN_MAX_SPLITS,
+        DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
     )

@@ -851,7 +851,7 @@ def history_json(
         var j = records[i].to_json()
         # to_json always ends with the closing brace; the
         # status rides inside the object.
-        var stamped = String(j.as_bytes()[: j.byte_length() - 1])
+        var stamped = String(j[byte= : j.byte_length() - 1])
         stamped += ',"chain_status":"' + statuses[i] + '"}'
         shown.append(stamped)
     out += String(len(shown))

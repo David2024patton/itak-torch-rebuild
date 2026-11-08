@@ -495,6 +495,14 @@ def test_record_hash_chain() raises:
     assert_equal(statuses[1], "verified")
     var hj = history_json(records, "", "")
     assert_true(hj.find('"chain_status":"verified"') != -1)
+    # The stamped history must keep each record's own JSON
+    # intact: the literal quoted hash fields survive (a
+    # byte-list rendering of the tail fails this; window 5b
+    # caught exactly that on the wire).
+    assert_true(
+        hj.find('"record_sha256":"' + r2.record_sha256 + '"') != -1
+    )
+    assert_true(hj.find('"prev_record_sha256":"') != -1)
     var lj = leaderboard_json(records)
     assert_true(lj.find('"verified":2') != -1)
     assert_true(lj.find('"tampered":0') != -1)

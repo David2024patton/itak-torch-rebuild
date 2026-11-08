@@ -228,7 +228,7 @@ struct DeviceWeights(Movable):
         var resident = slot_resident_bytes(
             slot.type_id, len(slot.bytes), len(slot.values)
         )
-        var buffer_index = -1
+        var buffer_index: Int
         if is_f32:
             buffer_index = len(self.f32_buffers)
             var buf = upload_f32(rt, slot.values)

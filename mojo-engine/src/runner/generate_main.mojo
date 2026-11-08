@@ -136,6 +136,9 @@ def _gpu_generate_phase(
     path: String,
     context_len: Int,
     budget_bytes: Int,
+    attn_tile: Int,
+    attn_max_splits: Int,
+    attn_span: Int,
     prompt: List[Int],
 ) raises -> Tuple[List[Int], Int, Int]:
     """Build the GPU model, time its load, generate, and
@@ -147,7 +150,9 @@ def _gpu_generate_phase(
     prefill model is built only after this one is gone. The
     printed lines and their order are unchanged."""
     var t0 = perf_counter_ns()
-    var model = GpuGlimmerModel.open(path, context_len, budget_bytes)
+    var model = GpuGlimmerModel.open_attn(
+        path, context_len, budget_bytes, attn_tile, attn_max_splits, attn_span
+    )
     var t_load = perf_counter_ns()
     var load_ms = Int((t_load - t0) // 1_000_000)
     var t_gen0 = perf_counter_ns()
@@ -161,13 +166,18 @@ def _gpu_prefill_phase(
     path: String,
     context_len: Int,
     budget_bytes: Int,
+    attn_tile: Int,
+    attn_max_splits: Int,
+    attn_span: Int,
     prompt: List[Int],
 ) raises -> Int:
     """Build a fresh GPU model (the generate model is already
     destroyed), time forward_rows over the prompt ids, and
     destroy it on return. The Wave B prefill construction,
     phased for device memory."""
-    var fresh = GpuGlimmerModel.open(path, context_len, budget_bytes)
+    var fresh = GpuGlimmerModel.open_attn(
+        path, context_len, budget_bytes, attn_tile, attn_max_splits, attn_span
+    )
     var t_pf0 = perf_counter_ns()
     _ = fresh.forward_rows(prompt.copy())
     var t_pf1 = perf_counter_ns()
@@ -178,6 +188,9 @@ def _run_gpu(
     path: String,
     context_len: Int,
     budget_bytes: Int,
+    attn_tile: Int,
+    attn_max_splits: Int,
+    attn_span: Int,
     tok: Tokenizer,
     prompt: List[Int],
 ) raises:
@@ -185,16 +198,29 @@ def _run_gpu(
     GpuGlimmerModel. Prefill is measured on a second fresh GPU
     model stepping the same prompt ids (forward_rows), the
     identical construction to the CPU path below, phased so
-    only one device model is resident at a time."""
+    only one device model is resident at a time. The Wave D
+    attention knobs arrive from run()'s EngineConfig."""
     var phase = _gpu_generate_phase(
-        path, context_len, budget_bytes, prompt
+        path,
+        context_len,
+        budget_bytes,
+        attn_tile,
+        attn_max_splits,
+        attn_span,
+        prompt,
     )
     var out = phase[0].copy()
     print("LOAD_MS", String(phase[1]))
     _report_results(tok, out, phase[2])
 
     var prefill_ms = _gpu_prefill_phase(
-        path, context_len, budget_bytes, prompt
+        path,
+        context_len,
+        budget_bytes,
+        attn_tile,
+        attn_max_splits,
+        attn_span,
+        prompt,
     )
     _report_prefill(prefill_ms, phase[2])
 
@@ -230,7 +256,14 @@ def run() raises:
     print("MODEL_PATH_KIND", "gpu" if use_gpu else "cpu")
     if use_gpu:
         _run_gpu(
-            path, config.context_len, config.gpu_budget_bytes, tok, prompt
+            path,
+            config.context_len,
+            config.gpu_budget_bytes,
+            config.attn_tile_positions,
+            config.attn_max_splits,
+            config.attn_split_span_positions,
+            tok,
+            prompt,
         )
         return
 

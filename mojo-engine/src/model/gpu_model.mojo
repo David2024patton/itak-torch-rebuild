@@ -32,7 +32,9 @@
 #      ones as the weight row - the kernel's weighted formula
 #      with ones is the plain form, the same arithmetic-path
 #      argument rms_norm_plain_cpu makes on the CPU side);
-#   3. gpu_layer_step for all layers in order (C2), which
+#   3. gpu_layer_step_cfg for all layers in order (C2; Wave
+#      D reconciliation threads the attention tile/split
+#      knobs through, pointed at the resident step), which
 #      appends to the DeviceKvCache as it goes.
 # Captures: the CPU model's captures remain the isolation tool
 # (the contract says so for C2; the same holds here). What
@@ -55,13 +57,18 @@
 # gpu_budget_exceeded, gpu_kv_capacity_exceeded, ...), propagated
 # untouched. Diag seam: phase `model`, model.mojo's phase.
 
-from config import DEFAULT_GPU_BUDGET_BYTES
+from config import (
+    DEFAULT_ATTN_MAX_SPLITS,
+    DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
+    DEFAULT_ATTN_TILE_POSITIONS,
+    DEFAULT_GPU_BUDGET_BYTES,
+)
 from diag import log_debug
 from generate.generate import ForwardModel
 from gpu.context import GpuRuntime, download_f32, upload_f32
 from gpu.device_kv import DeviceKvCache
 from gpu.weights import DeviceWeights
-from model.gpu_layer import gpu_layer_step, gpu_logits
+from model.gpu_layer import gpu_layer_step_cfg, gpu_logits
 from model.model import GlimmerModel
 from ops.gpu_embedding import gpu_embed_token
 from ops.rms_norm import RMS_THREADS, rms_norm_kernel
@@ -78,12 +85,21 @@ struct GpuGlimmerModel(ForwardModel, Movable):
     var rt: GpuRuntime
     var weights: DeviceWeights
     var kv: DeviceKvCache
+    # Wave D attention knobs (config seam): tile positions,
+    # split-KV cap, split span; threaded into every layer's
+    # resident attention launch.
+    var attn_tile_positions: Int
+    var attn_max_splits: Int
+    var attn_split_span_positions: Int
 
     def __init__(
         out self,
         var cpu_model: GlimmerModel,
         context_len: Int,
         budget_bytes: Int,
+        attn_tile_positions: Int = DEFAULT_ATTN_TILE_POSITIONS,
+        attn_max_splits: Int = DEFAULT_ATTN_MAX_SPLITS,
+        attn_split_span_positions: Int = DEFAULT_ATTN_SPLIT_SPAN_POSITIONS,
     ) raises:
         # Build the device trio from the borrowed CPU model
         # BEFORE it moves into the struct: weights upload from
@@ -102,6 +118,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.rt = rt^
         self.weights = weights^
         self.kv = kv^
+        self.attn_tile_positions = attn_tile_positions
+        self.attn_max_splits = attn_max_splits
+        self.attn_split_span_positions = attn_split_span_positions
         _ = log_debug(
             "model",
             "gpu model built layers="
@@ -109,7 +128,13 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             + " hidden="
             + String(self.cpu.cfg.hidden)
             + " context_len="
-            + String(context_len),
+            + String(context_len)
+            + " attn_tile="
+            + String(attn_tile_positions)
+            + " attn_max_splits="
+            + String(attn_max_splits)
+            + " attn_split_span="
+            + String(attn_split_span_positions),
         )
 
     @staticmethod
@@ -120,9 +145,33 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         build the device model over it under the given budget
         cap (callers hand in EngineConfig.gpu_budget_bytes, so
         MOJO_ENGINE_GPU_BUDGET_BYTES is honored end to end).
-        Mirrors GlimmerModel.open's shape."""
+        Mirrors GlimmerModel.open's shape. Attention knobs
+        take their config defaults; open_attn is the explicit
+        form."""
         var cpu_model = GlimmerModel.open(path)
         return GpuGlimmerModel(cpu_model^, context_len, budget_bytes)
+
+    @staticmethod
+    def open_attn(
+        path: String,
+        context_len: Int,
+        budget_bytes: Int,
+        attn_tile_positions: Int,
+        attn_max_splits: Int,
+        attn_split_span_positions: Int,
+    ) raises -> GpuGlimmerModel:
+        """open() with explicit Wave D attention knobs (the
+        runner hands in EngineConfig's attn fields, so the
+        MOJO_ENGINE_ATTN_* env vars are honored end to end)."""
+        var cpu_model = GlimmerModel.open(path)
+        return GpuGlimmerModel(
+            cpu_model^,
+            context_len,
+            budget_bytes,
+            attn_tile_positions,
+            attn_max_splits,
+            attn_split_span_positions,
+        )
 
     def _plain_rms_norm(
         mut self, x: List[Float32], eps: Float32
@@ -153,7 +202,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
     def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
         """One token at one absolute position through the whole
         stack on device; appends to the device KV cache (inside
-        gpu_layer_step); returns the final hidden row. Mirrors
+        gpu_layer_step_cfg); returns the final hidden row. Mirrors
         GlimmerModel.step statement for statement."""
         var cfg = self.cpu.cfg.copy()
         if token_id < 0 or token_id >= cfg.vocab:
@@ -172,7 +221,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         if self.cpu.capture_enabled:
             self.cpu.capture_embed = x.copy()
         for layer in range(cfg.layers):
-            x = gpu_layer_step(
+            x = gpu_layer_step_cfg(
                 self.rt,
                 self.weights,
                 self.kv,
@@ -180,6 +229,9 @@ struct GpuGlimmerModel(ForwardModel, Movable):
                 x,
                 layer,
                 position,
+                self.attn_tile_positions,
+                self.attn_max_splits,
+                self.attn_split_span_positions,
             )
         _ = log_debug(
             "model",

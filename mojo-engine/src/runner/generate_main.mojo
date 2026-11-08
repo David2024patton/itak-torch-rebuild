@@ -132,6 +132,48 @@ def _report_prefill(prefill_ms: Int, generate_ms: Int):
     print("RUNNER_DONE")
 
 
+def _gpu_generate_phase(
+    path: String,
+    context_len: Int,
+    budget_bytes: Int,
+    prompt: List[Int],
+) raises -> Tuple[List[Int], Int, Int]:
+    """Build the GPU model, time its load, generate, and
+    DESTROY the model on return. Wave C integration fix: the
+    CPU path holds its generate model and its fresh prefill
+    model alive at the same time (host RAM shrugs); on device
+    two resident models are about 41 GB against a 24 GB card,
+    so the GPU path phases the two constructions - the
+    prefill model is built only after this one is gone. The
+    printed lines and their order are unchanged."""
+    var t0 = perf_counter_ns()
+    var model = GpuGlimmerModel.open(path, context_len, budget_bytes)
+    var t_load = perf_counter_ns()
+    var load_ms = Int((t_load - t0) // 1_000_000)
+    var t_gen0 = perf_counter_ns()
+    var out = generate(model, prompt.copy(), MAX_TOKENS, EOS_ID)
+    var t_gen1 = perf_counter_ns()
+    var generate_ms = Int((t_gen1 - t_gen0) // 1_000_000)
+    return (out^, load_ms, generate_ms)
+
+
+def _gpu_prefill_phase(
+    path: String,
+    context_len: Int,
+    budget_bytes: Int,
+    prompt: List[Int],
+) raises -> Int:
+    """Build a fresh GPU model (the generate model is already
+    destroyed), time forward_rows over the prompt ids, and
+    destroy it on return. The Wave B prefill construction,
+    phased for device memory."""
+    var fresh = GpuGlimmerModel.open(path, context_len, budget_bytes)
+    var t_pf0 = perf_counter_ns()
+    _ = fresh.forward_rows(prompt.copy())
+    var t_pf1 = perf_counter_ns()
+    return Int((t_pf1 - t_pf0) // 1_000_000)
+
+
 def _run_gpu(
     path: String,
     context_len: Int,
@@ -142,25 +184,19 @@ def _run_gpu(
     """The Wave C GPU path: same run, same prints, driven by
     GpuGlimmerModel. Prefill is measured on a second fresh GPU
     model stepping the same prompt ids (forward_rows), the
-    identical construction to the CPU path below."""
-    var t0 = perf_counter_ns()
-    var model = GpuGlimmerModel.open(path, context_len, budget_bytes)
-    var t_load = perf_counter_ns()
-    print("LOAD_MS", String((t_load - t0) // 1_000_000))
+    identical construction to the CPU path below, phased so
+    only one device model is resident at a time."""
+    var phase = _gpu_generate_phase(
+        path, context_len, budget_bytes, prompt
+    )
+    var out = phase[0].copy()
+    print("LOAD_MS", String(phase[1]))
+    _report_results(tok, out, phase[2])
 
-    var t_gen0 = perf_counter_ns()
-    var out = generate(model, prompt.copy(), MAX_TOKENS, EOS_ID)
-    var t_gen1 = perf_counter_ns()
-    var generate_ms = (t_gen1 - t_gen0) // 1_000_000
-    _report_results(tok, out, generate_ms)
-
-    # Prefill timing on a second fresh GPU model (see header).
-    var fresh = GpuGlimmerModel.open(path, context_len, budget_bytes)
-    var t_pf0 = perf_counter_ns()
-    _ = fresh.forward_rows(prompt.copy())
-    var t_pf1 = perf_counter_ns()
-    var prefill_ms = (t_pf1 - t_pf0) // 1_000_000
-    _report_prefill(prefill_ms, generate_ms)
+    var prefill_ms = _gpu_prefill_phase(
+        path, context_len, budget_bytes, prompt
+    )
+    _report_prefill(prefill_ms, phase[2])
 
 
 def run() raises:

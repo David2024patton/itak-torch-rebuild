@@ -483,7 +483,7 @@ def reference_rows() -> List[LeaderRow]:
             0,
             "",
             "llama.cpp baseline record,"
-            " bench/wave20-session-2026-11-07.md era (llama-bench,"
+            " bench/baseline-session-2026-11-06.md (llama-bench,"
             " 1,022-token prefill 995.99 tok/s, decode 44.59 tok/s)",
         )
     )

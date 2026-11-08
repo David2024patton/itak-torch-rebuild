@@ -103,8 +103,16 @@ from kernels.k1_gemv import (
     ROWS_PER_WG as K1_ROWS_PER_WG,
 )
 from kernels.q6k_gemv import q6k_gemv_kernel, THREADS as Q6_THREADS
-from kernels.q5k_gemv import q5k_gemv_kernel, THREADS as Q5_THREADS
-from kernels.f32_gemv import f32_gemv_kernel, f16_gemv_kernel, THREADS as F_THREADS
+from kernels.q5k_gemv import (
+    q5k_gemv_kernel,
+    THREADS as Q5_THREADS,
+    ROWS_PER_WG as Q5_ROWS_PER_WG,
+)
+from kernels.f32_gemv import (
+    f32_gemv_kernel,
+    f16_gemv_kernel,
+    THREADS as F_THREADS,
+)
 from ops.rms_norm import rms_norm_kernel, RMS_THREADS
 from ops.rope import rope_kernel
 from ops.swiglu import swiglu_kernel
@@ -170,6 +178,15 @@ def gpu_layer_check_proj(
             + String(rows)
             + " is not a multiple of the K1 workgroup tile "
             + String(K1_ROWS_PER_WG)
+        )
+    if type_id == DT_Q5_K and rows % Q5_ROWS_PER_WG != 0:
+        raise Error(
+            "gpu_layer_bad_shape: "
+            + name
+            + " rows "
+            + String(rows)
+            + " is not a multiple of the Q5_K workgroup tile "
+            + String(Q5_ROWS_PER_WG)
         )
 
 
@@ -240,9 +257,7 @@ def attn_gate_kernel(
         y[unsafe_offset=i] = a[unsafe_offset=i] * _sigmoid(g[unsafe_offset=i])
 
 
-def attn_gate_cpu(
-    a: List[Float32], g: List[Float32]
-) raises -> List[Float32]:
+def attn_gate_cpu(a: List[Float32], g: List[Float32]) raises -> List[Float32]:
     """Host twin of attn_gate_kernel (VM tests + parity)."""
     if len(a) != len(g):
         raise Error(
@@ -288,8 +303,13 @@ def _rms_norm_device(
 
 
 def _check_view(
-    name: String, type_id: Int, rows: Int, cols: Int,
-    cpu_type: Int, cpu_rows: Int, cpu_cols: Int,
+    name: String,
+    type_id: Int,
+    rows: Int,
+    cols: Int,
+    cpu_type: Int,
+    cpu_rows: Int,
+    cpu_cols: Int,
 ) raises:
     if type_id != cpu_type or rows != cpu_rows or cols != cpu_cols:
         raise Error(
@@ -330,17 +350,29 @@ def _gemv_u8_device(
         )
     elif view.type_id == DT_Q6_K:
         rt.ctx.enqueue_function[q6k_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
             block_dim=Q6_THREADS,
         )
     elif view.type_id == DT_Q5_K:
         rt.ctx.enqueue_function[q5k_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows // Q5_ROWS_PER_WG,
             block_dim=Q5_THREADS,
         )
     elif view.type_id == DT_F16:
         rt.ctx.enqueue_function[f16_gemv_kernel](
-            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            view.buffer,
+            x_dev,
+            y_dev,
+            Int32(view.cols),
+            grid_dim=view.rows,
             block_dim=F_THREADS,
         )
     else:
@@ -351,7 +383,9 @@ def _gemv_u8_device(
             + String(view.type_id)
         )
     rt.ctx.synchronize()
-    _ = log_debug("gpu.layer", "gemv " + view.name + " rows=" + String(view.rows))
+    _ = log_debug(
+        "gpu.layer", "gemv " + view.name + " rows=" + String(view.rows)
+    )
     return download_f32(rt, y_dev, view.rows)
 
 
@@ -363,7 +397,11 @@ def _gemv_f32_device(
     var x_dev = upload_f32(rt, x)
     var y_dev = create_zero_f32(rt, view.rows)
     rt.ctx.enqueue_function[f32_gemv_kernel](
-        view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+        view.buffer,
+        x_dev,
+        y_dev,
+        Int32(view.cols),
+        grid_dim=view.rows,
         block_dim=F_THREADS,
     )
     rt.ctx.synchronize()
@@ -397,7 +435,12 @@ def _proj_layer(
     if cpu_type == DT_F32:
         var fview = weights.slot_f32(layer, suffix_index)
         _check_view(
-            name, fview.type_id, fview.rows, fview.cols, cpu_type, cpu_rows,
+            name,
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
             cpu_cols,
         )
         return _gemv_f32_device(rt, fview, x)
@@ -421,14 +464,24 @@ def _proj_output(
     if cpu_type == DT_F32:
         var fview = weights.output_f32()
         _check_view(
-            "output.weight", fview.type_id, fview.rows, fview.cols, cpu_type,
-            cpu_rows, cpu_cols,
+            "output.weight",
+            fview.type_id,
+            fview.rows,
+            fview.cols,
+            cpu_type,
+            cpu_rows,
+            cpu_cols,
         )
         return _gemv_f32_device(rt, fview, x)
     var view = weights.output_u8()
     _check_view(
-        "output.weight", view.type_id, view.rows, view.cols, cpu_type,
-        cpu_rows, cpu_cols,
+        "output.weight",
+        view.type_id,
+        view.rows,
+        view.cols,
+        cpu_type,
+        cpu_rows,
+        cpu_cols,
     )
     return _gemv_u8_device(rt, view, x)
 
@@ -591,7 +644,11 @@ def _attn_gate_device(
     var y_dev = create_zero_f32(rt, len(attn))
     var grid = (len(attn) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[attn_gate_kernel](
-        a_dev, g_dev, y_dev, Int32(len(attn)), grid_dim=grid,
+        a_dev,
+        g_dev,
+        y_dev,
+        Int32(len(attn)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
@@ -614,7 +671,11 @@ def _swiglu_device(
     var y_dev = create_zero_f32(rt, len(gate))
     var grid = (len(gate) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[swiglu_kernel](
-        g_dev, u_dev, y_dev, Int32(len(gate)), grid_dim=grid,
+        g_dev,
+        u_dev,
+        y_dev,
+        Int32(len(gate)),
+        grid_dim=grid,
         block_dim=GATE_THREADS,
     )
     rt.ctx.synchronize()
@@ -712,8 +773,7 @@ def gpu_layer_step(
             + String(position)
             + " would wrap its window "
             + String(kind.window)
-            + "; the CPU path is the fallback beyond the window"
-            " (Wave C limit)"
+            + "; the CPU path is the fallback beyond the window (Wave C limit)"
         )
     _ = log_debug(
         "gpu.layer",
@@ -726,26 +786,37 @@ def gpu_layer_step(
     )
     var residual = x.copy()
     var h = _rms_norm_device(
-        rt, residual, _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        rt,
+        residual,
+        _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
     )
     var q = _proj_layer(rt, weights, cpu_model, layer, 1, h)
     var k = _proj_layer(rt, weights, cpu_model, layer, 2, h)
     var v = _proj_layer(rt, weights, cpu_model, layer, 3, h)
     q = _rms_norm_device(
-        rt, q, _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        rt,
+        q,
+        _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     k = _rms_norm_device(
-        rt, k, _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
-        cfg.head_dim, cfg.rms_eps,
+        rt,
+        k,
+        _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
     )
     var q_for_attn = q.copy()
     if sliding:
         # K rotates HERE (write time; the cache holds rotated
         # K, Rust-exact); Q rotates before the attention
         # launch because the kernel takes pre-rotated Q.
-        k = _rope_device(rt, k, cfg.kv_heads, cfg.head_dim, position, cfg.rope_base_swa)
+        k = _rope_device(
+            rt, k, cfg.kv_heads, cfg.head_dim, position, cfg.rope_base_swa
+        )
         q_for_attn = _rope_device(
             rt, q, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
         )
@@ -757,21 +828,30 @@ def gpu_layer_step(
     var gated = _attn_gate_device(rt, attn, gate)
     var out = _proj_layer(rt, weights, cpu_model, layer, 6, gated)
     out = _rms_norm_device(
-        rt, out, _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        rt,
+        out,
+        _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     var after_attn = residual_add_cpu(residual, out)
     var residual2 = after_attn.copy()
     var h2 = _rms_norm_device(
-        rt, residual2, _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
-        cfg.hidden, cfg.rms_eps,
+        rt,
+        residual2,
+        _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
     )
     var gate_ffn = _proj_layer(rt, weights, cpu_model, layer, 10, h2)
     var up_ffn = _proj_layer(rt, weights, cpu_model, layer, 11, h2)
     var act = _swiglu_device(rt, gate_ffn, up_ffn)
     var ffn = _proj_layer(rt, weights, cpu_model, layer, 12, act)
     ffn = _rms_norm_device(
-        rt, ffn, _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
-        cfg.hidden, POST_NORM_EPS,
+        rt,
+        ffn,
+        _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
     )
     return residual_add_cpu(residual2, ffn)

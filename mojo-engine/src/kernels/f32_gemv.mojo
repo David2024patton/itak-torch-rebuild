@@ -18,18 +18,25 @@
 # F16 weights arrive as raw bytes, two per element, little
 # endian, exactly as stored. Every bad shape refuses by name.
 #
-# TUNED SHAPE (Wave D): the tuned-K1 lessons translated to
-# plain floats. 2 rows per 128-thread workgroup as 8 groups
-# of 16; each group strides the row in 256-element segments,
-# one thread owning four quads per segment (quads t, t+16,
-# t+32, t+48 of the segment, so consecutive threads read
-# consecutive quads); weight and activation values move as
-# vec4 loads only, the activation quads are loaded once per
-# segment and shared by both rows, and the reduction is
-# K1's segmented shuffle_xor butterfly plus a short
-# shared-memory finish. The F16 kernel is the same shape
-# over the raw half bytes: each quad arrives as two u32
-# words and decodes through the bit-trick f16 route. The
+# TUNED SHAPES (Wave D): the tuned-K1 lessons translated to
+# plain floats, with opposite outcomes per dtype, both
+# measured in cleared-card window 1 (bench note
+# bench/mojo-d3-gemv-ladder-2026-11-07.md). The F16 kernel
+# took the full translation and kept it: 2 rows per
+# 128-thread workgroup as 8 groups of 16, each group
+# striding the row in 256-element segments, one thread
+# owning four quads per segment (quads t, t+16, t+32, t+48,
+# so consecutive threads read consecutive quads), each quad
+# arriving as two u32 words decoded through the bit-trick
+# f16 route, activation quads loaded once per segment and
+# shared by both rows, K1's segmented shuffle_xor butterfly
+# plus a short shared-memory finish: 180.19 -> 717.94 GB/s
+# median (3.98x the port). The same shape applied to F32
+# measured 415.42 against the port's 432.13 GB/s median,
+# slower in every rep - the port was already a clean
+# streaming kernel and the vec4 segment shape bought
+# nothing - so the F32 tuned iteration was REJECTED and
+# f32_gemv_kernel below is the Wave A port, unchanged. The
 # CPU twins below are byte-behaved and unchanged.
 #
 # Standalone usage mirrors k1_gemv:
@@ -50,6 +57,7 @@ from diag import log_debug
 from kernels.dequant import f16_to_f32, note_loaded
 
 comptime THREADS = 128
+comptime F32_THREADS = 256
 comptime ROWS_PER_WG = 2
 comptime GROUP_THREADS = 16
 comptime GROUPS = THREADS // GROUP_THREADS
@@ -101,60 +109,35 @@ def f32_gemv_kernel(
     y: Pointer[Float32, MutAnyOrigin],
     cols: Int32,
 ):
-    # The tuned shape (see the file header): one workgroup
-    # covers ROWS_PER_WG rows; GROUPS groups of GROUP_THREADS
-    # threads each own one 256-element segment at a time, a
-    # thread owning the segment's quads t, t+16, t+32, t+48.
-    # The host refuses an odd row count by name (see main),
-    # so row0 + 1 is always a real row here.
-    var lane = Int(thread_idx.x)
-    var group = lane // GROUP_THREADS
-    var t = lane % GROUP_THREADS
-    var row0 = Int(block_idx.x) * ROWS_PER_WG
-    var base0 = row0 * Int(cols)
-    var base1 = (row0 + 1) * Int(cols)
+    # The Wave A straight port, restored after the tuned
+    # iteration was measured and rejected (see the header):
+    # one row per 256-thread workgroup, scalar loads, a
+    # shared-memory tree reduction. On the synthetic timing
+    # fixture the port's streaming shape beat the vec4
+    # segment shape in every rep, so this kernel keeps it.
+    var row = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var base = row * Int(cols)
     var shared = stack_allocation[
-        ROWS_PER_WG * GROUPS, Float32, address_space=AddressSpace.SHARED
+        F32_THREADS, Float32, address_space=AddressSpace.SHARED
     ]()
-    var acc0 = Float32(0.0)
-    var acc1 = Float32(0.0)
-    var segments = Int(cols) // SEG_ELEMS
-    for seg in range(group, segments, GROUPS):
-        var xb = seg * SEG_ELEMS + t * 4
-        var xa = x.unsafe_load[width=4](xb)
-        var xbq = x.unsafe_load[width=4](xb + 64)
-        var xc = x.unsafe_load[width=4](xb + 128)
-        var xd = x.unsafe_load[width=4](xb + 192)
-        acc0 += (w.unsafe_load[width=4](base0 + xb) * xa).reduce_add()
-        acc0 += (w.unsafe_load[width=4](base0 + xb + 64) * xbq).reduce_add()
-        acc0 += (w.unsafe_load[width=4](base0 + xb + 128) * xc).reduce_add()
-        acc0 += (w.unsafe_load[width=4](base0 + xb + 192) * xd).reduce_add()
-        acc1 += (w.unsafe_load[width=4](base1 + xb) * xa).reduce_add()
-        acc1 += (w.unsafe_load[width=4](base1 + xb + 64) * xbq).reduce_add()
-        acc1 += (w.unsafe_load[width=4](base1 + xb + 128) * xc).reduce_add()
-        acc1 += (w.unsafe_load[width=4](base1 + xb + 192) * xd).reduce_add()
-    # Segmented butterfly inside each 16-thread group, then
-    # one shared-memory finish across groups (K1's hybrid).
-    acc0 += shuffle_xor(acc0, UInt32(1))
-    acc0 += shuffle_xor(acc0, UInt32(2))
-    acc0 += shuffle_xor(acc0, UInt32(4))
-    acc0 += shuffle_xor(acc0, UInt32(8))
-    acc1 += shuffle_xor(acc1, UInt32(1))
-    acc1 += shuffle_xor(acc1, UInt32(2))
-    acc1 += shuffle_xor(acc1, UInt32(4))
-    acc1 += shuffle_xor(acc1, UInt32(8))
-    if t == 0:
-        shared[unsafe_offset=group] = acc0
-        shared[unsafe_offset=GROUPS + group] = acc1
+    var acc = Float32(0.0)
+    var steps = Int(cols) // F32_THREADS
+    for k in range(steps):
+        var col = tid + k * F32_THREADS
+        acc += w[unsafe_offset=base + col] * x[unsafe_offset=col]
+    shared[unsafe_offset=tid] = acc
     barrier()
-    if lane == 0:
-        var s0 = Float32(0.0)
-        var s1 = Float32(0.0)
-        for g in range(GROUPS):
-            s0 += shared[unsafe_offset=g]
-            s1 += shared[unsafe_offset=GROUPS + g]
-        y[unsafe_offset=row0] = s0
-        y[unsafe_offset=row0 + 1] = s1
+    var stride = F32_THREADS // 2
+    while stride > 0:
+        if tid < stride:
+            shared[unsafe_offset=tid] = (
+                shared[unsafe_offset=tid] + shared[unsafe_offset=tid + stride]
+            )
+        barrier()
+        stride //= 2
+    if tid == 0:
+        y[unsafe_offset=row] = shared[unsafe_offset=0]
 
 
 def f16_gemv_kernel(
@@ -386,7 +369,7 @@ def main() raises:
             "cols must be a multiple of the 256-element segment, got "
             + String(cols),
         )
-    if rows % ROWS_PER_WG != 0:
+    if dtype == "f16" and rows % ROWS_PER_WG != 0:
         refuse(
             "bad shape",
             "rows must be a multiple of the 2-row workgroup tile, got "
@@ -429,8 +412,8 @@ def main() raises:
             x_dev,
             o_dev,
             Int32(cols),
-            grid_dim=rows // ROWS_PER_WG,
-            block_dim=THREADS,
+            grid_dim=rows,
+            block_dim=F32_THREADS,
         )
         ctx.synchronize()
         if iters > 0:
@@ -440,8 +423,8 @@ def main() raises:
                     x_dev,
                     o_dev,
                     Int32(cols),
-                    grid_dim=rows // ROWS_PER_WG,
-                    block_dim=THREADS,
+                    grid_dim=rows,
+                    block_dim=F32_THREADS,
                 )
             ctx.synchronize()
             var t0 = perf_counter_ns()
@@ -451,8 +434,8 @@ def main() raises:
                     x_dev,
                     o_dev,
                     Int32(cols),
-                    grid_dim=rows // ROWS_PER_WG,
-                    block_dim=THREADS,
+                    grid_dim=rows,
+                    block_dim=F32_THREADS,
                 )
             ctx.synchronize()
             var elapsed = Float64(perf_counter_ns() - t0) / 1.0e9

@@ -112,6 +112,7 @@ from kernels.f32_gemv import (
     f32_gemv_kernel,
     f16_gemv_kernel,
     THREADS as F_THREADS,
+    F32_THREADS,
     ROWS_PER_WG as F_ROWS_PER_WG,
 )
 from ops.rms_norm import rms_norm_kernel, RMS_THREADS
@@ -189,7 +190,7 @@ def gpu_layer_check_proj(
             + " is not a multiple of the Q5_K workgroup tile "
             + String(Q5_ROWS_PER_WG)
         )
-    if (type_id == DT_F32 or type_id == DT_F16) and rows % F_ROWS_PER_WG != 0:
+    if type_id == DT_F16 and rows % F_ROWS_PER_WG != 0:
         raise Error(
             "gpu_layer_bad_shape: "
             + name
@@ -411,8 +412,8 @@ def _gemv_f32_device(
         x_dev,
         y_dev,
         Int32(view.cols),
-        grid_dim=view.rows // F_ROWS_PER_WG,
-        block_dim=F_THREADS,
+        grid_dim=view.rows,
+        block_dim=F32_THREADS,
     )
     rt.ctx.synchronize()
     _ = log_debug("gpu.layer", "gemv f32 " + view.name)

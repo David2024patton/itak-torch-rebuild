@@ -100,11 +100,27 @@
 # TEACHER-FORCED VERDICT LINE: Lane C3's proof prints its own
 # verdict lines and exits nonzero on any mismatch (WAVE_C
 # contract: teacher-forced positions 0..7, 8 of 8). The exact
-# wording is C3's; the extractor accepts, in order: a line
-# naming TEACHER with PASS/DONE/VERDICT or a pass= count, a
-# GPU proof/generate verdict line, any line carrying
-# pass=<n>/<m>, or any line carrying an <n>/<m> count of 8.
-# The matched line is printed verbatim in the summary.
+# wording is C3's; the extractor accepts, in order: the
+# proof's own verdict line, a line anchored at the start
+# TEACHER_FORCED_GPU <n>/<m> (optionally followed by more
+# fields, e.g. total_ms=...), or a TEACHER line carrying a
+# pass=<n>/<m> count. The matched line is printed verbatim
+# in the summary.
+# Wave E fix (Lane E3; wart recorded in
+# bench/mojo-engine-wave-c-2026-11-07.md): the original shape
+# list tried a generic GPU_(GENERATE|PROOF) line BEFORE the
+# count shapes, so it matched the proof's header line
+# (GPU_GENERATE_PROOF context_len 4096) and reported that as
+# the verdict - and a log with NO verdict line at all still
+# "extracted" the header and passed. The generic proof shape
+# is gone: a log whose verdict line is missing now fails
+# loudly with TEACHER_FORCED_VERDICT_LINE_MISSING, and the
+# extracted line is the proof's verdict line itself. The
+# wave_d_timing.sh lineage never had this bug (it greps the
+# exact TEACHER_FORCED_GPU 8/8 string); this fixed wave_c
+# harness remains the rich-summary harness for Wave E, and
+# a wave_e_timing.sh, if the coordinator wants one, should
+# be a copy of THIS file, not of the pre-fix shapes.
 #
 # FAILURE LAW (fail loudly: nonzero exit, named message):
 #   STAGED_COMMIT_MISSING        no stamp file found
@@ -274,13 +290,14 @@ ratio_decode() { # CPU_S_PER_STEP GPU_DECODE_MS -> %.4f or MISSING
 teacher_verdict_line() { # FILE -> verbatim verdict line
     local file="$1" line
     [ -f "$file" ] || fail "LOG_MISSING: $file"
-    line=$(grep -Ei 'teacher' "$file" | grep -Ei 'pass|done|verdict' | tail -n 1 || true)
+    # 1. The proof's own verdict line (Wave E fix; see the
+    # header): anchored at line start so the per-step
+    # TEACHER_FORCED_GPU idx=... lines and the
+    # GPU_GENERATE_PROOF header lines can never match.
+    line=$(grep -E '^TEACHER_FORCED_GPU [0-9]+/[0-9]+([[:space:]]|$)' "$file" | tail -n 1 || true)
     [ -n "$line" ] && { printf '%s' "$line"; return 0; }
-    line=$(grep -E 'GPU_(GENERATE|PROOF)|PROOF_GPU_GENERATE' "$file" | tail -n 1 || true)
-    [ -n "$line" ] && { printf '%s' "$line"; return 0; }
-    line=$(grep -E 'pass=[0-9]+/[0-9]+' "$file" | tail -n 1 || true)
-    [ -n "$line" ] && { printf '%s' "$line"; return 0; }
-    line=$(grep -E '(^|[^0-9])8/8([^0-9]|$)' "$file" | tail -n 1 || true)
+    # 2. A TEACHER line carrying an explicit pass=<n>/<m>.
+    line=$(grep -Ei 'teacher' "$file" | grep -E 'pass=[0-9]+/[0-9]+' | tail -n 1 || true)
     [ -n "$line" ] && { printf '%s' "$line"; return 0; }
     return 1
 }
@@ -385,8 +402,16 @@ verify_stamp
 
 # Teacher-forced verdict (from the log file, foreground).
 TEACHER_VERDICT=$(teacher_verdict_line "$TEACHER_LOG") || fail "TEACHER_FORCED_VERDICT_LINE_MISSING: no verdict line matched in $TEACHER_LOG"
-# If the verdict carries a pass=<n>/<m> count, it must be full.
+# The verdict's count, in either carried shape (pass=<n>/<m>
+# or the verdict line's own bare <n>/<m>), must be full: a
+# partial teacher-forced pass is a failing verdict, not a
+# summary line (Wave E: the bare shape is checked too - the
+# original code only checked pass=, so a 7/8 verdict line
+# would have been reported without failing).
 _tf_count=$(printf '%s' "$TEACHER_VERDICT" | grep -oE 'pass=[0-9]+/[0-9]+' | tail -n 1 || true)
+if [ -z "$_tf_count" ]; then
+    _tf_count=$(printf '%s' "$TEACHER_VERDICT" | grep -oE '[0-9]+/[0-9]+' | tail -n 1 || true)
+fi
 if [ -n "$_tf_count" ]; then
     _tf_n=${_tf_count#pass=}; _tf_num=${_tf_n%/*}; _tf_den=${_tf_n#*/}
     [ "$_tf_num" = "$_tf_den" ] || fail "TEACHER_FORCED_NOT_FULL_PASS: $_tf_count in $TEACHER_LOG"

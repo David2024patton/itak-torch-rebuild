@@ -72,6 +72,8 @@ cargo build --release -p itak-engine
 TORCH_API_KEY=<your-key> ./platform/torchd -engine-socket /tmp/itak-engine.sock -models glimmer
 ```
 
+The engine socket is owner-only by construction, which is what makes the /tmp path safe. Binding pins the socket file to mode 0600, and the engine reads the connecting process's uid from the kernel (SO_PEERCRED) on every connection and refuses any other uid with a named `peer_refused` error, debug and embed operations included (crates/itak-engine/src/main.rs, `bind_socket` and `check_peer`). The platform verifies the same facts before it dials: the path must be a socket owned by its own uid with mode exactly 0600, or it refuses to connect (platform/internal/engine/socket_unix.go).
+
 Operating the pair, flags and all, is in [SERVING.md](SERVING.md); the operations book is [docs/RUNBOOK.md](docs/RUNBOOK.md). The gates that must pass before any commit: `cargo test --workspace`, `cargo clippy --workspace --all-targets`, `cargo fmt --all -- --check`, `cargo deny check`, and in platform/ `go test ./...`, `go vet ./...`, `govulncheck ./...`.
 
 ## The grid: module map
@@ -90,7 +92,7 @@ Operating the pair, flags and all, is in [SERVING.md](SERVING.md); the operation
 | dflash | Rust crate | The DFlash draft architecture: conditioning fused from named target layer inputs, non-causal block forward. |
 | itak-kv | Rust crate | The persistent tiered prefix-KV store: versioned KV snapshots keyed by token prefix, verified on load, LRU-bounded by bytes, on the attention crate's KV cache. |
 | itak-spec | Rust crate | The speculative decoding loop: block drafting, exact-output verification, KV checkpoint and rewind, rejection sampling. |
-| itak-engine | Rust binary | Owns one loaded model and serves the NDJSON-over-unix-socket protocol (hello, ping, debug, generate, embed, chat_template) with streamed token events and named errors. |
+| itak-engine | Rust binary | Owns one loaded model and serves the NDJSON-over-unix-socket protocol (hello, ping, debug, generate, embed, chat_template) with streamed token events and named errors. Access is owner-only: the socket file is pinned to mode 0600 and every connection's peer uid is checked against the engine's own, any other uid refused as `peer_refused`. |
 | Go platform | Go service | API handlers (OpenAI-compatible), API-key auth, scheduler, response cache, engine client and supervision, chat-template rendering, the torchd daemon. |
 
 Full map with links traced both ways: [docs/MAP.md](docs/MAP.md). Still designed and not yet built: the training stack (Phase 7), the .itf format (Phase 8), MoE expert streaming, and the SSM scan crate; they are in PLAN.md and TODO.md, not in the table above.

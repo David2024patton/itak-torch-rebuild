@@ -114,11 +114,17 @@ comptime DEFAULT_VOCAB = 202048
 # when BOTH this knob and PREFILL_GEMM_MIN_BATCH admit the
 # prompt, so the Wave D A/B control (raising the GEMM
 # minimum above any prompt length) still forces the
-# per-row arm on its own. The default is set from the
-# measured batch-vs-per-row crossover on the real model;
-# the trial record is
+# per-row arm on its own. The default is the measured
+# batch-vs-per-row crossover on the real model
+# (2026-11-08, RX 7900 XTX, interleaved fresh-model
+# arms): at 6 tokens the batch arm loses (286 ms vs the
+# per-row arm's 218 ms); at 16 tokens it wins (364 ms vs
+# 557 ms) and it stays ahead at every larger measured
+# length (32/64/128/256/512/1022). So prompts below 16
+# tokens prefill per-row and prompts at or above 16 take
+# the batch route. The trial record is
 # bench/mojo-engine-wave-e1-batch-2026-11-08.md.
-comptime DEFAULT_PREFILL_BATCH_MIN_TOKENS = 64
+comptime DEFAULT_PREFILL_BATCH_MIN_TOKENS = 16
 
 
 def parse_context_len(raw: String) raises -> Int:

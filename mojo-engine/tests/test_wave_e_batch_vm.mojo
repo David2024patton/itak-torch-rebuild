@@ -38,7 +38,7 @@ from model.gpu_layer_batch import (
 
 
 def test_routing_knob_default_and_parser() raises:
-    assert_equal(DEFAULT_PREFILL_BATCH_MIN_TOKENS, 64)
+    assert_equal(DEFAULT_PREFILL_BATCH_MIN_TOKENS, 16)
     assert_equal(parse_prefill_batch_min_tokens("1"), 1)
     assert_equal(parse_prefill_batch_min_tokens("64"), 64)
     assert_equal(parse_prefill_batch_min_tokens("1022"), 1022)

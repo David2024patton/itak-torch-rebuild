@@ -7,9 +7,9 @@
 #                  position) -> List[Float32]
 # (The contract's gpu_logits shorthand omits cpu_model; the
 # CPU model is a parameter here because the task fixes the
-# final-logit scale/softcap and every norm value as "from the
-# CPU model's config values, not literals", and the CPU model
-# is the holder of those values and of the final-norm vector.
+# final-logit scale/softcap as "from the CPU model's config
+# values, not literals", and the CPU model is the holder of
+# those values and the cross-check for every slot's shape.
 # Lane C3 holds the CPU model for config/fallback anyway.)
 #
 # Port shape (contract): weights and KV are resident on
@@ -44,29 +44,26 @@
 # traffic, and it keeps the add in the CPU twin's exact f32
 # arithmetic. Stated per the contract's "say which, and why".
 #
-# Norm weights: read from the CPU model (cpu_model is the
-# loader of record) and uploaded per call - 26 KB for a
-# hidden-width norm, 512 B for a head norm. The contract
-# sanctions this until DeviceWeights grows f32 accessors for
-# every norm; correctness first. F32 PROJECTION slots (none
-# in Glimmer - the census says its F32 tensors are the
-# norms) take the same per-call upload path from the CPU
-# slot's values; quantized and F16 projections always launch
-# against the RESIDENT DeviceWeights buffers.
+# Norm weights are RESIDENT: C1's DeviceWeights serves them
+# as float32 buffers (slot_f32 for the per-layer norms,
+# output_norm() for the final norm), so no norm is uploaded
+# per call. Every device slot's (type_id, rows, cols) is
+# cross-checked against the CPU model's slot before launch;
+# a disagreement refuses gpu_layer_shape_mismatch.
 #
 # Captures: the CPU model's captures (embed, named-layer
 # in/out) are the isolation tool for divergence work, per
 # the contract; this GPU step adds no capture hooks of its
 # own.
 #
-# C1 surface used (contract, gpu package):
+# C1 surface used (gpu package, Lane C1 as built):
 #   gpu.context: GpuRuntime (its .ctx DeviceContext is the
-#     launch surface), upload_u8 / upload_f32 / download_f32.
-#   gpu.weights: DeviceWeights.layer_u8(layer, suffix_index)
-#     and .output_u8(), each returning (buffer, type_id,
-#     rows, cols); the buffer is uint8 for quantized/F16
-#     slots.
-#   gpu.device_kv: DeviceKvCache.append(layer, k, v,
+#     launch surface), upload_f32 / download_f32 /
+#     create_zero_f32.
+#   gpu.weights: DeviceWeights.slot_u8 / slot_f32 /
+#     output_u8 / output_f32 (views carrying buffer, name,
+#     type_id, rows, cols) and .output_norm().
+#   gpu.device_kv: DeviceKvCache.append(rt, layer, k, v,
 #     position), .key_buffer(layer), .value_buffer(layer),
 #     .stored_len(layer), .first_visible_position(layer).
 #
@@ -82,8 +79,13 @@ from max.gpu import thread_idx, block_idx, block_dim
 from max.gpu.host import DeviceBuffer
 
 from diag import log_debug
-from gpu.context import GpuRuntime, upload_f32, download_f32
-from gpu.weights import DeviceWeights
+from gpu.context import (
+    GpuRuntime,
+    upload_f32,
+    download_f32,
+    create_zero_f32,
+)
+from gpu.weights import DeviceWeights, DeviceSlotU8, DeviceSlotF32
 from gpu.device_kv import DeviceKvCache
 from model.model import (
     GlimmerModel,
@@ -259,30 +261,22 @@ def attn_gate_cpu(
 # ---- device launch helpers -----------------------------------
 
 
-def _zeros(n: Int) -> List[Float32]:
-    var z = List[Float32](capacity=n)
-    z.resize(n, Float32(0.0))
-    return z^
-
-
 def _rms_norm_device(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     x: List[Float32],
-    weight: List[Float32],
+    w_buf: DeviceBuffer[DType.float32],
     row_len: Int,
     eps: Float32,
 ) raises -> List[Float32]:
     """rms_norm_kernel over x as rows of row_len (grid = row
-    count); the norm weight is uploaded per call (see the
-    module header for why)."""
-    gpu_layer_check_norm(len(x), len(weight), row_len)
+    count); the norm weight is a RESIDENT device buffer."""
+    gpu_layer_check_norm(len(x), row_len, row_len)
     var rows = len(x) // row_len
     var x_dev = upload_f32(rt, x)
-    var w_dev = upload_f32(rt, weight)
-    var y_dev = upload_f32(rt, _zeros(len(x)))
+    var y_dev = create_zero_f32(rt, len(x))
     rt.ctx.enqueue_function[rms_norm_kernel](
         x_dev,
-        w_dev,
+        w_buf,
         y_dev,
         Int32(row_len),
         eps,
@@ -293,55 +287,92 @@ def _rms_norm_device(
     return download_f32(rt, y_dev, len(x))
 
 
-def _gemv_device(
-    rt: GpuRuntime,
-    buf: DeviceBuffer[DType.uint8],
-    f32_values: List[Float32],
-    type_id: Int,
-    rows: Int,
-    cols: Int,
-    x: List[Float32],
-    name: String,
+def _check_view(
+    name: String, type_id: Int, rows: Int, cols: Int,
+    cpu_type: Int, cpu_rows: Int, cpu_cols: Int,
+) raises:
+    if type_id != cpu_type or rows != cpu_rows or cols != cpu_cols:
+        raise Error(
+            "gpu_layer_shape_mismatch: "
+            + name
+            + " device slot (type "
+            + String(type_id)
+            + ", "
+            + String(rows)
+            + "x"
+            + String(cols)
+            + ") disagrees with the CPU slot (type "
+            + String(cpu_type)
+            + ", "
+            + String(cpu_rows)
+            + "x"
+            + String(cpu_cols)
+            + ")"
+        )
+
+
+def _gemv_u8_device(
+    mut rt: GpuRuntime, view: DeviceSlotU8, x: List[Float32]
 ) raises -> List[Float32]:
-    """One GEMV launch dispatched by slot dtype. `buf` is the
-    resident uint8 weight buffer (quantized/F16); F32 slots
-    ignore it and upload `f32_values` per call instead."""
-    gpu_layer_check_proj(name, type_id, rows, cols, len(x))
+    """One GEMV launch for a byte-stored slot (Q4_K / Q6_K /
+    Q5_K / F16), dispatched by the view's dtype."""
+    gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, len(x))
     var x_dev = upload_f32(rt, x)
-    var y_dev = upload_f32(rt, _zeros(rows))
-    if type_id == DT_Q4_K:
+    var y_dev = create_zero_f32(rt, view.rows)
+    if view.type_id == DT_Q4_K:
         rt.ctx.enqueue_function[k1_gemv_kernel](
-            buf,
+            view.buffer,
             x_dev,
             y_dev,
-            Int32(cols),
-            grid_dim=rows // K1_ROWS_PER_WG,
+            Int32(view.cols),
+            grid_dim=view.rows // K1_ROWS_PER_WG,
             block_dim=K1_THREADS,
         )
-    elif type_id == DT_Q6_K:
+    elif view.type_id == DT_Q6_K:
         rt.ctx.enqueue_function[q6k_gemv_kernel](
-            buf, x_dev, y_dev, Int32(cols), grid_dim=rows, block_dim=Q6_THREADS
+            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            block_dim=Q6_THREADS,
         )
-    elif type_id == DT_Q5_K:
+    elif view.type_id == DT_Q5_K:
         rt.ctx.enqueue_function[q5k_gemv_kernel](
-            buf, x_dev, y_dev, Int32(cols), grid_dim=rows, block_dim=Q5_THREADS
+            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            block_dim=Q5_THREADS,
         )
-    elif type_id == DT_F16:
+    elif view.type_id == DT_F16:
         rt.ctx.enqueue_function[f16_gemv_kernel](
-            buf, x_dev, y_dev, Int32(cols), grid_dim=rows, block_dim=F_THREADS
+            view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+            block_dim=F_THREADS,
         )
-    else:  # DT_F32, validated by gpu_layer_check_proj.
-        var w_dev = upload_f32(rt, f32_values)
-        rt.ctx.enqueue_function[f32_gemv_kernel](
-            w_dev, x_dev, y_dev, Int32(cols), grid_dim=rows, block_dim=F_THREADS
+    else:
+        raise Error(
+            "gpu_layer_unsupported_dtype: "
+            + view.name
+            + " reached the byte GEMV path with ggml type id "
+            + String(view.type_id)
         )
     rt.ctx.synchronize()
-    _ = log_debug("gpu.layer", "gemv " + name + " rows=" + String(rows))
-    return download_f32(rt, y_dev, rows)
+    _ = log_debug("gpu.layer", "gemv " + view.name + " rows=" + String(view.rows))
+    return download_f32(rt, y_dev, view.rows)
+
+
+def _gemv_f32_device(
+    mut rt: GpuRuntime, view: DeviceSlotF32, x: List[Float32]
+) raises -> List[Float32]:
+    """One GEMV launch for an F32 slot's resident buffer."""
+    gpu_layer_check_proj(view.name, view.type_id, view.rows, view.cols, len(x))
+    var x_dev = upload_f32(rt, x)
+    var y_dev = create_zero_f32(rt, view.rows)
+    rt.ctx.enqueue_function[f32_gemv_kernel](
+        view.buffer, x_dev, y_dev, Int32(view.cols), grid_dim=view.rows,
+        block_dim=F_THREADS,
+    )
+    rt.ctx.synchronize()
+    _ = log_debug("gpu.layer", "gemv f32 " + view.name)
+    return download_f32(rt, y_dev, view.rows)
 
 
 def _proj_layer(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     weights: DeviceWeights,
     cpu_model: GlimmerModel,
     layer: Int,
@@ -364,48 +395,21 @@ def _proj_layer(
     var cpu_cols = cpu_model.layer_weights[idx].cols
     var name = cpu_model.layer_weights[idx].name.copy()
     if cpu_type == DT_F32:
-        # No resident uint8 launch for an F32 slot; the values
-        # upload path in _gemv_device serves it. The empty
-        # buffer is never read by the F32 kernel.
-        var empty_u8 = rt.ctx.enqueue_create_buffer[DType.uint8](0)
-        return _gemv_device(
-            rt,
-            empty_u8,
-            cpu_model.layer_weights[idx].values,
-            cpu_type,
-            cpu_rows,
+        var fview = weights.slot_f32(layer, suffix_index)
+        _check_view(
+            name, fview.type_id, fview.rows, fview.cols, cpu_type, cpu_rows,
             cpu_cols,
-            x,
-            name,
         )
-    var slot = weights.layer_u8(layer, suffix_index)
-    var buf = slot[0].copy()
-    if slot[1] != cpu_type or slot[2] != cpu_rows or slot[3] != cpu_cols:
-        raise Error(
-            "gpu_layer_shape_mismatch: "
-            + name
-            + " device slot (type "
-            + String(slot[1])
-            + ", "
-            + String(slot[2])
-            + "x"
-            + String(slot[3])
-            + ") disagrees with the CPU slot (type "
-            + String(cpu_type)
-            + ", "
-            + String(cpu_rows)
-            + "x"
-            + String(cpu_cols)
-            + ")"
-        )
-    return _gemv_device(
-        rt, buf, cpu_model.layer_weights[idx].values, cpu_type, cpu_rows,
-        cpu_cols, x, name,
+        return _gemv_f32_device(rt, fview, x)
+    var view = weights.slot_u8(layer, suffix_index)
+    _check_view(
+        name, view.type_id, view.rows, view.cols, cpu_type, cpu_rows, cpu_cols
     )
+    return _gemv_u8_device(rt, view, x)
 
 
 def _proj_output(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     weights: DeviceWeights,
     cpu_model: GlimmerModel,
     x: List[Float32],
@@ -415,32 +419,64 @@ def _proj_output(
     var cpu_rows = cpu_model.output.rows
     var cpu_cols = cpu_model.output.cols
     if cpu_type == DT_F32:
-        var empty_u8 = rt.ctx.enqueue_create_buffer[DType.uint8](0)
-        return _gemv_device(
-            rt,
-            empty_u8,
-            cpu_model.output.values,
-            cpu_type,
-            cpu_rows,
-            cpu_cols,
-            x,
-            String("output.weight"),
+        var fview = weights.output_f32()
+        _check_view(
+            "output.weight", fview.type_id, fview.rows, fview.cols, cpu_type,
+            cpu_rows, cpu_cols,
         )
-    var slot = weights.output_u8()
-    var buf = slot[0].copy()
-    if slot[1] != cpu_type or slot[2] != cpu_rows or slot[3] != cpu_cols:
-        raise Error(
-            "gpu_layer_shape_mismatch: output.weight device slot"
-            " disagrees with the CPU slot"
-        )
-    return _gemv_device(
-        rt, buf, cpu_model.output.values, cpu_type, cpu_rows, cpu_cols, x,
-        String("output.weight"),
+        return _gemv_f32_device(rt, fview, x)
+    var view = weights.output_u8()
+    _check_view(
+        "output.weight", view.type_id, view.rows, view.cols, cpu_type,
+        cpu_rows, cpu_cols,
     )
+    return _gemv_u8_device(rt, view, x)
+
+
+def _norm_buffer(
+    weights: DeviceWeights,
+    cpu_model: GlimmerModel,
+    layer: Int,
+    suffix_index: Int,
+    row_len: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """A per-layer norm's RESIDENT float32 buffer, validated
+    against the CPU slot (an F32 slot of exactly row_len
+    values)."""
+    var idx = layer * LAYER_SUFFIX_COUNT + suffix_index
+    if layer < 0 or idx < 0 or idx >= len(cpu_model.layer_weights):
+        raise Error(
+            "gpu_layer_bad_shape: norm slot layer "
+            + String(layer)
+            + " suffix "
+            + String(suffix_index)
+            + " outside the CPU model's slots"
+        )
+    if cpu_model.layer_weights[idx].type_id != DT_F32:
+        raise Error(
+            "gpu_layer_unsupported_dtype: norm slot "
+            + cpu_model.layer_weights[idx].name
+            + " has ggml type id "
+            + String(cpu_model.layer_weights[idx].type_id)
+            + ", expected F32 values"
+        )
+    var view = weights.slot_f32(layer, suffix_index)
+    if view.cols != row_len or view.rows != 1:
+        raise Error(
+            "gpu_layer_shape_mismatch: norm slot "
+            + view.name
+            + " device shape "
+            + String(view.rows)
+            + "x"
+            + String(view.cols)
+            + " is not a row of "
+            + String(row_len)
+        )
+    return view.buffer.copy()
 
 
 def _rope_device(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     x: List[Float32],
     vectors: Int,
     head_dim: Int,
@@ -459,7 +495,7 @@ def _rope_device(
         )
     var shape = rope_launch_shape(vectors * (head_dim // 2))
     var x_dev = upload_f32(rt, x)
-    var y_dev = upload_f32(rt, _zeros(len(x)))
+    var y_dev = create_zero_f32(rt, len(x))
     var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
     for i in range(vectors):
         pos_host[i] = Int32(position)
@@ -479,7 +515,7 @@ def _rope_device(
 
 
 def _attention_device(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     kv: DeviceKvCache,
     q: List[Float32],
     layer: Int,
@@ -518,7 +554,7 @@ def _attention_device(
             + String(q_heads * head_dim)
         )
     var q_dev = upload_f32(rt, q)
-    var y_dev = upload_f32(rt, _zeros(q_heads * head_dim))
+    var y_dev = create_zero_f32(rt, q_heads * head_dim)
     var k_buf = kv.key_buffer(layer)
     var v_buf = kv.value_buffer(layer)
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
@@ -540,7 +576,7 @@ def _attention_device(
 
 
 def _attn_gate_device(
-    rt: GpuRuntime, attn: List[Float32], gate: List[Float32]
+    mut rt: GpuRuntime, attn: List[Float32], gate: List[Float32]
 ) raises -> List[Float32]:
     """attn_gate_kernel over the downloaded rows."""
     if len(attn) != len(gate):
@@ -552,7 +588,7 @@ def _attn_gate_device(
         )
     var a_dev = upload_f32(rt, attn)
     var g_dev = upload_f32(rt, gate)
-    var y_dev = upload_f32(rt, _zeros(len(attn)))
+    var y_dev = create_zero_f32(rt, len(attn))
     var grid = (len(attn) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[attn_gate_kernel](
         a_dev, g_dev, y_dev, Int32(len(attn)), grid_dim=grid,
@@ -563,7 +599,7 @@ def _attn_gate_device(
 
 
 def _swiglu_device(
-    rt: GpuRuntime, gate: List[Float32], up: List[Float32]
+    mut rt: GpuRuntime, gate: List[Float32], up: List[Float32]
 ) raises -> List[Float32]:
     """swiglu_kernel over the downloaded rows."""
     if len(gate) != len(up):
@@ -575,7 +611,7 @@ def _swiglu_device(
         )
     var g_dev = upload_f32(rt, gate)
     var u_dev = upload_f32(rt, up)
-    var y_dev = upload_f32(rt, _zeros(len(gate)))
+    var y_dev = create_zero_f32(rt, len(gate))
     var grid = (len(gate) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[swiglu_kernel](
         g_dev, u_dev, y_dev, Int32(len(gate)), grid_dim=grid,
@@ -585,36 +621,11 @@ def _swiglu_device(
     return download_f32(rt, y_dev, len(gate))
 
 
-def _norm_weight(
-    cpu_model: GlimmerModel, layer: Int, suffix_index: Int
-) raises -> List[Float32]:
-    """A per-layer norm weight from the CPU model (the values
-    are the slot's F32 values; a non-F32 norm slot refuses)."""
-    var idx = layer * LAYER_SUFFIX_COUNT + suffix_index
-    if layer < 0 or idx < 0 or idx >= len(cpu_model.layer_weights):
-        raise Error(
-            "gpu_layer_bad_shape: norm slot layer "
-            + String(layer)
-            + " suffix "
-            + String(suffix_index)
-            + " outside the CPU model's slots"
-        )
-    if cpu_model.layer_weights[idx].type_id != DT_F32:
-        raise Error(
-            "gpu_layer_unsupported_dtype: norm slot "
-            + cpu_model.layer_weights[idx].name
-            + " has ggml type id "
-            + String(cpu_model.layer_weights[idx].type_id)
-            + ", expected F32 values"
-        )
-    return cpu_model.layer_weights[idx].values.copy()
-
-
 # ---- public surface ------------------------------------------
 
 
 def gpu_logits(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     weights: DeviceWeights,
     cpu_model: GlimmerModel,
     hidden: List[Float32],
@@ -631,12 +642,20 @@ def gpu_logits(
             + ", hidden is "
             + String(cfg.hidden)
         )
+    var norm_view = weights.output_norm()
+    if norm_view.cols != cfg.hidden:
+        raise Error(
+            "gpu_layer_shape_mismatch: output_norm device width "
+            + String(norm_view.cols)
+            + " is not hidden "
+            + String(cfg.hidden)
+        )
     var normed = _rms_norm_device(
-        rt, hidden, cpu_model.final_norm, cfg.hidden, cfg.rms_eps
+        rt, hidden, norm_view.buffer, cfg.hidden, cfg.rms_eps
     )
     var raw = _proj_output(rt, weights, cpu_model, normed)
     var x_dev = upload_f32(rt, raw)
-    var y_dev = upload_f32(rt, _zeros(len(raw)))
+    var y_dev = create_zero_f32(rt, len(raw))
     var grid = (len(raw) + GATE_THREADS - 1) // GATE_THREADS
     rt.ctx.enqueue_function[final_logit_kernel](
         x_dev,
@@ -653,7 +672,7 @@ def gpu_logits(
 
 
 def gpu_layer_step(
-    rt: GpuRuntime,
+    mut rt: GpuRuntime,
     weights: DeviceWeights,
     mut kv: DeviceKvCache,
     cpu_model: GlimmerModel,
@@ -707,17 +726,19 @@ def gpu_layer_step(
     )
     var residual = x.copy()
     var h = _rms_norm_device(
-        rt, residual, _norm_weight(cpu_model, layer, 0), cfg.hidden,
-        cfg.rms_eps,
+        rt, residual, _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
+        cfg.hidden, cfg.rms_eps,
     )
     var q = _proj_layer(rt, weights, cpu_model, layer, 1, h)
     var k = _proj_layer(rt, weights, cpu_model, layer, 2, h)
     var v = _proj_layer(rt, weights, cpu_model, layer, 3, h)
     q = _rms_norm_device(
-        rt, q, _norm_weight(cpu_model, layer, 4), cfg.head_dim, cfg.rms_eps
+        rt, q, _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
+        cfg.head_dim, cfg.rms_eps,
     )
     k = _rms_norm_device(
-        rt, k, _norm_weight(cpu_model, layer, 5), cfg.head_dim, cfg.rms_eps
+        rt, k, _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
+        cfg.head_dim, cfg.rms_eps,
     )
     var q_for_attn = q.copy()
     if sliding:
@@ -728,7 +749,7 @@ def gpu_layer_step(
         q_for_attn = _rope_device(
             rt, q, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
         )
-    kv.append(layer, k, v, position)
+    kv.append(rt, layer, k, v, position)
     var attn = _attention_device(
         rt, kv, q_for_attn, layer, cfg.q_heads, cfg.kv_heads, cfg.head_dim
     )
@@ -736,19 +757,21 @@ def gpu_layer_step(
     var gated = _attn_gate_device(rt, attn, gate)
     var out = _proj_layer(rt, weights, cpu_model, layer, 6, gated)
     out = _rms_norm_device(
-        rt, out, _norm_weight(cpu_model, layer, 8), cfg.hidden, POST_NORM_EPS
+        rt, out, _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
+        cfg.hidden, POST_NORM_EPS,
     )
     var after_attn = residual_add_cpu(residual, out)
     var residual2 = after_attn.copy()
     var h2 = _rms_norm_device(
-        rt, residual2, _norm_weight(cpu_model, layer, 9), cfg.hidden,
-        cfg.rms_eps,
+        rt, residual2, _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
+        cfg.hidden, cfg.rms_eps,
     )
     var gate_ffn = _proj_layer(rt, weights, cpu_model, layer, 10, h2)
     var up_ffn = _proj_layer(rt, weights, cpu_model, layer, 11, h2)
     var act = _swiglu_device(rt, gate_ffn, up_ffn)
     var ffn = _proj_layer(rt, weights, cpu_model, layer, 12, act)
     ffn = _rms_norm_device(
-        rt, ffn, _norm_weight(cpu_model, layer, 13), cfg.hidden, POST_NORM_EPS
+        rt, ffn, _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
+        cfg.hidden, POST_NORM_EPS,
     )
     return residual_add_cpu(residual2, ffn)

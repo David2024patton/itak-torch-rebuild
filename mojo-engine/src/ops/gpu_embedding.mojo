@@ -13,21 +13,21 @@
 #   Q6_K: q6k_element_ptr.  Q5_K: q5k_element_ptr.
 #   F16:  read_f16_ptr gather.
 #   F32:  REFUSED BY NAME (gpu_embedding_unsupported_dtype):
-#         an F32 table lives in DeviceWeights as a float32
-#         buffer, not the uint8 buffer this path launches
-#         against, and the Wave A census says this file's
-#         F32 tensors are the norms, so no live model hits
-#         the refusal. Any other type id refuses the same way.
+#         an F32 table is resident as a float32 buffer, not
+#         the uint8 buffer this kernel launches against, and
+#         the Wave A census says this file's F32 tensors are
+#         the norms, so no live model hits the refusal. Any
+#         other type id refuses the same way.
 #
 # Dequant is exact arithmetic per element (no accumulation),
 # so the parity bar against the CPU twin is element-exact
 # class (proof bar: max abs <= 1e-6).
 #
-# C1 surface used (contract): GpuRuntime + upload_f32 /
-# download_f32 from gpu.context, DeviceWeights.embedding_u8()
-# returning (buffer, type_id, rows, cols) from gpu.weights.
-# Norm-free module: this file never touches src/gpu/ itself
-# beyond those imports.
+# C1 surface used (gpu package, Lane C1 as built):
+#   gpu.context: GpuRuntime, create_zero_f32, download_f32.
+#   gpu.weights: DeviceWeights.embedding_meta() for the
+#     slot's type/rows/cols and .embedding_u8() for the
+#     resident byte buffer view.
 #
 # Named refusals: gpu_embedding_bad_token,
 # gpu_embedding_bad_shape, gpu_embedding_unsupported_dtype.
@@ -35,7 +35,7 @@
 from max.gpu import thread_idx, block_idx, block_dim
 
 from diag import log_debug
-from gpu.context import GpuRuntime, upload_f32, download_f32
+from gpu.context import GpuRuntime, create_zero_f32, download_f32
 from gpu.weights import DeviceWeights
 from kernels.dequant import (
     read_f16_ptr,
@@ -145,14 +145,13 @@ def embedding_dequant_kernel(
 
 
 def gpu_embed_token(
-    rt: GpuRuntime, weights: DeviceWeights, token: Int
+    mut rt: GpuRuntime, weights: DeviceWeights, token: Int
 ) raises -> List[Float32]:
     """Device-dequantized embedding row for one token."""
-    var slot = weights.embedding_u8()
-    var buf = slot[0].copy()
-    var type_id = slot[1]
-    var rows = slot[2]
-    var cols = slot[3]
+    var meta = weights.embedding_meta()
+    var type_id = meta.type_id
+    var rows = meta.rows
+    var cols = meta.cols
     if token < 0 or token >= rows:
         raise Error(
             "gpu_embedding_bad_token: token "
@@ -174,12 +173,11 @@ def gpu_embed_token(
             " (F32 refuses here by design, see the module header)"
         )
     _ = embedding_row_bytes(type_id, cols)
-    var zeros = List[Float32](capacity=cols)
-    zeros.resize(cols, Float32(0.0))
-    var out_dev = upload_f32(rt, zeros)
+    var view = weights.embedding_u8()
+    var out_dev = create_zero_f32(rt, cols)
     var grid = (cols + EMB_THREADS - 1) // EMB_THREADS
     rt.ctx.enqueue_function[embedding_dequant_kernel](
-        buf,
+        view.buffer,
         out_dev,
         Int32(token),
         Int32(cols),

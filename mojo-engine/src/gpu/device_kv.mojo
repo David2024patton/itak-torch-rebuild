@@ -600,7 +600,22 @@ struct DeviceKvCache(Movable):
         buffers (the residency path: the layer's K/V rows never
         cross to the host). The buffers' first row_len()
         elements are the row; the scatter is device-to-device.
-        Same validation and refusals as append()."""
+        Same validation and refusals as append().
+
+        NO SYNCHRONIZE (Wave F, Lane F1-A item 2): this append
+        used to end in rt.ctx.synchronize(), which capped host
+        lookahead at half a layer - the host could not enqueue
+        layer N+1's work until layer N's scatters had finished
+        on device. The sync bought nothing: the context's
+        single queue executes in enqueue order, so the
+        layer's attention launches (enqueued after these
+        scatters) read the rows exactly as written, and the
+        host-side commit below touches only host state. Every
+        read-back path (download_f32, _read_row, the layer
+        boundary download) synchronizes for itself. The host
+        append() above KEEPS its sync: its callers are proofs
+        and staging paths that read rows back immediately and
+        are not the per-token hot path."""
         var row = self.row_len()
         var slot = self._append_slot(layer, position, row, row)
         var offset = slot * row
@@ -620,7 +635,7 @@ struct DeviceKvCache(Movable):
             grid_dim=1,
             block_dim=_KV_BLOCK,
         )
-        rt.ctx.synchronize()
+        # No synchronize: see the docstring (Wave F item 2).
         self._append_commit(layer, slot, position)
 
     # -- visible-order read for attention (Wave D) ----------------

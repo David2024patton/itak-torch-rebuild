@@ -19,7 +19,10 @@
 # slots), the head GEMV via gpu_logits whole and via its
 # Q5_K launch, rms norms (hidden row, Q-head rows, K-head
 # rows), rope (Q and K), the KV append pair (production
-# DeviceKvCache.append_device, sync included as shipped),
+# DeviceKvCache.append_device; since Wave F item 2 it carries
+# NO internal synchronize - this proof follows with its own
+# sync before reading timings back, so the series measures
+# the enqueue cost, not a full round trip),
 # resident attention at stored 16 and 128 (production
 # attention_device_residency_cfg entry, config-default
 # knobs, splits == 1 in both regimes), attn_gate, swiglu,
@@ -402,8 +405,11 @@ def phase_ops() raises:
             times,
         )
 
-    # ---- KV append pair (production append_device; its
-    # internal synchronize is part of the shipped shape).
+    # ---- KV append pair (production append_device; since
+    # Wave F item 2 it has no internal synchronize - the rep
+    # after the timed one is covered by the loop's next
+    # iteration, and exactness of the appends is the wrap
+    # proof's business, not this timing proof's).
     var kv = DeviceKvCache.build(
         rt, cfg.kinds.copy(), cfg.kv_heads, cfg.head_dim, 4096
     )
@@ -415,7 +421,7 @@ def phase_ops() raises:
         kv.append_device(rt, 0, k_row, v_row, rep)
         if rep >= 3:
             atimes.append(Int(perf_counter_ns() - t0))
-    _report("kv_append_device_pair_incl_sync", atimes)
+    _report("kv_append_device_pair_enqueue", atimes)
 
     # ---- Resident attention at stored 16 and 128 (kv above
     # now holds 53 rows in layer 0; rebuild fresh caches at

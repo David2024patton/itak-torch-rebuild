@@ -819,8 +819,10 @@ def _rope_buf_batch(
 ) raises -> DeviceBuffer[DType.float32]:
     """rope_kernel over a resident flat [batch][vectors]
     [head_dim] batch; the positions buffer carries each
-    element's own absolute position, as the Wave D batch
-    step built it on the host path."""
+    element's own absolute position, served by the runtime's
+    SHARED span buffer (GpuRuntime.rope_positions_span,
+    Wave F item 4): one fill per prefill instead of one
+    host buffer + device buffer + copy per layer call."""
     var vectors = batch * vectors_per_batch
     if n != vectors * head_dim:
         raise Error(
@@ -831,11 +833,9 @@ def _rope_buf_batch(
         )
     var shape = rope_launch_shape(vectors * (head_dim // 2))
     var y_dev = create_zero_f32(rt, n)
-    var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
-    for v in range(vectors):
-        pos_host[v] = Int32(start_position + v // vectors_per_batch)
-    var pos_dev = rt.ctx.enqueue_create_buffer[DType.int32](vectors)
-    rt.ctx.enqueue_copy(src_buf=pos_host, dst_buf=pos_dev)
+    var pos_dev = rt.rope_positions_span(
+        start_position, vectors, vectors_per_batch
+    )
     rt.ctx.enqueue_function[rope_kernel](
         x_buf,
         y_dev,

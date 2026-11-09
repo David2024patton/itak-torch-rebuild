@@ -628,8 +628,11 @@ def _rope_device(
     base: Float32,
 ) raises -> List[Float32]:
     """rope_kernel over a flat [vectors][head_dim] row; the
-    positions buffer is filled with this step's one absolute
-    position, the CPU step's construction."""
+    positions come from the runtime's SHARED position buffer
+    (GpuRuntime.rope_positions, Wave F item 4): every entry is
+    this step's one absolute position, the CPU step's
+    construction, now built once per position change instead
+    of per call."""
     if len(x) != vectors * head_dim:
         raise Error(
             "gpu_layer_bad_shape: rope input has "
@@ -640,11 +643,7 @@ def _rope_device(
     var shape = rope_launch_shape(vectors * (head_dim // 2))
     var x_dev = upload_f32(rt, x)
     var y_dev = create_zero_f32(rt, len(x))
-    var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
-    for i in range(vectors):
-        pos_host[i] = Int32(position)
-    var pos_dev = rt.ctx.enqueue_create_buffer[DType.int32](vectors)
-    rt.ctx.enqueue_copy(src_buf=pos_host, dst_buf=pos_dev)
+    var pos_dev = rt.rope_positions(position, vectors)
     rt.ctx.enqueue_function[rope_kernel](
         x_dev,
         y_dev,
@@ -1002,11 +1001,7 @@ def _rope_buf(
         )
     var shape = rope_launch_shape(vectors * (head_dim // 2))
     var y_dev = _alloc_f32(rt, n)
-    var pos_host = rt.ctx.enqueue_create_host_buffer[DType.int32](vectors)
-    for i in range(vectors):
-        pos_host[i] = Int32(position)
-    var pos_dev = rt.ctx.enqueue_create_buffer[DType.int32](vectors)
-    rt.ctx.enqueue_copy(src_buf=pos_host, dst_buf=pos_dev)
+    var pos_dev = rt.rope_positions(position, vectors)
     rt.ctx.enqueue_function[rope_kernel](
         x_buf,
         y_dev,

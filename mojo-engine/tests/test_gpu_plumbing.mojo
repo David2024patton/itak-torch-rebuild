@@ -16,6 +16,10 @@ from gpu.context import (
     budget_release,
     check_gpu_budget,
     gpu_budget_total,
+    rope_pos_grown_capacity,
+    rope_pos_needs_fill,
+    rope_pos_needs_grow,
+    rope_span_needs_fill,
 )
 from gpu.device_kv import (
     kv_append_refusal,
@@ -26,6 +30,7 @@ from gpu.device_kv import (
     kv_total_bytes,
     kv_visible_slot,
 )
+from gpu.scratch import SCRATCH_POOL_MAX_FREE_PER_CLASS, ScratchPoolState
 from gpu.weights import meta_index, slot_resident_bytes
 from kv.cache import LayerKind, glimmer_layer_pattern
 
@@ -348,6 +353,158 @@ def test_kv_visible_order_arithmetic() raises:
     )
     assert_true(not kv_gather_needed(glob, 0), "global never gathers")
     print("gpu kv visible order: slot map + gather-needed exact")
+
+
+# Shared RoPE position buffers (Wave F, Lane F1-A item 4):
+# the runtime's cache policy, simulated as plain ints through
+# the SAME pure functions GpuRuntime.rope_positions /
+# rope_positions_span delegate to (the methods themselves need
+# a DeviceContext). Scenario: a decode step at position 41 on
+# Glimmer shapes - K rope asks for kv_heads=2 vectors, Q rope
+# for q_heads=32, on each of the 39 sliding layers.
+def test_rope_pos_sharing_policy() raises:
+    # First call ever: no capacity, nothing filled.
+    var capacity = 0
+    var cached_position = -1
+    assert_true(rope_pos_needs_grow(capacity, 2), "first K rope must grow")
+    capacity = rope_pos_grown_capacity(capacity, 2)
+    assert_equal(capacity, 2)
+    assert_true(
+        rope_pos_needs_fill(cached_position, 41, True),
+        "a grow always refills",
+    )
+    cached_position = 41
+    # Same layer's Q rope: wider than the K-shaped cache.
+    assert_true(rope_pos_needs_grow(capacity, 32), "Q rope outgrows K cache")
+    capacity = rope_pos_grown_capacity(capacity, 32)
+    assert_equal(capacity, 32)
+    assert_true(
+        rope_pos_needs_fill(cached_position, 41, True),
+        "the Q grow refills even at the same position",
+    )
+    cached_position = 41
+    # The remaining 38 sliding layers, K then Q at position 41:
+    # no grow, no fill. This is the sharing the item buys:
+    # 2 fills per step instead of 2 allocations + 2 copies
+    # per rope call (4 per sliding layer, 156 per token).
+    for _ in range(38):
+        assert_true(not rope_pos_needs_grow(capacity, 2), "K fits the cache")
+        assert_true(not rope_pos_needs_grow(capacity, 32), "Q fits the cache")
+        assert_true(
+            not rope_pos_needs_fill(cached_position, 41, False),
+            "same position: no refill inside a step",
+        )
+    # Next token: position changes, exactly one refill, no grow.
+    assert_true(
+        rope_pos_needs_fill(cached_position, 42, False),
+        "a new position refills once",
+    )
+    assert_true(not rope_pos_needs_grow(capacity, 32), "no grow on step 2")
+    # Growth arithmetic: at least the request, at least double.
+    assert_equal(rope_pos_grown_capacity(0, 5), 5)
+    assert_equal(rope_pos_grown_capacity(4, 5), 8)
+    assert_equal(rope_pos_grown_capacity(4, 100), 100)
+    assert_equal(rope_pos_grown_capacity(32, 33), 64)
+    print("gpu rope positions: grow/fill policy shares one buffer per step")
+
+
+def test_rope_span_sharing_policy() raises:
+    # One prefill: start 0, 6 rows x 32 vectors-per-row = 192
+    # entries, every layer's K and Q ropes on the same key.
+    var capacity = 0
+    assert_true(rope_pos_needs_grow(capacity, 192), "first span must grow")
+    capacity = rope_pos_grown_capacity(capacity, 192)
+    assert_true(
+        rope_span_needs_fill(-1, 0, 0, 0, 192, 32, True),
+        "a grow always refills the span",
+    )
+    # Same key, all 52 layers: no refill.
+    for _ in range(52):
+        assert_true(
+            not rope_span_needs_fill(0, 192, 32, 0, 192, 32, False),
+            "same span key: no refill inside a prefill",
+        )
+    # A new prompt at a continued position, or a different
+    # batch shape, refills; nothing here grows again.
+    assert_true(
+        rope_span_needs_fill(0, 192, 32, 6, 192, 32, False),
+        "a later start refills",
+    )
+    assert_true(
+        rope_span_needs_fill(0, 192, 32, 0, 192, 2, False),
+        "a different vectors-per-row refills",
+    )
+    assert_true(
+        not rope_pos_needs_grow(capacity, 192), "the span cache only grows"
+    )
+    print("gpu rope span: one fill per prefill key")
+
+
+# Scratch pool policy (Wave F, Lane F1-A item 3): the pool's
+# bookkeeping, simulated through ScratchPoolState - the same
+# pure state ScratchPool drives (the pool itself holds device
+# buffers). Scenario: the resident layer chain's acquire
+# pattern at Glimmer sizes, layer after layer.
+def test_scratch_pool_state_policy() raises:
+    var st = ScratchPoolState()
+    # One layer's intermediates: hidden x6 (norms + residual
+    # adds + stream), q width x3, kv width x2, ffn width x3.
+    var layer_sizes = List[Int]()
+    for _ in range(6):
+        layer_sizes.append(6656)
+    for _ in range(3):
+        layer_sizes.append(4096)
+    for _ in range(2):
+        layer_sizes.append(256)
+    for _ in range(3):
+        layer_sizes.append(19968)
+    # Layer 1 (cold pool): every acquire creates.
+    for i in range(len(layer_sizes)):
+        assert_true(
+            not st.note_acquire(layer_sizes[i]),
+            "cold pool: every acquire creates",
+        )
+    assert_equal(st.created, 14)
+    assert_equal(st.reused, 0)
+    assert_equal(st.live, 14)
+    for i in range(len(layer_sizes)):
+        assert_true(
+            st.note_release(layer_sizes[i]), "under the cap: releases park"
+        )
+    assert_equal(st.live, 0)
+    assert_equal(st.total_free(), 14)
+    # Layer 2 (warm pool): every acquire is served by a parked
+    # buffer; nothing new is created. Across 52 layers this is
+    # the item's whole effect: the working set is created once.
+    for i in range(len(layer_sizes)):
+        assert_true(
+            st.note_acquire(layer_sizes[i]), "warm pool: acquires reuse"
+        )
+    assert_equal(st.created, 14)
+    assert_equal(st.reused, 14)
+    for i in range(len(layer_sizes)):
+        _ = st.note_release(layer_sizes[i])
+    assert_equal(st.live, 0)
+    # Exact-size classes: a near size is a different class.
+    assert_equal(st.find_class(6656), 0)
+    assert_true(st.find_class(6657) == -1, "classes match exactly")
+    assert_true(not st.note_acquire(6657), "a new size creates")
+    assert_equal(st.created, 15)
+    _ = st.note_release(6657)
+    # The park cap: 65 outstanding buffers of one fresh size,
+    # released together - 64 park, the 65th is dropped.
+    var cap = SCRATCH_POOL_MAX_FREE_PER_CLASS
+    for _ in range(cap + 1):
+        _ = st.note_acquire(128)
+    var parked = 0
+    var dropped_before = st.dropped
+    for _ in range(cap + 1):
+        if st.note_release(128):
+            parked += 1
+    assert_equal(parked, cap)
+    assert_equal(st.dropped, dropped_before + 1)
+    assert_equal(st.live, 0)
+    print("gpu scratch pool: cold-create / warm-reuse / park-cap exact")
 
 
 def main() raises:

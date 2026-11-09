@@ -651,9 +651,18 @@ struct DeviceKvCache(Movable):
         global layers, and windowed layers whose first visible
         position lands on slot 0) the raw buffer itself is
         returned, no copy; otherwise kv_visible_gather_kernel
-        materializes the order into a fresh scratch buffer
-        (at most window x row floats, inside the runtime's
-        scratch envelope)."""
+        materializes the order into a scratch buffer (at most
+        window x row floats, inside the runtime's scratch
+        envelope). Wave F item 3: the materialized buffer is
+        drawn from the runtime's scratch POOL (the gather
+        kernel writes every element of every visible row, so
+        the pool's undefined contents are safe) and the caller
+        owns it until release_f32 with stored_len x row_len
+        elements - the attention launches do exactly that once
+        their reads are enqueued; the batch path lets it die
+        at scope exit, which is also correct (it just misses
+        the reuse). The raw-buffer return is a VIEW of the
+        cache's own memory and must NEVER be released."""
         self._check_layer(layer)
         var kind = self.layers[layer].kind.copy()
         var first = self.layers[layer].first_visible_position()
@@ -666,7 +675,7 @@ struct DeviceKvCache(Movable):
             return src^
         var stored = self.layers[layer].stored()
         var row = self.row_len()
-        var out = create_zero_f32(rt, stored * row)
+        var out = rt.acquire_f32(stored * row)
         var window = 0 if kind.is_global else kind.window
         var first_slot = kv_visible_slot(kind, first, 0)
         rt.ctx.enqueue_function[kv_visible_gather_kernel](

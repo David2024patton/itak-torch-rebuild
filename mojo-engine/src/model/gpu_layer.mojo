@@ -152,6 +152,7 @@ from gpu.context import (
     download_f32,
     create_zero_f32,
 )
+from gpu.device_kv import kv_gather_needed
 from gpu.weights import DeviceWeights, DeviceSlotU8, DeviceSlotF32
 from gpu.device_kv import DeviceKvCache
 from model.model import (
@@ -785,29 +786,37 @@ def _swiglu_device(
 def _alloc_f32(
     mut rt: GpuRuntime, n: Int
 ) raises -> DeviceBuffer[DType.float32]:
-    """A raw (UNINITIALIZED) device float32 buffer of n
-    elements, for resident-chain outputs that their kernel
-    writes IN FULL before any read (Wave E, Lane E2: the
-    create_zero_f32 zero-fill launch per op - about 21 per
-    layer - was pure overhead on this chain). Full-write
-    audit, kernel by kernel: rms_norm_kernel writes every
-    row element; the GEMV family (k1/q6k/q5k/f32/f16) writes
+    """A float32 device buffer of n elements for a
+    resident-chain output, drawn from the runtime's SCRATCH
+    POOL (Wave F, Lane F1-A item 3; gpu/scratch.mojo): the
+    first step creates the chain's working set, later steps
+    reuse it - the per-op driver allocation this used to be
+    (a raw enqueue_create_buffer per call, about 21 per
+    layer) is gone after warmup. Contents are UNDEFINED,
+    exactly as the raw create's were: every consumer kernel
+    writes every element before any read. Full-write audit,
+    kernel by kernel: rms_norm_kernel writes every row
+    element; the GEMV family (k1/q6k/q5k/f32/f16) writes
     every output row its launch grid covers, and
     gpu_layer_check_proj refuses row counts the tile cannot
     cover exactly; rope_kernel's launch covers exactly the
     input's pairs (rope_launch_shape); attention_merge_kernel
     and the splits==1 direct kernel write every head/channel;
     attn_gate_kernel, swiglu_kernel, residual_add_kernel and
-    final_logit_kernel write every element under their
-    bounds guard. Any future kernel that ACCUMULATES into
-    its output or writes partially must NOT take its output
-    from here - it needs create_zero_f32."""
+    final_logit_kernel write every element under their bounds
+    guard. Any future kernel that ACCUMULATES into its output
+    or writes partially must NOT take its output from here -
+    it needs create_zero_f32. The caller owns the buffer
+    until it is returned with rt.release_f32(buf, n) at its
+    last use or destroyed at scope exit (destruction is the
+    pre-pool behavior and stays correct; release is what
+    makes the next acquire free)."""
     if n <= 0:
         raise Error(
             "gpu_layer_bad_shape: raw alloc length must be positive, got "
             + String(n)
         )
-    return rt.ctx.enqueue_create_buffer[DType.float32](n)
+    return rt.acquire_f32(n)
 
 
 def _rms_norm_buf(
@@ -1257,6 +1266,16 @@ def attention_device_resident_cfg(
     attn_validate_tile(tile)
     var splits = attn_split_count(stored, split_span, max_splits)
     var y_dev = _alloc_f32(rt, q_heads * head_dim)
+    # Whether the gather materialized scratch buffers (they
+    # are pool buffers, released below once the launches that
+    # read them are enqueued) or returned the cache's own raw
+    # buffers (NEVER released - the cache owns them). The
+    # predicate is the cache's own: gather_needed on the
+    # layer's kind and first visible position.
+    var kind = kv.layer_kind(layer)
+    var gather_owned = kv_gather_needed(
+        kind, kv.first_visible_position(layer)
+    )
     var k_vis = kv.gather_visible(rt, layer, False)
     var v_vis = kv.gather_visible(rt, layer, True)
     var scale = Float32(1.0) / sqrt(Float32(head_dim))
@@ -1279,15 +1298,9 @@ def attention_device_resident_cfg(
             scale,
         )
     else:
-        var p_out = rt.ctx.enqueue_create_buffer[DType.float32](
-            splits * q_heads * head_dim
-        )
-        var p_max = rt.ctx.enqueue_create_buffer[DType.float32](
-            splits * q_heads
-        )
-        var p_sum = rt.ctx.enqueue_create_buffer[DType.float32](
-            splits * q_heads
-        )
+        var p_out = _alloc_f32(rt, splits * q_heads * head_dim)
+        var p_max = _alloc_f32(rt, splits * q_heads)
+        var p_sum = _alloc_f32(rt, splits * q_heads)
         _launch_tiled(
             rt,
             tile,
@@ -1315,6 +1328,19 @@ def attention_device_resident_cfg(
             grid_dim=q_heads,
             block_dim=ATTN_THREADS,
         )
+        # The partials are dead once the merge is enqueued
+        # (single in-order queue: the merge reads them before
+        # any later launch can rewrite them). Return them to
+        # the pool; before Wave F they were fresh driver
+        # allocations on every long-context layer call.
+        rt.release_f32(p_out^, splits * q_heads * head_dim)
+        rt.release_f32(p_max^, splits * q_heads)
+        rt.release_f32(p_sum^, splits * q_heads)
+    if gather_owned:
+        # The materialized visible-order buffers are dead
+        # once the attention launches above are enqueued.
+        rt.release_f32(k_vis^, stored * kv_heads * head_dim)
+        rt.release_f32(v_vis^, stored * kv_heads * head_dim)
     _ = log_debug(
         "gpu.layer",
         "attention resident tiled stored="

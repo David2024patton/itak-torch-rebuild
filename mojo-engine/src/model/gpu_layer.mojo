@@ -1417,26 +1417,21 @@ def _residual_add_buf(
 # ---- public surface ------------------------------------------
 
 
-def gpu_logits(
+def gpu_logits_buf(
     mut rt: GpuRuntime,
     weights: DeviceWeights,
     cpu_model: GlimmerModel,
-    hidden: List[Float32],
-) raises -> List[Float32]:
-    """finish_last on device: final rms_norm (grid 1) + head
-    GEMV by the output slot's dtype + final_logit_kernel
-    (scale then softcap, both from the CPU model's config).
-    Same math as GlimmerModel.logits."""
-    var prof = debug_enabled()
-    var prof_t0 = perf_counter_ns()
+    var hidden_dev: DeviceBuffer[DType.float32],
+) raises -> DeviceBuffer[DType.float32]:
+    """The head chain over a RESIDENT hidden row (Wave F,
+    Lane F1-A item 1): final rms_norm (grid 1) + head GEMV +
+    final_logit_kernel, all on buffers, returning the
+    finished logits as a device buffer. Takes ownership of
+    hidden_dev (it is dead at the norm launch and returns to
+    the scratch pool there); the returned buffer is the
+    caller's, under the same release-or-destroy law. The
+    arithmetic is gpu_logits', launch for launch."""
     var cfg = cpu_model.cfg.copy()
-    if len(hidden) != cfg.hidden:
-        raise Error(
-            "gpu_layer_bad_shape: logits got hidden row of "
-            + String(len(hidden))
-            + ", hidden is "
-            + String(cfg.hidden)
-        )
     var norm_view = weights.output_norm()
     if norm_view.cols != cfg.hidden:
         raise Error(
@@ -1445,14 +1440,12 @@ def gpu_logits(
             + " is not hidden "
             + String(cfg.hidden)
         )
-    # Resident chain (Wave D): upload the hidden row once,
-    # norm -> head GEMV -> final-logit transform on buffers,
-    # download the logits row once.
-    var hidden_dev = upload_f32(rt, hidden)
     var normed = _rms_norm_buf(
         rt, hidden_dev, cfg.hidden, norm_view.buffer, cfg.hidden, cfg.rms_eps
     )
+    rt.release_f32(hidden_dev^, cfg.hidden)
     var raw = _proj_output_buf(rt, weights, cpu_model, normed, cfg.hidden)
+    rt.release_f32(normed^, cfg.hidden)
     var raw_len = cpu_model.output.rows
     var y_dev = _alloc_f32(rt, raw_len)
     var grid = (raw_len + GATE_THREADS - 1) // GATE_THREADS
@@ -1465,8 +1458,43 @@ def gpu_logits(
         grid_dim=grid,
         block_dim=GATE_THREADS,
     )
+    rt.release_f32(raw^, raw_len)
     _ = log_debug("gpu.layer", "logits rows=" + String(raw_len))
+    return y_dev^
+
+
+def gpu_logits(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    cpu_model: GlimmerModel,
+    hidden: List[Float32],
+) raises -> List[Float32]:
+    """finish_last on device: final rms_norm (grid 1) + head
+    GEMV by the output slot's dtype + final_logit_kernel
+    (scale then softcap, both from the CPU model's config).
+    Same math as GlimmerModel.logits. The chain itself is
+    gpu_logits_buf's; this wrapper keeps the Wave C host-row
+    surface: upload the hidden row once, download the logits
+    row once."""
+    var prof = debug_enabled()
+    var prof_t0 = perf_counter_ns()
+    var cfg = cpu_model.cfg.copy()
+    if len(hidden) != cfg.hidden:
+        raise Error(
+            "gpu_layer_bad_shape: logits got hidden row of "
+            + String(len(hidden))
+            + ", hidden is "
+            + String(cfg.hidden)
+        )
+    var hidden_dev = rt.acquire_f32(cfg.hidden)
+    var host = rt.ctx.enqueue_create_host_buffer[DType.float32](cfg.hidden)
+    for i in range(cfg.hidden):
+        host[i] = hidden[i]
+    rt.ctx.enqueue_copy(src_buf=host, dst_buf=hidden_dev)
+    var y_dev = gpu_logits_buf(rt, weights, cpu_model, hidden_dev^)
+    var raw_len = cpu_model.output.rows
     var logits_out = download_f32(rt, y_dev, raw_len)
+    rt.release_f32(y_dev^, raw_len)
     if prof:
         # PROFILE_LOGITS (Wave E lane E2, MOJO_ENGINE_DEBUG
         # gated): wall time of one gpu_logits call. The
@@ -1608,6 +1636,183 @@ def gpu_layer_step_hostchain(
     return residual_add_cpu(residual2, ffn)
 
 
+def gpu_layer_step_buf(
+    mut rt: GpuRuntime,
+    weights: DeviceWeights,
+    mut kv: DeviceKvCache,
+    cpu_model: GlimmerModel,
+    var residual: DeviceBuffer[DType.float32],
+    layer: Int,
+    position: Int,
+    attn_tile: Int,
+    attn_max_splits: Int,
+    attn_split_span: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """One token's hidden row through one layer, BUFFER in,
+    BUFFER out (Wave F, Lane F1-A item 1): the Wave D resident
+    chain with the layer boundary itself removed - the input
+    arrives as a device buffer and the output leaves as one,
+    so a whole decode step (embedding, all 52 layers, the
+    head) crosses the host exactly once, at the final logits
+    download. Takes ownership of the input buffer (the
+    residual stream's first buffer: dead at the first residual
+    add, returned to the scratch pool there); every
+    intermediate returns to the pool at its last use (the
+    release map is in the body's comments); the returned
+    buffer is the caller's under the same law. Same kernels,
+    same launch order, same arithmetic as gpu_layer_step_cfg,
+    which is now this function's host wrapper."""
+    var cfg = cpu_model.cfg.copy()
+    if layer < 0 or layer >= cfg.layers:
+        raise Error(
+            "gpu_layer_bad_shape: layer "
+            + String(layer)
+            + " outside 0.."
+            + String(cfg.layers)
+        )
+    if position < 0:
+        raise Error(
+            "gpu_layer_bad_shape: position must be >= 0, got "
+            + String(position)
+        )
+    var kind = cfg.kinds[layer].copy()
+    var sliding = not kind.is_global
+    _ = log_debug(
+        "gpu.layer",
+        "step resident layer="
+        + String(layer)
+        + " position="
+        + String(position)
+        + " sliding="
+        + String(sliding),
+    )
+    var qkv_w = cfg.kv_heads * cfg.head_dim
+    var q_w = cfg.q_heads * cfg.head_dim
+    var ffn_w = _ffn_width(cpu_model, layer)
+    # Release map for the chain (each buffer returns to the
+    # pool at its LAST use; the single in-order queue makes a
+    # release safe the moment the consuming launch is
+    # enqueued): h dies at the gate projection (its last
+    # reader); q_proj/k_proj die at their norms; k_norm dies
+    # at the rope or the append; v dies at the append; q_norm
+    # (or its rope output) dies at the attention launch; attn
+    # and gate die at the gate assembly; gated dies at the
+    # out projection; out dies at its post norm; the residual
+    # input dies at the first residual add; residual2 dies at
+    # the second; h2 dies at the up projection; gate_ffn and
+    # up_ffn die at swiglu; act dies at the down projection;
+    # the normed ffn dies at the second residual add.
+    var h = _rms_norm_buf(
+        rt,
+        residual,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
+    )
+    var q_proj = _proj_layer_buf(rt, weights, cpu_model, layer, 1, h, cfg.hidden)
+    var k_proj = _proj_layer_buf(rt, weights, cpu_model, layer, 2, h, cfg.hidden)
+    var v = _proj_layer_buf(rt, weights, cpu_model, layer, 3, h, cfg.hidden)
+    var q = _rms_norm_buf(
+        rt,
+        q_proj,
+        q_w,
+        _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
+    )
+    rt.release_f32(q_proj^, q_w)
+    var k = _rms_norm_buf(
+        rt,
+        k_proj,
+        qkv_w,
+        _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
+        cfg.head_dim,
+        cfg.rms_eps,
+    )
+    rt.release_f32(k_proj^, qkv_w)
+    if sliding:
+        # K rotates at write time (the cache holds rotated K);
+        # Q rotates before the attention launch (pre-rotated
+        # contract), exactly as the hostchain step.
+        var k_rot = _rope_buf(
+            rt, k, qkv_w, cfg.kv_heads, cfg.head_dim, position, cfg.rope_base_swa
+        )
+        rt.release_f32(k^, qkv_w)
+        k = k_rot^
+        var q_rot = _rope_buf(
+            rt, q, q_w, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
+        )
+        rt.release_f32(q^, q_w)
+        q = q_rot^
+    kv.append_device(rt, layer, k, v, position)
+    rt.release_f32(k^, qkv_w)
+    rt.release_f32(v^, qkv_w)
+    var attn = attention_device_resident_cfg(
+        rt,
+        kv,
+        q,
+        layer,
+        cfg.q_heads,
+        cfg.kv_heads,
+        cfg.head_dim,
+        attn_tile,
+        attn_max_splits,
+        attn_split_span,
+    )
+    rt.release_f32(q^, q_w)
+    var gate = _proj_layer_buf(rt, weights, cpu_model, layer, 7, h, cfg.hidden)
+    rt.release_f32(h^, cfg.hidden)
+    var gated = _attn_gate_buf(rt, attn, gate, q_w)
+    rt.release_f32(attn^, q_w)
+    rt.release_f32(gate^, q_w)
+    var out_proj = _proj_layer_buf(rt, weights, cpu_model, layer, 6, gated, q_w)
+    rt.release_f32(gated^, q_w)
+    var out = _rms_norm_buf(
+        rt,
+        out_proj,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
+    )
+    rt.release_f32(out_proj^, cfg.hidden)
+    var residual2 = _residual_add_buf(rt, residual, out, cfg.hidden)
+    rt.release_f32(residual^, cfg.hidden)
+    rt.release_f32(out^, cfg.hidden)
+    var h2 = _rms_norm_buf(
+        rt,
+        residual2,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
+        cfg.hidden,
+        cfg.rms_eps,
+    )
+    var gate_ffn = _proj_layer_buf(
+        rt, weights, cpu_model, layer, 10, h2, cfg.hidden
+    )
+    var up_ffn = _proj_layer_buf(rt, weights, cpu_model, layer, 11, h2, cfg.hidden)
+    rt.release_f32(h2^, cfg.hidden)
+    var act = _swiglu_buf(rt, gate_ffn, up_ffn, ffn_w)
+    rt.release_f32(gate_ffn^, ffn_w)
+    rt.release_f32(up_ffn^, ffn_w)
+    var ffn_proj = _proj_layer_buf(rt, weights, cpu_model, layer, 12, act, ffn_w)
+    rt.release_f32(act^, ffn_w)
+    var ffn = _rms_norm_buf(
+        rt,
+        ffn_proj,
+        cfg.hidden,
+        _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
+        cfg.hidden,
+        POST_NORM_EPS,
+    )
+    rt.release_f32(ffn_proj^, cfg.hidden)
+    var result = _residual_add_buf(rt, residual2, ffn, cfg.hidden)
+    rt.release_f32(residual2^, cfg.hidden)
+    rt.release_f32(ffn^, cfg.hidden)
+    return result^
+
+
 def gpu_layer_step_cfg(
     mut rt: GpuRuntime,
     weights: DeviceWeights,
@@ -1629,7 +1834,10 @@ def gpu_layer_step_cfg(
     statement the CPU layer_step, same kernels in the same
     order as the hostchain step. Windowed layers run PAST
     the window here: the KV ring wraps (B1 semantics) and
-    attention reads through the visible-order gather."""
+    attention reads through the visible-order gather.
+    Wave F: the body is gpu_layer_step_buf's; this wrapper
+    keeps the host-row surface (upload, chain, download) the
+    Wave D proofs and the trait step are written against."""
     var prof = debug_enabled()
     var prof_t0 = perf_counter_ns()
     var cfg = cpu_model.cfg.copy()
@@ -1654,114 +1862,25 @@ def gpu_layer_step_cfg(
         )
     var kind = cfg.kinds[layer].copy()
     var sliding = not kind.is_global
-    _ = log_debug(
-        "gpu.layer",
-        "step resident layer="
-        + String(layer)
-        + " position="
-        + String(position)
-        + " sliding="
-        + String(sliding),
-    )
-    var qkv_w = cfg.kv_heads * cfg.head_dim
-    var q_w = cfg.q_heads * cfg.head_dim
-    var residual = upload_f32(rt, x)
-    var h = _rms_norm_buf(
+    var x_dev = rt.acquire_f32(cfg.hidden)
+    var host = rt.ctx.enqueue_create_host_buffer[DType.float32](cfg.hidden)
+    for i in range(cfg.hidden):
+        host[i] = x[i]
+    rt.ctx.enqueue_copy(src_buf=host, dst_buf=x_dev)
+    var result = gpu_layer_step_buf(
         rt,
-        residual,
-        cfg.hidden,
-        _norm_buffer(weights, cpu_model, layer, 0, cfg.hidden),
-        cfg.hidden,
-        cfg.rms_eps,
-    )
-    var q = _proj_layer_buf(rt, weights, cpu_model, layer, 1, h, cfg.hidden)
-    var k = _proj_layer_buf(rt, weights, cpu_model, layer, 2, h, cfg.hidden)
-    var v = _proj_layer_buf(rt, weights, cpu_model, layer, 3, h, cfg.hidden)
-    q = _rms_norm_buf(
-        rt,
-        q,
-        q_w,
-        _norm_buffer(weights, cpu_model, layer, 4, cfg.head_dim),
-        cfg.head_dim,
-        cfg.rms_eps,
-    )
-    k = _rms_norm_buf(
-        rt,
-        k,
-        qkv_w,
-        _norm_buffer(weights, cpu_model, layer, 5, cfg.head_dim),
-        cfg.head_dim,
-        cfg.rms_eps,
-    )
-    if sliding:
-        # K rotates at write time (the cache holds rotated K);
-        # Q rotates before the attention launch (pre-rotated
-        # contract), exactly as the hostchain step.
-        k = _rope_buf(
-            rt,
-            k,
-            qkv_w,
-            cfg.kv_heads,
-            cfg.head_dim,
-            position,
-            cfg.rope_base_swa,
-        )
-        q = _rope_buf(
-            rt, q, q_w, cfg.q_heads, cfg.head_dim, position, cfg.rope_base_swa
-        )
-    kv.append_device(rt, layer, k, v, position)
-    var attn = attention_device_resident_cfg(
-        rt,
+        weights,
         kv,
-        q,
+        cpu_model,
+        x_dev^,
         layer,
-        cfg.q_heads,
-        cfg.kv_heads,
-        cfg.head_dim,
+        position,
         attn_tile,
         attn_max_splits,
         attn_split_span,
     )
-    var gate = _proj_layer_buf(rt, weights, cpu_model, layer, 7, h, cfg.hidden)
-    var gated = _attn_gate_buf(rt, attn, gate, q_w)
-    var out = _proj_layer_buf(rt, weights, cpu_model, layer, 6, gated, q_w)
-    out = _rms_norm_buf(
-        rt,
-        out,
-        cfg.hidden,
-        _norm_buffer(weights, cpu_model, layer, 8, cfg.hidden),
-        cfg.hidden,
-        POST_NORM_EPS,
-    )
-    var residual2 = _residual_add_buf(rt, residual, out, cfg.hidden)
-    var h2 = _rms_norm_buf(
-        rt,
-        residual2,
-        cfg.hidden,
-        _norm_buffer(weights, cpu_model, layer, 9, cfg.hidden),
-        cfg.hidden,
-        cfg.rms_eps,
-    )
-    var gate_ffn = _proj_layer_buf(
-        rt, weights, cpu_model, layer, 10, h2, cfg.hidden
-    )
-    var up_ffn = _proj_layer_buf(
-        rt, weights, cpu_model, layer, 11, h2, cfg.hidden
-    )
-    var act = _swiglu_buf(rt, gate_ffn, up_ffn, _ffn_width(cpu_model, layer))
-    var ffn = _proj_layer_buf(
-        rt, weights, cpu_model, layer, 12, act, _ffn_width(cpu_model, layer)
-    )
-    ffn = _rms_norm_buf(
-        rt,
-        ffn,
-        cfg.hidden,
-        _norm_buffer(weights, cpu_model, layer, 13, cfg.hidden),
-        cfg.hidden,
-        POST_NORM_EPS,
-    )
-    var result = _residual_add_buf(rt, residual2, ffn, cfg.hidden)
     var layer_out = download_f32(rt, result, cfg.hidden)
+    rt.release_f32(result^, cfg.hidden)
     if prof:
         # PROFILE_LAYER (Wave E lane E2, MOJO_ENGINE_DEBUG
         # gated): wall time of one resident layer step. The

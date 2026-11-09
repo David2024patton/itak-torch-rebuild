@@ -30,10 +30,13 @@
 # Wave C (Lane C3): when the environment variable
 # MOJO_ENGINE_GPU is set to a value other than "" and "0"
 # (the diag seam's convention, diag.debug_value_enabled), the
-# run drives GpuGlimmerModel instead of the CPU model, through
-# the same B4 generate(), the same prints, and the same
-# prefill-measurement construction (a second fresh model
-# stepping the prompt ids). The default is the CPU path,
+# run drives GpuGlimmerModel instead of the CPU model, the
+# same prints, and the same prefill-measurement construction
+# (a second fresh model stepping the prompt ids). Wave F:
+# the GPU drive is generate_device (the resident-seam loop,
+# generate()'s exact semantics with decode steps resident on
+# device); the CPU path still runs B4's generate(). The
+# default is the CPU path,
 # exactly as Wave B shipped. One printed line names the path
 # taken: MODEL_PATH_KIND gpu|cpu. Every other printed line
 # keeps its Wave B format.
@@ -44,7 +47,7 @@ from std.time import perf_counter_ns
 
 from config import ENGINE_NAME, ENGINE_VERSION, EngineConfig
 from diag import debug_value_enabled, log_debug
-from generate.generate import generate
+from generate.generate import generate, generate_device
 from generate.sampler import golden_first_match
 from model.gpu_model import GpuGlimmerModel
 from model.model import GlimmerForwardAdapter, GlimmerModel
@@ -165,7 +168,7 @@ def _gpu_generate_phase(
     var t_load = perf_counter_ns()
     var load_ms = Int((t_load - t0) // 1_000_000)
     var t_gen0 = perf_counter_ns()
-    var out = generate(model, prompt.copy(), MAX_TOKENS, EOS_ID)
+    var out = generate_device(model, prompt.copy(), MAX_TOKENS, EOS_ID)
     var t_gen1 = perf_counter_ns()
     var generate_ms = Int((t_gen1 - t_gen0) // 1_000_000)
     return (out^, load_ms, generate_ms)

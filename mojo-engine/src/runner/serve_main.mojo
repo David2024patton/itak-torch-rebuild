@@ -72,7 +72,7 @@ from std.time import perf_counter_ns
 
 from config import ENGINE_VERSION, EngineConfig, parse_ipv4
 from diag import debug_value_enabled, log_debug
-from generate.generate import ForwardModel
+from generate.generate import ForwardModel, ResidentForwardModel
 from generate.sampler import greedy_argmax
 from model.gpu_model import GpuGlimmerModel
 from model.model import GlimmerForwardAdapter, GlimmerModel
@@ -303,6 +303,51 @@ def _generate_timed[M: ForwardModel](
     )
 
 
+def _generate_timed_device[M: ResidentForwardModel](
+    mut model: M,
+    prompt_ids: List[Int],
+    max_tokens: Int,
+    eos_id: Int,
+    reserved_mib: Int,
+    kv_mib: Int,
+) raises -> GenOutcome:
+    """_generate_timed's loop on the resident seam (Wave F,
+    Lane F1-A item 1): identical picks, timing split, and
+    step accounting, with decode steps running resident
+    (step_device / logits_device) instead of crossing to the
+    host at every layer boundary and again into the head."""
+    if len(prompt_ids) == 0:
+        raise Error("generate_empty_prompt: prompt has no token ids")
+    var n = len(prompt_ids)
+    var t0 = perf_counter_ns()
+    var hidden = model.prefill(prompt_ids)
+    var t1 = perf_counter_ns()
+    var out = List[Int]()
+    var steps = 0
+    var hidden_dev = model.hidden_device(hidden)
+    while True:
+        var row = model.logits_device(hidden_dev^)
+        var next_id = greedy_argmax(row)
+        if next_id == eos_id:
+            break
+        out.append(next_id)
+        if len(out) >= max_tokens:
+            break
+        steps += 1
+        hidden_dev = model.step_device(next_id, n + len(out) - 1)
+    var t2 = perf_counter_ns()
+    return GenOutcome(
+        out^,
+        Int((t1 - t0) // 1_000_000),
+        Int((t2 - t1) // 1_000_000),
+        Int(t1 - t0),
+        Int(t2 - t1),
+        steps,
+        reserved_mib,
+        kv_mib,
+    )
+
+
 def _run_generation(
     st: ServeState, prompt_ids: List[Int], max_tokens: Int
 ) raises -> GenOutcome:
@@ -328,7 +373,7 @@ def _run_generation(
         )
         var reserved = model.rt.total_reserved()
         var kv_mib = model.kv.total_bytes // MIB_BYTES
-        return _generate_timed(
+        return _generate_timed_device(
             model,
             prompt_ids,
             max_tokens,

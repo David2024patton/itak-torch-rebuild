@@ -57,6 +57,13 @@
 # consumed at position n + k. No id is ever fed at a
 # position the prompt already used.
 #
+# Wave F (Lane F1-A, item 1) adds the resident seam beside
+# the trait: ResidentForwardModel extends ForwardModel with
+# device-buffer step/logits methods, and generate_device()
+# runs this module's exact loop over it (see the trait's
+# docstring). Models opt in by implementing the extension;
+# generate() itself is unchanged for every existing model.
+#
 # Named refusals: generate_empty_prompt,
 # generate_bad_max_tokens. Shape discipline: greedy_argmax
 # refuses an empty logits row by name, and the model's own
@@ -73,6 +80,8 @@
 # context literal appears in this module.
 
 from diag import log_debug
+
+from max.gpu.host import DeviceBuffer
 
 from generate.sampler import greedy_argmax
 
@@ -114,6 +123,102 @@ trait ForwardModel:
         for i in range(1, len(prompt_ids)):
             hidden = self.step(prompt_ids[i], i)
         return hidden^
+
+
+trait ResidentForwardModel(ForwardModel):
+    """A ForwardModel whose decode step can stay on device
+    (Wave F, Lane F1-A item 1).
+
+    step_device runs one position keeping the hidden row in
+    a device buffer; hidden_device lifts a host hidden row
+    (a prefill's last row) into one; logits_device finishes
+    a resident row into host logits. generate_device below
+    drives exactly this surface, so the decode loop's only
+    per-token host crossing is the logits row the argmax
+    needs. The CPU adapter does not implement this trait and
+    keeps the plain generate() loop; the two loops' pick
+    semantics are identical (same prefill contract, EOS
+    excluded, never fed back).
+    """
+
+    def step_device(
+        mut self, token_id: Int, position: Int
+    ) raises -> DeviceBuffer[DType.float32]:
+        """Run token_id at position, append to the cache
+        internally, return that position's final hidden row
+        as a device buffer the caller owns."""
+        ...
+
+    def hidden_device(
+        mut self, hidden: List[Float32]
+    ) raises -> DeviceBuffer[DType.float32]:
+        """Lift a host hidden row into a caller-owned device
+        buffer (the prefill seam for the resident loop)."""
+        ...
+
+    def logits_device(
+        mut self, var hidden: DeviceBuffer[DType.float32]
+    ) raises -> List[Float32]:
+        """Finished logits for a resident hidden row;
+        consumes the buffer."""
+        ...
+
+
+def generate_device[
+    M: ResidentForwardModel
+](
+    mut model: M, prompt_ids: List[Int], max_tokens: Int, eos_id: Int
+) raises -> List[Int]:
+    """Greedy generation on the resident seam: generate()'s
+    exact loop (same refusals, same position accounting, EOS
+    excluded and never fed back) with the decode steps
+    running resident - prefill through the trait (its last
+    row crosses to the host once, a per-REQUEST cost), then
+    per generated token: step_device keeps the hidden row on
+    device through every layer and logits_device brings back
+    only the logits row."""
+    if len(prompt_ids) == 0:
+        raise Error("generate_empty_prompt: prompt has no token ids")
+    if max_tokens <= 0:
+        raise Error(
+            "generate_bad_max_tokens: max_tokens must be positive, got "
+            + String(max_tokens)
+        )
+    var n = len(prompt_ids)
+    var hidden = model.prefill(prompt_ids)
+    _ = log_debug(
+        "generate.prefill",
+        "prompt ids " + String(n) + " positions 0.." + String(n - 1),
+    )
+    var out = List[Int]()
+    var hidden_dev = model.hidden_device(hidden)
+    while True:
+        # logits_device consumes the buffer; step_device
+        # replaces it when generation continues.
+        var row = model.logits_device(hidden_dev^)
+        var next_id = greedy_argmax(row)
+        if next_id == eos_id:
+            _ = log_debug(
+                "generate.decode",
+                "eos id "
+                + String(next_id)
+                + " picked at position "
+                + String(n + len(out))
+                + "; stop, eos excluded from output",
+            )
+            break
+        out.append(next_id)
+        _ = log_debug(
+            "generate.decode",
+            "token id "
+            + String(next_id)
+            + " position "
+            + String(n + len(out) - 1),
+        )
+        if len(out) >= max_tokens:
+            break
+        hidden_dev = model.step_device(next_id, n + len(out) - 1)
+    return out^
 
 
 def generate[

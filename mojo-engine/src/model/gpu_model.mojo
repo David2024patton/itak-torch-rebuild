@@ -55,6 +55,23 @@
 # step() and logits() - the decode path - are untouched, and
 # prefill returns the same last hidden row step() would.
 #
+# Wave F (Lane F1-A, item 1): step-level activation
+# residency. step_device() runs one whole decode step with
+# the hidden row ON DEVICE from the embedding to the last
+# layer: gpu_embed_token_device, the plain embedding norm
+# over a resident ones row (built once, lazily, and held in
+# embed_ones below - step() used to rebuild and re-upload
+# that row on every call), then gpu_layer_step_buf per
+# layer, buffer to buffer. logits_device() finishes the
+# step through gpu_logits_buf, so a decode step's only host
+# crossing is the final logits download the argmax needs.
+# step() is now download(step_device(...)) and keeps the
+# trait surface (and its results) unchanged. The resident
+# decode loop that consumes the pair lives in
+# generate/generate.mojo (generate_device) and is what the
+# runners drive; the trait's generate() still works over
+# step()/logits() for the CPU-shaped callers and proofs.
+#
 # Named refusals: gpu_model_bad_token (token outside vocab,
 # checked before any device work, mirroring
 # model_bad_token), gpu_model_bad_shape (hidden row width at
@@ -73,19 +90,21 @@ from config import (
     DEFAULT_PREFILL_GEMM_MIN_BATCH,
     prefill_uses_batch,
 )
+from max.gpu.host import DeviceBuffer
+
 from diag import log_debug
-from generate.generate import ForwardModel
+from generate.generate import ForwardModel, ResidentForwardModel
 from gpu.context import GpuRuntime, download_f32, upload_f32
 from gpu.device_kv import DeviceKvCache
 from gpu.weights import DeviceWeights
-from model.gpu_layer import gpu_layer_step_cfg, gpu_logits
+from model.gpu_layer import gpu_layer_step_buf, gpu_layer_step_cfg, gpu_logits, gpu_logits_buf
 from model.gpu_layer_batch import gpu_layer_step_batch_cfg, batch_row_slice
 from model.model import GlimmerModel
-from ops.gpu_embedding import gpu_embed_token
+from ops.gpu_embedding import gpu_embed_token, gpu_embed_token_device
 from ops.rms_norm import RMS_THREADS, rms_norm_kernel
 
 
-struct GpuGlimmerModel(ForwardModel, Movable):
+struct GpuGlimmerModel(ResidentForwardModel, Movable):
     """The device-resident Glimmer forward.
 
     Holds the CPU model (config, captures, fallback, loader of
@@ -115,6 +134,12 @@ struct GpuGlimmerModel(ForwardModel, Movable):
     # construction site landing its arguments in the same
     # parameters (the Wave D positional-slip lesson).
     var prefill_batch_min_tokens: Int
+    # Wave F: the resident ones row for the embedding norm
+    # (step_device's plain rms_norm weight), built lazily on
+    # the first resident step and held for the model's life;
+    # empty list = not built. Struct-internal (no __init__
+    # parameter), so construction sites are untouched.
+    var embed_ones: List[DeviceBuffer[DType.float32]]
 
     def __init__(
         out self,
@@ -165,6 +190,7 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.prefill_gemm_min_batch = prefill_gemm_min_batch
         self.gemm_tiled_min_batch = gemm_tiled_min_batch
         self.prefill_batch_min_tokens = prefill_batch_min_tokens
+        self.embed_ones = List[DeviceBuffer[DType.float32]]()
         _ = log_debug(
             "model",
             "gpu model built layers="
@@ -283,11 +309,40 @@ struct GpuGlimmerModel(ForwardModel, Movable):
         self.rt.ctx.synchronize()
         return download_f32(self.rt, y_dev, n)
 
-    def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
+    def _embed_ones(mut self) raises -> DeviceBuffer[DType.float32]:
+        """The resident ones row (hidden floats of 1.0) that
+        the plain embedding norm uses as its weight, built and
+        uploaded ONCE per model (Wave F; step() used to build
+        and upload it on every call). Returns a view; the
+        model owns the buffer for its whole life - callers
+        must never release it."""
+        if len(self.embed_ones) == 0:
+            var n = self.cpu.cfg.hidden
+            var ones = List[Float32](capacity=n)
+            ones.resize(n, Float32(1.0))
+            self.embed_ones.append(upload_f32(self.rt, ones))
+            _ = log_debug(
+                "model", "embed ones row built hidden=" + String(n)
+            )
+        return self.embed_ones[0].copy()
+
+    def step_device(
+        mut self, token_id: Int, position: Int
+    ) raises -> DeviceBuffer[DType.float32]:
         """One token at one absolute position through the whole
-        stack on device; appends to the device KV cache (inside
-        gpu_layer_step_cfg); returns the final hidden row. Mirrors
-        GlimmerModel.step statement for statement."""
+        stack, the hidden row RESIDENT on device end to end
+        (Wave F, Lane F1-A item 1): embedding dequant on
+        device, the plain embedding norm on device over the
+        resident ones row, then gpu_layer_step_buf for all
+        layers in order, buffer to buffer, appending to the
+        device KV cache as it goes. Returns the final hidden
+        row as a device buffer (the caller owns it: feed it
+        to logits_device, or release it with
+        rt.release_f32(buf, hidden)). Mirrors step()
+        statement for statement, including the capture point:
+        with captures enabled the post-norm embedding row is
+        downloaded into the CPU model, the step's only extra
+        crossing, and only in capture mode."""
         var cfg = self.cpu.cfg.copy()
         if token_id < 0 or token_id >= cfg.vocab:
             raise Error(
@@ -300,17 +355,28 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             raise Error(
                 "gpu_model_bad_shape: negative position " + String(position)
             )
-        var x = gpu_embed_token(self.rt, self.weights, token_id)
-        x = self._plain_rms_norm(x, cfg.rms_eps)
+        var x = gpu_embed_token_device(self.rt, self.weights, token_id)
+        var normed = self.rt.acquire_f32(cfg.hidden)
+        self.rt.ctx.enqueue_function[rms_norm_kernel](
+            x,
+            self._embed_ones(),
+            normed,
+            Int32(cfg.hidden),
+            cfg.rms_eps,
+            grid_dim=1,
+            block_dim=RMS_THREADS,
+        )
+        self.rt.release_f32(x^, cfg.hidden)
+        x = normed^
         if self.cpu.capture_enabled:
-            self.cpu.capture_embed = x.copy()
+            self.cpu.capture_embed = download_f32(self.rt, x, cfg.hidden)
         for layer in range(cfg.layers):
-            x = gpu_layer_step_cfg(
+            x = gpu_layer_step_buf(
                 self.rt,
                 self.weights,
                 self.kv,
                 self.cpu,
-                x,
+                x^,
                 layer,
                 position,
                 self.attn_tile_positions,
@@ -319,12 +385,71 @@ struct GpuGlimmerModel(ForwardModel, Movable):
             )
         _ = log_debug(
             "model",
-            "gpu step token="
+            "gpu step resident token="
             + String(token_id)
             + " position="
             + String(position),
         )
         return x^
+
+    def logits_device(
+        mut self, var hidden_dev: DeviceBuffer[DType.float32]
+    ) raises -> List[Float32]:
+        """Finished logits for a RESIDENT hidden row (the
+        output of step_device): gpu_logits_buf's head chain
+        on buffers, one download of the logits row - the
+        decode step's only host crossing, and the one the
+        host-side argmax genuinely needs. Consumes the
+        hidden buffer (the head chain releases it)."""
+        var y_dev = gpu_logits_buf(self.rt, self.weights, self.cpu, hidden_dev^)
+        var raw_len = self.cpu.output.rows
+        var out = download_f32(self.rt, y_dev, raw_len)
+        self.rt.release_f32(y_dev^, raw_len)
+        return out^
+
+    def hidden_device(
+        mut self, hidden: List[Float32]
+    ) raises -> DeviceBuffer[DType.float32]:
+        """Upload a host hidden row into a pooled device
+        buffer (the resident decode loop's entry point for a
+        prefill's last row, which the trait prefill returns
+        on the host). The caller owns the buffer."""
+        var cfg = self.cpu.cfg.copy()
+        if len(hidden) != cfg.hidden:
+            raise Error(
+                "gpu_model_bad_shape: hidden row of "
+                + String(len(hidden))
+                + ", hidden is "
+                + String(cfg.hidden)
+            )
+        var buf = self.rt.acquire_f32(cfg.hidden)
+        var host = self.rt.ctx.enqueue_create_host_buffer[DType.float32](
+            cfg.hidden
+        )
+        for i in range(cfg.hidden):
+            host[i] = hidden[i]
+        self.rt.ctx.enqueue_copy(src_buf=host, dst_buf=buf)
+        return buf^
+
+    def step(mut self, token_id: Int, position: Int) raises -> List[Float32]:
+        """One token at one absolute position through the whole
+        stack on device; appends to the device KV cache (inside
+        gpu_layer_step_buf); returns the final hidden row.
+        Mirrors GlimmerModel.step statement for statement.
+        Wave F: the body is step_device's; this method is its
+        host surface (resident step + the one download), so
+        the trait's callers get the resident path too."""
+        var x = self.step_device(token_id, position)
+        var out = download_f32(self.rt, x, self.cpu.cfg.hidden)
+        self.rt.release_f32(x^, self.cpu.cfg.hidden)
+        _ = log_debug(
+            "model",
+            "gpu step token="
+            + String(token_id)
+            + " position="
+            + String(position),
+        )
+        return out^
 
     def logits(mut self, hidden: List[Float32]) raises -> List[Float32]:
         """Finished logits for one hidden row: C2's gpu_logits

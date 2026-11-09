@@ -23,8 +23,16 @@
 # so the parity bar against the CPU twin is element-exact
 # class (proof bar: max abs <= 1e-6).
 #
+# Wave F (Lane F1-A, item 1): gpu_embed_token_device is the
+# resident form - same validation, same kernel launch, but
+# the row stays on device (pool buffer, no synchronize, no
+# download) for the resident step chain. gpu_embed_token is
+# now its host wrapper (device form + download), so the two
+# can never drift apart.
+#
 # C1 surface used (gpu package, Lane C1 as built):
-#   gpu.context: GpuRuntime, create_zero_f32, download_f32.
+#   gpu.context: GpuRuntime (incl. acquire_f32 for the
+#     resident form's row), download_f32.
 #   gpu.weights: DeviceWeights.embedding_meta() for the
 #     slot's type/rows/cols and .embedding_u8() for the
 #     resident byte buffer view.
@@ -33,9 +41,10 @@
 # gpu_embedding_bad_shape, gpu_embedding_unsupported_dtype.
 
 from max.gpu import thread_idx, block_idx, block_dim
+from max.gpu.host import DeviceBuffer
 
 from diag import log_debug
-from gpu.context import GpuRuntime, create_zero_f32, download_f32
+from gpu.context import GpuRuntime, download_f32
 from gpu.weights import DeviceWeights
 from kernels.dequant import (
     read_f16_ptr,
@@ -144,10 +153,17 @@ def embedding_dequant_kernel(
     y[unsafe_offset=idx] = q5k_element_ptr(w, sb5, within)
 
 
-def gpu_embed_token(
+def gpu_embed_token_device(
     mut rt: GpuRuntime, weights: DeviceWeights, token: Int
-) raises -> List[Float32]:
-    """Device-dequantized embedding row for one token."""
+) raises -> DeviceBuffer[DType.float32]:
+    """Device-resident embedding row for one token (Wave F,
+    Lane F1-A item 1): gpu_embed_token's validation and
+    dequant launch, but the row stays on device - a scratch
+    pool buffer (the kernel writes every element, so the
+    pool's undefined contents are safe), no synchronize, no
+    download. The caller owns the buffer: release it with
+    rt.release_f32(buf, hidden) at its last use or let it die
+    at scope exit."""
     var meta = weights.embedding_meta()
     var type_id = meta.type_id
     var rows = meta.rows
@@ -174,7 +190,7 @@ def gpu_embed_token(
         )
     _ = embedding_row_bytes(type_id, cols)
     var view = weights.embedding_u8()
-    var out_dev = create_zero_f32(rt, cols)
+    var out_dev = rt.acquire_f32(cols)
     var grid = (cols + EMB_THREADS - 1) // EMB_THREADS
     rt.ctx.enqueue_function[embedding_dequant_kernel](
         view.buffer,
@@ -185,8 +201,47 @@ def gpu_embed_token(
         grid_dim=grid,
         block_dim=EMB_THREADS,
     )
-    rt.ctx.synchronize()
     _ = log_debug(
-        "gpu.embedding", "token " + String(token) + " hidden " + String(cols)
+        "gpu.embedding",
+        "token " + String(token) + " hidden " + String(cols) + " resident",
     )
+    return out_dev^
+
+
+def gpu_embed_token(
+    mut rt: GpuRuntime, weights: DeviceWeights, token: Int
+) raises -> List[Float32]:
+    """Device-dequantized embedding row for one token,
+    downloaded to the host: the resident form
+    (gpu_embed_token_device) plus the download, whose own
+    synchronize orders the read - the explicit pre-download
+    synchronize the Wave C form carried was redundant with
+    it and is gone."""
+    var meta = weights.embedding_meta()
+    var type_id = meta.type_id
+    var rows = meta.rows
+    var cols = meta.cols
+    if token < 0 or token >= rows:
+        raise Error(
+            "gpu_embedding_bad_token: token "
+            + String(token)
+            + " outside vocab 0.."
+            + String(rows)
+        )
+    if (
+        type_id != DT_Q4_K
+        and type_id != DT_Q6_K
+        and type_id != DT_Q5_K
+        and type_id != DT_F16
+    ):
+        raise Error(
+            "gpu_embedding_unsupported_dtype: token_embd.weight has"
+            " ggml type id "
+            + String(type_id)
+            + "; this path serves Q4_K/Q6_K/Q5_K/F16 byte tables"
+            " (F32 refuses here by design, see the module header)"
+        )
+    _ = embedding_row_bytes(type_id, cols)
+    var view = weights.embedding_u8()
+    var out_dev = gpu_embed_token_device(rt, weights, token)
     return download_f32(rt, out_dev, cols)

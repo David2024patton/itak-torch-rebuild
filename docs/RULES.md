@@ -101,3 +101,15 @@ Patton and apply to every module, every language, every time.
   array on the home server; see DECISIONS.md 2026-10-27.
 - **The server never reboots for this project.** Any step that appears
   to need one stops and is reported instead (see docs/RUNBOOK.md).
+
+### Relational diagram
+
+- This project always has a relational diagram: the whole system as
+  nodes and wires, every module and how it connects, each node
+  marked LIVE, PLANNED, or ABSENT with its source file, built from
+  the code. It lives in this repo under docs/relational-map/, and
+  docs/MAP.md points at it.
+- The diagram is updated after every build unit and after any
+  change to any part of the project, in the same push cycle as the
+  change itself. A unit is not fully landed until the diagram
+  matches it.
